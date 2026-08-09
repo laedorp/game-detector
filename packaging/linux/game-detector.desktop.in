@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Game Detector
+GenericName=Object Detection Viewer
+Comment=Run offline object detection on Moonlight, a capture device, or a video
+Exec=@EXECUTABLE@
+TryExec=@EXECUTABLE@
+Icon=game-detector
+Terminal=false
+Categories=Utility;
+Keywords=object;detection;OpenVINO;Moonlight;video;
+StartupNotify=true
+StartupWMClass=GameDetector

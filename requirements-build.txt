@@ -1,0 +1,5 @@
+-r requirements.txt
+
+# PyInstaller 6.22 supports Python 3.14 and provides current hooks for the
+# OpenCV wheel used by this project.
+pyinstaller>=6.22,<7
