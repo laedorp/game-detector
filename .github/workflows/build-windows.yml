@@ -29,7 +29,7 @@ jobs:
       - name: Build and package Windows app
         shell: pwsh
         env:
-          GAME_DETECTOR_PYTHON: python
+          GAME_DETECTOR_PYTHON: ${{ env.pythonLocation }}\python.exe
         run: ./scripts/build_windows_app.ps1
 
       - name: Upload Windows ZIP

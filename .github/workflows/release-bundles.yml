@@ -35,7 +35,7 @@ jobs:
 
       - name: Build Linux desktop bundle
         env:
-          GAME_DETECTOR_PYTHON: python
+          GAME_DETECTOR_PYTHON: ${{ env.pythonLocation }}/bin/python
         run: ./scripts/build_linux_app.sh
 
       - name: Create Linux ZIP
@@ -73,7 +73,7 @@ jobs:
       - name: Build Windows desktop bundle
         shell: pwsh
         env:
-          GAME_DETECTOR_PYTHON: python
+          GAME_DETECTOR_PYTHON: ${{ env.pythonLocation }}\python.exe
         run: ./scripts/build_windows_app.ps1
 
       - name: Upload Windows ZIP artifact
