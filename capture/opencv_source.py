@@ -36,6 +36,7 @@ class OpenCVCaptureSource(CaptureSource):
         buffer_size: int = 1,
         live: bool | None = None,
         close_timeout: float = 2.0,
+        pixel_format: str | None = None,
     ) -> None:
         if isinstance(source, bool):
             raise TypeError("source must be a device index or file path, not bool")
@@ -49,6 +50,7 @@ class OpenCVCaptureSource(CaptureSource):
             raise ValueError("buffer_size must be positive")
         if close_timeout < 0:
             raise ValueError("close_timeout must be non-negative")
+        self._pixel_format = _normalized_pixel_format(pixel_format)
 
         self._source: int | str = str(source) if isinstance(source, Path) else source
         self._live = isinstance(source, int) if live is None else bool(live)
@@ -205,11 +207,30 @@ class OpenCVCaptureSource(CaptureSource):
         return cv2.VideoCapture(self._source, self._backend)
 
     def _apply_live_requests(self, capture: Any) -> None:
+        # The pixel format must be negotiated before size and rate.  A card's
+        # advertised high frame rates usually exist only in a compressed or
+        # subsampled mode, and drivers clamp the rate to whatever the *current*
+        # format can sustain, so requesting 240 fps while still in the default
+        # uncompressed mode silently yields 30 or 60.
+        if self._pixel_format is not None:
+            fourcc_id = getattr(cv2, "CAP_PROP_FOURCC", None)
+            writer_fourcc = getattr(cv2, "VideoWriter_fourcc", None)
+            if fourcc_id is not None and writer_fourcc is not None:
+                try:
+                    capture.set(fourcc_id, writer_fourcc(*self._pixel_format))
+                except Exception:
+                    pass
+
         requested = (
             ("CAP_PROP_FRAME_WIDTH", self._requested_width),
             ("CAP_PROP_FRAME_HEIGHT", self._requested_height),
             ("CAP_PROP_FPS", self._requested_fps),
             ("CAP_PROP_BUFFERSIZE", self._buffer_size),
+            # Ask for BGR explicitly so both compressed (MJPG) and subsampled
+            # (NV12, YUY2) modes are decoded by the backend.  Without it a
+            # backend that hands back raw planar data would reach the detector
+            # as a wrongly shaped array rather than an image.
+            ("CAP_PROP_CONVERT_RGB", 1),
         )
         for property_name, value in requested:
             property_id = getattr(cv2, property_name, None)
@@ -232,6 +253,11 @@ class OpenCVCaptureSource(CaptureSource):
             "fps": _float_property(capture, "CAP_PROP_FPS"),
             "frame_count": _integer_property(capture, "CAP_PROP_FRAME_COUNT"),
             "buffer_size": _integer_property(capture, "CAP_PROP_BUFFERSIZE"),
+            # Report what the driver actually granted.  A request is only a
+            # hint, and silently running in the wrong format is the single
+            # most common reason a capture card misses its rated frame rate.
+            "pixel_format": _fourcc_text(capture),
+            "requested_pixel_format": self._pixel_format,
         }
         with self._settings_lock:
             self._actual_settings = settings
@@ -298,6 +324,43 @@ def _describe_source(source: int | str, live: bool) -> str:
     if live:
         return f"live OpenCV source {source!r}"
     return f"video file {source!r}"
+
+
+# Formats worth naming.  NV12 and YUY2 are uncompressed, so their bandwidth is
+# fixed by resolution and rate; MJPG is compressed and is usually the only way a
+# USB card reaches its highest advertised rates.
+KNOWN_PIXEL_FORMATS = ("MJPG", "NV12", "YUY2", "YUYV", "UYVY", "BGR3", "RGB3", "H264")
+
+
+def _normalized_pixel_format(value: str | None) -> str | None:
+    """Validate a FOURCC request without requiring it to be one we know."""
+
+    if value is None:
+        return None
+    text = str(value).strip().upper()
+    if not text:
+        return None
+    if len(text) != 4:
+        raise ValueError(
+            f"pixel format must be a four-character FOURCC code, got {value!r}"
+        )
+    if not text.isalnum():
+        raise ValueError(f"pixel format must be alphanumeric, got {value!r}")
+    return text
+
+
+def _fourcc_text(capture: Any) -> str | None:
+    """Decode the driver's active FOURCC into readable characters."""
+
+    raw = _integer_property(capture, "CAP_PROP_FOURCC")
+    if not raw:
+        return None
+    try:
+        characters = [chr((raw >> shift) & 0xFF) for shift in (0, 8, 16, 24)]
+    except (TypeError, ValueError):
+        return None
+    text = "".join(characters).strip()
+    return text if text.isprintable() and text else None
 
 
 def _backend_name(capture: Any) -> str | None:

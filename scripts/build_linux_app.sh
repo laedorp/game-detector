@@ -44,21 +44,32 @@ if ! "$PROJECT_PYTHON" -c "import evdev, evdev._ecodes, evdev._input, evdev._uin
     exit 2
 fi
 
+if ! "$PROJECT_PYTHON" -c "import serial, serial.tools.list_ports" >/dev/null 2>&1; then
+    echo "MAKCU support cannot be bundled because pyserial is missing." >&2
+    echo "Install the runtime dependencies first:" >&2
+    echo "  '$PROJECT_PYTHON' -m pip install -r '$PROJECT_DIR/requirements.txt'" >&2
+    exit 2
+fi
+
 cd "$PROJECT_DIR"
 "$PROJECT_PYTHON" -m PyInstaller --noconfirm --clean packaging/game_detector.spec
 
-install -d "$PROJECT_DIR/dist/GameDetector/setup"
+install -d "$PROJECT_DIR/dist/ProAim/setup"
 install -m 0755 "$PROJECT_DIR/scripts/install_linux_desktop.py" \
-    "$PROJECT_DIR/dist/GameDetector/setup/install_linux_desktop.py"
+    "$PROJECT_DIR/dist/ProAim/setup/install_linux_desktop.py"
 install -m 0644 "$PROJECT_DIR/packaging/linux/game-detector.desktop.in" \
-    "$PROJECT_DIR/dist/GameDetector/setup/game-detector.desktop.in"
+    "$PROJECT_DIR/dist/ProAim/setup/game-detector.desktop.in"
 install -m 0644 "$PROJECT_DIR/assets/game-detector.svg" \
-    "$PROJECT_DIR/dist/GameDetector/setup/game-detector.svg"
+    "$PROJECT_DIR/dist/ProAim/setup/game-detector.svg"
+install -m 0644 "$PROJECT_DIR/packaging/linux/70-game-detector-makcu.rules" \
+    "$PROJECT_DIR/dist/ProAim/setup/70-game-detector-makcu.rules"
+install -m 0755 "$PROJECT_DIR/scripts/install_makcu_access.sh" \
+    "$PROJECT_DIR/dist/ProAim/setup/install_makcu_access.sh"
 install -m 0755 "$PROJECT_DIR/packaging/linux/install.sh" \
-    "$PROJECT_DIR/dist/GameDetector/install.sh"
+    "$PROJECT_DIR/dist/ProAim/install.sh"
 
 echo
 echo "Linux desktop bundle created:"
-echo "  $PROJECT_DIR/dist/GameDetector/GameDetector"
+echo "  $PROJECT_DIR/dist/ProAim/ProAim"
 echo "Install it in your application menu with:"
-echo "  $PROJECT_DIR/dist/GameDetector/install.sh"
+echo "  $PROJECT_DIR/dist/ProAim/install.sh"

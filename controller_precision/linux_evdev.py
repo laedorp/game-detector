@@ -141,7 +141,7 @@ class ControllerCandidate:
 
     @property
     def is_virtual(self) -> bool:
-        return self.phys.startswith("game-detector-precision/")
+        return self.phys.startswith("game-detector-")
 
     @property
     def identity(self) -> ControllerIdentity:

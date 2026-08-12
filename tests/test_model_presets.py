@@ -31,8 +31,11 @@ from launcher.settings import (
     LauncherSettings,
     MODEL_PRESETS,
     MODEL_PRESET_COCO,
+    MODEL_PRESET_COCO_BALANCED,
+    MODEL_PRESET_COCO_HIGH,
     MODEL_PRESET_CUSTOM,
     MODEL_PRESET_FORT_PLAYER,
+    MODEL_PRESET_FORT_PLAYER_BALANCED,
     SETTINGS_VERSION,
     load_settings,
     model_preset,
@@ -74,23 +77,58 @@ def create_bundled_files(root: Path, preset_key: str) -> tuple[Path, Path]:
 
 
 class ModelPresetSettingsTests(unittest.TestCase):
-    def test_preset_catalog_has_stable_keys_labels_and_player_description(self) -> None:
+    def test_preset_catalog_has_balanced_fast_and_custom_choices(self) -> None:
         self.assertEqual(
             [preset.key for preset in MODEL_PRESETS],
-            [MODEL_PRESET_FORT_PLAYER, MODEL_PRESET_COCO, MODEL_PRESET_CUSTOM],
+            [
+                MODEL_PRESET_FORT_PLAYER_BALANCED,
+                MODEL_PRESET_FORT_PLAYER,
+                MODEL_PRESET_COCO_BALANCED,
+                MODEL_PRESET_COCO_HIGH,
+                MODEL_PRESET_COCO,
+                MODEL_PRESET_CUSTOM,
+            ],
+        )
+        self.assertEqual(
+            model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED).label,
+            "Game players — Balanced 416 (Recommended)",
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_FORT_PLAYER).label,
-            "Fortnite-style players (Recommended)",
+            "Game players — Fast 320",
+        )
+        self.assertEqual(
+            model_preset(MODEL_PRESET_COCO_BALANCED).label,
+            "People — Balanced 416 (COCO fallback)",
+        )
+        self.assertEqual(
+            model_preset(MODEL_PRESET_COCO_HIGH).label,
+            "Ultralytics YOLO11x — High-end 1080p test (GPU)",
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_COCO).label,
-            "General objects (COCO fallback)",
+            "People — Fast 320",
         )
-        description = model_preset(MODEL_PRESET_FORT_PLAYER).description.lower()
-        self.assertIn("one class: player", description)
-        self.assertIn("auto", description)
-        self.assertIn("self filter", description)
+        player = model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED)
+        self.assertEqual(player.inference_size, 416)
+        self.assertIn("player", player.description.lower())
+        self.assertEqual(model_preset(MODEL_PRESET_FORT_PLAYER).inference_size, 320)
+        balanced = model_preset(MODEL_PRESET_COCO_BALANCED)
+        self.assertEqual(balanced.inference_size, 416)
+        self.assertIn("person", balanced.description.lower())
+        high_end = model_preset(MODEL_PRESET_COCO_HIGH)
+        self.assertEqual(high_end.inference_size, 640)
+        self.assertIn("gpu", high_end.description.lower())
+
+    def test_high_end_settings_lock_to_1080p_capture_defaults(self) -> None:
+        settings = LauncherSettings(model_tier="high")
+
+        self.assertEqual(settings.model_preset, MODEL_PRESET_COCO_HIGH)
+        self.assertEqual(settings.capture_width, "1920")
+        self.assertEqual(settings.capture_height, "1080")
+        self.assertEqual(settings.capture_fps, "100")
+        self.assertEqual(settings.screen_fps, "100")
+        self.assertEqual(settings.inference_size, "640")
 
     def test_fresh_settings_choose_recommended_pair_from_resource_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -98,15 +136,16 @@ class ModelPresetSettingsTests(unittest.TestCase):
             with mock.patch("launcher.settings.resource_root", return_value=root):
                 settings = LauncherSettings()
                 expected = model_preset_paths(DEFAULT_MODEL_PRESET)
-        self.assertEqual(settings.model_preset, MODEL_PRESET_FORT_PLAYER)
+        self.assertEqual(settings.model_preset, MODEL_PRESET_FORT_PLAYER_BALANCED)
         self.assertEqual((settings.model_path, settings.labels_path), expected)
+        self.assertEqual(settings.inference_size, "416")
 
     def test_bundled_pair_is_resolved_atomically_when_arguments_are_built(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            model, labels = create_bundled_files(root, MODEL_PRESET_FORT_PLAYER)
+            model, labels = create_bundled_files(root, MODEL_PRESET_COCO_BALANCED)
             with mock.patch("launcher.settings.resource_root", return_value=root):
-                settings = LauncherSettings(model_preset=MODEL_PRESET_FORT_PLAYER)
+                settings = LauncherSettings(model_preset=MODEL_PRESET_COCO_BALANCED)
                 # Simulate stale or manually mixed UI state.  The semantic key
                 # remains authoritative when a detector command is created.
                 settings.model_path = "/stale/coco.xml"
@@ -141,18 +180,18 @@ class ModelPresetSettingsTests(unittest.TestCase):
             target = temporary_root / "settings.json"
             with mock.patch("launcher.settings.resource_root", return_value=first_root):
                 save_settings(
-                    LauncherSettings(model_preset=MODEL_PRESET_FORT_PLAYER),
+                    LauncherSettings(model_preset=MODEL_PRESET_COCO_BALANCED),
                     target,
                 )
             payload = json.loads(target.read_text(encoding="utf-8"))
             self.assertEqual(payload["version"], SETTINGS_VERSION)
-            self.assertEqual(payload["model_preset"], MODEL_PRESET_FORT_PLAYER)
+            self.assertEqual(payload["model_preset"], MODEL_PRESET_COCO_BALANCED)
             self.assertNotIn("model_path", payload)
             self.assertNotIn("labels_path", payload)
 
             with mock.patch("launcher.settings.resource_root", return_value=second_root):
                 loaded = load_settings(target)
-                expected = model_preset_paths(MODEL_PRESET_FORT_PLAYER)
+                expected = model_preset_paths(MODEL_PRESET_COCO_BALANCED)
         self.assertEqual((loaded.model_path, loaded.labels_path), expected)
 
     def test_each_legacy_schema_keeps_old_bundled_profiles_on_coco(self) -> None:
@@ -186,6 +225,16 @@ class ModelPresetSettingsTests(unittest.TestCase):
         self.assertEqual(loaded.model_preset, MODEL_PRESET_CUSTOM)
         self.assertEqual(loaded.model_path, "/models/old.xml")
         self.assertEqual(loaded.labels_path, "/models/old.txt")
+
+    def test_stored_fort_preset_keeps_the_320_player_detector(self) -> None:
+        # The key was bundled at 320 before it briefly disappeared, so a profile
+        # carrying it must resolve back to that same 320 player model rather
+        # than being silently moved onto a different detector.
+        loaded = LauncherSettings.from_mapping(
+            {"version": SETTINGS_VERSION, "model_preset": MODEL_PRESET_FORT_PLAYER}
+        )
+        self.assertEqual(loaded.model_preset, MODEL_PRESET_FORT_PLAYER)
+        self.assertEqual(loaded.inference_size, "320")
 
     def test_known_v4_preset_ignores_stale_serialized_paths(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -231,6 +280,7 @@ class ModelPresetUiStateTests(unittest.TestCase):
         self.launcher.model_path = FakeVariable("/custom/player.xml")
         self.launcher.labels_path = FakeVariable("/custom/player.txt")
         self.launcher.output_format = FakeVariable("traditional")
+        self.launcher.inference_size = FakeVariable("512")
         self.launcher._active_model_preset = MODEL_PRESET_CUSTOM
         self.launcher._custom_model_path = "/custom/player.xml"
         self.launcher._custom_labels_path = "/custom/player.txt"
@@ -241,14 +291,14 @@ class ModelPresetUiStateTests(unittest.TestCase):
         self.launcher.labels_browse_button = FakeWidget()
 
     def test_bundled_presets_lock_paths_and_custom_restores_cached_pair(self) -> None:
-        fort_pair = ("/bundle/fort.xml", "/bundle/fort.txt")
+        balanced_pair = ("/bundle/balanced.xml", "/bundle/coco.txt")
         coco_pair = ("/bundle/coco.xml", "/bundle/coco.txt")
 
         def resolve(key: str) -> tuple[str, str]:
-            return fort_pair if key == MODEL_PRESET_FORT_PLAYER else coco_pair
+            return balanced_pair if key == MODEL_PRESET_COCO_BALANCED else coco_pair
 
         self.launcher.model_preset.set(
-            MODEL_PRESET_LABELS[MODEL_PRESET_FORT_PLAYER]
+            MODEL_PRESET_LABELS[MODEL_PRESET_COCO_BALANCED]
         )
         with mock.patch("launcher.application.model_preset_paths", side_effect=resolve):
             self.launcher._model_preset_changed()
@@ -257,8 +307,9 @@ class ModelPresetUiStateTests(unittest.TestCase):
                     self.launcher.model_path.get(),
                     self.launcher.labels_path.get(),
                 ),
-                fort_pair,
+                balanced_pair,
             )
+            self.assertEqual(self.launcher.inference_size.get(), "416")
             self.assertEqual(self.launcher.model_path_entry.state, "readonly")
             self.assertEqual(self.launcher.labels_path_entry.state, "readonly")
             self.assertEqual(self.launcher.model_browse_button.state, "disabled")
@@ -299,7 +350,7 @@ class ModelPresetUiStateTests(unittest.TestCase):
         self.launcher.model_path.set("/custom/new.xml")
         self.launcher.labels_path.set("/custom/new.txt")
         self.launcher.model_preset.set(
-            MODEL_PRESET_LABELS[MODEL_PRESET_FORT_PLAYER]
+            MODEL_PRESET_LABELS[MODEL_PRESET_COCO_BALANCED]
         )
         with mock.patch(
             "launcher.application.model_preset_paths",
@@ -313,7 +364,7 @@ class ModelPresetUiStateTests(unittest.TestCase):
 
     def test_bundled_settings_override_incompatible_serialized_decoder(self) -> None:
         settings = LauncherSettings(
-            model_preset=MODEL_PRESET_FORT_PLAYER,
+            model_preset=MODEL_PRESET_COCO_BALANCED,
             output_format="traditional",
         )
         self.assertEqual(settings.output_format, "auto")

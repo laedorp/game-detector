@@ -83,7 +83,7 @@ class NormalizedBottomZoneTests(unittest.TestCase):
         self.assertEqual((x2, y2), (1040, 999))
 
     def test_custom_player_like_label_inside_zone_is_excluded(self) -> None:
-        self_detection = self.detection((500, 600, 900, 900), label="custom_avatar")
+        self_detection = self.detection((550, 300, 850, 1000), label="custom_avatar")
         result = exclude_self_avatar([self_detection], self.frame_shape, self.zone)
         self.assertEqual(result.detections, ())
         self.assertEqual(result.ignored_count, 1)
@@ -120,8 +120,8 @@ class NormalizedBottomZoneTests(unittest.TestCase):
         self.assertEqual(result.ignored_count, 0)
 
     def test_ambiguous_candidates_are_all_retained(self) -> None:
-        smaller = self.detection((500, 700, 800, 1000), "person")
-        larger = self.detection((600, 500, 1000, 1000), "player")
+        smaller = self.detection((550, 200, 850, 1000), "person")
+        larger = self.detection((600, 300, 900, 1000), "player")
         result = exclude_self_avatar([smaller, larger], self.frame_shape, self.zone)
         self.assertEqual(result.detections, (smaller, larger))
         self.assertEqual(result.ignored_count, 0)
@@ -187,6 +187,50 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         self.assertTrue(self.filter.acquired)
         self.assertEqual(self.filter.apply([self.avatar], self.frame_shape).ignored_count, 1)
 
+    def test_aim_can_fail_closed_until_self_is_actually_removed(self) -> None:
+        enemy = self.detection((1200, 250, 1500, 850), "person")
+        first = self.filter.apply([self.avatar, enemy], self.frame_shape)
+        second = self.filter.apply([self.avatar, enemy], self.frame_shape)
+        third = self.filter.apply([self.avatar, enemy], self.frame_shape)
+
+        self.assertEqual(first.ignored_count, 0)
+        self.assertEqual(second.ignored_count, 0)
+        self.assertEqual(third.ignored_count, 1)
+        self.assertFalse(first.aim_safe)
+        self.assertFalse(second.aim_safe)
+        self.assertTrue(third.aim_safe)
+        self.assertEqual(third.detections, (enemy,))
+        self.assertIs(third.ignored_detection, self.avatar)
+
+    def test_aim_is_allowed_during_acquisition_when_no_self_candidate_is_visible(self) -> None:
+        enemy_outside_self_zone = self.detection((1200, 250, 1500, 850), "person")
+
+        first = self.filter.apply([enemy_outside_self_zone], self.frame_shape)
+        second = self.filter.apply([enemy_outside_self_zone], self.frame_shape)
+
+        self.assertTrue(first.aim_safe)
+        self.assertTrue(second.aim_safe)
+        self.assertEqual(first.detections, (enemy_outside_self_zone,))
+        self.assertEqual(second.detections, (enemy_outside_self_zone,))
+
+    def test_short_self_dropout_keeps_enemy_aim_available(self) -> None:
+        self.acquire()
+        enemy = self.detection((1200, 250, 1500, 850), "person")
+
+        first = self.filter.apply([enemy], self.frame_shape)
+        second = self.filter.apply([enemy], self.frame_shape)
+
+        self.assertTrue(first.aim_safe)
+        self.assertTrue(second.aim_safe)
+        self.assertEqual(first.detections, (enemy,))
+        self.assertEqual(second.detections, (enemy,))
+
+    def test_ambiguous_self_overlap_blocks_aim(self) -> None:
+        self.acquire()
+        duplicate = self.detection((440, 570, 860, 1080), "person")
+        result = self.filter.apply([self.avatar, duplicate], self.frame_shape)
+        self.assertFalse(result.aim_safe)
+
     def test_one_or_two_frame_transient_is_retained(self) -> None:
         first = self.filter.apply([self.avatar], self.frame_shape)
         second = self.filter.apply([self.avatar], self.frame_shape)
@@ -227,6 +271,15 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         outside = self.detection((1200, 200, 1700, 1000), "person")
         result = self.filter.apply([outside, self.avatar], self.frame_shape)
         self.assertEqual(result.detections, (outside,))
+
+    def test_acquired_avatar_is_tracked_just_outside_anchor_zone(self) -> None:
+        self.acquire()
+        raised_avatar = self.detection((430, 520, 850, 970), "person")
+        result = self.filter.apply([raised_avatar], self.frame_shape)
+        self.assertTrue(result.aim_safe)
+        self.assertEqual(result.ignored_count, 1)
+        self.assertEqual(result.detections, ())
+        self.assertIs(result.ignored_detection, raised_avatar)
 
     def test_two_frame_dropout_keeps_lock_without_suppressing_anything(self) -> None:
         self.acquire()

@@ -9,9 +9,18 @@ import shlex
 import shutil
 import subprocess
 import threading
+import time
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
+
+from detection.devices import (
+    DeviceDiscoveryError,
+    available_openvino_devices,
+    selectable_openvino_devices,
+)
+
+from aiming.makcu import MakcuAimConfig, MakcuAimingController, MakcuError
 
 from .process import (
     external_process_environment,
@@ -37,6 +46,8 @@ from .precision import (
     verification_calibration,
 )
 from .settings import (
+    AIM_OUTPUT_LOCAL,
+    AIM_OUTPUT_MAKCU,
     DEFAULT_MODEL_PRESET,
     LauncherSettings,
     MODEL_PRESETS,
@@ -70,6 +81,18 @@ PRECISION_PRESET_LABELS = {preset.key: preset.label for preset in PRECISION_PRES
 PRECISION_PRESET_VALUES = {preset.label: preset.key for preset in PRECISION_PRESETS}
 MODEL_PRESET_LABELS = {preset.key: preset.label for preset in MODEL_PRESETS}
 MODEL_PRESET_VALUES = {preset.label: preset.key for preset in MODEL_PRESETS}
+AIM_OUTPUT_LABELS = {
+    AIM_OUTPUT_MAKCU: "MAKCU mouse passthrough (Recommended)",
+    AIM_OUTPUT_LOCAL: "Local Linux virtual controller",
+}
+AIM_OUTPUT_VALUES = {label: value for value, label in AIM_OUTPUT_LABELS.items()}
+MAKCU_BUTTON_LABELS = ("Left", "Right", "Middle", "Side 4", "Side 5")
+AIM_POINT_LABELS = {
+    "0.08": "Upper head",
+    "0.12": "Head center (Recommended)",
+    "0.16": "Lower head",
+}
+AIM_POINT_VALUES = {label: value for value, label in AIM_POINT_LABELS.items()}
 
 
 class DetectorLauncher:
@@ -89,6 +112,9 @@ class DetectorLauncher:
         self._precision_guidance_shown = False
         self._precision_pending_identity = ""
         self._precision_recent_output: list[str] = []
+        self._makcu_verify_thread: threading.Thread | None = None
+        self._makcu_verify_result: queue.Queue[tuple[bool, str, str, str]] = queue.Queue()
+        self._makcu_verify_cancel = threading.Event()
         self._closing = False
         self._stop_requested = False
         self._log_lines = 0
@@ -101,6 +127,7 @@ class DetectorLauncher:
         self._update_region_state()
         self._update_draw_state()
         self._update_self_filter_state()
+        self._refresh_detection_devices(silent=True)
         self._refresh_precision_devices(silent=True)
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -142,12 +169,47 @@ class DetectorLauncher:
         )
         self._custom_output_format = settings.output_format
         self.device = tk.StringVar(value=settings.device)
+        self.backend = tk.StringVar(value=settings.backend)
+        self.device_status = tk.StringVar(value="Detecting OpenVINO devices…")
         self.inference_size = tk.StringVar(value=settings.inference_size)
         self.crop_size = tk.StringVar(value=settings.crop_size)
-        self.confidence = tk.StringVar(value=settings.confidence)
+        self.confidence = tk.DoubleVar(value=self._parse_float(settings.confidence, 0.25))
         self.iou_threshold = tk.StringVar(value=settings.iou_threshold)
         self.output_format = tk.StringVar(value=settings.output_format)
         self.ignore_self = tk.BooleanVar(value=settings.ignore_self)
+        self.aim = tk.BooleanVar(value=settings.aim)
+        self.aim_label = tk.StringVar(value=settings.aim_label)
+        self.aim_invert_x = tk.BooleanVar(value=settings.aim_invert_x)
+        self.aim_invert_y = tk.BooleanVar(value=settings.aim_invert_y)
+        self.aim_point = tk.StringVar(
+            value=AIM_POINT_LABELS.get(
+                settings.aim_head_ratio,
+                AIM_POINT_LABELS["0.12"],
+            )
+        )
+        self.aim_output = tk.StringVar(
+            value=AIM_OUTPUT_LABELS.get(
+                settings.aim_output,
+                AIM_OUTPUT_LABELS[AIM_OUTPUT_MAKCU],
+            )
+        )
+        self.aim_host = tk.StringVar(value=settings.aim_host)
+        self.aim_port = tk.StringVar(value=settings.aim_port)
+        self.aim_pairing_key = tk.StringVar(value=settings.aim_pairing_key)
+        self.aim_makcu_port = tk.StringVar(value=settings.aim_makcu_port)
+        makcu_button = min(max(self._parse_int(settings.aim_makcu_button, default=1), 0), 4)
+        self.aim_makcu_button = tk.StringVar(value=MAKCU_BUTTON_LABELS[makcu_button])
+        self.aim_makcu_strength = tk.StringVar(value=settings.aim_makcu_strength)
+        self.aim_makcu_smoothing_alpha = tk.DoubleVar(
+            value=self._parse_float(settings.aim_makcu_smoothing_alpha, 0.78)
+        )
+        self.aim_makcu_max_step = tk.StringVar(value=settings.aim_makcu_max_step)
+        self._makcu_verified_port = settings.aim_makcu_verified_port
+        self._makcu_verified_button = settings.aim_makcu_verified_button
+        self.aim_makcu_verification_status = tk.StringVar(value="Not verified")
+        self.aim_activate_path = tk.StringVar(value=settings.aim_activate_path)
+        self.aim_activate_axis = tk.StringVar(value=str(settings.aim_activate_axis))
+        self.aim_activate_threshold = tk.StringVar(value=settings.aim_activate_threshold)
         self.self_position = tk.StringVar(
             value=SELF_POSITION_LABELS.get(
                 settings.self_position,
@@ -224,8 +286,8 @@ class DetectorLauncher:
         detection_tab = ttk.Frame(self.notebook, padding=14)
         precision_tab = ttk.Frame(self.notebook, padding=14)
         self.notebook.add(capture_tab, text="  Capture source  ")
-        self.notebook.add(detection_tab, text="  Detection settings  ")
-        self.notebook.add(precision_tab, text="  Controller precision  ")
+        self.notebook.add(detection_tab, text="  AI detection + aim  ")
+        self.notebook.add(precision_tab, text="  Manual precision (not AI)  ")
         self._build_capture_tab(capture_tab)
         self._build_detection_tab(detection_tab)
         self._build_precision_tab(precision_tab)
@@ -260,14 +322,17 @@ class DetectorLauncher:
         self.log.tag_configure("warning", foreground="#ffd479")
         self.log.tag_configure("error", foreground="#ff9797")
         self.log.tag_configure("heading", foreground="#8fc7ff")
-        self._append_log("Choose a source and press Start detection. F5 also starts; Escape stops.\n", "heading")
+        self._append_log(
+            "Choose a source and press Start AI object detection. F5 also starts; Escape stops.\n",
+            "heading",
+        )
 
         actions = ttk.Frame(self.root, padding=(18, 2, 18, 14))
         actions.grid(row=3, column=0, sticky="ew")
         actions.columnconfigure(1, weight=1)
         self.start_button = ttk.Button(
             actions,
-            text="Start detection",
+            text="Start AI object detection",
             style="Start.TButton",
             command=self.start,
         )
@@ -347,6 +412,18 @@ class DetectorLauncher:
             text="Tip: keep the preview outside the captured Moonlight area to avoid a mirror effect.",
             style="Subtitle.TLabel",
         ).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        self.capture_start_button = ttk.Button(
+            display,
+            text="Start capture + AI preview",
+            style="Start.TButton",
+            command=self.start,
+        )
+        self.capture_start_button.grid(row=2, column=0, sticky="w", pady=(12, 0))
+        ttk.Label(
+            display,
+            text="Opens the live model view with detection boxes and timing.",
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=1, sticky="w", padx=(12, 0), pady=(12, 0))
 
     def _build_screen_panel(self, parent: ttk.Frame) -> ttk.Frame:
         panel = ttk.Frame(parent)
@@ -410,9 +487,9 @@ class DetectorLauncher:
         ttk.Label(
             controller,
             text=(
-                "Connect your controller to this laptop. Moonlight forwards your "
-                "physical controls; detection never controls the gamepad. The optional "
-                "precision tab only reshapes right-stick input you produce."
+                "For AI mouse aim, connect the mouse through MAKCU and connect MAKCU to the "
+                "gaming PC. This laptop uses the board's serial link only for bounded movement "
+                "while you hold the selected physical mouse button."
             ),
             style="Subtitle.TLabel",
         ).grid(row=0, column=0, sticky="w")
@@ -479,7 +556,7 @@ class DetectorLauncher:
             style="Section.TLabelframe",
             padding=10,
         )
-        model_frame.grid(row=0, column=0, sticky="ew")
+        model_frame.grid(row=1, column=0, sticky="ew", pady=(10, 0))
         model_frame.columnconfigure(1, weight=1)
         ttk.Label(model_frame, text="Preset").grid(
             row=0, column=0, sticky="w", padx=(0, 8)
@@ -535,21 +612,62 @@ class DetectorLauncher:
             style="Section.TLabelframe",
             padding=10,
         )
-        runtime.grid(row=1, column=0, sticky="ew", pady=(10, 0))
+        runtime.grid(row=2, column=0, sticky="ew", pady=(10, 0))
         for column in range(5):
             runtime.columnconfigure(column, weight=1)
         controls = (
             ("OpenVINO device", self.device, ("CPU", "AUTO", "GPU", "NPU")),
             ("Inference size", self.inference_size, ("256", "320", "416", "640")),
             ("Center crop (optional)", self.crop_size, ("", "512", "640", "720", "1080")),
-            ("Confidence", self.confidence, ("0.15", "0.25", "0.40", "0.50", "0.65")),
+            ("Confidence", self.confidence, ()),
             ("IoU threshold", self.iou_threshold, ("0.30", "0.45", "0.60")),
         )
         for column, (label, variable, values) in enumerate(controls):
             ttk.Label(runtime, text=label).grid(row=0, column=column, sticky="w", padx=(0, 12))
-            ttk.Combobox(runtime, textvariable=variable, values=values, width=15).grid(
+            if label == "Confidence":
+                confidence_frame = ttk.Frame(runtime)
+                confidence_frame.grid(row=1, column=column, sticky="ew", padx=(0, 12), pady=(3, 0))
+                confidence_frame.columnconfigure(0, weight=1)
+                self._confidence_scale = ttk.Scale(
+                    confidence_frame,
+                    from_=0.05,
+                    to=0.95,
+                    variable=self.confidence,
+                    command=self._sync_confidence_label,
+                )
+                self._confidence_scale.grid(row=0, column=0, sticky="ew")
+                self._confidence_value = ttk.Label(
+                    confidence_frame,
+                    text=f"{self.confidence.get():.2f}",
+                    width=5,
+                )
+                self._confidence_value.grid(row=0, column=1, sticky="w", padx=(8, 0))
+                continue
+            combo = ttk.Combobox(runtime, textvariable=variable, values=values, width=15)
+            combo.grid(
                 row=1, column=column, sticky="ew", padx=(0, 12), pady=(3, 0)
             )
+            if variable is self.device:
+                self.device_combo = combo
+        ttk.Label(
+            runtime,
+            textvariable=self.device_status,
+            style="Subtitle.TLabel",
+        ).grid(row=2, column=0, columnspan=4, sticky="w", pady=(8, 0))
+        self.device_refresh_button = ttk.Button(
+            runtime,
+            text="Refresh devices",
+            command=self._refresh_detection_devices,
+        )
+        self.device_refresh_button.grid(row=2, column=4, sticky="e", padx=(0, 12), pady=(8, 0))
+        self.hardware_scan_button = ttk.Button(
+            runtime,
+            text="Scan hardware",
+            command=self._scan_hardware,
+        )
+        self.hardware_scan_button.grid(
+            row=3, column=4, sticky="e", padx=(0, 12), pady=(4, 0)
+        )
 
         third_person = ttk.LabelFrame(
             parent,
@@ -557,7 +675,7 @@ class DetectorLauncher:
             style="Section.TLabelframe",
             padding=10,
         )
-        third_person.grid(row=2, column=0, sticky="ew", pady=(10, 0))
+        third_person.grid(row=3, column=0, sticky="ew", pady=(10, 0))
         ttk.Checkbutton(
             third_person,
             text="Ignore my on-screen character",
@@ -592,7 +710,7 @@ class DetectorLauncher:
             style="Section.TLabelframe",
             padding=10,
         )
-        advanced.grid(row=3, column=0, sticky="ew", pady=(10, 0))
+        advanced.grid(row=4, column=0, sticky="ew", pady=(10, 0))
         ttk.Label(advanced, text="Output decoder").grid(row=0, column=0, sticky="w")
         ttk.Combobox(
             advanced,
@@ -611,7 +729,215 @@ class DetectorLauncher:
             parent,
             text="Lower inference sizes are usually faster. Settings are saved automatically when detection starts or the app closes.",
             style="Subtitle.TLabel",
-        ).grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ).grid(row=5, column=0, sticky="w", pady=(10, 0))
+
+        aiming = ttk.LabelFrame(
+            parent,
+            text="Detection-driven aiming",
+            style="Section.TLabelframe",
+            padding=10,
+        )
+        aiming.grid(row=0, column=0, sticky="ew")
+        aiming.columnconfigure(1, weight=1)
+        ttk.Checkbutton(
+            aiming,
+            text="Use AI detections for bounded mouse aim",
+            variable=self.aim,
+            command=self._update_aim_state,
+        ).grid(row=0, column=0, columnspan=3, sticky="w")
+        ttk.Label(aiming, text="Aim output").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._aim_output_combo = ttk.Combobox(
+            aiming,
+            textvariable=self.aim_output,
+            values=tuple(AIM_OUTPUT_VALUES),
+            state="readonly",
+            width=38,
+        )
+        self._aim_output_combo.grid(row=1, column=1, columnspan=2, sticky="w", pady=(8, 0))
+        self._aim_output_combo.bind("<<ComboboxSelected>>", self._aim_output_changed)
+        ttk.Label(aiming, text="Target label (optional)").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._aim_label_entry = ttk.Entry(aiming, textvariable=self.aim_label, width=24)
+        self._aim_label_entry.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        aim_point_frame = ttk.Frame(aiming)
+        aim_point_frame.grid(row=2, column=2, sticky="w", padx=(12, 0), pady=(8, 0))
+        ttk.Label(aim_point_frame, text="Aim point").grid(row=0, column=0, sticky="w")
+        self._aim_point_combo = ttk.Combobox(
+            aim_point_frame,
+            textvariable=self.aim_point,
+            values=tuple(AIM_POINT_VALUES),
+            state="readonly",
+            width=24,
+        )
+        self._aim_point_combo.grid(row=1, column=0, sticky="w", pady=(2, 0))
+        self._aim_invert_x_check = ttk.Checkbutton(
+            aiming,
+            text="Invert X",
+            variable=self.aim_invert_x,
+        )
+        self._aim_invert_x_check.grid(row=5, column=0, sticky="w", pady=(8, 0))
+        self._aim_invert_y_check = ttk.Checkbutton(
+            aiming,
+            text="Invert Y",
+            variable=self.aim_invert_y,
+        )
+        self._aim_invert_y_check.grid(row=5, column=1, sticky="w", pady=(8, 0))
+
+        self._makcu_aim_panel = ttk.Frame(aiming)
+        self._makcu_aim_panel.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._makcu_aim_panel.columnconfigure(1, weight=1)
+        ttk.Label(self._makcu_aim_panel, text="MAKCU serial device").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self._aim_makcu_port_entry = ttk.Entry(
+            self._makcu_aim_panel,
+            textvariable=self.aim_makcu_port,
+            width=44,
+        )
+        self._aim_makcu_port_entry.grid(row=0, column=1, sticky="ew")
+        self._aim_makcu_port_browse = ttk.Button(
+            self._makcu_aim_panel,
+            text="Browse…",
+            command=self._browse_aim_makcu_port,
+        )
+        self._aim_makcu_port_browse.grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(self._makcu_aim_panel, text="Hold to activate").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._aim_makcu_button_combo = ttk.Combobox(
+            self._makcu_aim_panel,
+            textvariable=self.aim_makcu_button,
+            values=MAKCU_BUTTON_LABELS,
+            state="readonly",
+            width=12,
+        )
+        self._aim_makcu_button_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        self._aim_makcu_button_combo.bind(
+            "<<ComboboxSelected>>",
+            self._makcu_verification_selection_changed,
+        )
+        self._aim_makcu_verify_button = ttk.Button(
+            self._makcu_aim_panel,
+            text="Verify Right Mouse…",
+            command=self.verify_makcu_activation,
+        )
+        self._aim_makcu_verify_button.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+        ttk.Label(
+            self._makcu_aim_panel,
+            textvariable=self.aim_makcu_verification_status,
+            style="Subtitle.TLabel",
+        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ttk.Label(self._makcu_aim_panel, text="Tracking strength").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._aim_makcu_strength_entry = ttk.Entry(
+            self._makcu_aim_panel,
+            textvariable=self.aim_makcu_strength,
+            width=9,
+        )
+        self._aim_makcu_strength_entry.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(self._makcu_aim_panel, text="Maximum per frame").grid(
+            row=2, column=1, sticky="w", padx=(90, 8), pady=(8, 0)
+        )
+        self._aim_makcu_max_step_entry = ttk.Entry(
+            self._makcu_aim_panel,
+            textvariable=self.aim_makcu_max_step,
+            width=9,
+        )
+        self._aim_makcu_max_step_entry.grid(row=2, column=2, sticky="w", pady=(8, 0))
+        ttk.Label(self._makcu_aim_panel, text="Smoothing").grid(
+            row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._aim_makcu_smoothing_scale = ttk.Scale(
+            self._makcu_aim_panel,
+            from_=0.10,
+            to=1.00,
+            variable=self.aim_makcu_smoothing_alpha,
+            command=self._sync_smoothing_label,
+        )
+        self._aim_makcu_smoothing_scale.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self._aim_makcu_smoothing_value = ttk.Label(
+            self._makcu_aim_panel,
+            text=f"{self.aim_makcu_smoothing_alpha.get():.2f}",
+        )
+        self._aim_makcu_smoothing_value.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+
+        self._local_aim_panel = ttk.Frame(aiming)
+        self._local_aim_panel.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        self._local_aim_panel.columnconfigure(1, weight=1)
+        ttk.Label(self._local_aim_panel, text="Activation device path").grid(
+            row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self._aim_activate_path_entry = ttk.Entry(
+            self._local_aim_panel,
+            textvariable=self.aim_activate_path,
+            width=40,
+        )
+        self._aim_activate_path_entry.grid(row=0, column=1, sticky="ew")
+        self._aim_activate_path_browse = ttk.Button(
+            self._local_aim_panel,
+            text="Browse…",
+            command=self._browse_aim_activate_path,
+        )
+        self._aim_activate_path_browse.grid(row=0, column=2, padx=(8, 0))
+        ttk.Label(self._local_aim_panel, text="Axis code").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._aim_activate_axis_entry = ttk.Entry(
+            self._local_aim_panel,
+            textvariable=self.aim_activate_axis,
+            width=10,
+        )
+        self._aim_activate_axis_entry.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        ttk.Label(self._local_aim_panel, text="Activation threshold").grid(
+            row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+        )
+        self._aim_activate_threshold_entry = ttk.Entry(
+            self._local_aim_panel,
+            textvariable=self.aim_activate_threshold,
+            width=10,
+        )
+        self._aim_activate_threshold_entry.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        self._aim_help_label = ttk.Label(
+            aiming,
+            text=(
+                "MAKCU passes your physical mouse through unchanged. AI movement is sent only "
+                "while the selected mouse button is held and a target is detected. The COCO "
+                "person class cannot distinguish enemies from allies."
+            ),
+            style="Subtitle.TLabel",
+            wraplength=700,
+        )
+        self._aim_help_label.grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        self._aim_common_widgets = [
+            self._aim_output_combo,
+            self._aim_label_entry,
+            self._aim_point_combo,
+            self._aim_invert_x_check,
+            self._aim_invert_y_check,
+        ]
+        self._makcu_aim_widgets = [
+            self._aim_makcu_port_entry,
+            self._aim_makcu_port_browse,
+            self._aim_makcu_button_combo,
+            self._aim_makcu_verify_button,
+            self._aim_makcu_strength_entry,
+            self._aim_makcu_smoothing_scale,
+            self._aim_makcu_smoothing_value,
+            self._aim_makcu_max_step_entry,
+        ]
+        self._local_aim_widgets = [
+            self._aim_activate_path_entry,
+            self._aim_activate_path_browse,
+            self._aim_activate_axis_entry,
+            self._aim_activate_threshold_entry,
+        ]
+        self.aim_makcu_port.trace_add("write", self._makcu_verification_selection_changed)
+        self._makcu_verification_selection_changed()
+        self._update_aim_state()
 
     def _build_precision_tab(self, parent: ttk.Frame) -> None:
         """Build controls for the independent, user-driven controller worker."""
@@ -784,6 +1110,77 @@ class DetectorLauncher:
             panel.grid_remove()
         panels.get(mode, self._screen_panel).grid()
 
+    def _scan_hardware(self) -> None:
+        """Detect every accelerator present and apply the best usable one.
+
+        The scan reports what is physically installed as well as what this
+        installation can currently drive, so a present-but-unusable card is
+        explained with the package that would enable it instead of being
+        silently ignored.
+        """
+
+        from detection.hardware import describe, scan_and_recommend
+
+        try:
+            profile, plans = scan_and_recommend()
+        except Exception as exc:  # pragma: no cover - defensive UI boundary
+            messagebox.showerror("Hardware scan failed", str(exc), parent=self.root)
+            return
+
+        report = describe(profile, plans)
+        ready = [plan for plan in plans if plan.ready]
+        if not ready:
+            self.device_status.set("Hardware scan found no usable inference device.")
+            messagebox.showwarning("Hardware scan", report, parent=self.root)
+            return
+
+        best = ready[0]
+        self.backend.set(best.backend)
+        self.device.set(best.device)
+        self.inference_size.set(str(best.inference_size))
+        if best.backend == "openvino":
+            self._refresh_detection_devices(silent=True)
+        else:
+            # ONNX Runtime names execution providers rather than OpenVINO
+            # devices, so the combo box must offer those instead.
+            from detection.onnx_yolo import PROVIDER_ALIASES
+
+            self.device_combo.configure(
+                values=tuple(sorted(PROVIDER_ALIASES)), state="normal"
+            )
+        self.device_status.set(f"Scan selected {best.summary}")
+
+        pending = [plan for plan in plans if not plan.ready and plan.setup_hint]
+        if pending:
+            report += "\n\nNot yet usable on this machine:\n" + "\n".join(
+                f"  - {plan.accelerator.label}: {plan.setup_hint}" for plan in pending
+            )
+        messagebox.showinfo("Hardware scan", report, parent=self.root)
+
+    def _refresh_detection_devices(self, silent: bool = False) -> None:
+        try:
+            available = available_openvino_devices()
+        except DeviceDiscoveryError as exc:
+            self.device_status.set(f"Could not query OpenVINO devices: {exc}")
+            if not silent:
+                messagebox.showerror(
+                    "OpenVINO device discovery failed",
+                    str(exc),
+                    parent=self.root,
+                )
+            return
+        choices = selectable_openvino_devices(available)
+        self.device_combo.configure(values=choices, state="readonly")
+        current = self.device.get().strip().upper()
+        if not current:
+            self.device.set("AUTO")
+            current = "AUTO"
+        physical = ", ".join(available) or "none"
+        availability = "available" if current in choices else "not reported"
+        self.device_status.set(
+            f"Detected: {physical}. Selected {current} is {availability}."
+        )
+
     def _update_region_state(self) -> None:
         state = "normal" if self.use_screen_region.get() else "disabled"
         for widget in getattr(self, "_region_widgets", ()):
@@ -798,6 +1195,177 @@ class DetectorLauncher:
     def _update_self_filter_state(self) -> None:
         state = "readonly" if self.ignore_self.get() else "disabled"
         self.self_position_combo.configure(state=state)
+
+    def _update_aim_state(self) -> None:
+        enabled = self.aim.get()
+        for widget in getattr(self, "_aim_common_widgets", ()):
+            widget.configure(state="normal" if enabled else "disabled")
+        if enabled:
+            self._aim_output_combo.configure(state="readonly")
+        output = AIM_OUTPUT_VALUES.get(self.aim_output.get(), AIM_OUTPUT_MAKCU)
+        self._makcu_aim_panel.grid_remove()
+        self._local_aim_panel.grid_remove()
+        if output == AIM_OUTPUT_LOCAL:
+            self._local_aim_panel.grid()
+            help_text = (
+                "Local virtual-controller output is separate from MAKCU mouse passthrough."
+            )
+        else:
+            self._makcu_aim_panel.grid()
+            help_text = (
+                "MAKCU passes your physical mouse through unchanged. AI movement is sent only "
+                "while the selected mouse button is held and a target is detected. The COCO "
+                "person class cannot distinguish enemies from allies."
+            )
+        self._aim_help_label.configure(text=help_text)
+        for widget in getattr(self, "_makcu_aim_widgets", ()):
+            widget.configure(
+                state="normal" if enabled and output == AIM_OUTPUT_MAKCU else "disabled"
+            )
+        if enabled and output == AIM_OUTPUT_MAKCU:
+            self._aim_makcu_button_combo.configure(state="readonly")
+            verification_busy = bool(
+                self._makcu_verify_thread is not None
+                and self._makcu_verify_thread.is_alive()
+            )
+            detector_busy = self.process is not None and self.process.poll() is None
+            self._aim_makcu_verify_button.configure(
+                state="disabled" if verification_busy or detector_busy else "normal"
+            )
+        for widget in getattr(self, "_local_aim_widgets", ()):
+            widget.configure(
+                state="normal" if enabled and output == AIM_OUTPUT_LOCAL else "disabled"
+            )
+
+    def _aim_output_changed(self, _event: tk.Event[tk.Misc] | None = None) -> None:
+        self._update_aim_state()
+
+    def _browse_aim_makcu_port(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select MAKCU serial device",
+            initialdir="/dev/serial/by-id",
+            filetypes=(("Serial devices", "*"),),
+            parent=self.root,
+        )
+        if selected:
+            self.aim_makcu_port.set(selected)
+
+    def _selected_makcu_button(self) -> int:
+        try:
+            return MAKCU_BUTTON_LABELS.index(self.aim_makcu_button.get())
+        except ValueError:
+            return 1
+
+    def _makcu_verification_matches(self) -> bool:
+        return bool(
+            self._makcu_verified_port
+            and self._makcu_verified_port == self.aim_makcu_port.get().strip()
+            and self._makcu_verified_button == str(self._selected_makcu_button())
+        )
+
+    def _refresh_makcu_verification_status(self) -> None:
+        if self._makcu_verification_matches():
+            button = MAKCU_BUTTON_LABELS[self._selected_makcu_button()]
+            self.aim_makcu_verification_status.set(
+                f"Verified: {button} press and release were reported by this MAKCU."
+            )
+        else:
+            self.aim_makcu_verification_status.set(
+                "Not verified. Verification reads buttons only and never moves or clicks."
+            )
+
+    def _makcu_verification_selection_changed(self, *_args) -> None:
+        if hasattr(self, "_aim_makcu_verify_button"):
+            button = MAKCU_BUTTON_LABELS[self._selected_makcu_button()]
+            self._aim_makcu_verify_button.configure(text=f"Verify {button} Mouse…")
+        self._refresh_makcu_verification_status()
+
+    def verify_makcu_activation(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            messagebox.showinfo(
+                "Stop detection first",
+                "Stop capture before verifying MAKCU so only one process owns its serial port.",
+                parent=self.root,
+            )
+            return
+        if self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive():
+            return
+        self._refresh_makcu_verification_status()
+        port = self.aim_makcu_port.get().strip()
+        button = self._selected_makcu_button()
+        button_name = MAKCU_BUTTON_LABELS[button]
+        if not messagebox.askokcancel(
+            f"Verify {button_name} Mouse",
+            f"Press OK, then press and release {button_name} Mouse once within 10 seconds.\n\n"
+            "This check reads the physical button report only. It does not move or click.",
+            parent=self.root,
+        ):
+            return
+        self._makcu_verify_cancel.clear()
+        self.aim_makcu_verification_status.set(f"Waiting for {button_name} press…")
+        self._aim_makcu_verify_button.configure(state="disabled")
+        self._makcu_verify_thread = threading.Thread(
+            target=self._verify_makcu_activation_worker,
+            args=(port, button),
+            name="makcu-button-verifier",
+            daemon=True,
+        )
+        self._makcu_verify_thread.start()
+
+    def _verify_makcu_activation_worker(self, port: str, button: int) -> None:
+        controller = MakcuAimingController(
+            MakcuAimConfig(port=port, activation_button=button)
+        )
+        pressed = False
+        deadline = time.monotonic() + 10.0
+        try:
+            controller.start(output_loop=False)
+            while time.monotonic() < deadline and not self._makcu_verify_cancel.is_set():
+                active = controller.poll_activation()
+                if active:
+                    pressed = True
+                elif pressed:
+                    self._makcu_verify_result.put((True, port, str(button), ""))
+                    return
+                time.sleep(0.01)
+            detail = "Verification cancelled." if self._makcu_verify_cancel.is_set() else (
+                f"No complete {MAKCU_BUTTON_LABELS[button]} press and release was received."
+            )
+            self._makcu_verify_result.put((False, port, str(button), detail))
+        except (MakcuError, OSError, ValueError) as exc:
+            self._makcu_verify_result.put((False, port, str(button), str(exc)))
+        finally:
+            controller.stop()
+
+    def _browse_aim_activate_path(self) -> None:
+        selected = filedialog.askopenfilename(
+            title="Select activation device",
+            initialdir="/dev/input",
+            filetypes=(("Input devices", "*"),),
+            parent=self.root,
+        )
+        if selected:
+            self.aim_activate_path.set(selected)
+
+    def _parse_int(self, value: str, default: int = 0) -> int:
+        try:
+            return int(value.strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _parse_float(self, value: str, default: float = 0.0) -> float:
+        try:
+            return float(value.strip())
+        except (TypeError, ValueError):
+            return default
+
+    def _sync_confidence_label(self, _value: str | None = None) -> None:
+        self._confidence_value.configure(text=f"{self.confidence.get():.2f}")
+
+    def _sync_smoothing_label(self, _value: str | None = None) -> None:
+        self._aim_makcu_smoothing_value.configure(
+            text=f"{self.aim_makcu_smoothing_alpha.get():.2f}"
+        )
 
     def _model_preset_changed(self, _event: tk.Event[tk.Misc] | None = None) -> None:
         """Switch model+labels together and retain the session's custom pair."""
@@ -818,6 +1386,8 @@ class DetectorLauncher:
             # Never carry a custom model's traditional/end2end choice into a
             # bundled preset.
             self.output_format.set("auto")
+            assert selected.inference_size is not None
+            self.inference_size.set(str(selected.inference_size))
         else:
             model_path = self._custom_model_path
             labels_path = self._custom_labels_path
@@ -1011,7 +1581,7 @@ class DetectorLauncher:
             device=self.device.get(),
             inference_size=self.inference_size.get(),
             crop_size=self.crop_size.get(),
-            confidence=self.confidence.get(),
+            confidence=f"{self.confidence.get():.2f}",
             iou_threshold=self.iou_threshold.get(),
             output_format=self.output_format.get(),
             ignore_self=self.ignore_self.get(),
@@ -1021,6 +1591,33 @@ class DetectorLauncher:
             ),
             preview=self.preview.get(),
             draw=self.draw.get(),
+            aim=self.aim.get(),
+            aim_label=self.aim_label.get().strip(),
+            aim_invert_x=self.aim_invert_x.get(),
+            aim_invert_y=self.aim_invert_y.get(),
+            aim_head_ratio=AIM_POINT_VALUES.get(self.aim_point.get(), "0.12"),
+            aim_output=AIM_OUTPUT_VALUES.get(self.aim_output.get(), AIM_OUTPUT_MAKCU),
+            aim_host=self.aim_host.get().strip(),
+            aim_port=self.aim_port.get().strip(),
+            aim_pairing_key=self.aim_pairing_key.get().strip(),
+            aim_makcu_port=self.aim_makcu_port.get().strip(),
+            aim_makcu_button=str(
+                MAKCU_BUTTON_LABELS.index(self.aim_makcu_button.get())
+                if self.aim_makcu_button.get() in MAKCU_BUTTON_LABELS
+                else 1
+            ),
+            aim_makcu_strength=self.aim_makcu_strength.get().strip(),
+            aim_makcu_smoothing_alpha=f"{self.aim_makcu_smoothing_alpha.get():.2f}",
+            aim_makcu_max_step=self.aim_makcu_max_step.get().strip(),
+            aim_makcu_verified_port=(
+                self._makcu_verified_port if self._makcu_verification_matches() else ""
+            ),
+            aim_makcu_verified_button=(
+                self._makcu_verified_button if self._makcu_verification_matches() else ""
+            ),
+            aim_activate_path=self.aim_activate_path.get().strip(),
+            aim_activate_axis=self._parse_int(self.aim_activate_axis.get(), default=10),
+            aim_activate_threshold=self.aim_activate_threshold.get().strip(),
             precision_device_path=precision_path,
             precision_device_identity=(self._precision_verified_identity if verified else ""),
             precision_mapping_verified=verified,
@@ -1298,6 +1895,13 @@ class DetectorLauncher:
     def start(self) -> None:
         if self.process is not None and self.process.poll() is None:
             return
+        if self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive():
+            messagebox.showinfo(
+                "MAKCU verification in progress",
+                "Finish or cancel the MAKCU button check before starting capture.",
+                parent=self.root,
+            )
+            return
         settings = self._settings_from_form()
         if (
             settings.source_mode == SOURCE_SCREEN
@@ -1346,6 +1950,7 @@ class DetectorLauncher:
         self.process = process
         self._stop_requested = False
         self.start_button.configure(state="disabled")
+        self.capture_start_button.configure(state="disabled")
         self.stop_button.configure(state="normal")
         self.status.set("Starting model…")
         self._reader = threading.Thread(
@@ -1396,6 +2001,41 @@ class DetectorLauncher:
         self._process_output.put(None)
 
     def _poll_process(self) -> None:
+        try:
+            verified, port, button, detail = self._makcu_verify_result.get_nowait()
+        except queue.Empty:
+            pass
+        else:
+            self._makcu_verify_thread = None
+            if verified:
+                self._makcu_verified_port = port
+                self._makcu_verified_button = button
+                button_name = MAKCU_BUTTON_LABELS[int(button)]
+                self._refresh_makcu_verification_status()
+                self._append_log(
+                    f"MAKCU activation verified: {button_name} press and release.\n",
+                    "heading",
+                )
+                try:
+                    save_settings(self._settings_from_form())
+                except OSError as exc:
+                    self._append_log(
+                        f"Warning: MAKCU verification could not be saved: {exc}\n",
+                        "warning",
+                    )
+            else:
+                self.aim_makcu_verification_status.set(
+                    f"Verification failed: {detail}"
+                )
+                self._append_log(f"MAKCU verification failed: {detail}\n", "error")
+                if not self._closing:
+                    messagebox.showerror(
+                        "MAKCU verification failed",
+                        detail,
+                        parent=self.root,
+                    )
+            self._update_aim_state()
+
         saw_end = False
         for _ in range(300):
             try:
@@ -1460,6 +2100,7 @@ class DetectorLauncher:
         self.process = None
         self._reader = None
         self.start_button.configure(state="normal")
+        self.capture_start_button.configure(state="normal")
         self.stop_button.configure(state="disabled")
         if self._stop_requested and return_code in (0, 130, -2, -15):
             self.status.set("Stopped")
@@ -1698,6 +2339,7 @@ class DetectorLauncher:
             save_settings(self._settings_from_form())
         except OSError:
             pass
+        self._makcu_verify_cancel.set()
         detector_running = self.process is not None and self.process.poll() is None
         precision_running = (
             self.precision_process is not None and self.precision_process.poll() is None

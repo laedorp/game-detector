@@ -3,3 +3,8 @@
 # PyInstaller 6.22 supports Python 3.14 and provides current hooks for the
 # OpenCV wheel used by this project.
 pyinstaller>=6.22,<7
+
+# The desktop interface. PySide6-Essentials excludes the large optional Qt
+# modules (WebEngine, Charts, 3D) that this application never imports, which
+# keeps the bundle to the Qt libraries actually used.
+PySide6-Essentials>=6.7,<7

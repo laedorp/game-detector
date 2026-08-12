@@ -8,12 +8,13 @@ from unittest import mock
 
 from launcher.process import external_process_environment
 from launcher.settings import (
+    AIM_OUTPUT_MAKCU,
+    AIM_OUTPUT_REMOTE,
     BUNDLED_LABELS,
     BUNDLED_MODEL,
     DEFAULT_MODEL_PRESET,
     LauncherSettings,
     MODEL_PRESET_CUSTOM,
-    MODEL_PRESET_FORT_PLAYER,
     SETTINGS_VERSION,
     SELF_POSITION_CENTER,
     SELF_POSITION_LEFT,
@@ -119,6 +120,84 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertIn("--no-preview", args)
         self.assertNotIn("--no-draw", args)
 
+    def test_aim_activation_arguments(self) -> None:
+        args = self.settings(
+            aim=True,
+            aim_label="player",
+            aim_invert_x=True,
+            aim_invert_y=False,
+            aim_activate_path="/dev/input/event0",
+            aim_activate_axis=10,
+            aim_activate_threshold="0.42",
+        ).detector_arguments()
+        self.assertIn("--aim", args)
+        self.assertIn("--aim-label", args)
+        self.assertEqual(args[args.index("--aim-label") + 1], "player")
+        self.assertIn("--aim-invert-x", args)
+        self.assertIn("--aim-activate-path", args)
+        self.assertEqual(args[args.index("--aim-activate-path") + 1], "/dev/input/event0")
+        self.assertIn("--aim-activate-axis", args)
+        self.assertEqual(args[args.index("--aim-activate-axis") + 1], "10")
+        self.assertIn("--aim-activate-threshold", args)
+        self.assertEqual(args[args.index("--aim-activate-threshold") + 1], "0.42")
+
+    def test_remote_aim_arguments_replace_local_activation_device(self) -> None:
+        args = self.settings(
+            aim=True,
+            aim_output=AIM_OUTPUT_REMOTE,
+            aim_host="192.168.1.40",
+            aim_port="47621",
+            aim_pairing_key="0123456789abcdef0123456789abcdef",
+            aim_activate_path="/dev/input/event0",
+        ).detector_arguments()
+        self.assertEqual(args[args.index("--aim-output") + 1], "remote")
+        self.assertEqual(args[args.index("--aim-host") + 1], "192.168.1.40")
+        self.assertEqual(args[args.index("--aim-port") + 1], "47621")
+        self.assertIn("--aim-pairing-key", args)
+        self.assertNotIn("--aim-activate-path", args)
+
+    def test_makcu_aim_arguments_use_mouse_button_and_bounded_movement(self) -> None:
+        args = self.settings(
+            aim=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/serial/by-id/makcu",
+            aim_makcu_button="1",
+            aim_makcu_strength="0.25",
+            aim_makcu_max_step="80",
+            aim_makcu_smoothing_alpha="0.70",
+            aim_makcu_prediction_lead_seconds="0.05",
+            aim_makcu_derivative_damping_seconds="0.01",
+            aim_makcu_verified_port="/dev/serial/by-id/makcu",
+            aim_makcu_verified_button="1",
+            aim_activate_path="/dev/input/event0",
+        ).detector_arguments()
+        self.assertEqual(args[args.index("--aim-output") + 1], "makcu")
+        self.assertEqual(
+            args[args.index("--aim-makcu-port") + 1],
+            "/dev/serial/by-id/makcu",
+        )
+        self.assertEqual(args[args.index("--aim-makcu-button") + 1], "1")
+        self.assertEqual(args[args.index("--aim-makcu-strength") + 1], "0.25")
+        self.assertEqual(args[args.index("--aim-makcu-max-step") + 1], "80")
+        self.assertEqual(args[args.index("--aim-makcu-smoothing-alpha") + 1], "0.7")
+        self.assertEqual(args[args.index("--aim-makcu-prediction-lead-seconds") + 1], "0.05")
+        self.assertEqual(
+            args[args.index("--aim-makcu-derivative-damping-seconds") + 1],
+            "0.01",
+        )
+        self.assertEqual(args[args.index("--aim-head-ratio") + 1], "0.12")
+        self.assertNotIn("--aim-activate-path", args)
+
+    def test_unverified_makcu_button_is_accepted_when_port_is_set(self) -> None:
+        args = self.settings(
+            aim=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/serial/by-id/makcu",
+            aim_makcu_button="1",
+        ).detector_arguments()
+        self.assertEqual(args[args.index("--aim-output") + 1], "makcu")
+        self.assertEqual(args[args.index("--aim-makcu-button") + 1], "1")
+
     def test_video_path_is_one_argument_even_with_spaces(self) -> None:
         settings = self.settings(source_mode="video", video_path=str(self.video))
         command = launcher_command(
@@ -137,9 +216,11 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertNotIn("app.py", command)
 
     def test_frozen_windows_command_uses_console_helper(self) -> None:
-        gui_executable = self.root / "GameDetector.exe"
+        gui_executable = self.root / "ProAim.exe"
         gui_executable.write_bytes(b"gui")
-        helper_executable = self.root / "GameDetectorCLI.exe"
+        # The windowed executable cannot provide stdout on Windows, so detector
+        # work is delegated to the console-subsystem sibling built beside it.
+        helper_executable = self.root / "ProAimCLI.exe"
         helper_executable.write_bytes(b"cli")
         settings = self.settings(source_mode="video", video_path=str(self.video))
         with mock.patch("launcher.settings.sys.platform", "win32"):
@@ -182,6 +263,23 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertTrue(loaded.ignore_self)
         self.assertEqual(loaded.self_position, SELF_POSITION_RIGHT)
 
+    def test_makcu_verification_binding_round_trip(self) -> None:
+        target = self.root / "makcu-settings.json"
+        original = self.settings(
+            aim=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/serial/by-id/makcu",
+            aim_makcu_button="1",
+            aim_makcu_verified_port="/dev/serial/by-id/makcu",
+            aim_makcu_verified_button="1",
+        )
+
+        save_settings(original, target)
+        loaded = load_settings(target)
+
+        self.assertEqual(loaded.aim_makcu_verified_port, original.aim_makcu_port)
+        self.assertEqual(loaded.aim_makcu_verified_button, "1")
+
     def test_older_settings_do_not_silently_enable_filtering(self) -> None:
         target = self.root / "old-settings.json"
         target.write_text(
@@ -210,7 +308,7 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertNotIn("model_path", payload)
         self.assertNotIn("labels_path", payload)
         restored = load_settings(target)
-        self.assertEqual(restored.model_preset, MODEL_PRESET_FORT_PLAYER)
+        self.assertEqual(restored.model_preset, DEFAULT_MODEL_PRESET)
         self.assertEqual(restored.model_path, original.model_path)
         self.assertEqual(restored.labels_path, original.labels_path)
 

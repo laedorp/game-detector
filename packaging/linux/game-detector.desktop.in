@@ -1,14 +1,14 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=Game Detector
+Name=ProAim
 GenericName=Object Detection Viewer
 Comment=Run offline object detection on Moonlight, a capture device, or a video
 Exec=@EXECUTABLE@
-TryExec=@EXECUTABLE@
-Icon=game-detector
+TryExec=@TRY_EXECUTABLE@
+Icon=proaim
 Terminal=false
 Categories=Utility;
-Keywords=object;detection;OpenVINO;Moonlight;video;
+Keywords=proaim;object;detection;OpenVINO;Moonlight;capture;video;
 StartupNotify=true
-StartupWMClass=GameDetector
+StartupWMClass=ProAim

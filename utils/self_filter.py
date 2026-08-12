@@ -16,8 +16,9 @@ import re
 from typing import Any
 
 
-MIN_SELF_BOX_HEIGHT = 0.28
+MIN_SELF_BOX_HEIGHT = 0.25
 MIN_SELF_BOX_WIDTH = 0.06
+MAX_SELF_BOX_ASPECT_RATIO = 0.6
 DEFAULT_ACQUIRE_FRAMES = 3
 DEFAULT_LOST_GRACE_FRAMES = 3
 DEFAULT_HANDOFF_CONFIRM_FRAMES = 3
@@ -96,6 +97,7 @@ class NormalizedBottomZone:
         *,
         minimum_box_height: float = MIN_SELF_BOX_HEIGHT,
         minimum_box_width: float = MIN_SELF_BOX_WIDTH,
+        maximum_aspect_ratio: float = MAX_SELF_BOX_ASPECT_RATIO,
     ) -> tuple[float, float, float] | None:
         """Rank an eligible box by expected anchor proximity, lowness, then size."""
 
@@ -105,6 +107,8 @@ class NormalizedBottomZone:
         ):
             if not math.isfinite(value) or not 0.0 < value <= 1.0:
                 raise ValueError(f"{name} must be finite, greater than 0, and at most 1")
+        if not math.isfinite(maximum_aspect_ratio) or not 0.0 < maximum_aspect_ratio <= 1.0:
+            raise ValueError("maximum aspect ratio must be finite, greater than 0, and at most 1")
 
         normalized = _normalized_box(box, frame_shape)
         if normalized is None:
@@ -113,6 +117,8 @@ class NormalizedBottomZone:
         box_width = max(0.0, x2 - x1)
         box_height = max(0.0, y2 - y1)
         if box_width < minimum_box_width or box_height < minimum_box_height:
+            return None
+        if box_height > 0.0 and box_width / box_height > maximum_aspect_ratio:
             return None
 
         anchor_x = (x1 + x2) * 0.5
@@ -132,6 +138,7 @@ class ExclusionResult:
     detections: tuple[Any, ...]
     ignored_count: int
     ignored_detection: Any | None = None
+    aim_safe: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,7 +206,7 @@ class SelfAvatarFilter:
         materialized = tuple(detections)
         candidates = _candidates(materialized, frame_shape, self.zone)
         if self._locked_box is not None and self._locked_class is not None:
-            return self._apply_locked(materialized, candidates)
+            return self._apply_locked(materialized, candidates, frame_shape)
         return self._apply_acquisition(materialized, candidates)
 
     def _apply_acquisition(
@@ -207,6 +214,12 @@ class SelfAvatarFilter:
         detections: tuple[Any, ...],
         candidates: tuple[_Candidate, ...],
     ) -> ExclusionResult:
+        if not candidates:
+            self._clear_pending()
+            # No plausible self-avatar candidate is visible in this frame, so
+            # aiming can proceed normally while acquisition waits.
+            return ExclusionResult(detections, 0, aim_safe=True)
+
         # Multiple plausible players at startup is ambiguous.  Keep every box
         # and wait for an unambiguous view instead of guessing which is self.
         if len(candidates) != 1:
@@ -235,14 +248,19 @@ class SelfAvatarFilter:
         self,
         detections: tuple[Any, ...],
         candidates: tuple[_Candidate, ...],
+        frame_shape: Sequence[int],
     ) -> ExclusionResult:
         assert self._locked_box is not None
         assert self._locked_class is not None
+        tracking_candidates = _tracking_candidates(
+            detections,
+            frame_shape,
+            self._locked_class,
+        )
         matches = tuple(
             candidate
-            for candidate in candidates
-            if candidate.class_key == self._locked_class
-            and _association_score(self._locked_box, candidate.box) is not None
+            for candidate in tracking_candidates
+            if _association_score(self._locked_box, candidate.box) is not None
         )
 
         # Zero matches means the avatar was missed.  Multiple matches means an
@@ -251,12 +269,14 @@ class SelfAvatarFilter:
         if len(matches) != 1:
             self._clear_handoff()
             self._lost_frames += 1
+            aim_safe = len(matches) == 0 and not candidates
             if self._lost_frames > self.lost_grace_frames:
                 self._locked_box = None
                 self._locked_class = None
                 self._lost_frames = 0
                 self._clear_pending()
-            return ExclusionResult(detections, 0)
+                aim_safe = False
+            return ExclusionResult(detections, 0, aim_safe=aim_safe)
 
         candidate = matches[0]
         self._lost_frames = 0
@@ -347,7 +367,11 @@ def _candidates(
         box = _detection_box(detection)
         if not is_player_like(detection):
             continue
-        score = zone.candidate_score(box, frame_shape)
+        score = zone.candidate_score(
+            box,
+            frame_shape,
+            maximum_aspect_ratio=MAX_SELF_BOX_ASPECT_RATIO,
+        )
         normalized = _normalized_box(box, frame_shape)
         if score is None or normalized is None:
             continue
@@ -363,6 +387,32 @@ def _candidates(
     return tuple(candidates)
 
 
+def _tracking_candidates(
+    detections: tuple[Any, ...],
+    frame_shape: Sequence[int],
+    class_key: str,
+) -> tuple[_Candidate, ...]:
+    """Return same-class tracks after acquisition, independent of anchor zone."""
+
+    candidates: list[_Candidate] = []
+    for index, detection in enumerate(detections):
+        if not is_player_like(detection) or _class_key(detection) != class_key:
+            continue
+        normalized = _normalized_box(_detection_box(detection), frame_shape)
+        if normalized is None:
+            continue
+        candidates.append(
+            _Candidate(
+                index=index,
+                detection=detection,
+                class_key=class_key,
+                box=normalized,
+                prior_score=(0.0, 0.0, 0.0),
+            )
+        )
+    return tuple(candidates)
+
+
 def _remove_candidate(
     detections: tuple[Any, ...],
     candidate: _Candidate,
@@ -372,7 +422,7 @@ def _remove_candidate(
         for index, detection in enumerate(detections)
         if index != candidate.index
     )
-    return ExclusionResult(retained, 1, candidate.detection)
+    return ExclusionResult(retained, 1, candidate.detection, aim_safe=True)
 
 
 def _association_score(
@@ -408,11 +458,17 @@ def _is_strong_continuation(
     area_ratio = current_area / previous_area
     previous_anchor = ((previous[0] + previous[2]) * 0.5, previous[3])
     current_anchor = ((current[0] + current[2]) * 0.5, current[3])
+    iou = _box_iou(previous, current)
     return (
         0.72 <= area_ratio <= 1.38
-        and abs(previous_anchor[0] - current_anchor[0]) <= 0.025
-        and abs(previous_anchor[1] - current_anchor[1]) <= 0.025
-        and _box_iou(previous, current) >= 0.60
+        and (
+            iou >= 0.70
+            or (
+                abs(previous_anchor[0] - current_anchor[0]) <= 0.025
+                and abs(previous_anchor[1] - current_anchor[1]) <= 0.025
+                and iou >= 0.60
+            )
+        )
     )
 
 

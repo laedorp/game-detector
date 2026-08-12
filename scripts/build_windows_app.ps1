@@ -31,6 +31,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "Tkinter is missing from this Python installation. Install a standard python.org build with Tcl/Tk support."
 }
 
+& $ProjectPython -c "import serial, serial.tools.list_ports"
+if ($LASTEXITCODE -ne 0) {
+    throw "MAKCU support requires pyserial. Install requirements.txt before building."
+}
+
 Push-Location $ProjectDir
 try {
     & $ProjectPython -m PyInstaller --noconfirm --clean "packaging\game_detector.spec"
@@ -41,6 +46,18 @@ try {
     Pop-Location
 }
 
-Write-Host "Windows bundle created at: $ProjectDir\dist\GameDetector\GameDetector.exe"
+$BundleDir = Join-Path $ProjectDir "dist\GameDetector"
+$TesterGuide = Join-Path $ProjectDir "packaging\windows\README-Windows.txt"
+$ZipPath = Join-Path $ProjectDir "dist\GameDetector-Windows-x64.zip"
+Copy-Item $TesterGuide (Join-Path $BundleDir "README-Windows.txt") -Force
+if (Test-Path $ZipPath) {
+    Remove-Item $ZipPath -Force
+}
+Compress-Archive -Path $BundleDir -DestinationPath $ZipPath -CompressionLevel Optimal
+$Hash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
+
+Write-Host "Windows bundle created at: $BundleDir\GameDetector.exe"
+Write-Host "Shareable ZIP created at: $ZipPath"
+Write-Host "SHA256: $Hash"
 Write-Host "The bundled GameDetectorCLI.exe helper is used internally for live detector logs."
 Write-Host "PyInstaller builds for the current OS; run this helper on Windows to create the .exe."

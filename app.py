@@ -26,9 +26,24 @@ def main(argv: Sequence[str] | None = None) -> int:
         finally:
             sys.argv = original_argv
 
-    if arguments and arguments != ["--gui"]:
+    if not arguments or arguments in (["--gui"], ["--qt"]):
+        # The Qt interface is the default face of the application.  --tk stays
+        # available because the Tk launcher still carries panels the Qt one
+        # does not.
+        try:
+            from launcher.qt_app import run_gui as run_qt_gui
+        except ImportError as exc:
+            print(
+                "The desktop interface needs PySide6. Install it with "
+                f"'python -m pip install PySide6-Essentials'.\nDetails: {exc}",
+                file=sys.stderr,
+            )
+            return 3
+        return run_qt_gui()
+
+    if arguments != ["--tk"]:
         print(
-            "Usage: app.py [--gui] | app.py --cli [detector options] | "
+            "Usage: app.py [--gui] | app.py --tk | app.py --cli [detector options] | "
             "app.py --controller-precision [options]",
             file=sys.stderr,
         )

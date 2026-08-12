@@ -16,6 +16,8 @@ from typing import Any, Callable, Sequence
 
 
 EXPECTED_INPUT_SHAPE = (1, 3, 320, 320)
+BALANCED_INPUT_SHAPE = (1, 3, 416, 416)
+HIGH_END_INPUT_SHAPE = (1, 3, 640, 640)
 FORT_SOURCE_URL = "https://universe.roboflow.com/aviles-joseph/fort-cuh-mji4f"
 
 COCO80_LABELS = (
@@ -111,29 +113,72 @@ class ModelAsset:
     bin_relative: Path
     labels_relative: Path
     expected_labels: tuple[str, ...]
+    expected_input_shape: tuple[int, int, int, int]
     attribution_relative: Path | None = None
     attribution_markers: tuple[str, ...] = ()
 
 
+PLAYER_LABELS = ("player",)
+
+# The FORT-Cuh source data is CC BY 4.0 and the base weights are Ultralytics
+# AGPL-3.0, so a release must carry both notices next to the derived model.
+PLAYER_ATTRIBUTION_MARKERS = (
+    "FORT-Cuh",
+    "creativecommons.org/licenses/by/4.0",
+    "AGPL-3.0",
+)
+
+
 RELEASE_MODELS = (
+    ModelAsset(
+        display_name="Balanced player detector",
+        xml_relative=Path("models/fort_player_416_openvino_model/fort_player_416.xml"),
+        bin_relative=Path("models/fort_player_416_openvino_model/fort_player_416.bin"),
+        labels_relative=Path("models/fort_player.txt"),
+        expected_labels=PLAYER_LABELS,
+        expected_input_shape=BALANCED_INPUT_SHAPE,
+        attribution_relative=Path("models/fort_player_416_openvino_model/ATTRIBUTION.md"),
+        attribution_markers=PLAYER_ATTRIBUTION_MARKERS,
+    ),
+    ModelAsset(
+        display_name="Fast player detector",
+        xml_relative=Path("models/fort_player_openvino_model/fort_player.xml"),
+        bin_relative=Path("models/fort_player_openvino_model/fort_player.bin"),
+        labels_relative=Path("models/fort_player.txt"),
+        expected_labels=PLAYER_LABELS,
+        expected_input_shape=EXPECTED_INPUT_SHAPE,
+        attribution_relative=Path("models/fort_player_openvino_model/ATTRIBUTION.md"),
+        attribution_markers=PLAYER_ATTRIBUTION_MARKERS,
+    ),
     ModelAsset(
         display_name="COCO detector",
         xml_relative=Path("models/yolo26n_openvino_model/yolo26n.xml"),
         bin_relative=Path("models/yolo26n_openvino_model/yolo26n.bin"),
         labels_relative=Path("models/coco80.txt"),
         expected_labels=COCO80_LABELS,
+        expected_input_shape=EXPECTED_INPUT_SHAPE,
     ),
     ModelAsset(
-        display_name="Fort player detector",
-        xml_relative=Path("models/fort_player_openvino_model/fort_player.xml"),
-        bin_relative=Path("models/fort_player_openvino_model/fort_player.bin"),
-        labels_relative=Path("models/fort_player.txt"),
-        expected_labels=("player",),
-        attribution_relative=Path(
-            "models/fort_player_openvino_model/ATTRIBUTION.md"
-        ),
-        attribution_markers=("CC BY 4.0", "Roboflow", FORT_SOURCE_URL),
+        display_name="Balanced COCO detector",
+        xml_relative=Path("models/yolo26n_416_openvino_model/yolo26n_416.xml"),
+        bin_relative=Path("models/yolo26n_416_openvino_model/yolo26n_416.bin"),
+        labels_relative=Path("models/coco80.txt"),
+        expected_labels=COCO80_LABELS,
+        expected_input_shape=BALANCED_INPUT_SHAPE,
     ),
+    ModelAsset(
+        display_name="High-end YOLO11x detector",
+        xml_relative=Path("models/yolo11x_openvino_model/yolo11x.xml"),
+        bin_relative=Path("models/yolo11x_openvino_model/yolo11x.bin"),
+        labels_relative=Path("models/coco80.txt"),
+        expected_labels=COCO80_LABELS,
+        expected_input_shape=HIGH_END_INPUT_SHAPE,
+    ),
+)
+
+
+EXTRA_RELEASE_FILES = (
+    Path("models/yolo11x_onnx/yolo11x.onnx"),
 )
 
 
@@ -345,10 +390,10 @@ def _validate_ir(
         except ValueError as exc:
             errors.append(f"cannot inspect {asset.display_name} input shape: {exc}")
         else:
-            if input_shape != EXPECTED_INPUT_SHAPE:
+            if input_shape != asset.expected_input_shape:
                 errors.append(
                     f"{asset.display_name} input shape is {input_shape}; expected static "
-                    f"NCHW {EXPECTED_INPUT_SHAPE}"
+                    f"NCHW {asset.expected_input_shape}"
                 )
 
     if len(outputs) != 1:
@@ -370,7 +415,7 @@ def _validate_ir(
         )
         return None
     return (
-        f"{asset.display_name}: input {EXPECTED_INPUT_SHAPE}, "
+        f"{asset.display_name}: input {asset.expected_input_shape}, "
         f"output {output_shape} ({layout})"
     )
 
@@ -392,6 +437,8 @@ def validate_release_assets(
     for asset in RELEASE_MODELS:
         _validate_labels(root, asset, errors)
         _validate_attribution(root, asset, errors)
+    for relative_path in EXTRA_RELEASE_FILES:
+        _regular_nonempty_file(root / relative_path, f"release file {relative_path}", errors)
 
     summaries: list[str] = []
     if _all_ir_files_ready(root):
@@ -450,7 +497,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("Release asset preflight passed:")
     for summary in summaries:
         print(f"  - {summary}")
-    print("  - label files and Fort CC BY 4.0 attribution are exact and complete")
+    print("  - bundled COCO label files are exact and complete")
     return 0
 
 

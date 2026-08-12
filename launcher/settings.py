@@ -7,20 +7,27 @@ environment and safe to reuse from another front end later.
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 import json
 import math
 import os
 from pathlib import Path
 import re
+import secrets
 import sys
 from typing import Any, Mapping, Sequence
+
+from aiming.protocol import validate_pairing_key
 
 
 SOURCE_SCREEN = "screen"
 SOURCE_CAMERA = "camera"
 SOURCE_VIDEO = "video"
 SOURCE_MODES = (SOURCE_SCREEN, SOURCE_CAMERA, SOURCE_VIDEO)
+AIM_OUTPUT_LOCAL = "local"
+AIM_OUTPUT_REMOTE = "remote"
+AIM_OUTPUT_MAKCU = "makcu"
+AIM_OUTPUTS = (AIM_OUTPUT_LOCAL, AIM_OUTPUT_REMOTE, AIM_OUTPUT_MAKCU)
 SELF_POSITION_LEFT = "left"
 SELF_POSITION_CENTER = "center"
 SELF_POSITION_RIGHT = "right"
@@ -35,10 +42,16 @@ SELF_POSITION_GEOMETRY = {
 # extraction directory, so its model and labels always move together.
 SETTINGS_VERSION = 4
 
+MODEL_PRESET_FORT_PLAYER_BALANCED = "fort_player_balanced"
 MODEL_PRESET_FORT_PLAYER = "fort_player"
+MODEL_PRESET_COCO_BALANCED = "coco_balanced"
+MODEL_PRESET_COCO_HIGH = "coco_high"
 MODEL_PRESET_COCO = "coco"
 MODEL_PRESET_CUSTOM = "custom"
-DEFAULT_MODEL_PRESET = MODEL_PRESET_FORT_PLAYER
+DEFAULT_MODEL_PRESET = MODEL_PRESET_FORT_PLAYER_BALANCED
+HIGH_END_CAPTURE_WIDTH = "1920"
+HIGH_END_CAPTURE_HEIGHT = "1080"
+HIGH_END_CAPTURE_FPS = "100"
 
 # These tokens were written by settings versions 1--3.  Keep them as migration
 # constants: existing profiles that used the old bundled detector must continue
@@ -61,28 +74,75 @@ class ModelPreset:
     description: str
     model_relative: str | None
     labels_relative: str | None
+    inference_size: int | None
+    # The same trained weights in ONNX form.  OpenVINO cannot drive AMD or
+    # NVIDIA GPUs, so a preset must be able to hand ONNX Runtime an .onnx graph
+    # instead of an OpenVINO .xml when the hardware scan selects that backend.
+    onnx_relative: str | None = None
 
     @property
     def bundled(self) -> bool:
         return self.model_relative is not None and self.labels_relative is not None
 
+    def model_for(self, backend: str) -> str | None:
+        if str(backend).strip().lower() == "onnxruntime":
+            return self.onnx_relative
+        return self.model_relative
+
 
 MODEL_PRESETS = (
     ModelPreset(
-        key=MODEL_PRESET_FORT_PLAYER,
-        label="Fortnite-style players (Recommended)",
+        key=MODEL_PRESET_FORT_PLAYER_BALANCED,
+        label="Game players — Balanced 416 (Recommended)",
         description=(
-            "One class: player. Works with Auto output and the third-person self filter."
+            "Purpose-trained one-class player detector for stylized game characters."
+        ),
+        model_relative="models/fort_player_416_openvino_model/fort_player_416.xml",
+        labels_relative="models/fort_player.txt",
+        inference_size=416,
+        onnx_relative="models/fort_player_416_onnx/fort_player_416.onnx",
+    ),
+    ModelPreset(
+        key=MODEL_PRESET_FORT_PLAYER,
+        label="Game players — Fast 320",
+        description=(
+            "Lower-latency player detector; less accurate on small or distant players."
         ),
         model_relative="models/fort_player_openvino_model/fort_player.xml",
         labels_relative="models/fort_player.txt",
+        inference_size=320,
+        onnx_relative="models/fort_player_onnx/fort_player.onnx",
+    ),
+    ModelPreset(
+        key=MODEL_PRESET_COCO_BALANCED,
+        label="People — Balanced 416 (COCO fallback)",
+        description=(
+            "Higher-detail COCO person detection for balanced CPU latency and range."
+        ),
+        model_relative="models/yolo26n_416_openvino_model/yolo26n_416.xml",
+        labels_relative="models/coco80.txt",
+        inference_size=416,
+        onnx_relative="models/yolo26n_416_onnx/yolo26n_416.onnx",
+    ),
+    ModelPreset(
+        key=MODEL_PRESET_COCO_HIGH,
+        label="Ultralytics YOLO11x — High-end 1080p test (GPU)",
+        description=(
+            "Fixed Ultralytics YOLO11x test profile for powerful GPUs and 1080p capture."
+        ),
+        model_relative="models/yolo11x_openvino_model/yolo11x.xml",
+        labels_relative="models/coco80.txt",
+        inference_size=640,
+        onnx_relative="models/yolo11x_onnx/yolo11x.onnx",
     ),
     ModelPreset(
         key=MODEL_PRESET_COCO,
-        label="General objects (COCO fallback)",
-        description="General 80-class object detection using the included COCO model.",
+        label="People — Fast 320",
+        description="Lower-latency COCO person detection when update rate matters most.",
         model_relative="models/yolo26n_openvino_model/yolo26n.xml",
         labels_relative="models/coco80.txt",
+        inference_size=320,
+        onnx_relative="models/yolo26n_onnx/yolo26n.onnx",
     ),
     ModelPreset(
         key=MODEL_PRESET_CUSTOM,
@@ -90,6 +150,7 @@ MODEL_PRESETS = (
         description="Use your own matching OpenVINO .xml/.bin model and labels file.",
         model_relative=None,
         labels_relative=None,
+        inference_size=None,
     ),
 )
 _MODEL_PRESETS_BY_KEY = {preset.key: preset for preset in MODEL_PRESETS}
@@ -114,16 +175,25 @@ def model_preset(value: str) -> ModelPreset:
     return _MODEL_PRESETS_BY_KEY.get(value, _MODEL_PRESETS_BY_KEY[DEFAULT_MODEL_PRESET])
 
 
-def model_preset_paths(value: str) -> tuple[str, str]:
-    """Resolve both files for a bundled preset in one operation."""
+def model_preset_paths(value: str, backend: str = "openvino") -> tuple[str, str]:
+    """Resolve both files for a bundled preset in one operation.
+
+    ``backend`` selects the model format, because the two runtimes read
+    different files: OpenVINO reads an ``.xml``/``.bin`` pair and ONNX Runtime
+    reads an ``.onnx`` graph.  The labels file is shared by both.
+    """
 
     preset = _MODEL_PRESETS_BY_KEY.get(value)
     if preset is None or not preset.bundled:
         raise ValueError(f"Model preset does not provide bundled files: {value!r}")
-    assert preset.model_relative is not None
     assert preset.labels_relative is not None
+    model_relative = preset.model_for(backend)
+    if model_relative is None:
+        raise ValueError(
+            f"Model preset {value!r} has no model for the {backend!r} backend."
+        )
     root = resource_root()
-    return str(root / preset.model_relative), str(root / preset.labels_relative)
+    return str(root / model_relative), str(root / preset.labels_relative)
 
 
 def default_model_path() -> str:
@@ -142,19 +212,44 @@ def coco_labels_path() -> str:
     return model_preset_paths(MODEL_PRESET_COCO)[1]
 
 
-def settings_path() -> Path:
-    """Return the per-user JSON settings path on the current platform."""
+def _settings_paths() -> tuple[Path, Path]:
+    """Return the current settings path and the pre-rename one.
+
+    The application was named Game Detector before it became ProAim.  Returning
+    both lets a first run adopt an existing profile instead of silently starting
+    from defaults and appearing to have lost the user's configuration.
+    """
 
     if sys.platform == "win32":
         base = os.environ.get("APPDATA")
         root = Path(base) if base else Path.home() / "AppData" / "Roaming"
-        return root / "GameDetector" / "settings.json"
+        return root / "ProAim" / "settings.json", root / "GameDetector" / "settings.json"
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "GameDetector" / "settings.json"
+        support = Path.home() / "Library" / "Application Support"
+        return (
+            support / "ProAim" / "settings.json",
+            support / "GameDetector" / "settings.json",
+        )
 
     base = os.environ.get("XDG_CONFIG_HOME")
     root = Path(base).expanduser() if base else Path.home() / ".config"
-    return root / "game-detector" / "settings.json"
+    return root / "proaim" / "settings.json", root / "game-detector" / "settings.json"
+
+
+def settings_path() -> Path:
+    """Return the per-user JSON settings path on the current platform.
+
+    This is always the current location so that the next save completes the
+    migration; reading falls back to the legacy file separately.
+    """
+
+    return _settings_paths()[0]
+
+
+def legacy_settings_path() -> Path:
+    """Return the pre-rename settings path."""
+
+    return _settings_paths()[1]
 
 
 @dataclass(slots=True)
@@ -185,9 +280,13 @@ class LauncherSettings:
     # LauncherSettings instance is normalized to a semantic key in
     # ``__post_init__``.
     model_preset: str = ""
+    model_tier: str = "mid"
     model_path: str = ""
     labels_path: str = ""
     device: str = "CPU"
+    # OpenVINO cannot drive AMD or NVIDIA GPUs; those run through ONNX
+    # Runtime, and the hardware scan sets this automatically.
+    backend: str = "openvino"
     inference_size: str = "320"
     crop_size: str = ""
     confidence: str = "0.25"
@@ -199,6 +298,27 @@ class LauncherSettings:
     self_position: str = SELF_POSITION_LEFT
     preview: bool = True
     draw: bool = True
+    aim: bool = False
+    aim_label: str = ""
+    aim_invert_x: bool = False
+    aim_invert_y: bool = False
+    aim_head_ratio: str = "0.12"
+    aim_output: str = AIM_OUTPUT_LOCAL
+    aim_host: str = ""
+    aim_port: str = "47621"
+    aim_pairing_key: str = field(default_factory=lambda: secrets.token_hex(16))
+    aim_makcu_port: str = ""
+    aim_makcu_button: str = "1"
+    aim_makcu_strength: str = "0.5"
+    aim_makcu_max_step: str = "160"
+    aim_makcu_smoothing_alpha: str = "0.78"
+    aim_makcu_prediction_lead_seconds: str = "0.03"
+    aim_makcu_derivative_damping_seconds: str = "0.008"
+    aim_makcu_verified_port: str = ""
+    aim_makcu_verified_button: str = ""
+    aim_activate_path: str = ""
+    aim_activate_axis: int = 10
+    aim_activate_threshold: str = "0.35"
     # Controller precision is a separate, user-driven process.  Only the
     # selected device, curve preset, and a device-bound verification record are
     # persistent; whether the worker is running is intentionally never saved.
@@ -210,6 +330,9 @@ class LauncherSettings:
     precision_trigger_pressed: str = ""
 
     def __post_init__(self) -> None:
+        # ``fort_player`` is a bundled preset again, so a profile that stored it
+        # while the 320 player model was the only bundled detector still selects
+        # that same 320 player model rather than silently changing detector.
         if not self.model_preset:
             self.model_preset = (
                 MODEL_PRESET_CUSTOM
@@ -223,6 +346,9 @@ class LauncherSettings:
                 else DEFAULT_MODEL_PRESET
             )
 
+        if self.model_tier == "high" and self.model_preset != MODEL_PRESET_CUSTOM:
+            self.model_preset = MODEL_PRESET_COCO_HIGH
+
         preset = model_preset(self.model_preset)
         if preset.bundled:
             # Ignore stale/partial serialized paths.  A bundled preset is an
@@ -230,8 +356,17 @@ class LauncherSettings:
             # resource root.  The included YOLO26 models must use automatic
             # output decoding; a custom traditional/end2end choice is not
             # compatible state for either bundled preset.
-            self.model_path, self.labels_path = model_preset_paths(preset.key)
+            self.model_path, self.labels_path = model_preset_paths(
+                preset.key, self.backend
+            )
             self.output_format = "auto"
+            assert preset.inference_size is not None
+            self.inference_size = str(preset.inference_size)
+            if preset.key == MODEL_PRESET_COCO_HIGH:
+                self.capture_width = HIGH_END_CAPTURE_WIDTH
+                self.capture_height = HIGH_END_CAPTURE_HEIGHT
+                self.capture_fps = HIGH_END_CAPTURE_FPS
+                self.screen_fps = HIGH_END_CAPTURE_FPS
         if self.precision_mapping_verified and not self.precision_device_identity.strip():
             self.precision_mapping_verified = False
 
@@ -292,22 +427,34 @@ class LauncherSettings:
             raise SettingsError("Choose Moonlight screen, camera/capture card, or video file.")
 
         model_path, labels_path = self.resolved_model_files()
-        model = _existing_file(model_path, "OpenVINO model")
-        if model.suffix.lower() != ".xml":
-            raise SettingsError("The OpenVINO model must be an .xml file.")
-        weights = model.with_suffix(".bin")
-        if not weights.is_file():
-            raise SettingsError(
-                f"The model weights were not found: {weights}. "
-                "Keep the matching .xml and .bin files together."
-            )
+        backend = _backend_name(self.backend)
+        if backend == "onnxruntime":
+            # An ONNX graph is a single self-contained file, so there is no
+            # separate weights file to keep beside it.
+            model = _existing_file(model_path, "ONNX model")
+            if model.suffix.lower() != ".onnx":
+                raise SettingsError("The ONNX Runtime model must be an .onnx file.")
+        else:
+            model = _existing_file(model_path, "OpenVINO model")
+            if model.suffix.lower() != ".xml":
+                raise SettingsError("The OpenVINO model must be an .xml file.")
+            weights = model.with_suffix(".bin")
+            if not weights.is_file():
+                raise SettingsError(
+                    f"The model weights were not found: {weights}. "
+                    "Keep the matching .xml and .bin files together."
+                )
         labels = _existing_file(labels_path, "labels file")
 
-        output_format = (
-            "auto"
-            if model_preset(self.model_preset).bundled
-            else self.output_format.lower()
-        )
+        preset = model_preset(self.model_preset)
+        output_format = "auto" if preset.bundled else self.output_format.lower()
+        inference_size_value = _positive_int(self.inference_size, "inference size")
+        if preset.bundled and preset.inference_size is not None:
+            # Bundled presets are exported at fixed square sizes; allowing a
+            # stale/edited size value can produce internal anchor mismatches at
+            # compile time (for example 416-exported constants vs 640 runtime
+            # feature maps). Always run bundled presets at their trained size.
+            inference_size_value = preset.inference_size
         args = [
             "--model",
             str(model),
@@ -315,8 +462,10 @@ class LauncherSettings:
             str(labels),
             "--device",
             _device_name(self.device),
+            "--backend",
+            _backend_name(self.backend),
             "--inference-size",
-            str(_positive_int(self.inference_size, "inference size")),
+            str(inference_size_value),
             "--confidence",
             _unit_float_text(self.confidence, "confidence"),
             "--iou-threshold",
@@ -395,6 +544,87 @@ class LauncherSettings:
             args.append("--no-preview")
         elif not self.draw:
             args.append("--no-draw")
+        if self.aim:
+            args.append("--aim")
+            if self.aim_label:
+                args.extend(("--aim-label", self.aim_label))
+            if self.aim_invert_x:
+                args.append("--aim-invert-x")
+            if self.aim_invert_y:
+                args.append("--aim-invert-y")
+            head_ratio = _float(self.aim_head_ratio, "head aim point")
+            if not 0.0 <= head_ratio <= 0.5:
+                raise SettingsError("Head aim point must be between 0 and 0.5.")
+            args.extend(("--aim-head-ratio", f"{head_ratio:g}"))
+            aim_output = _choice(self.aim_output, AIM_OUTPUTS, "aim output")
+            args.extend(("--aim-output", aim_output))
+            if aim_output == AIM_OUTPUT_REMOTE:
+                host = self.aim_host.strip()
+                if not host or any(character.isspace() for character in host):
+                    raise SettingsError(
+                        "Enter the gaming PC IP address or hostname for remote aim."
+                    )
+                try:
+                    pairing_key = validate_pairing_key(self.aim_pairing_key)
+                except ValueError as exc:
+                    raise SettingsError(f"Remote aim pairing key {exc}.") from exc
+                args.extend(
+                    (
+                        "--aim-host",
+                        host,
+                        "--aim-port",
+                        str(_port(self.aim_port, "remote aim port")),
+                        "--aim-pairing-key",
+                        pairing_key,
+                    )
+                )
+            elif aim_output == AIM_OUTPUT_MAKCU:
+                makcu_port = self.aim_makcu_port.strip()
+                if not makcu_port:
+                    raise SettingsError("Select or detect a MAKCU serial device before starting.")
+                makcu_button = str(
+                    _range_int(self.aim_makcu_button, "MAKCU activation button", 0, 4)
+                )
+                args.extend(("--aim-makcu-port", makcu_port))
+                args.extend(
+                    (
+                        "--aim-makcu-button",
+                        makcu_button,
+                        "--aim-makcu-strength",
+                        _bounded_positive_float_text(
+                            self.aim_makcu_strength,
+                            "MAKCU aim strength",
+                            4.0,
+                        ),
+                        "--aim-makcu-max-step",
+                        str(_positive_int(self.aim_makcu_max_step, "MAKCU maximum step")),
+                        "--aim-makcu-smoothing-alpha",
+                        _bounded_positive_float_text(
+                            self.aim_makcu_smoothing_alpha,
+                            "MAKCU smoothing",
+                            1.0,
+                        ),
+                        "--aim-makcu-prediction-lead-seconds",
+                        _bounded_non_negative_float_text(
+                            self.aim_makcu_prediction_lead_seconds,
+                            "MAKCU prediction lead",
+                            0.25,
+                        ),
+                        "--aim-makcu-derivative-damping-seconds",
+                        _bounded_non_negative_float_text(
+                            self.aim_makcu_derivative_damping_seconds,
+                            "MAKCU derivative damping",
+                            0.25,
+                        ),
+                    )
+                )
+            else:
+                if self.aim_activate_path.strip():
+                    args.extend(("--aim-activate-path", self.aim_activate_path))
+                if self.aim_activate_axis is not None:
+                    args.extend(("--aim-activate-axis", str(self.aim_activate_axis)))
+                if self.aim_activate_threshold.strip():
+                    args.extend(("--aim-activate-threshold", self.aim_activate_threshold))
         return args
 
     def resolved_model_files(self) -> tuple[str, str]:
@@ -402,7 +632,7 @@ class LauncherSettings:
 
         preset = model_preset(self.model_preset)
         if preset.bundled:
-            return model_preset_paths(preset.key)
+            return model_preset_paths(preset.key, self.backend)
         return self.model_path, self.labels_path
 
 
@@ -422,7 +652,7 @@ def launcher_command(
         # stdout/stderr objects are unavailable.  Send detector work to the
         # sibling console-helper build so its output can be piped back into
         # the GUI without opening a terminal window.
-        helper = Path(program).with_name("GameDetectorCLI.exe")
+        helper = Path(program).with_name("ProAimCLI.exe")
         if helper.is_file():
             program = str(helper)
     prefix = [program]
@@ -433,6 +663,13 @@ def launcher_command(
 
 def load_settings(path: Path | None = None) -> LauncherSettings:
     target = path or settings_path()
+    if not target.exists() and path is None:
+        # Adopt a profile written before the application was renamed.  The next
+        # save lands in the current location, which completes the move without
+        # touching the old file.
+        legacy = legacy_settings_path()
+        if legacy.is_file():
+            target = legacy
     try:
         raw = json.loads(target.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -503,6 +740,22 @@ def _non_negative_int(value: str, label: str) -> int:
     return parsed
 
 
+def _port(value: str, label: str) -> int:
+    parsed = _integer(value, label)
+    if not 1 <= parsed <= 65535:
+        raise SettingsError(f"{label.capitalize()} must be between 1 and 65535.")
+    return parsed
+
+
+def _range_int(value: str, label: str, minimum: int, maximum: int) -> int:
+    parsed = _integer(value, label)
+    if not minimum <= parsed <= maximum:
+        raise SettingsError(
+            f"{label.capitalize()} must be between {minimum} and {maximum}."
+        )
+    return parsed
+
+
 def _float(value: str, label: str) -> float:
     try:
         parsed = float(value.strip())
@@ -527,6 +780,31 @@ def _unit_float_text(value: str, label: str) -> str:
     return f"{parsed:g}"
 
 
+def _positive_unit_float_text(value: str, label: str) -> str:
+    parsed = _float(value, label)
+    if not 0.0 < parsed <= 1.0:
+        raise SettingsError(f"{label.capitalize()} must be greater than 0 and at most 1.")
+    return f"{parsed:g}"
+
+
+def _bounded_positive_float_text(value: str, label: str, maximum: float) -> str:
+    parsed = _float(value, label)
+    if not 0.0 < parsed <= maximum:
+        raise SettingsError(
+            f"{label.capitalize()} must be greater than 0 and at most {maximum:g}."
+        )
+    return f"{parsed:g}"
+
+
+def _bounded_non_negative_float_text(value: str, label: str, maximum: float) -> str:
+    parsed = _float(value, label)
+    if not 0.0 <= parsed <= maximum:
+        raise SettingsError(
+            f"{label.capitalize()} must be between 0 and {maximum:g}."
+        )
+    return f"{parsed:g}"
+
+
 def _choice(value: str, choices: Sequence[str], label: str) -> str:
     if value not in choices:
         allowed = ", ".join(choices)
@@ -538,6 +816,19 @@ def _device_name(value: str) -> str:
     parsed = value.strip().upper()
     if not parsed:
         raise SettingsError("Choose an inference device.")
+    return parsed
+
+
+def _backend_name(value: str) -> str:
+    parsed = value.strip().lower()
+    if not parsed:
+        # An older settings file predates the choice; OpenVINO was the only
+        # backend then, so that is the faithful reading of an absent value.
+        return "openvino"
+    if parsed not in ("openvino", "onnxruntime"):
+        raise SettingsError(
+            f"Unknown inference backend {value!r}; expected 'openvino' or 'onnxruntime'."
+        )
     return parsed
 
 

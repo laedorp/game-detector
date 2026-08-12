@@ -1,0 +1,2 @@
+# Give the active desktop session access to the MAKCU USB serial interface.
+SUBSYSTEM=="tty", ATTRS{idVendor}=="1a86", ATTRS{idProduct}=="55d3", TAG+="uaccess", GROUP="uucp", MODE="0660"

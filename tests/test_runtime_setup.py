@@ -1,0 +1,205 @@
+from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+import unittest
+
+from detection.runtime_setup import (
+    DISTRIBUTION_CPU,
+    DISTRIBUTION_DIRECTML,
+    DISTRIBUTION_NVIDIA,
+    DISTRIBUTION_ROCM,
+    RuntimeSetupError,
+    activate,
+    describe,
+    ensure_runtime,
+    install_root,
+    plan_for,
+)
+
+
+def completed(returncode: int = 0, stderr: str = "") -> subprocess.CompletedProcess:
+    return subprocess.CompletedProcess(args=[], returncode=returncode, stdout="", stderr=stderr)
+
+
+class PlanTests(unittest.TestCase):
+    def test_amd_on_linux_uses_rocm_and_warns_about_the_driver(self) -> None:
+        plan = plan_for("amd", "linux")
+
+        self.assertEqual(plan.distribution, DISTRIBUTION_ROCM)
+        self.assertTrue(plan.needs_driver)
+        self.assertIn("HSA_OVERRIDE_GFX_VERSION", plan.driver_note)
+
+    def test_amd_on_windows_uses_directml(self) -> None:
+        plan = plan_for("amd", "windows")
+
+        self.assertEqual(plan.distribution, DISTRIBUTION_DIRECTML)
+
+    def test_nvidia_on_linux_uses_the_cuda_build(self) -> None:
+        plan = plan_for("nvidia", "linux")
+
+        self.assertEqual(plan.distribution, DISTRIBUTION_NVIDIA)
+        self.assertTrue(plan.needs_driver)
+
+    def test_nvidia_on_windows_prefers_directml_over_a_cuda_toolkit(self) -> None:
+        plan = plan_for("nvidia", "windows")
+
+        self.assertEqual(plan.distribution, DISTRIBUTION_DIRECTML)
+        self.assertFalse(plan.needs_driver)
+
+    def test_intel_and_unknown_vendors_fall_back_to_the_cpu_build(self) -> None:
+        for vendor in ("intel", "unknown", ""):
+            with self.subTest(vendor=vendor):
+                plan = plan_for(vendor, "linux")
+                self.assertEqual(plan.distribution, DISTRIBUTION_CPU)
+                self.assertFalse(plan.needs_driver)
+
+    def test_vendor_and_system_are_case_insensitive(self) -> None:
+        self.assertEqual(plan_for("AMD", "Linux").distribution, DISTRIBUTION_ROCM)
+
+
+class EnsureRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.settings = Path(self.temporary.name)
+        self._original_path = list(sys.path)
+
+    def tearDown(self) -> None:
+        sys.path[:] = self._original_path
+        self.temporary.cleanup()
+
+    def test_an_already_correct_install_downloads_nothing(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(command):
+            calls.append(list(command))
+            return completed()
+
+        install_root(self.settings).mkdir(parents=True)
+        ensure_runtime(
+            plan_for("amd", "linux"),
+            self.settings,
+            runner=runner,
+            already_installed=DISTRIBUTION_ROCM,
+        )
+
+        self.assertEqual(calls, [])
+
+    def test_a_conflicting_install_is_refused_rather_than_stacked(self) -> None:
+        def runner(command):
+            raise AssertionError("must not install over a conflicting distribution")
+
+        with self.assertRaises(RuntimeSetupError) as raised:
+            ensure_runtime(
+                plan_for("amd", "linux"),
+                self.settings,
+                runner=runner,
+                already_installed=DISTRIBUTION_NVIDIA,
+            )
+
+        message = str(raised.exception)
+        self.assertIn(DISTRIBUTION_NVIDIA, message)
+        self.assertIn("cannot be installed together", message)
+
+    def test_a_missing_runtime_is_installed_into_the_user_directory(self) -> None:
+        calls: list[list[str]] = []
+
+        def runner(command):
+            calls.append(list(command))
+            return completed()
+
+        target = ensure_runtime(
+            plan_for("amd", "linux"),
+            self.settings,
+            runner=runner,
+            already_installed=None,
+        )
+
+        self.assertEqual(len(calls), 1)
+        command = calls[0]
+        self.assertIn(DISTRIBUTION_ROCM, command)
+        self.assertIn("--target", command)
+        # The install must land beside the user's settings, never inside the
+        # application directory, which may be read-only or shared.
+        self.assertEqual(command[command.index("--target") + 1], str(target))
+        self.assertTrue(str(target).startswith(str(self.settings)))
+
+    def test_a_failed_install_reports_the_reason(self) -> None:
+        def runner(command):
+            return completed(returncode=1, stderr="No matching distribution found")
+
+        with self.assertRaises(RuntimeSetupError) as raised:
+            ensure_runtime(
+                plan_for("amd", "linux"),
+                self.settings,
+                runner=runner,
+                already_installed=None,
+            )
+
+        self.assertIn("No matching distribution found", str(raised.exception))
+
+    def test_an_unlaunchable_installer_is_reported_not_raised_raw(self) -> None:
+        def runner(command):
+            raise OSError("pip is missing")
+
+        with self.assertRaises(RuntimeSetupError) as raised:
+            ensure_runtime(
+                plan_for("nvidia", "linux"),
+                self.settings,
+                runner=runner,
+                already_installed=None,
+            )
+
+        self.assertIn("pip is missing", str(raised.exception))
+
+    def test_installing_puts_the_directory_first_on_the_import_path(self) -> None:
+        target = ensure_runtime(
+            plan_for("amd", "linux"),
+            self.settings,
+            runner=lambda command: completed(),
+            already_installed=None,
+        )
+
+        self.assertEqual(sys.path[0], str(target))
+
+
+class ActivateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._original_path = list(sys.path)
+
+    def tearDown(self) -> None:
+        sys.path[:] = self._original_path
+
+    def test_a_missing_directory_is_not_added(self) -> None:
+        self.assertFalse(activate(Path("/nonexistent-runtime-directory")))
+
+    def test_activation_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            self.assertTrue(activate(target))
+            self.assertTrue(activate(target))
+            self.assertEqual(sys.path.count(str(target)), 1)
+
+
+class DescribeTests(unittest.TestCase):
+    def test_already_installed_says_nothing_will_download(self) -> None:
+        text = describe(plan_for("amd", "linux"), DISTRIBUTION_ROCM)
+
+        self.assertIn("already installed", text)
+
+    def test_missing_runtime_says_it_will_download_on_approval(self) -> None:
+        text = describe(plan_for("amd", "linux"), None)
+
+        self.assertIn("downloaded on approval", text)
+        self.assertIn("ROCm", text)
+
+    def test_a_conflict_is_explained_before_anything_is_fetched(self) -> None:
+        text = describe(plan_for("amd", "linux"), DISTRIBUTION_NVIDIA)
+
+        self.assertIn("conflicts", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

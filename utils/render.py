@@ -50,6 +50,44 @@ def draw_detections(frame: np.ndarray, detections: Iterable[Any]) -> None:
         )
 
 
+def draw_aim_target(
+    frame: np.ndarray,
+    point: tuple[float, float],
+    *,
+    active: bool,
+) -> None:
+    """Mark the exact selected head point and whether activation is held."""
+
+    import cv2
+
+    x = min(frame.shape[1] - 1, max(0, int(round(point[0]))))
+    y = min(frame.shape[0] - 1, max(0, int(round(point[1]))))
+    color = (40, 220, 80) if active else (40, 210, 255)
+    line_width = max(1, round(min(frame.shape[:2]) / 450))
+    radius = max(7, round(min(frame.shape[:2]) / 100))
+    cv2.circle(frame, (x, y), radius, color, line_width, cv2.LINE_AA)
+    cv2.drawMarker(
+        frame,
+        (x, y),
+        color,
+        cv2.MARKER_CROSS,
+        radius * 2,
+        line_width,
+        cv2.LINE_AA,
+    )
+    label = "HEAD AIM ACTIVE" if active else "HEAD TARGET - HOLD RIGHT"
+    cv2.putText(
+        frame,
+        label,
+        (min(frame.shape[1] - 1, x + radius + 4), max(16, y - radius - 3)),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        max(0.42, min(frame.shape[:2]) / 1600),
+        color,
+        line_width,
+        cv2.LINE_AA,
+    )
+
+
 def draw_ignore_zone(
     frame: np.ndarray,
     zone: NormalizedBottomZone,
@@ -123,6 +161,7 @@ def draw_metrics(
     snapshot: MetricsSnapshot,
     skipped_frames: int,
     ignored_count: int | None = None,
+    aim_status: str | None = None,
 ) -> None:
     import cv2
 
@@ -137,6 +176,8 @@ def draw_metrics(
     ]
     if ignored_count is not None:
         lines.append(f"self-avatar filter: ignored {ignored_count} this frame")
+    if aim_status is not None:
+        lines.append(aim_status)
     scale = max(0.48, min(frame.shape[:2]) / 1300)
     line_height = max(18, int(round(25 * scale / 0.6)))
     overlay_width = max(

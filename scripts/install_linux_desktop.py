@@ -12,14 +12,14 @@ import sys
 import tempfile
 
 
-APP_ID = "game-detector"
-EXECUTABLE_NAME = "GameDetector"
+APP_ID = "proaim"
+EXECUTABLE_NAME = "ProAim"
 INSTALL_MARKER = ".game-detector-install"
 
 
 def _default_bundle() -> Path:
     script_path = Path(__file__).resolve()
-    repository_bundle = script_path.parents[1] / "dist" / "GameDetector"
+    repository_bundle = script_path.parents[1] / "dist" / "ProAim"
     packaged_bundle = script_path.parent.parent
     if (repository_bundle / EXECUTABLE_NAME).is_file():
         return repository_bundle
@@ -48,11 +48,9 @@ def _safe_existing_install(path: Path) -> bool:
     return path.is_dir() and (path / INSTALL_MARKER).is_file()
 
 
-def _quote_desktop_exec(path: Path) -> str:
-    # The freedesktop Exec format uses double quotes and backslash escaping.
+def _desktop_exec(path: Path) -> str:
     value = str(path)
-    escaped = value.replace("\\", "\\\\").replace('"', '\\"').replace("`", "\\`").replace("$", "\\$")
-    return f'"{escaped}"'
+    return value.replace(" ", "\\ ")
 
 
 def _write_atomic(path: Path, content: str, mode: int) -> None:
@@ -126,7 +124,11 @@ def install(bundle: Path) -> Path:
     desktop_template = desktop_template_path.read_text(encoding="utf-8")
     desktop_content = desktop_template.replace(
         "@EXECUTABLE@",
-        _quote_desktop_exec(installed_executable),
+        _desktop_exec(installed_executable),
+    )
+    desktop_content = desktop_content.replace(
+        "@TRY_EXECUTABLE@",
+        str(installed_executable),
     )
     _write_atomic(
         applications_dir / f"{APP_ID}.desktop",
@@ -168,7 +170,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--bundle",
         type=Path,
         default=_default_bundle(),
-        help="Path to the built one-folder GameDetector bundle.",
+        help="Path to the built one-folder ProAim bundle.",
     )
     return parser
 
@@ -183,8 +185,8 @@ def main() -> int:
         print(f"Installation failed: {exc}", file=sys.stderr)
         return 2
 
-    print("Game Detector is installed for this user.")
-    print("Open your application menu and click Game Detector.")
+    print("ProAim is installed for this user.")
+    print("Open your application menu and click ProAim.")
     print(f"Installed executable: {installed_executable}")
     return 0
 

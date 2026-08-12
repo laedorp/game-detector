@@ -9,18 +9,23 @@ import unittest
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SPEC_PATH = PROJECT_ROOT / "packaging" / "game_detector.spec"
 LINUX_BUILD = PROJECT_ROOT / "scripts" / "build_linux_app.sh"
+MAKCU_ACCESS_INSTALLER = PROJECT_ROOT / "scripts" / "install_makcu_access.sh"
 WINDOWS_BUILD = PROJECT_ROOT / "scripts" / "build_windows_app.ps1"
+WINDOWS_WORKFLOW = PROJECT_ROOT / ".github" / "workflows" / "build-windows.yml"
+WINDOWS_GUIDE = PROJECT_ROOT / "packaging" / "windows" / "README-Windows.txt"
 RELEASE_PREFLIGHT = PROJECT_ROOT / "scripts" / "validate_release_assets.py"
 README = PROJECT_ROOT / "README.md"
+MAKCU_RULE = PROJECT_ROOT / "packaging" / "linux" / "70-game-detector-makcu.rules"
 
 REQUIRED_MODEL_ASSETS = (
     "models/coco80.txt",
     "models/yolo26n_openvino_model/yolo26n.xml",
     "models/yolo26n_openvino_model/yolo26n.bin",
-    "models/fort_player.txt",
-    "models/fort_player_openvino_model/fort_player.xml",
-    "models/fort_player_openvino_model/fort_player.bin",
-    "models/fort_player_openvino_model/ATTRIBUTION.md",
+    "models/yolo26n_416_openvino_model/yolo26n_416.xml",
+    "models/yolo26n_416_openvino_model/yolo26n_416.bin",
+    "models/yolo11x_openvino_model/yolo11x.xml",
+    "models/yolo11x_openvino_model/yolo11x.bin",
+    "models/yolo11x_onnx/yolo11x.onnx",
 )
 
 
@@ -37,8 +42,10 @@ class PackagingContractTests(unittest.TestCase):
                         f"{component!r} is absent from {SPEC_PATH}",
                     )
 
-        self.assertIn('"models/fort_player_openvino_model"', source)
+        self.assertIn('"models/yolo26n_416_openvino_model"', source)
         self.assertIn('"models/yolo26n_openvino_model"', source)
+        self.assertIn('"models/yolo11x_openvino_model"', source)
+        self.assertIn('"models/yolo11x_onnx"', source)
 
     def test_linux_evdev_collection_is_platform_guarded(self) -> None:
         source = SPEC_PATH.read_text(encoding="utf-8")
@@ -76,19 +83,50 @@ class PackagingContractTests(unittest.TestCase):
             windows_source.index('-c "import PyInstaller"'),
         )
         self.assertIn("evdev._ecodes, evdev._input, evdev._uinput", linux_source)
+        self.assertIn("import serial, serial.tools.list_ports", linux_source)
+        self.assertIn("import serial, serial.tools.list_ports", windows_source)
+        self.assertIn("70-game-detector-makcu.rules", linux_source)
         self.assertNotIn("import evdev", windows_source)
 
+    def test_windows_build_creates_shareable_zip_and_ci_artifact(self) -> None:
+        build = WINDOWS_BUILD.read_text(encoding="utf-8")
+        workflow = WINDOWS_WORKFLOW.read_text(encoding="utf-8")
+        guide = WINDOWS_GUIDE.read_text(encoding="utf-8")
+        self.assertIn("GameDetector-Windows-x64.zip", build)
+        self.assertIn("Compress-Archive", build)
+        self.assertIn("README-Windows.txt", build)
+        self.assertIn("workflow_dispatch", workflow)
+        self.assertIn("windows-2022", workflow)
+        self.assertIn("dist/GameDetector-Windows-x64.zip", workflow)
+        self.assertIn("Refresh devices", guide)
+        self.assertIn("GPU", guide)
+        self.assertIn("NPU", guide)
+
+    def test_makcu_rule_is_narrow_and_documented(self) -> None:
+        rule = MAKCU_RULE.read_text(encoding="utf-8")
+        self.assertIn('ATTRS{idVendor}=="1a86"', rule)
+        self.assertIn('ATTRS{idProduct}=="55d3"', rule)
+        self.assertIn('TAG+="uaccess"', rule)
+        readme = README.read_text(encoding="utf-8")
+        self.assertIn("MAKCU detection aim", readme)
+        self.assertIn("Start capture + AI preview", readme)
+        self.assertIn("70-game-detector-makcu.rules", readme)
+
     def test_linux_build_helper_has_valid_shell_syntax(self) -> None:
-        result = subprocess.run(
-            ["bash", "-n", str(LINUX_BUILD)],
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        for script in (LINUX_BUILD, MAKCU_ACCESS_INSTALLER):
+            with self.subTest(script=script):
+                result = subprocess.run(
+                    ["bash", "-n", str(script)],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_readme_distinguishes_precision_from_detection_driven_input(self) -> None:
         source = README.read_text(encoding="utf-8")
+        self.assertIn("MAKCU detection aim", source)
+        self.assertIn("km.move(dx,dy)", source)
         self.assertIn("Linux Controller precision", source)
         self.assertIn("Verify LT + right stick", source)
         self.assertIn("Start controller precision", source)
