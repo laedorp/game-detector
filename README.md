@@ -23,13 +23,14 @@ For testers who should not install Python or dependencies manually:
 1. Open the repository's **Releases** page on GitHub.
 2. Download the asset for your OS:
   - `ProAim-Linux-x64.zip`
-  - `ProAim-Windows-x64.zip`
+  - `ProAim-Windows-x64-NVIDIA-CUDA.zip` (best performance on NVIDIA GPUs)
+  - `ProAim-Windows-x64-DirectML.zip` (compatibility fallback for mixed Windows GPUs)
 3. Extract the ZIP and keep the full folder structure together.
 4. Run the app executable from that extracted folder:
   - Linux: `ProAim/ProAim`
   - Windows: `ProAim/ProAim.exe`
 
-These bundles already contain the Python runtime and required libraries. Windows bundles also include ONNX Runtime DirectML for NVIDIA/AMD GPU execution. Testers do not need to run `pip install`.
+These bundles already contain the Python runtime and required libraries. Windows bundles include either ONNX Runtime CUDA/TensorRT (`NVIDIA-CUDA`) or DirectML (`DirectML`). Testers do not need to run `pip install`.
 
 ## Publish a release for testers
 
@@ -105,7 +106,7 @@ Two runtimes are used, because no single one covers every vendor:
 | Intel integrated/Arc GPU | OpenVINO | needs the Intel compute runtime |
 | Intel NPU | OpenVINO | Meteor Lake and newer |
 | AMD GPU | ONNX Runtime | ROCm on Linux, DirectML on Windows |
-| NVIDIA GPU | ONNX Runtime | CUDA/TensorRT, or DirectML on Windows |
+| NVIDIA GPU | ONNX Runtime | CUDA/TensorRT preferred; DirectML fallback on Windows |
 
 **OpenVINO has no AMD or NVIDIA GPU plugin at all**, which is why those cards go
 through ONNX Runtime instead. Every bundled model ships in both formats, so
@@ -158,7 +159,12 @@ Release builds deliberately stop unless the bundled COCO model pairs, the high-e
 
 ### Share a Windows build
 
-Push the repository changes to GitHub, open **Actions → Build Windows app → Run workflow**, and download the `ProAim-Windows-x64` artifact when it completes. Send the contained `ProAim-Windows-x64.zip` to testers. They extract the complete `ProAim` folder and run `ProAim.exe`; Python is not required on the tester's PC.
+Push the repository changes to GitHub, open **Actions → Build Windows app → Run workflow**, and download both artifacts when they complete:
+
+- `ProAim-Windows-x64-NVIDIA-CUDA` for NVIDIA systems
+- `ProAim-Windows-x64-DirectML` for compatibility fallback systems
+
+Send the matching ZIP to testers. They extract the complete `ProAim` folder and run `ProAim.exe`; Python is not required on the tester's PC.
 
 To build on a Windows development machine instead, install `requirements-build.txt` into `.venv`, then run:
 
@@ -166,7 +172,7 @@ To build on a Windows development machine instead, install `requirements-build.t
 .\scripts\build_windows_app.ps1
 ```
 
-That script creates `dist\ProAim-Windows-x64.zip` and prints its SHA-256 hash. In the app, **Refresh devices** queries that machine's OpenVINO runtime. Testers can select `AUTO`, `CPU`, `GPU`, or `NPU` only when it is reported; GPU/NPU execution also requires compatible hardware drivers on that PC.
+That script creates `dist\ProAim-Windows-x64-NVIDIA-CUDA.zip` by default (or `dist\ProAim-Windows-x64-DirectML.zip` with `-RuntimeVariant directml`) and prints its SHA-256 hash. In the app, **Refresh devices** queries that machine's OpenVINO runtime. Testers can select `AUTO`, `CPU`, `GPU`, or `NPU` only when it is reported; GPU/NPU execution also requires compatible hardware drivers on that PC.
 
 ## Export the starter model
 

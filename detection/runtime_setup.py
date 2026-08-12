@@ -83,11 +83,13 @@ def plan_for(vendor: str, system: str) -> RuntimePlan:
 
     if normalized_vendor == "nvidia":
         if normalized_system == "windows":
-            # DirectML needs no CUDA toolkit, which makes it the dependable
-            # default on Windows even though TensorRT can be faster.
             return RuntimePlan(
-                DISTRIBUTION_DIRECTML,
-                "NVIDIA GPUs run through DirectML on Windows without a CUDA toolkit",
+                DISTRIBUTION_NVIDIA,
+                "NVIDIA GPUs run best through CUDA/TensorRT on Windows",
+                driver_note=(
+                    "Use a recent NVIDIA driver. If CUDA providers are unavailable, "
+                    "the DirectML build is a compatibility fallback."
+                ),
             )
         return RuntimePlan(
             DISTRIBUTION_NVIDIA,

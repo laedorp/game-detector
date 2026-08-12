@@ -43,11 +43,11 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.distribution, DISTRIBUTION_NVIDIA)
         self.assertTrue(plan.needs_driver)
 
-    def test_nvidia_on_windows_prefers_directml_over_a_cuda_toolkit(self) -> None:
+    def test_nvidia_on_windows_prefers_cuda_tensorrt_runtime(self) -> None:
         plan = plan_for("nvidia", "windows")
 
-        self.assertEqual(plan.distribution, DISTRIBUTION_DIRECTML)
-        self.assertFalse(plan.needs_driver)
+        self.assertEqual(plan.distribution, DISTRIBUTION_NVIDIA)
+        self.assertTrue(plan.needs_driver)
 
     def test_intel_and_unknown_vendors_fall_back_to_the_cpu_build(self) -> None:
         for vendor in ("intel", "unknown", ""):

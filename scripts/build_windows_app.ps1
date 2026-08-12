@@ -1,3 +1,8 @@
+param(
+    [ValidateSet("cuda", "directml")]
+    [string]$RuntimeVariant = "cuda"
+)
+
 $ErrorActionPreference = "Stop"
 
 $ProjectDir = Split-Path -Parent $PSScriptRoot
@@ -38,7 +43,19 @@ if ($LASTEXITCODE -ne 0) {
 
 & $ProjectPython -c "import onnxruntime"
 if ($LASTEXITCODE -ne 0) {
-    throw "Windows release requires onnxruntime-directml so NVIDIA/AMD GPUs work out-of-the-box. Install requirements-build.txt before building."
+    throw "Windows release requires ONNX Runtime. Install requirements-build.txt before building."
+}
+
+if ($RuntimeVariant -eq "cuda") {
+    & $ProjectPython -c "from importlib import metadata; metadata.version('onnxruntime-gpu')"
+    if ($LASTEXITCODE -ne 0) {
+        throw "CUDA variant requires onnxruntime-gpu. Install it in the build environment before building."
+    }
+} else {
+    & $ProjectPython -c "from importlib import metadata; metadata.version('onnxruntime-directml')"
+    if ($LASTEXITCODE -ne 0) {
+        throw "DirectML variant requires onnxruntime-directml. Install it in the build environment before building."
+    }
 }
 
 Push-Location $ProjectDir
@@ -63,7 +80,8 @@ if (-not (Test-Path $BundleDir -PathType Container)) {
     }
 }
 $TesterGuide = Join-Path $ProjectDir "packaging\windows\README-Windows.txt"
-$ZipPath = Join-Path $ProjectDir "dist\ProAim-Windows-x64.zip"
+$ZipSuffix = if ($RuntimeVariant -eq "cuda") { "NVIDIA-CUDA" } else { "DirectML" }
+$ZipPath = Join-Path $ProjectDir ("dist\ProAim-Windows-x64-" + $ZipSuffix + ".zip")
 Copy-Item $TesterGuide (Join-Path $BundleDir "README-Windows.txt") -Force
 if (Test-Path $ZipPath) {
     Remove-Item $ZipPath -Force
@@ -74,5 +92,6 @@ $Hash = (Get-FileHash $ZipPath -Algorithm SHA256).Hash
 Write-Host "Windows bundle created at: $BundleDir\$BundleDisplayName.exe"
 Write-Host "Shareable ZIP created at: $ZipPath"
 Write-Host "SHA256: $Hash"
+Write-Host "Runtime variant: $RuntimeVariant"
 Write-Host "The bundled ProAimCLI.exe helper is used internally for live detector logs."
 Write-Host "PyInstaller builds for the current OS; run this helper on Windows to create the .exe."

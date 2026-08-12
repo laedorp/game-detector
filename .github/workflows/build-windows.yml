@@ -10,11 +10,22 @@ jobs:
   build-windows:
     runs-on: windows-2022
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runtime_variant: cuda
+            artifact_name: ProAim-Windows-x64-NVIDIA-CUDA
+            zip_path: dist/ProAim-Windows-x64-NVIDIA-CUDA.zip
+          - runtime_variant: directml
+            artifact_name: ProAim-Windows-x64-DirectML
+            zip_path: dist/ProAim-Windows-x64-DirectML.zip
     steps:
       - name: Check out source
         uses: actions/checkout@v5
 
       - name: Set up Python
+        id: setup-python
         uses: actions/setup-python@v6
         with:
           python-version: "3.13"
@@ -25,17 +36,21 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
+          if ('${{ matrix.runtime_variant }}' -eq 'cuda') {
+            python -m pip uninstall -y onnxruntime-directml
+            python -m pip install "onnxruntime-gpu>=1.22,<2"
+          }
 
       - name: Build and package Windows app
         shell: pwsh
         env:
-          GAME_DETECTOR_PYTHON: ${{ env.pythonLocation }}\python.exe
-        run: ./scripts/build_windows_app.ps1
+          GAME_DETECTOR_PYTHON: ${{ steps.setup-python.outputs.python-path }}
+        run: ./scripts/build_windows_app.ps1 -RuntimeVariant ${{ matrix.runtime_variant }}
 
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v5
         with:
-          name: ProAim-Windows-x64
-          path: dist/ProAim-Windows-x64.zip
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.zip_path }}
           if-no-files-found: error
           retention-days: 14
