@@ -167,9 +167,9 @@ RELEASE_MODELS = (
         expected_input_shape=BALANCED_INPUT_SHAPE,
     ),
     ModelAsset(
-        display_name="High-end YOLO11x detector",
-        xml_relative=Path("models/yolo11x_openvino_model/yolo11x.xml"),
-        bin_relative=Path("models/yolo11x_openvino_model/yolo11x.bin"),
+        display_name="High-end YOLO11l detector",
+        xml_relative=Path("models/yolo11l_openvino_model/yolo11l.xml"),
+        bin_relative=Path("models/yolo11l_openvino_model/yolo11l.bin"),
         labels_relative=Path("models/coco80.txt"),
         expected_labels=COCO80_LABELS,
         expected_input_shape=HIGH_END_INPUT_SHAPE,
@@ -178,7 +178,7 @@ RELEASE_MODELS = (
 
 
 EXTRA_RELEASE_FILES = (
-    Path("models/yolo11x_onnx/yolo11x.onnx"),
+    Path("models/yolo11l_onnx/yolo11l.onnx"),
 )
 
 

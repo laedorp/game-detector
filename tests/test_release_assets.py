@@ -47,7 +47,7 @@ class FakeCore:
                 input_shape=BALANCED_INPUT_SHAPE,
                 output_shapes=((1, 84, 3549),),
             ),
-            "yolo11x.xml": high_end
+            "yolo11l.xml": high_end
             or FakeModel(
                 input_shape=(1, 3, 640, 640),
                 output_shapes=((1, 84, 5670),),
@@ -83,7 +83,7 @@ class ReleaseAssetValidationTests(unittest.TestCase):
     def _write_valid_files(self) -> None:
         coco_dir = self.root / "models" / "yolo26n_openvino_model"
         balanced_dir = self.root / "models" / "yolo26n_416_openvino_model"
-        high_end_dir = self.root / "models" / "yolo11x_openvino_model"
+        high_end_dir = self.root / "models" / "yolo11l_openvino_model"
         coco_dir.mkdir(parents=True)
         balanced_dir.mkdir(parents=True)
         high_end_dir.mkdir(parents=True)
@@ -91,14 +91,14 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         (coco_dir / "yolo26n.bin").write_bytes(b"coco weights")
         (balanced_dir / "yolo26n_416.xml").write_text("<net/>", encoding="utf-8")
         (balanced_dir / "yolo26n_416.bin").write_bytes(b"balanced weights")
-        (high_end_dir / "yolo11x.xml").write_text("<net/>", encoding="utf-8")
-        (high_end_dir / "yolo11x.bin").write_bytes(b"high-end weights")
+        (high_end_dir / "yolo11l.xml").write_text("<net/>", encoding="utf-8")
+        (high_end_dir / "yolo11l.bin").write_bytes(b"high-end weights")
         (self.root / "models" / "coco80.txt").write_text(
             "\n".join(COCO80_LABELS) + "\n", encoding="utf-8"
         )
-        high_end_onnx = self.root / "models" / "yolo11x_onnx"
+        high_end_onnx = self.root / "models" / "yolo11l_onnx"
         high_end_onnx.mkdir(parents=True)
-        (high_end_onnx / "yolo11x.onnx").write_bytes(b"onnx weights")
+        (high_end_onnx / "yolo11l.onnx").write_bytes(b"onnx weights")
 
         player_dir = self.root / "models" / "fort_player_openvino_model"
         player_balanced_dir = self.root / "models" / "fort_player_416_openvino_model"
@@ -136,11 +136,11 @@ class ReleaseAssetValidationTests(unittest.TestCase):
 
         self.assertEqual(len(summaries), 5)
         # The two player detectors are end-to-end; the COCO pair in this fixture
-        # uses the traditional layout, while the high-end YOLO11x bundle keeps
+        # uses the traditional layout, while the high-end YOLO11l bundle keeps
         # the dynamic end-to-end path exercised.
         player_summaries = [text for text in summaries if "player detector" in text]
         coco_summaries = [text for text in summaries if "COCO detector" in text]
-        high_end_summaries = [text for text in summaries if "YOLO11x detector" in text]
+        high_end_summaries = [text for text in summaries if "YOLO11l detector" in text]
         self.assertEqual(len(player_summaries), 2)
         self.assertEqual(len(coco_summaries), 2)
         self.assertEqual(len(high_end_summaries), 1)

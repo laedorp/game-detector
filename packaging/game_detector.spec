@@ -18,8 +18,8 @@ ENTRY_POINT = PROJECT_ROOT / "app.py"
 ASSETS_DIR = PROJECT_ROOT / "assets"
 MODEL_DIR = PROJECT_ROOT / "models" / "yolo26n_openvino_model"
 BALANCED_MODEL_DIR = PROJECT_ROOT / "models" / "yolo26n_416_openvino_model"
-HIGH_END_MODEL_DIR = PROJECT_ROOT / "models" / "yolo11x_openvino_model"
-HIGH_END_ONNX_DIR = PROJECT_ROOT / "models" / "yolo11x_onnx"
+HIGH_END_MODEL_DIR = PROJECT_ROOT / "models" / "yolo11l_openvino_model"
+HIGH_END_ONNX_DIR = PROJECT_ROOT / "models" / "yolo11l_onnx"
 PLAYER_MODEL_DIR = PROJECT_ROOT / "models" / "fort_player_openvino_model"
 PLAYER_BALANCED_MODEL_DIR = PROJECT_ROOT / "models" / "fort_player_416_openvino_model"
 # ONNX copies of every bundled model.  OpenVINO cannot drive AMD or NVIDIA
@@ -41,8 +41,8 @@ required_files = (
     MODEL_DIR / "yolo26n.bin",
     BALANCED_MODEL_DIR / "yolo26n_416.xml",
     BALANCED_MODEL_DIR / "yolo26n_416.bin",
-    HIGH_END_MODEL_DIR / "yolo11x.xml",
-    HIGH_END_MODEL_DIR / "yolo11x.bin",
+    HIGH_END_MODEL_DIR / "yolo11l.xml",
+    HIGH_END_MODEL_DIR / "yolo11l.bin",
     PROJECT_ROOT / "models" / "fort_player.txt",
     PLAYER_MODEL_DIR / "fort_player.xml",
     PLAYER_MODEL_DIR / "fort_player.bin",
@@ -72,8 +72,8 @@ datas = [
     (str(MODEL_DIR / "yolo26n.bin"), "models/yolo26n_openvino_model"),
     (str(BALANCED_MODEL_DIR / "yolo26n_416.xml"), "models/yolo26n_416_openvino_model"),
     (str(BALANCED_MODEL_DIR / "yolo26n_416.bin"), "models/yolo26n_416_openvino_model"),
-    (str(HIGH_END_MODEL_DIR / "yolo11x.xml"), "models/yolo11x_openvino_model"),
-    (str(HIGH_END_MODEL_DIR / "yolo11x.bin"), "models/yolo11x_openvino_model"),
+    (str(HIGH_END_MODEL_DIR / "yolo11l.xml"), "models/yolo11l_openvino_model"),
+    (str(HIGH_END_MODEL_DIR / "yolo11l.bin"), "models/yolo11l_openvino_model"),
     (str(PROJECT_ROOT / "models" / "fort_player.txt"), "models"),
     (str(PLAYER_MODEL_DIR / "fort_player.xml"), "models/fort_player_openvino_model"),
     (str(PLAYER_MODEL_DIR / "fort_player.bin"), "models/fort_player_openvino_model"),
@@ -95,7 +95,7 @@ datas += [
     (str(PROJECT_ROOT / directory / filename), directory)
     for directory, filename in ONNX_MODEL_DIRS.items()
 ]
-datas += [(str(HIGH_END_ONNX_DIR / "yolo11x.onnx"), "models/yolo11x_onnx")]
+datas += [(str(HIGH_END_ONNX_DIR / "yolo11l.onnx"), "models/yolo11l_onnx")]
 
 # OpenVINO locates device plugins and model frontends dynamically in its
 # package-local libs directory. Keep both its data index and native libraries

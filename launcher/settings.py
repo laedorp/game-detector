@@ -126,14 +126,14 @@ MODEL_PRESETS = (
     ),
     ModelPreset(
         key=MODEL_PRESET_COCO_HIGH,
-        label="Ultralytics YOLO11x — High-end 1080p test (GPU)",
+        label="Ultralytics YOLO11l — High-end 1080p test (GPU)",
         description=(
-            "Fixed Ultralytics YOLO11x test profile for powerful GPUs and 1080p capture."
+            "Fixed Ultralytics YOLO11l test profile for powerful GPUs and 1080p capture."
         ),
-        model_relative="models/yolo11x_openvino_model/yolo11x.xml",
+        model_relative="models/yolo11l_openvino_model/yolo11l.xml",
         labels_relative="models/coco80.txt",
         inference_size=640,
-        onnx_relative="models/yolo11x_onnx/yolo11x.onnx",
+        onnx_relative="models/yolo11l_onnx/yolo11l.onnx",
     ),
     ModelPreset(
         key=MODEL_PRESET_COCO,

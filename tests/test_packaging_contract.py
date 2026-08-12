@@ -23,9 +23,9 @@ REQUIRED_MODEL_ASSETS = (
     "models/yolo26n_openvino_model/yolo26n.bin",
     "models/yolo26n_416_openvino_model/yolo26n_416.xml",
     "models/yolo26n_416_openvino_model/yolo26n_416.bin",
-    "models/yolo11x_openvino_model/yolo11x.xml",
-    "models/yolo11x_openvino_model/yolo11x.bin",
-    "models/yolo11x_onnx/yolo11x.onnx",
+    "models/yolo11l_openvino_model/yolo11l.xml",
+    "models/yolo11l_openvino_model/yolo11l.bin",
+    "models/yolo11l_onnx/yolo11l.onnx",
 )
 
 
@@ -44,8 +44,8 @@ class PackagingContractTests(unittest.TestCase):
 
         self.assertIn('"models/yolo26n_416_openvino_model"', source)
         self.assertIn('"models/yolo26n_openvino_model"', source)
-        self.assertIn('"models/yolo11x_openvino_model"', source)
-        self.assertIn('"models/yolo11x_onnx"', source)
+        self.assertIn('"models/yolo11l_openvino_model"', source)
+        self.assertIn('"models/yolo11l_onnx"', source)
 
     def test_linux_evdev_collection_is_platform_guarded(self) -> None:
         source = SPEC_PATH.read_text(encoding="utf-8")

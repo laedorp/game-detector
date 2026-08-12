@@ -103,7 +103,7 @@ class ModelPresetSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_COCO_HIGH).label,
-            "Ultralytics YOLO11x — High-end 1080p test (GPU)",
+            "Ultralytics YOLO11l — High-end 1080p test (GPU)",
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_COCO).label,

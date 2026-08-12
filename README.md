@@ -10,7 +10,7 @@ This workstation already has the verified Linux build installed in the applicati
 
 1. Choose **Moonlight / screen**, **Camera / capture card**, or **Video file**.
 2. Pick the source options. For Moonlight, the **Open Moonlight** button starts its normal client UI.
-3. Leave **Game players — Balanced 416 (Recommended)** selected for the custom player detector, or choose **Game players — Fast 320** for lower latency. On high-end GPUs, **Ultralytics YOLO11x — High-end 1080p test (GPU)** is the ready-to-run test profile and uses the largest shipped detector in this workspace. The preset selects its required inference size automatically.
+3. Leave **Game players — Balanced 416 (Recommended)** selected for the custom player detector, or choose **Game players — Fast 320** for lower latency. On high-end GPUs, **Ultralytics YOLO11l — High-end 1080p test (GPU)** is the ready-to-run test profile and uses the largest shipped detector in this workspace. The preset selects its required inference size automatically.
 4. In **Detection settings → Third-person view**, leave **Ignore my on-screen character** enabled and choose where your character normally appears.
 5. Click **Start capture + AI preview**. Click **Stop**, press Escape, or close the preview to finish.
 
@@ -106,7 +106,7 @@ Running the GUI from source also requires Tk. On CachyOS/Arch, install it with `
 
 ## Build or reinstall the desktop app
 
-The Linux build is a self-contained PyInstaller one-folder application. It includes Python, Tk, OpenVINO, OpenCV, MSS, Linux `evdev` support, the 320/416 COCO detectors, and the YOLO11x high-end bundle. Build it with:
+The Linux build is a self-contained PyInstaller one-folder application. It includes Python, Tk, OpenVINO, OpenCV, MSS, Linux `evdev` support, the 320/416 COCO detectors, and the YOLO11l high-end bundle. Build it with:
 
 ```bash
 source .venv/bin/activate
@@ -122,7 +122,7 @@ The result is `dist/GameDetector/GameDetector`. Install or update the current us
 
 Keep the complete `GameDetector` directory together when moving it. PyInstaller builds are platform-specific: run `scripts/build_windows_app.ps1` on Windows to create `dist\GameDetector\GameDetector.exe`; a Linux build cannot be renamed or converted into a Windows `.exe`.
 
-Release builds deliberately stop unless the bundled COCO model pairs, the high-end YOLO11x bundle, and the exact labels are readable with their required static input shapes. The Windows build includes all shipped detectors and MAKCU serial support but omits Linux-only `evdev`; Controller precision is disabled there.
+Release builds deliberately stop unless the bundled COCO model pairs, the high-end YOLO11l bundle, and the exact labels are readable with their required static input shapes. The Windows build includes all shipped detectors and MAKCU serial support but omits Linux-only `evdev`; Controller precision is disabled there.
 
 ### Share a Windows build
 
@@ -142,7 +142,7 @@ YOLO26n is downloaded and converted once. Inference is offline after the `.xml` 
 
 The current workspace already contains the exported 320×320 model. Run the following only when provisioning a fresh checkout or replacing the model; the exporter deliberately refuses to overwrite an existing output directory.
 
-The launcher's high-end preset uses Ultralytics YOLO11x, the largest shipped detector in this workspace, and pre-fills a 1920×1080 / 100 fps test profile so the only practical tuning knobs are confidence and smoothing.
+The launcher's high-end preset uses Ultralytics YOLO11l, the largest shipped detector in this workspace, and pre-fills a 1920×1080 / 100 fps test profile so the only practical tuning knobs are confidence and smoothing.
 
 ## Developer handoff
 
@@ -151,7 +151,7 @@ If you are sending this repository to other developers, the shortest path is:
 1. Pull the latest `main` branch from GitHub.
 2. Create the runtime environment with `python3 -m venv .venv` and `python -m pip install -r requirements.txt`.
 3. Launch the desktop app with `./run_gui.sh`, or rebuild and reinstall the Linux menu entry with `./scripts/build_linux_app.sh` and `./dist/ProAim/install.sh`.
-4. Use **High-end PC** to test the shipped YOLO11x profile, or choose the Balanced/Fast presets for the smaller bundled detectors.
+4. Use **High-end PC** to test the shipped YOLO11l profile, or choose the Balanced/Fast presets for the smaller bundled detectors.
 5. Leave capture FPS at the source rate you want to test, and tune confidence and smoothing first.
 
 The exported detector files are already included in the repo, so a fresh clone can test without running the Ultralytics export step unless you want to regenerate model assets.
