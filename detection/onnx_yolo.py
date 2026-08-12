@@ -115,6 +115,11 @@ def resolve_providers(
         )
 
     chain = [target]
+    # TensorRT on Windows often appears as installed even when its runtime DLLs
+    # are missing from PATH. Keep CUDA ahead of CPU so failed TensorRT setup
+    # falls back to a fast NVIDIA path instead of collapsing to CPU.
+    if target == "TensorrtExecutionProvider" and "CUDAExecutionProvider" in available_set:
+        chain.append("CUDAExecutionProvider")
     if "CPUExecutionProvider" in available_set and target != "CPUExecutionProvider":
         chain.append("CPUExecutionProvider")
     return chain, target
@@ -158,7 +163,7 @@ class OnnxRuntimeYoloDetector(Detector):
         except Exception as exc:
             raise DependencyError(f"Could not query ONNX Runtime providers: {exc}") from exc
 
-        chain, self.device = resolve_providers(device, self._available_devices)
+        chain, requested_device = resolve_providers(device, self._available_devices)
 
         try:
             options = runtime.SessionOptions()
@@ -173,7 +178,7 @@ class OnnxRuntimeYoloDetector(Detector):
             )
         except Exception as exc:
             raise ModelError(
-                f"Could not load ONNX model {self.model_path} on {self.device}: {exc}"
+                f"Could not load ONNX model {self.model_path} on {requested_device}: {exc}"
             ) from exc
 
         try:
@@ -196,11 +201,14 @@ class OnnxRuntimeYoloDetector(Detector):
             )
 
         active = list(getattr(self._session, "get_providers", lambda: chain)())
+        active_device = active[0] if active else requested_device
+        self.device = active_device
         self._runtime_summary: dict[str, Any] = {
             "runtime": "ONNX Runtime",
             "onnxruntime_version": version,
             "model_path": str(self.model_path),
-            "device": self.device,
+            "device": active_device,
+            "requested_device": requested_device,
             "available_devices": list(self._available_devices),
             "provider_chain": chain,
             "active_providers": active,

@@ -50,11 +50,17 @@ def _print_startup(detector, source) -> None:
     print(f"{runtime} {version}")
     devices = ", ".join(detector.available_devices) or "none"
     print(f"Detected {runtime} devices: {devices}")
+    requested = summary.get("requested_device")
+    active_device = summary.get("device")
+    if requested and active_device and requested != active_device:
+        inference_label = f"{active_device} (requested {requested})"
+    else:
+        inference_label = active_device
     hint = summary.get("performance_hint") or ", ".join(
         summary.get("active_providers", ())
     )
     print(
-        f"Inference: {summary.get('device')} | input {summary.get('input_shape')} | "
+        f"Inference: {inference_label} | input {summary.get('input_shape')} | "
         f"hint {hint} | one synchronous request"
     )
     print(f"Model: {summary.get('model_path')}")

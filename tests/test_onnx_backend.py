@@ -31,6 +31,19 @@ class ProviderResolutionTests(unittest.TestCase):
         self.assertEqual(target, "TensorrtExecutionProvider")
         self.assertEqual(chain[0], "TensorrtExecutionProvider")
 
+    def test_tensorrt_chain_keeps_cuda_before_cpu(self) -> None:
+        chain, target = resolve_providers("AUTO", ALL_PROVIDERS)
+
+        self.assertEqual(target, "TensorrtExecutionProvider")
+        self.assertEqual(
+            chain,
+            [
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+        )
+
     def test_auto_falls_back_to_cpu_when_nothing_else_exists(self) -> None:
         chain, target = resolve_providers("AUTO", CPU_ONLY)
 
