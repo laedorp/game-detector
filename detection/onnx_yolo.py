@@ -47,6 +47,10 @@ PROVIDER_PREFERENCE = (
 # full provider class names.
 PROVIDER_ALIASES = {
     "AUTO": None,
+    # Launcher/device settings historically used OpenVINO-style tokens (CPU/GPU).
+    # Treat generic GPU as AUTO so ONNX Runtime picks the best installed GPU
+    # provider (DirectML/CUDA/ROCM/TensorRT) instead of failing hard.
+    "GPU": None,
     "CPU": "CPUExecutionProvider",
     "CUDA": "CUDAExecutionProvider",
     "NVIDIA": "CUDAExecutionProvider",

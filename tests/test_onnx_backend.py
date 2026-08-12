@@ -37,6 +37,12 @@ class ProviderResolutionTests(unittest.TestCase):
         self.assertEqual(target, "CPUExecutionProvider")
         self.assertEqual(chain, ["CPUExecutionProvider"])
 
+    def test_generic_gpu_alias_uses_auto_selection(self) -> None:
+        chain, target = resolve_providers("GPU", ALL_PROVIDERS)
+
+        self.assertEqual(target, "TensorrtExecutionProvider")
+        self.assertEqual(chain[0], "TensorrtExecutionProvider")
+
     def test_every_chain_ends_with_cpu_so_partial_graphs_still_run(self) -> None:
         for requested in ("ROCM", "CUDA", "DIRECTML"):
             chain, _ = resolve_providers(requested, ALL_PROVIDERS)
