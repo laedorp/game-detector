@@ -8,3 +8,7 @@ pyinstaller>=6.22,<7
 # modules (WebEngine, Charts, 3D) that this application never imports, which
 # keeps the bundle to the Qt libraries actually used.
 PySide6-Essentials>=6.7,<7
+
+# Windows release bundles should run on NVIDIA/AMD GPUs out-of-the-box. The
+# DirectML wheel is only installed on Windows builds and bundled by PyInstaller.
+onnxruntime-directml>=1.22,<2; sys_platform == "win32"

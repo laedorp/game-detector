@@ -27,9 +27,9 @@ For testers who should not install Python or dependencies manually:
 3. Extract the ZIP and keep the full folder structure together.
 4. Run the app executable from that extracted folder:
   - Linux: `ProAim/ProAim`
-  - Windows: `GameDetector/GameDetector.exe`
+  - Windows: `ProAim/ProAim.exe`
 
-These bundles already contain the Python runtime and required libraries. Testers do not need to run `pip install`.
+These bundles already contain the Python runtime and required libraries. Windows bundles also include ONNX Runtime DirectML for NVIDIA/AMD GPU execution. Testers do not need to run `pip install`.
 
 ## Publish a release for testers
 

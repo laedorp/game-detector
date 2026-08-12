@@ -36,6 +36,11 @@ if ($LASTEXITCODE -ne 0) {
     throw "MAKCU support requires pyserial. Install requirements.txt before building."
 }
 
+& $ProjectPython -c "import onnxruntime"
+if ($LASTEXITCODE -ne 0) {
+    throw "Windows release requires onnxruntime-directml so NVIDIA/AMD GPUs work out-of-the-box. Install requirements-build.txt before building."
+}
+
 Push-Location $ProjectDir
 try {
     & $ProjectPython -m PyInstaller --noconfirm --clean "packaging\game_detector.spec"
