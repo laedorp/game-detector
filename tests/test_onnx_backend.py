@@ -10,6 +10,7 @@ from detection.base import DeviceNotAvailableError, DetectorError, ModelError
 from detection.onnx_yolo import (
     PROVIDER_PREFERENCE,
     OnnxRuntimeYoloDetector,
+    _configure_session_options,
     resolve_providers,
 )
 
@@ -97,6 +98,46 @@ class ProviderResolutionTests(unittest.TestCase):
 
     def test_cpu_provider_is_ranked_last_in_the_preference_order(self) -> None:
         self.assertEqual(PROVIDER_PREFERENCE[-1], "CPUExecutionProvider")
+
+
+class SessionOptionsTests(unittest.TestCase):
+    class _FakeRuntime:
+        class GraphOptimizationLevel:
+            ORT_ENABLE_ALL = object()
+
+        class ExecutionMode:
+            ORT_SEQUENTIAL = object()
+
+    class _Options:
+        pass
+
+    def test_gpu_chains_use_low_latency_threading(self) -> None:
+        options = self._Options()
+        _configure_session_options(
+            self._FakeRuntime(),
+            options,
+            ["DmlExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        self.assertIsNotNone(options.graph_optimization_level)
+        self.assertIsNotNone(options.execution_mode)
+        self.assertFalse(options.enable_mem_pattern)
+        self.assertEqual(options.intra_op_num_threads, 1)
+        self.assertEqual(options.inter_op_num_threads, 1)
+
+    def test_cpu_only_chain_keeps_default_thread_pool(self) -> None:
+        options = self._Options()
+        _configure_session_options(
+            self._FakeRuntime(),
+            options,
+            ["CPUExecutionProvider"],
+        )
+
+        self.assertIsNotNone(options.graph_optimization_level)
+        self.assertIsNotNone(options.execution_mode)
+        self.assertFalse(options.enable_mem_pattern)
+        self.assertFalse(hasattr(options, "intra_op_num_threads"))
+        self.assertFalse(hasattr(options, "inter_op_num_threads"))
 
 
 class FakeTensorSpec:

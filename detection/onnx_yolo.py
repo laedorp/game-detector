@@ -76,6 +76,39 @@ def _load_onnxruntime() -> tuple[Any, str]:
     return onnxruntime, getattr(onnxruntime, "__version__", "unknown")
 
 
+def _configure_session_options(runtime: Any, options: Any, providers: Sequence[str]) -> None:
+    """Apply latency-oriented defaults that work across GPU providers.
+
+    ONNX Runtime defaults are throughput-friendly on some platforms. Real-time
+    single-frame detection benefits from sequential execution and lower host
+    scheduling overhead, especially when CUDA/ROCm/DirectML do the heavy work.
+    """
+
+    options.graph_optimization_level = runtime.GraphOptimizationLevel.ORT_ENABLE_ALL
+
+    execution_mode = getattr(runtime, "ExecutionMode", None)
+    if execution_mode is not None and hasattr(execution_mode, "ORT_SEQUENTIAL"):
+        options.execution_mode = execution_mode.ORT_SEQUENTIAL
+
+    # DirectML paths in particular can stutter with memory pattern reuse.
+    options.enable_mem_pattern = False
+
+    gpu_chain = any(
+        provider
+        in {
+            "TensorrtExecutionProvider",
+            "CUDAExecutionProvider",
+            "ROCMExecutionProvider",
+            "MIGraphXExecutionProvider",
+            "DmlExecutionProvider",
+        }
+        for provider in providers
+    )
+    if gpu_chain:
+        options.intra_op_num_threads = 1
+        options.inter_op_num_threads = 1
+
+
 def resolve_providers(
     requested: str, available: Sequence[str]
 ) -> tuple[list[str], str]:
@@ -167,11 +200,7 @@ class OnnxRuntimeYoloDetector(Detector):
 
         try:
             options = runtime.SessionOptions()
-            # One thread pool sized for latency, mirroring the OpenVINO backend's
-            # single-stream LATENCY hint rather than optimizing for throughput.
-            options.graph_optimization_level = (
-                runtime.GraphOptimizationLevel.ORT_ENABLE_ALL
-            )
+            _configure_session_options(runtime, options, chain)
             factory = session_factory or runtime.InferenceSession
             self._session = factory(
                 str(self.model_path), sess_options=options, providers=chain

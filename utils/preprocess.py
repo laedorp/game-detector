@@ -5,6 +5,18 @@ from dataclasses import dataclass
 import numpy as np
 
 
+_LETTERBOX_WORKSPACE: dict[int, np.ndarray] = {}
+
+
+def _letterbox_workspace(inference_size: int) -> np.ndarray:
+    workspace = _LETTERBOX_WORKSPACE.get(inference_size)
+    if workspace is None:
+        workspace = np.empty((inference_size, inference_size, 3), dtype=np.uint8)
+        _LETTERBOX_WORKSPACE[inference_size] = workspace
+    workspace.fill(114)
+    return workspace
+
+
 @dataclass(frozen=True, slots=True)
 class FrameTransform:
     scale: float
@@ -86,11 +98,7 @@ def preprocess_frame(
     pad_top = int(round(vertical_padding / 2 - 0.1))
 
     if horizontal_padding or vertical_padding:
-        letterboxed = np.full(
-            (inference_size, inference_size, 3),
-            114,
-            dtype=np.uint8,
-        )
+        letterboxed = _letterbox_workspace(inference_size)
         letterboxed[
             pad_top : pad_top + resized_height,
             pad_left : pad_left + resized_width,
