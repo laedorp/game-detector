@@ -35,6 +35,11 @@ jobs:
             requirements.txt
             requirements-build.txt
             requirements-runtime-${{ matrix.runtime_variant }}.txt
+      - name: Install Linux Qt runtime libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libegl1 libgl1
       - name: Install Python dependencies
         shell: pwsh
         if: runner.os == 'Windows'

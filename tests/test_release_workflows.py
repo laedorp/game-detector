@@ -85,6 +85,8 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("python app.py --cli --help", source)
         self.assertIn("python app.py --runtime-info", source)
         self.assertIn("QT_QPA_PLATFORM: offscreen", source)
+        self.assertIn("if: runner.os == 'Linux'", source)
+        self.assertIn("sudo apt-get install -y libegl1 libgl1", source)
 
     def test_release_builds_are_gated_by_cross_platform_tests(self) -> None:
         source = _source(RELEASE_WORKFLOW)
@@ -106,6 +108,10 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("runtime_variant: cpu", linux_job)
         self.assertIn("runtime_variant: directml", windows_job)
         self.assertNotIn("runtime_variant: cuda", linux_job + windows_job)
+        # PySide6 links libEGL even with QT_QPA_PLATFORM=offscreen. Keep the
+        # source-test and oldest-supported Linux build runners explicit.
+        self.assertIn("sudo apt-get install -y libegl1 libgl1", test_job)
+        self.assertIn("sudo apt-get install -y libegl1 libgl1", linux_job)
 
     def test_linux_helper_allows_only_driver_library_for_cuda_bundle(self) -> None:
         source = _source(LINUX_BUILD)
