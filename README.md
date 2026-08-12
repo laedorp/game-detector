@@ -16,6 +16,38 @@ This workstation already has the verified Linux build installed in the applicati
 
 The preview is a separate window. When capturing Moonlight, keep it outside the captured monitor/rectangle so it does not appear inside its own input.
 
+## Download prebuilt release
+
+For testers who should not install Python or dependencies manually:
+
+1. Open the repository's **Releases** page on GitHub.
+2. Download the asset for your OS:
+  - `ProAim-Linux-x64.zip`
+  - `GameDetector-Windows-x64.zip`
+3. Extract the ZIP and keep the full folder structure together.
+4. Run the app executable from that extracted folder:
+  - Linux: `ProAim/ProAim`
+  - Windows: `GameDetector/GameDetector.exe`
+
+These bundles already contain the Python runtime and required libraries. Testers do not need to run `pip install`.
+
+## Publish a release for testers
+
+The repository includes a GitHub Actions workflow that builds both desktop bundles and attaches them to a GitHub Release automatically.
+
+1. Push all release-ready changes to `main`.
+2. Create and push a version tag:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+3. Wait for the **Build and publish desktop bundles** workflow to finish.
+4. Open the new GitHub Release and share the download link with testers.
+
+This is the lowest-friction path for devs and testers: download, extract, run.
+
 To run the source launcher instead of the installed build:
 
 ```bash

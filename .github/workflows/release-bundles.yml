@@ -1,0 +1,107 @@
+name: Build and publish desktop bundles
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Linux system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tk
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Build Linux desktop bundle
+        run: ./scripts/build_linux_app.sh
+
+      - name: Create Linux ZIP
+        run: |
+          cd dist
+          zip -r ProAim-Linux-x64.zip ProAim
+
+      - name: Upload Linux ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProAim-Linux-x64
+          path: dist/ProAim-Linux-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install Python dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Build Windows desktop bundle
+        shell: pwsh
+        run: ./scripts/build_windows_app.ps1
+
+      - name: Upload Windows ZIP artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ProAim-Windows-x64
+          path: dist/GameDetector-Windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
+
+  publish-release:
+    needs:
+      - build-linux
+      - build-windows
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProAim-Linux-x64
+          path: release-assets
+
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ProAim-Windows-x64
+          path: release-assets
+
+      - name: Publish GitHub Release assets
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release-assets/ProAim-Linux-x64.zip
+            release-assets/GameDetector-Windows-x64.zip
+          generate_release_notes: true
