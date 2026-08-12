@@ -1,0 +1,3 @@
+# NVIDIA CUDA/TensorRT provider plus its CUDA 13/cuDNN 9 user-space runtimes.
+# A compatible NVIDIA display driver is still required on the target machine.
+onnxruntime-gpu[cuda,cudnn]==1.28.0

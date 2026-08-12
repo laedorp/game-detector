@@ -238,6 +238,49 @@ class RecommendationTests(unittest.TestCase):
         self.assertFalse(plans[1].ready)
         self.assertIn("intel-compute-runtime", plans[1].setup_hint)
 
+    def test_windows_intel_gpu_falls_back_to_installed_directml_provider(self) -> None:
+        gpu = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.INTEL,
+            name="Intel Arc Graphics",
+            discrete=False,
+        )
+        plans = recommend(
+            build_profile(
+                system="windows",
+                accelerators=(gpu,),
+                runtime_devices=("CPU",),
+            ),
+            provider_factory=lambda: (
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ),
+        )
+
+        self.assertEqual(plans[0].accelerator, gpu)
+        self.assertEqual(plans[0].backend, "onnxruntime")
+        self.assertEqual(plans[0].device, "DIRECTML")
+        self.assertTrue(plans[0].ready)
+
+    def test_windows_intel_gpu_still_prefers_openvino_when_exposed(self) -> None:
+        gpu = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.INTEL,
+            name="Intel Arc Graphics",
+            discrete=False,
+        )
+        plans = recommend(
+            build_profile(
+                system="windows",
+                accelerators=(gpu,),
+                runtime_devices=("CPU", "GPU"),
+            ),
+            provider_factory=lambda: ("DmlExecutionProvider",),
+        )
+
+        self.assertEqual(plans[0].backend, "openvino")
+        self.assertEqual(plans[0].device, "GPU")
+
     def test_amd_gpu_never_recommends_openvino(self) -> None:
         gpu = Accelerator(
             kind=AcceleratorKind.GPU, vendor=Vendor.AMD, name="RX 6950 XT", discrete=True
@@ -261,7 +304,7 @@ class RecommendationTests(unittest.TestCase):
         )
 
         amd = [plan for plan in plans if plan.accelerator.vendor is Vendor.AMD][0]
-        self.assertEqual(amd.device, "DmlExecutionProvider")
+        self.assertEqual(amd.device, "DIRECTML")
         self.assertIn("directml", amd.setup_hint.lower())
 
     def test_amd_gpu_becomes_ready_once_its_provider_is_installed(self) -> None:
@@ -277,7 +320,7 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(plans[0].accelerator.vendor, Vendor.AMD)
         self.assertEqual(plans[0].setup_hint, "")
 
-    def test_nvidia_prefers_tensorrt_when_both_providers_exist(self) -> None:
+    def test_nvidia_prefers_cuda_when_tensorrt_is_also_exposed(self) -> None:
         gpu = Accelerator(
             kind=AcceleratorKind.GPU, vendor=Vendor.NVIDIA, name="RTX 3070", discrete=True
         )
@@ -289,7 +332,26 @@ class RecommendationTests(unittest.TestCase):
             ),
         )
 
-        self.assertEqual(plans[0].device, "TensorrtExecutionProvider")
+        self.assertEqual(plans[0].device, "CUDA")
+
+    def test_windows_nvidia_uses_installed_directml_when_cuda_is_absent(self) -> None:
+        gpu = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.NVIDIA,
+            name="RTX 5060 Laptop GPU",
+            discrete=True,
+        )
+        plans = recommend(
+            build_profile(system="windows", accelerators=(gpu,)),
+            provider_factory=lambda: (
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ),
+        )
+
+        self.assertTrue(plans[0].ready)
+        self.assertEqual(plans[0].backend, "onnxruntime")
+        self.assertEqual(plans[0].device, "DIRECTML")
 
     def test_intel_npu_is_ranked_first_when_openvino_exposes_it(self) -> None:
         npu = Accelerator(kind=AcceleratorKind.NPU, vendor=Vendor.INTEL, name="AI Boost")

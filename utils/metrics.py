@@ -12,6 +12,7 @@ class FrameTimings:
     preprocess_ms: float
     inference_ms: float
     postprocess_ms: float
+    control_ms: float
     processing_ms: float
     freshness_latency_ms: float
     observed_pipeline_ms: float

@@ -1,9 +1,27 @@
-description: Ultralytics YOLO26n model trained on /home/laedorp/object detection/datasets/fort_cuh_player/fort_cuh_player.yaml
+description: Post-training INT8 OpenVINO quantization of the 416px FORT-Cuh player detector
 author: Ultralytics
 date: '2026-08-10T19:52:18.816049-04:00'
 version: 8.4.116
 license: AGPL-3.0 License (https://ultralytics.com/license)
 docs: https://docs.ultralytics.com
+precision: INT8
+quantization:
+  method: NNCF post-training quantization
+  preset: MIXED
+  nncf_version: 3.3.0
+  openvino_version: 2026.3.0
+  quantized_at: '2026-08-10T20:10:46-04:00'
+  calibration_split: datasets/fort_cuh_player/images/valid
+  calibration_samples: 300
+  calibration_selection: sorted paths sampled at an even stride
+  calibration_path_list_sha256: 4f512b63522766a1be203a4bd829ab4c81aea315de66409e8f814bb4688a36ba
+  calibration_content_stream_sha256: 7fa00625d7ef446f232df2736c90b8bcd1c3a8c98f3a9b9c4a27800d6ebf086a
+  source_xml_sha256: 6779ead62c3ace7d4de4b5a43dd3cb2cf8c6be84fa1399cd40db1eaf4b8c6450
+  source_bin_sha256: c6d908bce89df473a796c8ad72690872f37e776eb41a70686095baeb77e72895
+  quantizer_script_sha256: f3c24023c74f76763915622497caa2a955f987d8fc75fd1fdb52f876b9893a97
+  reproduction_verified: '2026-08-12'
+  output_xml_sha256: e29876a30238511dae38382d358cf36592023f9183c2d35bd2c5a1714b71ee84
+  output_bin_sha256: 4b6d2893f334c0406092d7ba2011d41f8b5ae6f36fdd3ce6cc9941fcecbd2a20
 stride: 32
 task: detect
 head: Detect
@@ -17,7 +35,7 @@ args:
   data: null
   batch: 1
   fraction: 1.0
-  quantize: null
+  quantize: int8
   dynamic: false
   nms: false
 channels: 3

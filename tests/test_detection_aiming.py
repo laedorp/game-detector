@@ -3,21 +3,29 @@ from __future__ import annotations
 from dataclasses import dataclass
 import contextlib
 import io
+from types import SimpleNamespace
 import unittest
 
 from aiming.protocol import decode_aim_command
 from aiming.controller import (
+    AimActivationSensor,
     AimingController,
     AimConfig,
+    LOCAL_TARGET_STALE_SECONDS,
     TargetTracker,
     UdpAimingController,
     choose_target,
     head_target_point,
 )
-from controller_precision.codes import EV_ABS
+from controller_precision.codes import EV_ABS, EV_SYN
 from config import parse_args
 from detection.types import Detection
-from main import _start_optional_aiming
+from main import (
+    _aim_status,
+    _start_optional_aiming,
+    _update_aim_target,
+    _validate_aim_safety,
+)
 
 
 @dataclass(frozen=True)
@@ -57,6 +65,29 @@ class FakeSocket:
         self.closed = True
 
 
+class RecordingUInput:
+    def __init__(self) -> None:
+        self.writes: list[tuple[int, int, int]] = []
+        self.closed = False
+
+    def write(self, event_type: int, code: int, value: int) -> None:
+        self.writes.append((event_type, code, value))
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class ResampledAxisDevice:
+    def __init__(self, value: int) -> None:
+        self.value = value
+
+    def read_one(self):
+        return None
+
+    def absinfo(self, _axis: int) -> FakeAbsInfo:
+        return FakeAbsInfo(self.value, 0, 255, 0, 0, 0)
+
+
 class FailingAimController:
     def __init__(self) -> None:
         self.stopped = False
@@ -84,6 +115,76 @@ class AimingControllerTests(unittest.TestCase):
         self.assertIsNone(active_sensor)
         self.assertTrue(controller.stopped)
         self.assertIn("Capture, inference, and preview will continue", error.getvalue())
+        self.assertIsNone(
+            _aim_status(
+                runtime_enabled=active_controller is not None,
+                self_exclusion_ready=True,
+                selected_target=Detection(
+                    0, "person", 0.9, (700, 200, 900, 800)
+                ),
+                engaged=True,
+                activation_name="LT",
+                control_description="output",
+            )
+        )
+
+    def test_runtime_safety_validation_cannot_be_bypassed_with_direct_config(self) -> None:
+        with self.assertRaisesRegex(ValueError, "explicit target label"):
+            _validate_aim_safety(
+                SimpleNamespace(
+                    aim=True,
+                    aim_label=" ",
+                    aim_output="makcu",
+                    aim_activate_path=None,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "Remote aim is unavailable"):
+            _validate_aim_safety(
+                SimpleNamespace(
+                    aim=True,
+                    aim_label="person",
+                    aim_output="remote",
+                    aim_activate_path="/dev/input/event0",
+                    ignore_self=True,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "physical activation device"):
+            _validate_aim_safety(
+                SimpleNamespace(
+                    aim=True,
+                    aim_label="person",
+                    aim_output="local",
+                    aim_activate_path=None,
+                    ignore_self=True,
+                )
+            )
+        with self.assertRaisesRegex(ValueError, "self filter"):
+            _validate_aim_safety(
+                SimpleNamespace(
+                    aim=True,
+                    aim_label="person",
+                    aim_output="makcu",
+                    aim_activate_path=None,
+                    ignore_self=False,
+                )
+            )
+
+    def test_activation_sensor_resamples_axis_state_after_a_lost_release_event(self) -> None:
+        device = ResampledAxisDevice(255)
+        sensor = AimActivationSensor("/dev/input/fake", threshold=0.35)
+        sensor._device = device
+        sensor._minimum = 0
+        sensor._maximum = 255
+        sensor._active = True
+        self.assertTrue(sensor.read())
+
+        device.value = 0
+        self.assertFalse(sensor.read())
+
+    def test_local_watchdog_configuration_rejects_nonfinite_interval(self) -> None:
+        for invalid in (0.0, -0.1, float("nan"), float("inf")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                AimingController(watchdog_interval=invalid)
 
     def test_target_selection_prefers_matching_detection_nearest_crosshair(self) -> None:
         high_confidence_edge = Detection(0, "person", 0.99, (10, 10, 110, 410))
@@ -122,13 +223,44 @@ class AimingControllerTests(unittest.TestCase):
         tracker.reset()
         self.assertIsNone(tracker.update([], (1080, 1920, 3)))
 
-    def test_target_tracker_can_coast_through_self_filter_uncertainty(self) -> None:
+    def test_target_tracker_can_bridge_ordinary_detection_misses(self) -> None:
         tracker = TargetTracker(label="person", lost_grace_frames=18)
         target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
         tracker.update([target], (1080, 1920, 3))
 
         for _ in range(18):
             self.assertIsNotNone(tracker.update((), (1080, 1920, 3)))
+        self.assertIsNone(tracker.update((), (1080, 1920, 3)))
+
+    def test_unsafe_self_exclusion_resets_tracker_without_grace(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=18)
+        target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        tracker.update([target], (1080, 1920, 3))
+
+        selected = _update_aim_target(
+            tracker,
+            (),
+            (1080, 1920, 3),
+            self_exclusion_safe=False,
+        )
+
+        self.assertIsNone(selected)
+        self.assertIsNone(tracker.update((), (1080, 1920, 3)))
+
+    def test_disabled_aim_runtime_cannot_select_or_retain_a_draw_target(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=18)
+        target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        tracker.update([target], (1080, 1920, 3))
+
+        selected = _update_aim_target(
+            tracker,
+            (target,),
+            (1080, 1920, 3),
+            self_exclusion_safe=True,
+            aim_runtime_enabled=False,
+        )
+
+        self.assertIsNone(selected)
         self.assertIsNone(tracker.update((), (1080, 1920, 3)))
 
     def test_target_tracker_smooths_small_box_jitter(self) -> None:
@@ -164,6 +296,55 @@ class AimingControllerTests(unittest.TestCase):
             self.assertGreaterEqual(info.value, info.min)
             self.assertLessEqual(info.value, info.max)
 
+    def test_local_output_never_synthesizes_trigger_and_watchdog_neutralizes(self) -> None:
+        now_ns = [1_000_000_000]
+        controller = AimingController(clock_ns=lambda: now_ns[0])
+        device = RecordingUInput()
+        controller._uinput = device
+        target = Detection(0, "person", 0.9, (1400, 300, 1600, 900))
+
+        controller.update(target, (1080, 1920, 3), active=True)
+
+        self.assertTrue(controller._output_active)
+        trigger_writes = [
+            value
+            for event_type, code, value in device.writes
+            if event_type == EV_ABS and code == controller.config.trigger_code
+        ]
+        self.assertEqual(trigger_writes, [controller.config.trigger_released_value])
+
+        now_ns[0] += int((LOCAL_TARGET_STALE_SECONDS + 0.01) * 1e9)
+        controller._watchdog_tick()
+
+        self.assertFalse(controller._output_active)
+        final_report = device.writes[-4:]
+        self.assertEqual(
+            final_report,
+            [
+                (EV_ABS, controller.config.right_x_code, controller.config.neutral_value),
+                (EV_ABS, controller.config.right_y_code, controller.config.neutral_value),
+                (
+                    EV_ABS,
+                    controller.config.trigger_code,
+                    controller.config.trigger_released_value,
+                ),
+                (EV_SYN, 0, 0),
+            ],
+        )
+
+    def test_local_output_neutralizes_and_closes_on_stop(self) -> None:
+        controller = AimingController(clock_ns=lambda: 1_000_000_000)
+        device = RecordingUInput()
+        controller._uinput = device
+        target = Detection(0, "person", 0.9, (1400, 300, 1600, 900))
+        controller.update(target, (1080, 1920, 3), active=True)
+
+        controller.stop()
+
+        self.assertTrue(device.closed)
+        self.assertIsNone(controller._uinput)
+        self.assertEqual(device.writes[-1], (EV_SYN, 0, 0))
+
     def test_udp_output_sends_target_vector_and_neutral_shutdown(self) -> None:
         sender = FakeSocket()
         key = "0123456789abcdef0123456789abcdef"
@@ -190,30 +371,62 @@ class AimingControllerTests(unittest.TestCase):
         self.assertFalse(neutral.active)
         self.assertEqual((neutral.x, neutral.y), (0.0, 0.0))
 
-    def test_remote_aim_cli_configuration_parses(self) -> None:
-        config = parse_args(
-            [
-                "--aim",
-                "--aim-output",
-                "remote",
-                "--aim-host",
-                "192.168.1.40",
-                "--aim-port",
-                "47621",
-                "--aim-pairing-key",
-                "0123456789abcdef0123456789abcdef",
-            ]
-        )
-        self.assertEqual(config.aim_output, "remote")
-        self.assertEqual(config.aim_host, "192.168.1.40")
-        self.assertEqual(config.aim_port, 47621)
+    def test_remote_aim_cli_is_rejected_until_a_safe_receiver_exists(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--aim",
+                    "--aim-label",
+                    "person",
+                    "--aim-output",
+                    "remote",
+                    "--ignore-self",
+                    "--aim-host",
+                    "192.168.1.40",
+                    "--aim-port",
+                    "47621",
+                    "--aim-pairing-key",
+                    "0123456789abcdef0123456789abcdef",
+                ]
+            )
+        self.assertIn("no authenticated, physically gated receiver", error.getvalue())
+
+    def test_aim_cli_requires_an_explicit_target_label(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--aim",
+                    "--aim-output",
+                    "makcu",
+                    "--aim-makcu-port",
+                    "/dev/ttyACM0",
+                ]
+            )
+        self.assertIn("--aim-label is required", error.getvalue())
+
+    def test_local_aim_cli_requires_a_physical_activation_device(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--aim",
+                    "--aim-label",
+                    "person",
+                    "--aim-output",
+                    "local",
+                    "--ignore-self",
+                ]
+            )
+        self.assertIn("--aim-activate-path is required", error.getvalue())
 
     def test_makcu_aim_cli_configuration_parses(self) -> None:
         config = parse_args(
             [
                 "--aim",
+                "--aim-label",
+                "player",
                 "--aim-output",
                 "makcu",
+                "--ignore-self",
                 "--aim-makcu-port",
                 "/dev/ttyACM0",
                 "--aim-makcu-button",
@@ -235,9 +448,25 @@ class AimingControllerTests(unittest.TestCase):
         self.assertEqual(config.aim_makcu_button, 1)
         self.assertEqual(config.aim_makcu_strength, 0.25)
         self.assertEqual(config.aim_makcu_max_step, 80)
+        self.assertTrue(config.ignore_self)
         self.assertEqual(config.aim_makcu_smoothing_alpha, 0.72)
         self.assertEqual(config.aim_makcu_prediction_lead_seconds, 0.04)
         self.assertEqual(config.aim_makcu_derivative_damping_seconds, 0.01)
+
+    def test_aim_cli_requires_self_filter(self) -> None:
+        with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):
+            parse_args(
+                [
+                    "--aim",
+                    "--aim-label",
+                    "player",
+                    "--aim-output",
+                    "makcu",
+                    "--aim-makcu-port",
+                    "/dev/ttyACM0",
+                ]
+            )
+        self.assertIn("--ignore-self is required", error.getvalue())
 
 
 if __name__ == "__main__":

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
 import tempfile
 import unittest
 
@@ -10,7 +11,9 @@ from scripts.validate_release_assets import (
     EXPECTED_INPUT_SHAPE,
     PLAYER_ATTRIBUTION_MARKERS,
     PLAYER_LABELS,
+    RELEASE_MODELS,
     ReleaseAssetError,
+    ULTRALYTICS_METADATA_MARKERS,
     validate_release_assets,
 )
 
@@ -39,6 +42,8 @@ class FakeCore:
         high_end: FakeModel | Exception | None = None,
         player_fast: FakeModel | Exception | None = None,
         player_balanced: FakeModel | Exception | None = None,
+        player_int8: FakeModel | Exception | None = None,
+        onnx_failure: Exception | None = None,
     ) -> None:
         self.models = {
             "yolo26n.xml": fast or FakeModel(output_shapes=((1, 84, 2100),)),
@@ -58,14 +63,29 @@ class FakeCore:
                 input_shape=BALANCED_INPUT_SHAPE,
                 output_shapes=((1, 300, 6),),
             ),
+            "fort_player_416_int8.xml": player_int8
+            or FakeModel(
+                input_shape=BALANCED_INPUT_SHAPE,
+                output_shapes=((1, 300, 6),),
+            ),
         }
         self.calls: list[tuple[Path, Path]] = []
+        self.onnx_failure = onnx_failure
 
-    def read_model(self, *, model: str, weights: str) -> FakeModel:
-        xml_path = Path(model)
-        bin_path = Path(weights)
-        self.calls.append((xml_path, bin_path))
-        outcome = self.models[xml_path.name]
+    def read_model(self, *, model: str, weights: str | None = None) -> FakeModel:
+        model_path = Path(model)
+        weights_path = Path(weights) if weights is not None else Path()
+        self.calls.append((model_path, weights_path))
+        if model_path.suffix == ".onnx" and self.onnx_failure is not None:
+            raise self.onnx_failure
+        aliases = {
+            "yolo26n.onnx": "yolo26n.xml",
+            "yolo26n_416.onnx": "yolo26n_416.xml",
+            "yolo11l.onnx": "yolo11l.xml",
+            "fort_player.onnx": "fort_player.xml",
+            "fort_player_416.onnx": "fort_player_416.xml",
+        }
+        outcome = self.models[aliases.get(model_path.name, model_path.name)]
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -93,17 +113,37 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         (balanced_dir / "yolo26n_416.bin").write_bytes(b"balanced weights")
         (high_end_dir / "yolo11l.xml").write_text("<net/>", encoding="utf-8")
         (high_end_dir / "yolo11l.bin").write_bytes(b"high-end weights")
+        for directory, size in (
+            (coco_dir, 320),
+            (balanced_dir, 416),
+            (high_end_dir, 640),
+        ):
+            directory.joinpath("metadata.yaml").write_text(
+                "\n".join(ULTRALYTICS_METADATA_MARKERS)
+                + f"\nimgsz:\n- {size}\n- {size}\n",
+                encoding="utf-8",
+            )
         (self.root / "models" / "coco80.txt").write_text(
             "\n".join(COCO80_LABELS) + "\n", encoding="utf-8"
         )
-        high_end_onnx = self.root / "models" / "yolo11l_onnx"
-        high_end_onnx.mkdir(parents=True)
-        (high_end_onnx / "yolo11l.onnx").write_bytes(b"onnx weights")
+        onnx_files = (
+            ("yolo11l_onnx", "yolo11l.onnx"),
+            ("yolo26n_onnx", "yolo26n.onnx"),
+            ("yolo26n_416_onnx", "yolo26n_416.onnx"),
+            ("fort_player_onnx", "fort_player.onnx"),
+            ("fort_player_416_onnx", "fort_player_416.onnx"),
+        )
+        for directory, filename in onnx_files:
+            target = self.root / "models" / directory
+            target.mkdir(parents=True)
+            (target / filename).write_bytes(b"onnx weights")
 
         player_dir = self.root / "models" / "fort_player_openvino_model"
         player_balanced_dir = self.root / "models" / "fort_player_416_openvino_model"
+        player_int8_dir = self.root / "models" / "fort_player_416_int8_openvino_model"
         player_dir.mkdir(parents=True)
         player_balanced_dir.mkdir(parents=True)
+        player_int8_dir.mkdir(parents=True)
         (player_dir / "fort_player.xml").write_text("<net/>", encoding="utf-8")
         (player_dir / "fort_player.bin").write_bytes(b"player weights")
         (player_balanced_dir / "fort_player_416.xml").write_text(
@@ -112,6 +152,12 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         (player_balanced_dir / "fort_player_416.bin").write_bytes(
             b"balanced player weights"
         )
+        (player_int8_dir / "fort_player_416_int8.xml").write_text(
+            "<net/>", encoding="utf-8"
+        )
+        (player_int8_dir / "fort_player_416_int8.bin").write_bytes(
+            b"int8 player weights"
+        )
         (self.root / "models" / "fort_player.txt").write_text(
             "\n".join(PLAYER_LABELS) + "\n", encoding="utf-8"
         )
@@ -119,6 +165,31 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         (player_dir / "ATTRIBUTION.md").write_text(attribution, encoding="utf-8")
         (player_balanced_dir / "ATTRIBUTION.md").write_text(
             attribution, encoding="utf-8"
+        )
+        (player_int8_dir / "ATTRIBUTION.md").write_text(
+            attribution, encoding="utf-8"
+        )
+        (player_int8_dir / "metadata.yaml").write_text(
+            "precision: INT8\nmethod: NNCF\noutput_xml_sha256: fixture\n",
+            encoding="utf-8",
+        )
+        manifest_paths: set[Path] = set()
+        for asset in RELEASE_MODELS:
+            manifest_paths.update(
+                (asset.xml_relative, asset.bin_relative, asset.labels_relative)
+            )
+            if asset.onnx_relative is not None:
+                manifest_paths.add(asset.onnx_relative)
+            if asset.attribution_relative is not None:
+                manifest_paths.add(asset.attribution_relative)
+            if asset.metadata_relative is not None:
+                manifest_paths.add(asset.metadata_relative)
+        lines = []
+        for relative in sorted(manifest_paths, key=lambda value: value.as_posix()):
+            digest = hashlib.sha256((self.root / relative).read_bytes()).hexdigest()
+            lines.append(f"{digest}  {relative.as_posix()}")
+        (self.root / "models" / "RELEASE-MANIFEST.sha256").write_text(
+            "\n".join(lines) + "\n", encoding="utf-8"
         )
 
     def assert_fails(self, expected: str, core: FakeCore | None = None) -> str:
@@ -134,14 +205,14 @@ class ReleaseAssetValidationTests(unittest.TestCase):
 
         summaries = validate_release_assets(self.root, core_factory=lambda: core)
 
-        self.assertEqual(len(summaries), 5)
+        self.assertEqual(len(summaries), 6)
         # The two player detectors are end-to-end; the COCO pair in this fixture
         # uses the traditional layout, while the high-end YOLO11l bundle keeps
         # the dynamic end-to-end path exercised.
         player_summaries = [text for text in summaries if "player detector" in text]
         coco_summaries = [text for text in summaries if "COCO detector" in text]
         high_end_summaries = [text for text in summaries if "YOLO11l detector" in text]
-        self.assertEqual(len(player_summaries), 2)
+        self.assertEqual(len(player_summaries), 3)
         self.assertEqual(len(coco_summaries), 2)
         self.assertEqual(len(high_end_summaries), 1)
         for text in player_summaries:
@@ -149,11 +220,12 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         for text in coco_summaries:
             self.assertIn("traditional [1,84,N]", text)
         self.assertIn("traditional [1,84,N]", high_end_summaries[0])
-        self.assertEqual(len(core.calls), 5)
-        for xml_path, bin_path in core.calls:
-            self.assertEqual(xml_path.stem, bin_path.stem)
-            self.assertTrue(xml_path.is_absolute())
-            self.assertTrue(bin_path.is_absolute())
+        self.assertEqual(len(core.calls), 11)
+        for model_path, weights_path in core.calls:
+            self.assertTrue(model_path.is_absolute())
+            if model_path.suffix == ".xml":
+                self.assertEqual(model_path.stem, weights_path.stem)
+                self.assertTrue(weights_path.is_absolute())
 
     def test_accepts_end_to_end_output_with_dynamic_detection_count(self) -> None:
         core = FakeCore(
@@ -199,6 +271,27 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         self.assertIn("yolo26n_416.xml, yolo26n_416.bin", message)
         self.assertIn("weights do not match graph", message)
 
+    def test_rejects_a_nonempty_onnx_graph_openvino_cannot_read(self) -> None:
+        message = self.assert_fails(
+            "OpenVINO could not read Balanced player detector ONNX",
+            FakeCore(onnx_failure=RuntimeError("corrupt protobuf")),
+        )
+        self.assertIn("corrupt protobuf", message)
+
+    def test_rejects_a_missing_bundled_onnx_graph_without_constructing_openvino(self) -> None:
+        path = self.root / "models" / "fort_player_onnx" / "fort_player.onnx"
+        path.unlink()
+        constructed = False
+
+        def factory() -> FakeCore:
+            nonlocal constructed
+            constructed = True
+            return FakeCore()
+
+        with self.assertRaisesRegex(ReleaseAssetError, "Fast player detector ONNX is missing"):
+            validate_release_assets(self.root, core_factory=factory)
+        self.assertFalse(constructed)
+
     def test_rejects_nonstatic_or_wrong_input_shape(self) -> None:
         for shape in ((1, 3, 640, 640), (None, 3, 320, 320), (1, 320, 320, 3)):
             with self.subTest(shape=shape):
@@ -231,6 +324,30 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         changed[0] = "human"
         coco_labels.write_text("\n".join(changed) + "\n", encoding="utf-8")
         self.assert_fails("COCO detector labels are wrong")
+
+    def test_requires_generic_yolo_export_metadata_and_provenance(self) -> None:
+        metadata = (
+            self.root / "models" / "yolo26n_openvino_model" / "metadata.yaml"
+        )
+        valid_metadata = metadata.read_bytes()
+        metadata.unlink()
+        self.assert_fails("COCO detector metadata is missing")
+
+        metadata.write_text("task: detect\n", encoding="utf-8")
+        self.assert_fails("missing required marker(s)")
+
+        metadata.write_bytes(valid_metadata)
+
+    def test_rejects_a_missing_or_tampered_hash_manifest(self) -> None:
+        manifest = self.root / "models" / "RELEASE-MANIFEST.sha256"
+        valid_manifest = manifest.read_bytes()
+        manifest.unlink()
+        self.assert_fails("release model SHA-256 manifest is missing")
+
+        manifest.write_bytes(valid_manifest)
+        model = self.root / "models" / "fort_player_openvino_model" / "fort_player.bin"
+        model.write_bytes(b"tampered weights")
+        self.assert_fails("SHA-256 mismatch for models/fort_player_openvino_model/fort_player.bin")
 
 if __name__ == "__main__":
     unittest.main()

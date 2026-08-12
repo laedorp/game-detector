@@ -1,0 +1,3 @@
+# Broad Windows DirectX 12 compatibility build. DirectML is in sustained
+# engineering, but remains the packaged fallback for non-CUDA Windows GPUs.
+onnxruntime-directml==1.24.4

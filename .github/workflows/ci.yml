@@ -1,0 +1,73 @@
+name: Test ProAim
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            runtime_variant: cpu
+          - os: windows-2022
+            runtime_variant: directml
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-build.txt
+            requirements-runtime-${{ matrix.runtime_variant }}.txt
+      - name: Install Python dependencies
+        shell: pwsh
+        if: runner.os == 'Windows'
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -m pip install -r requirements-runtime-${{ matrix.runtime_variant }}.txt
+      - name: Install Python dependencies
+        if: runner.os != 'Windows'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+          python -m pip install -r requirements-runtime-${{ matrix.runtime_variant }}.txt
+      - name: Compile and test
+        if: runner.os != 'Windows'
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m compileall -q app.py config.py main.py aiming capture controller_precision detection launcher scripts tests utils
+          python -m unittest discover -s tests
+          python scripts/validate_release_assets.py
+          python app.py --cli --help
+          python app.py --runtime-info
+      - name: Compile and test
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m compileall -q app.py config.py main.py aiming capture controller_precision detection launcher scripts tests utils
+          python -m unittest discover -s tests
+          python scripts/validate_release_assets.py
+          python app.py --cli --help
+          python app.py --runtime-info

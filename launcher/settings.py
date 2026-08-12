@@ -15,10 +15,8 @@ from pathlib import Path
 import re
 import secrets
 import sys
+import tempfile
 from typing import Any, Mapping, Sequence
-
-from aiming.protocol import validate_pairing_key
-
 
 SOURCE_SCREEN = "screen"
 SOURCE_CAMERA = "camera"
@@ -43,6 +41,7 @@ SELF_POSITION_GEOMETRY = {
 SETTINGS_VERSION = 4
 
 MODEL_PRESET_FORT_PLAYER_BALANCED = "fort_player_balanced"
+MODEL_PRESET_FORT_PLAYER_BALANCED_INT8 = "fort_player_balanced_int8"
 MODEL_PRESET_FORT_PLAYER = "fort_player"
 MODEL_PRESET_COCO_BALANCED = "coco_balanced"
 MODEL_PRESET_COCO_HIGH = "coco_high"
@@ -101,6 +100,19 @@ MODEL_PRESETS = (
         labels_relative="models/fort_player.txt",
         inference_size=416,
         onnx_relative="models/fort_player_416_onnx/fort_player_416.onnx",
+    ),
+    ModelPreset(
+        key=MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
+        label="Game players — Responsive 416 INT8 (OpenVINO CPU)",
+        description=(
+            "Quantized one-class player detector for lower-latency OpenVINO CPU use."
+        ),
+        model_relative=(
+            "models/fort_player_416_int8_openvino_model/fort_player_416_int8.xml"
+        ),
+        labels_relative="models/fort_player.txt",
+        inference_size=416,
+        onnx_relative=None,
     ),
     ModelPreset(
         key=MODEL_PRESET_FORT_PLAYER,
@@ -346,10 +358,13 @@ class LauncherSettings:
                 else DEFAULT_MODEL_PRESET
             )
 
-        if self.model_tier == "high" and self.model_preset != MODEL_PRESET_CUSTOM:
-            self.model_preset = MODEL_PRESET_COCO_HIGH
-
         preset = model_preset(self.model_preset)
+        if preset.bundled and preset.model_for(self.backend) is None:
+            # An OpenVINO-only preset can survive in a profile after the user
+            # switches to an ONNX GPU. Keep the player class semantics while
+            # falling back to the portable FP32 416 preset.
+            self.model_preset = DEFAULT_MODEL_PRESET
+            preset = model_preset(self.model_preset)
         if preset.bundled:
             # Ignore stale/partial serialized paths.  A bundled preset is an
             # atomic model+labels choice and always resolves against this run's
@@ -362,11 +377,11 @@ class LauncherSettings:
             self.output_format = "auto"
             assert preset.inference_size is not None
             self.inference_size = str(preset.inference_size)
-            if preset.key == MODEL_PRESET_COCO_HIGH:
-                self.capture_width = HIGH_END_CAPTURE_WIDTH
-                self.capture_height = HIGH_END_CAPTURE_HEIGHT
-                self.capture_fps = HIGH_END_CAPTURE_FPS
-                self.screen_fps = HIGH_END_CAPTURE_FPS
+        if self.model_tier == "high":
+            self.capture_width = HIGH_END_CAPTURE_WIDTH
+            self.capture_height = HIGH_END_CAPTURE_HEIGHT
+            self.capture_fps = HIGH_END_CAPTURE_FPS
+            self.screen_fps = HIGH_END_CAPTURE_FPS
         if self.precision_mapping_verified and not self.precision_device_identity.strip():
             self.precision_mapping_verified = False
 
@@ -384,6 +399,15 @@ class LauncherSettings:
             if isinstance(default_value, bool):
                 if isinstance(value, bool):
                     converted[name] = value
+            elif isinstance(default_value, int):
+                # JSON keeps integer values distinct from strings, but bool is
+                # an ``int`` subclass in Python.  Preserve real integer fields
+                # such as ``aim_activate_axis`` without accepting true/false as
+                # an axis number.
+                if isinstance(value, int) and not isinstance(value, bool):
+                    converted[name] = value
+                elif isinstance(value, str) and re.fullmatch(r"[+-]?\d+", value.strip()):
+                    converted[name] = int(value)
             elif isinstance(default_value, str) and isinstance(value, (str, int, float)):
                 converted[name] = str(value)
 
@@ -426,7 +450,10 @@ class LauncherSettings:
         if self.source_mode not in SOURCE_MODES:
             raise SettingsError("Choose Moonlight screen, camera/capture card, or video file.")
 
-        model_path, labels_path = self.resolved_model_files()
+        try:
+            model_path, labels_path = self.resolved_model_files()
+        except ValueError as exc:
+            raise SettingsError(str(exc)) from exc
         backend = _backend_name(self.backend)
         if backend == "onnxruntime":
             # An ONNX graph is a single self-contained file, so there is no
@@ -545,9 +572,17 @@ class LauncherSettings:
         elif not self.draw:
             args.append("--no-draw")
         if self.aim:
+            aim_label = self.aim_label.strip()
+            if not aim_label:
+                raise SettingsError(
+                    "Choose an explicit target label before enabling aim output."
+                )
+            if not self.ignore_self:
+                raise SettingsError(
+                    "Enable 'Ignore my on-screen character' before enabling aim output."
+                )
             args.append("--aim")
-            if self.aim_label:
-                args.extend(("--aim-label", self.aim_label))
+            args.extend(("--aim-label", aim_label))
             if self.aim_invert_x:
                 args.append("--aim-invert-x")
             if self.aim_invert_y:
@@ -559,24 +594,9 @@ class LauncherSettings:
             aim_output = _choice(self.aim_output, AIM_OUTPUTS, "aim output")
             args.extend(("--aim-output", aim_output))
             if aim_output == AIM_OUTPUT_REMOTE:
-                host = self.aim_host.strip()
-                if not host or any(character.isspace() for character in host):
-                    raise SettingsError(
-                        "Enter the gaming PC IP address or hostname for remote aim."
-                    )
-                try:
-                    pairing_key = validate_pairing_key(self.aim_pairing_key)
-                except ValueError as exc:
-                    raise SettingsError(f"Remote aim pairing key {exc}.") from exc
-                args.extend(
-                    (
-                        "--aim-host",
-                        host,
-                        "--aim-port",
-                        str(_port(self.aim_port, "remote aim port")),
-                        "--aim-pairing-key",
-                        pairing_key,
-                    )
+                raise SettingsError(
+                    "Remote aim output is unavailable until a safe, physically "
+                    "activated receiver is implemented."
                 )
             elif aim_output == AIM_OUTPUT_MAKCU:
                 makcu_port = self.aim_makcu_port.strip()
@@ -585,6 +605,14 @@ class LauncherSettings:
                 makcu_button = str(
                     _range_int(self.aim_makcu_button, "MAKCU activation button", 0, 4)
                 )
+                if (
+                    self.aim_makcu_verified_port.strip() != makcu_port
+                    or self.aim_makcu_verified_button.strip() != makcu_button
+                ):
+                    raise SettingsError(
+                        "Verify the selected MAKCU device and activation button with "
+                        "a complete physical press and release before starting."
+                    )
                 args.extend(("--aim-makcu-port", makcu_port))
                 args.extend(
                     (
@@ -619,8 +647,12 @@ class LauncherSettings:
                     )
                 )
             else:
-                if self.aim_activate_path.strip():
-                    args.extend(("--aim-activate-path", self.aim_activate_path))
+                activation_path = self.aim_activate_path.strip()
+                if not activation_path:
+                    raise SettingsError(
+                        "Local aim output requires an explicit physical activation device."
+                    )
+                args.extend(("--aim-activate-path", activation_path))
                 if self.aim_activate_axis is not None:
                     args.extend(("--aim-activate-axis", str(self.aim_activate_axis)))
                 if self.aim_activate_threshold.strip():
@@ -686,8 +718,16 @@ def save_settings(settings: LauncherSettings, path: Path | None = None) -> Path:
     """Atomically save settings and return the written path."""
 
     target = path or settings_path()
-    target.parent.mkdir(parents=True, exist_ok=True)
-    temporary = target.with_name(f".{target.name}.tmp")
+    parent_existed = target.parent.exists()
+    target.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    is_default_location = path is None or target == settings_path()
+    if is_default_location or not parent_existed:
+        try:
+            target.parent.chmod(0o700)
+        except OSError:
+            # Some platforms/filesystems do not implement POSIX permission bits.
+            pass
+    temporary: Path | None = None
     serialized = asdict(settings)
     serialized["version"] = SETTINGS_VERSION
     if settings.model_preset != MODEL_PRESET_CUSTOM:
@@ -698,11 +738,27 @@ def save_settings(settings: LauncherSettings, path: Path | None = None) -> Path:
         serialized.pop("labels_path", None)
     payload = json.dumps(serialized, indent=2, sort_keys=True) + "\n"
     try:
-        temporary.write_text(payload, encoding="utf-8")
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=target.parent,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+        try:
+            temporary.chmod(0o600)
+        except OSError:
+            pass
         os.replace(temporary, target)
+        try:
+            target.chmod(0o600)
+        except OSError:
+            pass
     except OSError:
         try:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
         except OSError:
             pass
         raise
@@ -737,13 +793,6 @@ def _non_negative_int(value: str, label: str) -> int:
     parsed = _integer(value, label)
     if parsed < 0:
         raise SettingsError(f"{label.capitalize()} cannot be negative.")
-    return parsed
-
-
-def _port(value: str, label: str) -> int:
-    parsed = _integer(value, label)
-    if not 1 <= parsed <= 65535:
-        raise SettingsError(f"{label.capitalize()} must be between 1 and 65535.")
     return parsed
 
 
@@ -816,7 +865,17 @@ def _device_name(value: str) -> str:
     parsed = value.strip().upper()
     if not parsed:
         raise SettingsError("Choose an inference device.")
-    return parsed
+    # Hardware scans return ONNX Runtime's class names while the CLI exposes
+    # stable short aliases. Accept old profiles and older release output too.
+    return {
+        "TENSORRTEXECUTIONPROVIDER": "TENSORRT",
+        "CUDAEXECUTIONPROVIDER": "CUDA",
+        "ROCMEXECUTIONPROVIDER": "ROCM",
+        "MIGRAPHXEXECUTIONPROVIDER": "MIGRAPHX",
+        "DMLEXECUTIONPROVIDER": "DIRECTML",
+        "CPUEXECUTIONPROVIDER": "CPU",
+        "OPENVINOEXECUTIONPROVIDER": "OPENVINO",
+    }.get(parsed, parsed)
 
 
 def _backend_name(value: str) -> str:

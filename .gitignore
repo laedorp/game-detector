@@ -6,3 +6,8 @@ __pycache__/
 .ruff_cache/
 /build/
 /dist/
+.vscode/
+/datasets/
+/runs/
+/yolo11*.pt
+/launcher/Untitled-1.txt

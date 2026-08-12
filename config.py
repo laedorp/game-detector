@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
 
-from aiming.protocol import validate_pairing_key
 from controller_precision.codes import ABS_BRAKE
 from aiming.controller import DEFAULT_HEAD_RATIO
 
@@ -345,12 +344,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aim",
         action="store_true",
-        help="Enable detection-driven aiming output to a virtual joystick via uinput.",
+        help=(
+            "Enable physically gated detection output. This requires an explicit "
+            "target label and a supported local or MAKCU activation source."
+        ),
     )
     parser.add_argument(
         "--aim-label",
         metavar="LABEL",
-        help="Only aim at detections matching this label; otherwise use the highest-confidence detection.",
+        help="Required with --aim; only detections matching this exact label are eligible.",
     )
     parser.add_argument(
         "--aim-invert-x",
@@ -372,21 +374,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--aim-output",
         choices=("local", "remote", "makcu"),
         default="local",
-        help="Send aim to local uinput, a remote receiver, or a MAKCU mouse board.",
+        help="Send aim to local uinput or a MAKCU mouse board; remote is unavailable.",
     )
     parser.add_argument(
         "--aim-host",
-        help="Gaming-PC hostname or IP address for --aim-output remote.",
+        help="Reserved for remote output, which is unavailable in this release.",
     )
     parser.add_argument(
         "--aim-port",
         type=_port,
         default=47621,
-        help="Gaming-PC UDP receiver port (default: 47621).",
+        help="Reserved for remote output, which is unavailable in this release.",
     )
     parser.add_argument(
         "--aim-pairing-key",
-        help="Shared pairing key used to authenticate remote aim packets.",
+        help="Reserved for remote output, which is unavailable in this release.",
     )
     parser.add_argument(
         "--aim-makcu-port",
@@ -433,7 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--aim-activate-path",
         metavar="PATH",
-        help="Optional physical input device path whose LT axis gates aim activation.",
+        help="Required for local output: physical input path whose LT axis gates every update.",
     )
     parser.add_argument(
         "--aim-activate-axis",
@@ -492,13 +494,23 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         parser.error("--aim-makcu-prediction-lead-seconds must be between 0 and 0.25")
     if not 0.0 <= args.aim_makcu_derivative_damping_seconds <= 0.25:
         parser.error("--aim-makcu-derivative-damping-seconds must be between 0 and 0.25")
-    if args.aim and args.aim_output == "remote":
-        if not (args.aim_host or "").strip():
-            parser.error("--aim-host is required for --aim-output remote")
-        try:
-            args.aim_pairing_key = validate_pairing_key(args.aim_pairing_key or "")
-        except ValueError as exc:
-            parser.error(f"--aim-pairing-key {exc}")
+    if args.aim:
+        args.aim_label = (args.aim_label or "").strip()
+        if not args.aim_label:
+            parser.error("--aim-label is required when --aim is enabled")
+        if not args.ignore_self:
+            parser.error("--ignore-self is required when --aim is enabled")
+        if args.aim_output == "remote":
+            parser.error(
+                "--aim-output remote is unavailable because this project has no "
+                "authenticated, physically gated receiver"
+            )
+        if args.aim_output == "local" and not (args.aim_activate_path or "").strip():
+            parser.error(
+                "--aim-activate-path is required for local aim so a physical control "
+                "can gate every output"
+            )
+        args.aim_activate_path = (args.aim_activate_path or "").strip() or None
     source: SourceSpec = args.source
     screen_monitor = (
         int(source.value)

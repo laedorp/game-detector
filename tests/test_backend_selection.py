@@ -22,6 +22,7 @@ from launcher.settings import (
     LauncherSettings,
     MODEL_PRESETS,
     MODEL_PRESET_CUSTOM,
+    MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
     SettingsError,
     model_preset,
     model_preset_paths,
@@ -43,9 +44,9 @@ def make_bundled_tree(root: Path, backend: str) -> tuple[Path, Path]:
 
 
 class PresetFormatTests(unittest.TestCase):
-    def test_every_bundled_preset_offers_both_model_formats(self) -> None:
+    def test_every_portable_bundled_preset_offers_both_model_formats(self) -> None:
         for preset in MODEL_PRESETS:
-            if not preset.bundled:
+            if not preset.bundled or preset.key == MODEL_PRESET_FORT_PLAYER_BALANCED_INT8:
                 continue
             with self.subTest(preset=preset.key):
                 self.assertIsNotNone(preset.model_for("openvino"), preset.key)
@@ -68,7 +69,7 @@ class PresetFormatTests(unittest.TestCase):
 
     def test_a_preset_without_an_onnx_form_is_refused_rather_than_guessed(self) -> None:
         with self.assertRaises(ValueError):
-            model_preset_paths(MODEL_PRESET_CUSTOM, "onnxruntime")
+            model_preset_paths(MODEL_PRESET_FORT_PLAYER_BALANCED_INT8, "onnxruntime")
 
 
 class DetectorArgumentTests(unittest.TestCase):

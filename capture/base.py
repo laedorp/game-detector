@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+import math
 from threading import Condition
 from time import monotonic
 from types import TracebackType
@@ -50,6 +51,7 @@ class CaptureSource(ABC):
         self._frames_overwritten = 0
         self._read_failures = 0
         self._started = False
+        self._closing = False
         self._closed = False
         self._ended = False
         self._error: str | None = None
@@ -116,6 +118,10 @@ class CaptureSource(ABC):
         with self._condition:
             if self._closed:
                 raise RuntimeError(f"Cannot restart closed source: {self.description}")
+            if self._closing:
+                raise RuntimeError(
+                    f"Cannot restart source while it is still closing: {self.description}"
+                )
             if self._started:
                 return False
             self._started = True
@@ -130,7 +136,7 @@ class CaptureSource(ABC):
         """Publish a packet, replacing an unread packet when necessary."""
 
         with self._condition:
-            if self._closed:
+            if self._closed or self._closing:
                 return
             self._frames_read += 1
             if self._latest_packet is not None:
@@ -144,7 +150,11 @@ class CaptureSource(ABC):
         deadline = None if timeout is None else monotonic() + timeout
 
         with self._condition:
-            while self._latest_packet is None and not self._ended:
+            while (
+                self._latest_packet is None
+                and not self._ended
+                and not self._closing
+            ):
                 if deadline is None:
                     self._condition.wait()
                     continue
@@ -181,6 +191,7 @@ class CaptureSource(ABC):
 
     def _mark_closed(self) -> None:
         with self._condition:
+            self._closing = False
             self._closed = True
             self._ended = True
             self._latest_packet = None
@@ -188,13 +199,48 @@ class CaptureSource(ABC):
 
     def _is_finished(self) -> bool:
         with self._condition:
-            return self._ended or self._closed
+            return self._ended or self._closing or self._closed
+
+    def _begin_close(self) -> None:
+        """Mark shutdown in progress without claiming the worker has exited."""
+
+        with self._condition:
+            if self._closed:
+                return
+            self._closing = True
+            self._latest_packet = None
+            self._condition.notify_all()
+
+    def _record_close_timeout(self, worker_name: str) -> None:
+        """Expose an incomplete close while keeping ``ended`` truthful."""
+
+        with self._condition:
+            if self._error is None:
+                self._error = (
+                    f"Timed out waiting for {worker_name} to stop; "
+                    "the capture source is still closing."
+                )
+            self._condition.notify_all()
+
+    def _complete_close_from_worker(self) -> None:
+        """Let a worker finish a close that outlived the caller's join timeout."""
+
+        with self._condition:
+            if not self._closing:
+                return
+            self._closing = False
+            self._closed = True
+            self._ended = True
+            self._latest_packet = None
+            self._condition.notify_all()
 
 
 def _validate_timeout(timeout: float | None) -> float | None:
     if timeout is None:
         return None
+    if isinstance(timeout, bool):
+        raise TypeError("timeout must be a finite non-negative number or None")
     timeout = float(timeout)
-    if timeout < 0:
-        raise ValueError("timeout must be non-negative or None")
+    if not math.isfinite(timeout) or timeout < 0:
+        raise ValueError("timeout must be finite and non-negative or None")
     return timeout

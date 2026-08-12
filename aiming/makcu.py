@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 import errno
+import os
 from pathlib import Path
 import math
 import threading
@@ -34,7 +35,11 @@ BUTTON_NAMES = ("Left", "Right", "Middle", "Side 4", "Side 5")
 DEFAULT_OUTPUT_HZ = 1000
 REFERENCE_CONTROL_HZ = 60.0
 TARGET_STALE_SECONDS = 0.15
-BUTTON_RELEASE_GRACE_SECONDS = 0.30
+# Ask the board for frequent full button-state snapshots and require a fresh
+# snapshot to keep output enabled. This bounds a missed-release failure rather
+# than allowing the last pressed mask to remain authoritative indefinitely.
+BUTTON_STREAM_PERIOD_MS = 25
+BUTTON_REPORT_STALE_SECONDS = 0.15
 CLOSE_RANGE_SLOWDOWN_PIXELS = 130.0
 MIN_CLOSE_RANGE_SCALE = 0.72
 THREADED_RATE_SMOOTHING_ALPHA = 0.82
@@ -61,12 +66,6 @@ def detect_makcu_port(
 ) -> str:
     """Return one MAKCU serial path or raise a user-facing discovery error."""
 
-    selected = requested.strip()
-    if selected:
-        if selected.startswith("/dev/") and not Path(selected).exists():
-            raise MakcuError(f"MAKCU serial device not found: {selected}")
-        return selected
-
     provider = ports_provider
     if provider is None:
         if _list_ports is None:
@@ -74,9 +73,35 @@ def detect_makcu_port(
             raise MakcuError("MAKCU discovery requires the 'pyserial' package" + detail)
         provider = _list_ports.comports
 
+    available = tuple(provider())
+    selected = requested.strip()
+    if selected:
+        if selected.startswith("/dev/") and not Path(selected).exists():
+            raise MakcuError(f"MAKCU serial device not found: {selected}")
+        selected_key = os.path.normcase(os.path.realpath(selected))
+        matching = [
+            port
+            for port in available
+            if os.path.normcase(os.path.realpath(str(getattr(port, "device", ""))))
+            == selected_key
+        ]
+        if len(matching) != 1:
+            raise MakcuError(
+                f"Selected serial path is not one uniquely enumerated device: {selected}"
+            )
+        port = matching[0]
+        if (
+            getattr(port, "vid", None) != MAKCU_VENDOR_ID
+            or getattr(port, "pid", None) != MAKCU_PRODUCT_ID
+        ):
+            raise MakcuError(
+                f"Selected serial device is not the expected MAKCU 1a86:55d3: {selected}"
+            )
+        return selected
+
     matches = [
         str(port.device)
-        for port in provider()
+        for port in available
         if getattr(port, "vid", None) == MAKCU_VENDOR_ID
         and getattr(port, "pid", None) == MAKCU_PRODUCT_ID
     ]
@@ -233,8 +258,7 @@ class MakcuAimingController:
         self._threaded_output = threaded_output
         self._serial: Any | None = None
         self._button_mask = 0
-        self._activation_latched = False
-        self._release_started_ns = 0
+        self._last_button_report_ns = 0
         self._serial_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -343,7 +367,7 @@ class MakcuAimingController:
                     break
         if permission_error is not None:
             raise MakcuError(
-                f"Permission denied opening {port}. Install the Game Detector MAKCU "
+                f"Permission denied opening {port}. Install the ProAim MAKCU "
                 "udev rule, then reconnect the board."
             ) from permission_error
         raise MakcuError(f"No MAKCU firmware response was received from {port}")
@@ -356,8 +380,7 @@ class MakcuAimingController:
         self._serial = self._connect(port)
         self.connected_port = port
         self._button_mask = 0
-        self._activation_latched = False
-        self._release_started_ns = 0
+        self._last_button_report_ns = 0
         self._worker_error = None
         self._latest_target = None
         self._latest_active = False
@@ -369,7 +392,7 @@ class MakcuAimingController:
         self._previous_error_x = 0.0
         self._previous_error_y = 0.0
         self._previous_error_ns = 0
-        self._command("km.buttons(1)")
+        self._command(f"km.buttons(1,{BUTTON_STREAM_PERIOD_MS})")
         should_start_output = self._threaded_output if output_loop is None else output_loop
         if should_start_output:
             self._stop_event.clear()
@@ -394,23 +417,22 @@ class MakcuAimingController:
             if value <= 0x1F and value not in (0x0A, 0x0D):
                 with self._state_lock:
                     self._button_mask = value
-                    if value & (1 << self.config.activation_button):
-                        self._activation_latched = True
-                        self._release_started_ns = 0
-                    elif self._activation_latched and self._release_started_ns == 0:
-                        self._release_started_ns = current_ns
+                    self._last_button_report_ns = current_ns
+                    # A valid release report is authoritative.  Do not keep
+                    # movement active after the physical button is released.
 
     def _activation_pressed_at(self, now_ns: int) -> bool:
         with self._state_lock:
+            report_ns = self._last_button_report_ns
+            age_ns = now_ns - report_ns
             if (
-                self._activation_latched
-                and self._release_started_ns
-                and now_ns - self._release_started_ns
-                >= int(BUTTON_RELEASE_GRACE_SECONDS * 1_000_000_000)
+                report_ns == 0
+                or age_ns < 0
+                or age_ns > int(BUTTON_REPORT_STALE_SECONDS * 1_000_000_000)
             ):
-                self._activation_latched = False
-                self._release_started_ns = 0
-            return self._activation_latched
+                self._button_mask = 0
+                return False
+            return bool(self._button_mask & (1 << self.config.activation_button))
 
     @property
     def activation_pressed(self) -> bool:
@@ -421,6 +443,7 @@ class MakcuAimingController:
 
         current_ns = time.perf_counter_ns() if now_ns is None else now_ns
         self._read_buttons(now_ns=current_ns)
+        self._activation_pressed_at(current_ns)
         with self._state_lock:
             return self._button_mask
 
@@ -631,8 +654,7 @@ class MakcuAimingController:
         self.connected_port = None
         with self._state_lock:
             self._button_mask = 0
-            self._activation_latched = False
-            self._release_started_ns = 0
+            self._last_button_report_ns = 0
             self._latest_target = None
             self._latest_active = False
             self._latest_update_ns = 0

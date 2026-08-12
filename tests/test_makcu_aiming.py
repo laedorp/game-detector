@@ -1,15 +1,17 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import time
+from pathlib import Path
+import tempfile
 import unittest
 
 from aiming.makcu import (
+    BUTTON_REPORT_STALE_SECONDS,
+    BUTTON_STREAM_PERIOD_MS,
     MAKCU_BAUD_CHANGE,
     MAKCU_FAST_BAUD,
     MAKCU_PRODUCT_ID,
     MAKCU_VENDOR_ID,
-    BUTTON_RELEASE_GRACE_SECONDS,
     TARGET_STALE_SECONDS,
     MakcuError,
     MakcuAimConfig,
@@ -105,7 +107,7 @@ class MakcuAimingTests(unittest.TestCase):
         self.assertEqual(self.factory.state["device_baud"], MAKCU_FAST_BAUD)
         active = self.factory.connections[-1]
         self.assertEqual(active.baudrate, MAKCU_FAST_BAUD)
-        self.assertIn(b"km.buttons(1)\r", active.writes)
+        self.assertIn(f"km.buttons(1,{BUTTON_STREAM_PERIOD_MS})\r".encode(), active.writes)
         controller.stop()
         self.assertIn(b"km.buttons(0)\r", active.writes)
         self.assertTrue(active.closed)
@@ -122,11 +124,6 @@ class MakcuAimingTests(unittest.TestCase):
         controller.update(target, (1080, 1920, 3))
         self.assertEqual(active.writes[-1], b"km.move(-40,-67)\r")
         active.responses.extend(bytes((0,)))
-        release_ns = time.perf_counter_ns()
-        controller.poll_activation(now_ns=release_ns)
-        controller.poll_activation(
-            now_ns=release_ns + int((BUTTON_RELEASE_GRACE_SECONDS + 0.01) * 1e9)
-        )
         before_release = len(active.writes)
         controller.update(target, (1080, 1920, 3))
         self.assertEqual(len(active.writes), before_release)
@@ -141,12 +138,7 @@ class MakcuAimingTests(unittest.TestCase):
         self.assertTrue(controller.poll_activation(now_ns=pressed_ns))
         self.assertFalse(any(write.startswith(b"km.move(") for write in active.writes))
         active.responses.extend(bytes((0,)))
-        self.assertTrue(controller.poll_activation(now_ns=pressed_ns + 100_000_000))
-        self.assertFalse(
-            controller.poll_activation(
-                now_ns=pressed_ns + int((BUTTON_RELEASE_GRACE_SECONDS + 0.11) * 1e9)
-            )
-        )
+        self.assertFalse(controller.poll_activation(now_ns=pressed_ns + 1))
 
     def test_poll_button_mask_reports_latest_button_bits(self) -> None:
         controller = self.controller()
@@ -159,7 +151,7 @@ class MakcuAimingTests(unittest.TestCase):
         active.responses.extend(bytes((0,)))
         self.assertEqual(controller.poll_button_mask(now_ns=now_ns + 10_000_000), 0)
 
-    def test_noisy_false_masks_do_not_flicker_held_activation(self) -> None:
+    def test_valid_release_report_stops_activation_immediately(self) -> None:
         controller = self.controller()
         controller.start()
         active = self.factory.connections[-1]
@@ -167,13 +159,20 @@ class MakcuAimingTests(unittest.TestCase):
         active.responses.extend(bytes((0b00010,)))
         self.assertTrue(controller.poll_activation(now_ns=now_ns))
 
-        for gap_ms in (90, 242, 154):
-            active.responses.extend(bytes((0,)))
-            now_ns += gap_ms * 1_000_000
-            self.assertTrue(controller.poll_activation(now_ns=now_ns))
-            active.responses.extend(bytes((0b00010,)))
-            now_ns += 10_000_000
-            self.assertTrue(controller.poll_activation(now_ns=now_ns))
+        active.responses.extend(bytes((0,)))
+        self.assertFalse(controller.poll_activation(now_ns=now_ns + 1))
+
+    def test_stale_button_report_fails_closed_if_release_is_lost(self) -> None:
+        controller = self.controller()
+        controller.start()
+        active = self.factory.connections[-1]
+        pressed_ns = 1_000_000_000
+        active.responses.extend(bytes((0b00010,)))
+        self.assertTrue(controller.poll_activation(now_ns=pressed_ns))
+
+        stale_ns = pressed_ns + int((BUTTON_REPORT_STALE_SECONDS + 0.01) * 1e9)
+        self.assertFalse(controller.poll_activation(now_ns=stale_ns))
+        self.assertEqual(controller.poll_button_mask(now_ns=stale_ns + 1), 0)
 
     def test_1000hz_ticks_preserve_fractional_motion_and_stop_when_stale(self) -> None:
         controller = self.controller(
@@ -227,6 +226,28 @@ class MakcuAimingTests(unittest.TestCase):
             detect_makcu_port(ports_provider=lambda: ())
         with self.assertRaisesRegex(MakcuError, "More than one MAKCU"):
             detect_makcu_port(ports_provider=lambda: (self.port, self.port))
+
+    def test_requested_port_must_be_the_enumerated_makcu_usb_device(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            selected = Path(directory) / "ttyUSB0"
+            selected.touch()
+            correct = FakePort(str(selected), MAKCU_VENDOR_ID, MAKCU_PRODUCT_ID)
+            wrong = FakePort(str(selected), 0x1234, 0x5678)
+
+            self.assertEqual(
+                detect_makcu_port(
+                    requested=str(selected), ports_provider=lambda: (correct,)
+                ),
+                str(selected),
+            )
+            with self.assertRaisesRegex(MakcuError, "not the expected MAKCU"):
+                detect_makcu_port(
+                    requested=str(selected), ports_provider=lambda: (wrong,)
+                )
+            with self.assertRaisesRegex(MakcuError, "not one uniquely enumerated"):
+                detect_makcu_port(
+                    requested=str(selected), ports_provider=lambda: ()
+                )
 
 
 if __name__ == "__main__":

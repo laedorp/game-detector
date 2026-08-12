@@ -144,7 +144,10 @@ class Recommendation:
 
     @property
     def summary(self) -> str:
-        state = "ready" if self.ready else "needs setup"
+        if self.ready and self.backend == "onnxruntime":
+            state = "provider found; verified at detector start"
+        else:
+            state = "ready" if self.ready else "needs setup"
         return f"{self.accelerator.label} — {self.backend}/{self.device} ({state})"
 
 
@@ -406,8 +409,10 @@ def recommend(
     """Rank tailored ways to run the detector on this machine, best first.
 
     Ordering is by expected throughput, but an entry that is not ``ready`` is
-    always sorted below every ready one: an unusable fast path is advice, not a
-    choice the launcher can act on.
+    always sorted below every ready one. For OpenVINO, ready means the device is
+    exposed by Core. For ONNX Runtime it means the installed wheel exposes the
+    provider; the driver and provider are still tested when the detector creates
+    its real model session.
     """
 
     providers = _onnxruntime_providers(provider_factory)
@@ -418,9 +423,13 @@ def recommend(
         if accelerator.kind is AcceleratorKind.CPU:
             entries.append((30, _cpu_recommendation(profile, accelerator)))
         elif accelerator.kind is AcceleratorKind.NPU:
-            entries.append((5, _intel_recommendation(profile, accelerator, "NPU")))
+            entries.append(
+                (5, _intel_recommendation(profile, accelerator, "NPU", providers))
+            )
         elif accelerator.vendor is Vendor.INTEL:
-            entries.append((10, _intel_recommendation(profile, accelerator, "GPU")))
+            entries.append(
+                (10, _intel_recommendation(profile, accelerator, "GPU", providers))
+            )
         elif accelerator.vendor is Vendor.AMD:
             entries.append((15, _amd_recommendation(accelerator, providers, windows)))
         elif accelerator.vendor is Vendor.NVIDIA:
@@ -452,12 +461,32 @@ def _cpu_recommendation(
 
 
 def _intel_recommendation(
-    profile: HardwareProfile, accelerator: Accelerator, family: str
+    profile: HardwareProfile,
+    accelerator: Accelerator,
+    family: str,
+    providers: Sequence[str] = (),
 ) -> Recommendation:
     ready = _openvino_family_present(profile.runtime_devices, family)
     if ready:
         hint = ""
         reason = f"OpenVINO exposes {family} on this machine"
+    elif (
+        profile.system == "windows"
+        and family == "GPU"
+        and "DmlExecutionProvider" in providers
+    ):
+        return Recommendation(
+            accelerator=accelerator,
+            backend="onnxruntime",
+            device="DIRECTML",
+            precision="fp16",
+            inference_size=416,
+            ready=True,
+            reason=(
+                "OpenVINO does not expose this Intel GPU, but ONNX Runtime "
+                "exposes DmlExecutionProvider"
+            ),
+        )
     elif profile.system == "windows":
         reason = f"Intel {family} is present but OpenVINO does not expose it"
         hint = "Install the latest Intel graphics driver, then re-scan."
@@ -485,6 +514,7 @@ def _amd_recommendation(
 ) -> Recommendation:
     # OpenVINO has no AMD GPU plugin at all, so this path is ONNX Runtime only.
     provider = "DmlExecutionProvider" if windows else "ROCMExecutionProvider"
+    device = "DIRECTML" if windows else "ROCM"
     ready = provider in providers
     if ready:
         hint = ""
@@ -498,7 +528,7 @@ def _amd_recommendation(
     return Recommendation(
         accelerator=accelerator,
         backend="onnxruntime",
-        device=provider,
+        device=device,
         precision="fp16",
         inference_size=416,
         ready=ready,
@@ -510,12 +540,21 @@ def _amd_recommendation(
 def _nvidia_recommendation(
     accelerator: Accelerator, providers: Sequence[str]
 ) -> Recommendation:
-    for provider in ("TensorrtExecutionProvider", "CUDAExecutionProvider"):
+    # CUDA is the dependable default shipped by the NVIDIA bundle. TensorRT is
+    # optional and may be reported by ORT even when its separate libraries are
+    # unavailable, so leave it as a manual advanced selection.
+    for provider, device in (
+        ("CUDAExecutionProvider", "CUDA"),
+        ("TensorrtExecutionProvider", "TENSORRT"),
+        # The Windows DirectML release is the broadly compatible NVIDIA/AMD
+        # fallback and must remain selectable on GeForce systems too.
+        ("DmlExecutionProvider", "DIRECTML"),
+    ):
         if provider in providers:
             return Recommendation(
                 accelerator=accelerator,
                 backend="onnxruntime",
-                device=provider,
+                device=device,
                 precision="fp16",
                 inference_size=416,
                 ready=True,
