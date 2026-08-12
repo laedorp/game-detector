@@ -23,7 +23,7 @@ For testers who should not install Python or dependencies manually:
 1. Open the repository's **Releases** page on GitHub.
 2. Download the asset for your OS:
   - `ProAim-Linux-x64.zip`
-  - `GameDetector-Windows-x64.zip`
+  - `ProAim-Windows-x64.zip`
 3. Extract the ZIP and keep the full folder structure together.
 4. Run the app executable from that extracted folder:
   - Linux: `ProAim/ProAim`
@@ -158,7 +158,7 @@ Release builds deliberately stop unless the bundled COCO model pairs, the high-e
 
 ### Share a Windows build
 
-Push the repository changes to GitHub, open **Actions → Build Windows app → Run workflow**, and download the `GameDetector-Windows-x64` artifact when it completes. Send the contained `GameDetector-Windows-x64.zip` to testers. They extract the complete `GameDetector` folder and run `GameDetector.exe`; Python is not required on the tester's PC.
+Push the repository changes to GitHub, open **Actions → Build Windows app → Run workflow**, and download the `ProAim-Windows-x64` artifact when it completes. Send the contained `ProAim-Windows-x64.zip` to testers. They extract the complete `ProAim` folder and run `ProAim.exe`; Python is not required on the tester's PC.
 
 To build on a Windows development machine instead, install `requirements-build.txt` into `.venv`, then run:
 
@@ -166,7 +166,7 @@ To build on a Windows development machine instead, install `requirements-build.t
 .\scripts\build_windows_app.ps1
 ```
 
-That script creates `dist\GameDetector-Windows-x64.zip` and prints its SHA-256 hash. In the app, **Refresh devices** queries that machine's OpenVINO runtime. Testers can select `AUTO`, `CPU`, `GPU`, or `NPU` only when it is reported; GPU/NPU execution also requires compatible hardware drivers on that PC.
+That script creates `dist\ProAim-Windows-x64.zip` and prints its SHA-256 hash. In the app, **Refresh devices** queries that machine's OpenVINO runtime. Testers can select `AUTO`, `CPU`, `GPU`, or `NPU` only when it is reported; GPU/NPU execution also requires compatible hardware drivers on that PC.
 
 ## Export the starter model
 

@@ -28,12 +28,14 @@ jobs:
 
       - name: Build and package Windows app
         shell: pwsh
+        env:
+          GAME_DETECTOR_PYTHON: python
         run: ./scripts/build_windows_app.ps1
 
       - name: Upload Windows ZIP
         uses: actions/upload-artifact@v4
         with:
-          name: GameDetector-Windows-x64
-          path: dist/GameDetector-Windows-x64.zip
+          name: ProAim-Windows-x64
+          path: dist/ProAim-Windows-x64.zip
           if-no-files-found: error
           retention-days: 14
