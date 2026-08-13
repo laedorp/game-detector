@@ -125,7 +125,19 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         # PySide6 links libEGL even with QT_QPA_PLATFORM=offscreen. Keep the
         # source-test and oldest-supported Linux build runners explicit.
         self.assertIn("sudo apt-get install -y libegl1 libgl1", test_job)
-        self.assertIn("sudo apt-get install -y libegl1 libgl1", linux_job)
+        self.assertIn("sudo apt-get install -y --no-install-recommends", linux_job)
+        for package in (
+            "libegl1",
+            "libgl1",
+            "libxcb-cursor0",
+            "libxcb-icccm4",
+            "libxcb-keysyms1",
+            "libxcb-shape0",
+            "libxkbcommon-x11-0",
+            "ocl-icd-libopencl1",
+        ):
+            with self.subTest(package=package):
+                self.assertIn(package, linux_job)
         self.assertIn("timeout-minutes: 30", test_job)
         self.assertIn("- name: Compile Python sources", test_job)
         self.assertIn("- name: Run unit tests", test_job)
