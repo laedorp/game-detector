@@ -35,11 +35,15 @@ BUTTON_NAMES = ("Left", "Right", "Middle", "Side 4", "Side 5")
 DEFAULT_OUTPUT_HZ = 1000
 REFERENCE_CONTROL_HZ = 60.0
 TARGET_STALE_SECONDS = 0.15
-# Ask the board for frequent full button-state snapshots and require a fresh
-# snapshot to keep output enabled. This bounds a missed-release failure rather
-# than allowing the last pressed mask to remain authoritative indefinitely.
-BUTTON_STREAM_PERIOD_MS = 25
-BUTTON_REPORT_STALE_SECONDS = 0.15
+# MAKCU button telemetry is edge-driven: the board sends a frame when the
+# physical state changes, not as a heartbeat.  The one-argument command is
+# supported by both older field firmware and the current protocol.
+BUTTON_STREAM_COMMAND = "km.buttons(1)"
+# The button stream is event-driven, so silence normally means "still held".
+# Bound that authority anyway: after an unusually long uninterrupted hold the
+# user must release and press again. This prevents a lost release byte from
+# authorizing movement indefinitely.
+MAX_CONTINUOUS_ACTIVATION_SECONDS = 10.0
 CLOSE_RANGE_SLOWDOWN_PIXELS = 130.0
 MIN_CLOSE_RANGE_SCALE = 0.72
 THREADED_RATE_SMOOTHING_ALPHA = 0.82
@@ -59,6 +63,127 @@ class MakcuError(RuntimeError):
     """User-facing MAKCU discovery, connection, or command failure."""
 
 
+_BUTTON_FRAME_PREFIX = b"km."
+_BUTTON_LONG_SUFFIX = b"buttons"
+
+
+class _ButtonStreamParser:
+    """Decode framed and legacy MAKCU button-state events across reads."""
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self._framed_mode = False
+
+    def reset(self) -> None:
+        self._pending.clear()
+        self._framed_mode = False
+
+    @staticmethod
+    def _prefix_tail_length(data: bytes | bytearray) -> int:
+        """Return the longest suffix which can begin the next ``km.`` frame."""
+
+        maximum = min(len(data), len(_BUTTON_FRAME_PREFIX) - 1)
+        for length in range(maximum, 0, -1):
+            if data[-length:] == _BUTTON_FRAME_PREFIX[:length]:
+                return length
+        return 0
+
+    def feed(self, data: bytes) -> tuple[int, ...]:
+        bare_mask = (
+            not self._framed_mode
+            and not self._pending
+            and len(data) == 1
+            and data[0] <= 0x1F
+        )
+        if data:
+            self._pending.extend(data)
+        masks: list[int] = []
+        while self._pending:
+            index = self._pending.find(_BUTTON_FRAME_PREFIX)
+            if index < 0:
+                # Field firmware can emit a naked one-byte five-bit mask. Only
+                # accept a standalone byte received before any framed traffic.
+                # Once a framed stream is observed, split CR/LF/prompt bytes
+                # must never be reclassified as physical mouse state.
+                if bare_mask and len(self._pending) == 1:
+                    masks.append(self._pending[0])
+                    self._pending.clear()
+                    break
+                tail_length = self._prefix_tail_length(self._pending)
+                if tail_length:
+                    del self._pending[:-tail_length]
+                else:
+                    self._pending.clear()
+                break
+
+            if index:
+                # Prefix-adjacent bytes are command ACK/prompt noise, not a
+                # naked legacy event.
+                del self._pending[:index]
+            self._framed_mode = True
+
+            after_prefix = bytes(self._pending[len(_BUTTON_FRAME_PREFIX) :])
+            if not after_prefix:
+                break
+
+            # ``km.`` is itself a valid short frame prefix, but it is also the
+            # beginning of ``km.buttons``. Wait across arbitrary serial-read
+            # boundaries while the available suffix can still become the long
+            # form; otherwise a split such as ``km.but`` would lose the frame.
+            if _BUTTON_LONG_SUFFIX.startswith(after_prefix):
+                break
+
+            if after_prefix.startswith(_BUTTON_LONG_SUFFIX):
+                value_index = len(_BUTTON_FRAME_PREFIX) + len(_BUTTON_LONG_SUFFIX)
+            else:
+                value_index = len(_BUTTON_FRAME_PREFIX)
+
+            if value_index >= len(self._pending):
+                break
+            value = self._pending[value_index]
+            if value <= 0x1F:
+                masks.append(value)
+                del self._pending[: value_index + 1]
+                continue
+
+            # Textual command response (for example ``km.buttons(1)``) or an
+            # unrelated ``km.*`` message. Drop this prefix and search for the
+            # next structured event without interpreting its control bytes.
+            del self._pending[: len(_BUTTON_FRAME_PREFIX)]
+
+        if len(self._pending) > 256:
+            # A malformed/noisy device must not grow this buffer forever.
+            del self._pending[:-32]
+        return tuple(masks)
+
+
+def _canonical_port(path: str) -> str:
+    return os.path.normcase(os.path.realpath(path))
+
+
+def _stable_linux_alias(path: str) -> str:
+    if os.name != "posix":
+        return path
+    selected_key = _canonical_port(path)
+    by_id = Path("/dev/serial/by-id")
+    if by_id.is_dir():
+        for candidate in sorted(by_id.iterdir()):
+            if _canonical_port(str(candidate)) == selected_key:
+                return str(candidate)
+    return path
+
+
+def _likely_makcu_path(port: Any) -> bool:
+    description = " ".join(
+        str(getattr(port, field, "") or "")
+        for field in ("device", "description", "hwid", "product")
+    ).casefold()
+    return any(
+        marker in description
+        for marker in ("ch343", "usb single serial", "usb-enhanced-serial")
+    )
+
+
 def detect_makcu_port(
     *,
     requested: str = "",
@@ -67,48 +192,70 @@ def detect_makcu_port(
     """Return one MAKCU serial path or raise a user-facing discovery error."""
 
     provider = ports_provider
+    use_system_candidates = provider is None
     if provider is None:
         if _list_ports is None:
             detail = f": {SERIAL_IMPORT_ERROR}" if SERIAL_IMPORT_ERROR else ""
             raise MakcuError("MAKCU discovery requires the 'pyserial' package" + detail)
-        provider = _list_ports.comports
+        provider = lambda: _list_ports.comports(include_links=True)
 
     available = tuple(provider())
     selected = requested.strip()
     if selected:
         if selected.startswith("/dev/") and not Path(selected).exists():
             raise MakcuError(f"MAKCU serial device not found: {selected}")
-        selected_key = os.path.normcase(os.path.realpath(selected))
+        selected_key = _canonical_port(selected)
         matching = [
             port
             for port in available
-            if os.path.normcase(os.path.realpath(str(getattr(port, "device", ""))))
-            == selected_key
+            if _canonical_port(str(getattr(port, "device", ""))) == selected_key
         ]
-        if len(matching) != 1:
-            raise MakcuError(
-                f"Selected serial path is not one uniquely enumerated device: {selected}"
-            )
-        port = matching[0]
-        if (
-            getattr(port, "vid", None) != MAKCU_VENDOR_ID
-            or getattr(port, "pid", None) != MAKCU_PRODUCT_ID
-        ):
+        known_ids = {
+            (getattr(port, "vid", None), getattr(port, "pid", None))
+            for port in matching
+            if getattr(port, "vid", None) is not None
+            or getattr(port, "pid", None) is not None
+        }
+        if known_ids and (MAKCU_VENDOR_ID, MAKCU_PRODUCT_ID) not in known_ids:
             raise MakcuError(
                 f"Selected serial device is not the expected MAKCU 1a86:55d3: {selected}"
             )
+        # Some CH343 drivers expose a usable COM/tty path without attaching USB
+        # metadata to pyserial's record (and pyserial 3.5 does not glob the
+        # official Linux /dev/ttyCH343USB* name).  Explicit choices are allowed
+        # through here; controller startup still requires a MAKCU firmware
+        # response before the path is trusted or any output is enabled.
         return selected
 
-    matches = [
+    exact_matches = [
         str(port.device)
         for port in available
         if getattr(port, "vid", None) == MAKCU_VENDOR_ID
         and getattr(port, "pid", None) == MAKCU_PRODUCT_ID
     ]
+    candidate_paths = list(exact_matches)
+    if not candidate_paths:
+        candidate_paths.extend(
+            str(port.device) for port in available if _likely_makcu_path(port)
+        )
+    if use_system_candidates and os.name == "posix":
+        candidate_paths.extend(
+            str(path) for path in sorted(Path("/dev").glob("ttyCH343USB*"))
+        )
+
+    unique: dict[str, str] = {}
+    for path in candidate_paths:
+        if path:
+            display_path = _stable_linux_alias(path) if use_system_candidates else path
+            unique.setdefault(_canonical_port(path), display_path)
+    matches = tuple(unique.values())
     if len(matches) == 1:
         return matches[0]
     if not matches:
-        raise MakcuError("MAKCU 1a86:55d3 serial device was not found")
+        raise MakcuError(
+            "MAKCU 1a86:55d3 serial device was not found. Connect the board's "
+            "USB2 control port and confirm the CH343 COM/serial driver is loaded."
+        )
     raise MakcuError("More than one MAKCU device was found; choose its serial path")
 
 
@@ -258,7 +405,10 @@ class MakcuAimingController:
         self._threaded_output = threaded_output
         self._serial: Any | None = None
         self._button_mask = 0
-        self._last_button_report_ns = 0
+        self._button_state_known = False
+        self._activation_started_ns = 0
+        self._activation_requires_release = False
+        self._button_parser = _ButtonStreamParser()
         self._serial_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -291,6 +441,8 @@ class MakcuAimingController:
         return _list_ports.comports()
 
     def _find_port(self) -> str:
+        if self._ports_provider is None:
+            return detect_makcu_port(requested=self.config.port)
         return detect_makcu_port(
             requested=self.config.port,
             ports_provider=self._available_ports,
@@ -380,7 +532,10 @@ class MakcuAimingController:
         self._serial = self._connect(port)
         self.connected_port = port
         self._button_mask = 0
-        self._last_button_report_ns = 0
+        self._button_state_known = False
+        self._activation_started_ns = 0
+        self._activation_requires_release = False
+        self._button_parser.reset()
         self._worker_error = None
         self._latest_target = None
         self._latest_active = False
@@ -392,7 +547,7 @@ class MakcuAimingController:
         self._previous_error_x = 0.0
         self._previous_error_y = 0.0
         self._previous_error_ns = 0
-        self._command(f"km.buttons(1,{BUTTON_STREAM_PERIOD_MS})")
+        self._command(BUTTON_STREAM_COMMAND)
         should_start_output = self._threaded_output if output_loop is None else output_loop
         if should_start_output:
             self._stop_event.clear()
@@ -413,26 +568,41 @@ class MakcuAimingController:
                 data = self._serial.read(available) if available else b""
         except (OSError, ValueError) as exc:
             raise MakcuError(f"MAKCU button read failed: {exc}") from exc
-        for value in data:
-            if value <= 0x1F and value not in (0x0A, 0x0D):
-                with self._state_lock:
-                    self._button_mask = value
-                    self._last_button_report_ns = current_ns
-                    # A valid release report is authoritative.  Do not keep
-                    # movement active after the physical button is released.
+        for value in self._button_parser.feed(data):
+            with self._state_lock:
+                was_pressed = bool(
+                    self._button_state_known
+                    and self._button_mask & (1 << self.config.activation_button)
+                )
+                self._button_mask = value & 0x1F
+                self._button_state_known = True
+                is_pressed = bool(
+                    self._button_mask & (1 << self.config.activation_button)
+                )
+                if not is_pressed:
+                    self._activation_started_ns = 0
+                    self._activation_requires_release = False
+                elif not was_pressed and not self._activation_requires_release:
+                    self._activation_started_ns = current_ns
+                # A valid release report is authoritative. Do not keep movement
+                # active after the physical button is released.
 
     def _activation_pressed_at(self, now_ns: int) -> bool:
         with self._state_lock:
-            report_ns = self._last_button_report_ns
-            age_ns = now_ns - report_ns
-            if (
-                report_ns == 0
-                or age_ns < 0
-                or age_ns > int(BUTTON_REPORT_STALE_SECONDS * 1_000_000_000)
-            ):
-                self._button_mask = 0
+            pressed = bool(
+                self._button_state_known
+                and self._button_mask & (1 << self.config.activation_button)
+            )
+            if not pressed or self._activation_requires_release:
                 return False
-            return bool(self._button_mask & (1 << self.config.activation_button))
+            if (
+                self._activation_started_ns
+                and now_ns - self._activation_started_ns
+                > int(MAX_CONTINUOUS_ACTIVATION_SECONDS * 1_000_000_000)
+            ):
+                self._activation_requires_release = True
+                return False
+            return True
 
     @property
     def activation_pressed(self) -> bool:
@@ -654,7 +824,9 @@ class MakcuAimingController:
         self.connected_port = None
         with self._state_lock:
             self._button_mask = 0
-            self._last_button_report_ns = 0
+            self._button_state_known = False
+            self._activation_started_ns = 0
+            self._activation_requires_release = False
             self._latest_target = None
             self._latest_active = False
             self._latest_update_ns = 0
@@ -665,3 +837,4 @@ class MakcuAimingController:
         self._previous_error_x = 0.0
         self._previous_error_y = 0.0
         self._previous_error_ns = 0
+        self._button_parser.reset()

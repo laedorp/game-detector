@@ -209,6 +209,8 @@ To enable it safely:
 Output is neutralized immediately when the gate is released, a detector state
 becomes stale, the self filter is unsafe, or the process stops. CLI local output
 also requires an explicit physical input-event gate via `--aim-activate-path`.
+As a missed-release safeguard, one uninterrupted MAKCU activation is capped at
+10 seconds; release and press the gate again to continue.
 `--aim-output remote` is deliberately unavailable because this project has no
 authenticated, physically gated receiver.
 

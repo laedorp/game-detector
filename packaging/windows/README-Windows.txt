@@ -62,7 +62,9 @@ software.
 
 Output returns to neutral immediately when the gate is released, detections go
 stale, the self filter is unsafe, or ProAim stops. Remote output is unavailable
-because no authenticated, physically gated receiver is included.
+because no authenticated, physically gated receiver is included. One
+uninterrupted MAKCU activation is capped at 10 seconds as a missed-release
+safeguard; release and press the gate again to continue.
 
 CONTROLLERS
 
