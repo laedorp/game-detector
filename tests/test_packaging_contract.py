@@ -273,7 +273,7 @@ class PackagingContractTests(unittest.TestCase):
         for script in (LINUX_BUILD, MAKCU_ACCESS_INSTALLER):
             with self.subTest(script=script):
                 result = subprocess.run(
-                    ["bash", "-n", str(script)],
+                    ["bash", "-n", script.as_posix()],
                     check=False,
                     capture_output=True,
                     text=True,

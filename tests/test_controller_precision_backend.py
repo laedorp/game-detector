@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import errno
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -186,6 +187,7 @@ class ControllerDiscoveryTests(unittest.TestCase):
         (device / "capabilities" / "key").write_text(key_mask, encoding="utf-8")
         return event_path
 
+    @unittest.skipIf(os.name == "nt", "Linux by-id symlinks are POSIX-only")
     def test_persistent_by_id_path_is_preferred_and_metadata_is_read(self) -> None:
         self.add_event(
             "event17",

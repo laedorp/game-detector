@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 import tempfile
 import unittest
@@ -62,6 +63,7 @@ class LinuxScanTests(unittest.TestCase):
         self.assertTrue(processor.name)
         self.assertEqual(processor.flags, frozenset())
 
+    @unittest.skipIf(os.name == "nt", "Linux PCI sysfs slot names are POSIX-only")
     def test_display_and_accelerator_classes_are_recognized(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -87,6 +89,7 @@ class LinuxScanTests(unittest.TestCase):
         self.assertEqual(kinds.count(AcceleratorKind.NPU), 1)
         self.assertEqual(len(found), 3)
 
+    @unittest.skipIf(os.name == "nt", "Linux PCI sysfs slot names are POSIX-only")
     def test_dedicated_video_memory_marks_a_card_discrete(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -103,6 +106,7 @@ class LinuxScanTests(unittest.TestCase):
         self.assertIs(by_vendor[Vendor.AMD].discrete, True)
         self.assertIs(by_vendor[Vendor.INTEL].discrete, False)
 
+    @unittest.skipIf(os.name == "nt", "Linux PCI sysfs slot names are POSIX-only")
     def test_unclassifiable_gpu_placement_stays_unknown_rather_than_guessing(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

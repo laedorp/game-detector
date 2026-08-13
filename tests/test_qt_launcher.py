@@ -326,6 +326,7 @@ class QtLauncherTests(unittest.TestCase):
         self.assertTrue(window._stop_requested)
         window.process = None
 
+    @unittest.skipIf(os.name == "nt", "Controller precision is Linux-only")
     def test_precision_verification_binds_device_and_calibration(self) -> None:
         selected = controller()
         window = self.window(
