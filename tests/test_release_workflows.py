@@ -12,6 +12,7 @@ RELEASE_WORKFLOW = WORKFLOW_DIR / "release-bundles.yml"
 WINDOWS_WORKFLOW = WORKFLOW_DIR / "build-windows.yml"
 LINUX_BUILD = PROJECT_ROOT / "scripts" / "build_linux_app.sh"
 WINDOWS_BUILD = PROJECT_ROOT / "scripts" / "build_windows_app.ps1"
+GIT_ATTRIBUTES = PROJECT_ROOT / ".gitattributes"
 
 RUNTIME_REQUIREMENTS = {
     "cpu": "onnxruntime==1.28.0",
@@ -70,6 +71,12 @@ class RuntimeRequirementContractTests(unittest.TestCase):
 
 
 class ReleaseWorkflowContractTests(unittest.TestCase):
+    def test_release_assets_have_cross_platform_checkout_bytes(self) -> None:
+        source = _source(GIT_ATTRIBUTES)
+        self.assertIn("* text=auto eol=lf", source)
+        self.assertIn("*.bin binary", source)
+        self.assertIn("*.onnx binary", source)
+
     def test_ci_tests_linux_cpu_and_windows_directml(self) -> None:
         source = _source(CI_WORKFLOW)
         self.assertIn("branches: [main]", source)
