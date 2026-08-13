@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 from aiming.makcu import (
-    BUTTON_REPORT_STALE_SECONDS,
-    BUTTON_STREAM_PERIOD_MS,
+    MAX_CONTINUOUS_ACTIVATION_SECONDS,
     MAKCU_BAUD_CHANGE,
     MAKCU_FAST_BAUD,
     MAKCU_PRODUCT_ID,
@@ -25,8 +26,8 @@ from detection.types import Detection
 @dataclass(frozen=True)
 class FakePort:
     device: str
-    vid: int
-    pid: int
+    vid: int | None
+    pid: int | None
 
 
 class FakeSerial:
@@ -107,7 +108,7 @@ class MakcuAimingTests(unittest.TestCase):
         self.assertEqual(self.factory.state["device_baud"], MAKCU_FAST_BAUD)
         active = self.factory.connections[-1]
         self.assertEqual(active.baudrate, MAKCU_FAST_BAUD)
-        self.assertIn(f"km.buttons(1,{BUTTON_STREAM_PERIOD_MS})\r".encode(), active.writes)
+        self.assertEqual(active.writes[-1], b"km.buttons(1)\r")
         controller.stop()
         self.assertIn(b"km.buttons(0)\r", active.writes)
         self.assertTrue(active.closed)
@@ -151,6 +152,115 @@ class MakcuAimingTests(unittest.TestCase):
         active.responses.extend(bytes((0,)))
         self.assertEqual(controller.poll_button_mask(now_ns=now_ns + 10_000_000), 0)
 
+    def test_framed_button_masks_survive_split_reads_and_ignore_prompt_noise(self) -> None:
+        controller = self.controller()
+        controller.start()
+        active = self.factory.connections[-1]
+        now_ns = 2_000_000_000
+
+        # Current MAKCU firmware frames a raw five-bit mask after this prefix.
+        for chunk in (b"km.but", b"tons", bytes((0b00010,)), b"\r", b"\n>>> "):
+            active.responses.extend(chunk)
+            controller.poll_button_mask(now_ns=now_ns)
+            now_ns += 1_000_000
+        self.assertEqual(controller.poll_button_mask(now_ns=now_ns), 0b00010)
+
+        # Command acknowledgements, prompts, and terminal control sequences are
+        # not mouse reports even though they can contain values below 0x20.
+        active.responses.extend(b"\x06km.buttons(1)\r\n>>> \x1b[2K")
+        self.assertEqual(controller.poll_button_mask(now_ns=now_ns + 1), 0b00010)
+
+        for chunk in (b"km.buttons", bytes((0,)), b"\r\n", b">>> "):
+            active.responses.extend(chunk)
+            controller.poll_button_mask(now_ns=now_ns)
+            now_ns += 1_000_000
+        self.assertEqual(controller.poll_button_mask(now_ns=now_ns), 0)
+
+    def test_every_frame_split_preserves_press_and_zero_release(self) -> None:
+        for prefix in (b"km.buttons", b"km."):
+            press = prefix + bytes((0b00010,)) + b"\r\n>>> "
+            release = prefix + bytes((0,)) + b"\r\n>>> "
+
+            for boundary in range(len(press) + 1):
+                with self.subTest(prefix=prefix, event="press", boundary=boundary):
+                    controller = self.controller()
+                    controller.start()
+                    active = self.factory.connections[-1]
+                    try:
+                        active.responses.extend(press[:boundary])
+                        controller.poll_button_mask(now_ns=1_000_000_000)
+                        active.responses.extend(press[boundary:])
+                        self.assertEqual(
+                            controller.poll_button_mask(now_ns=1_000_000_001),
+                            0b00010,
+                        )
+                    finally:
+                        controller.stop()
+
+            for boundary in range(len(release) + 1):
+                with self.subTest(prefix=prefix, event="release", boundary=boundary):
+                    controller = self.controller()
+                    controller.start()
+                    active = self.factory.connections[-1]
+                    try:
+                        active.responses.extend(press)
+                        self.assertEqual(
+                            controller.poll_button_mask(now_ns=2_000_000_000),
+                            0b00010,
+                        )
+                        active.responses.extend(release[:boundary])
+                        controller.poll_button_mask(now_ns=2_000_000_001)
+                        active.responses.extend(release[boundary:])
+                        self.assertEqual(
+                            controller.poll_button_mask(now_ns=2_000_000_002),
+                            0,
+                        )
+                    finally:
+                        controller.stop()
+
+    def test_every_coalesced_frame_pair_split_preserves_zero_release(self) -> None:
+        for prefix in (b"km.buttons", b"km."):
+            press = prefix + bytes((0b00010,)) + b"\r\n>>> "
+            release = prefix + bytes((0,)) + b"\r\n>>> "
+            events = press + release
+
+            # This includes boundaries inside both prefixes and the case where
+            # the first terminator and following release arrive in one read.
+            for boundary in range(len(events) + 1):
+                with self.subTest(prefix=prefix, boundary=boundary):
+                    controller = self.controller()
+                    controller.start()
+                    active = self.factory.connections[-1]
+                    try:
+                        active.responses.extend(events[:boundary])
+                        controller.poll_button_mask(now_ns=3_000_000_000)
+                        active.responses.extend(events[boundary:])
+                        self.assertEqual(
+                            controller.poll_button_mask(now_ns=3_000_000_001),
+                            0,
+                        )
+                    finally:
+                        controller.stop()
+
+    def test_legacy_raw_button_masks_remain_supported_across_reads(self) -> None:
+        controller = self.controller()
+        controller.start()
+        active = self.factory.connections[-1]
+        now_ns = 3_000_000_000
+
+        active.responses.extend(bytes((0b00010,)))
+        self.assertEqual(controller.poll_button_mask(now_ns=now_ns), 0b00010)
+        active.responses.extend(bytes((0,)))
+        self.assertEqual(controller.poll_button_mask(now_ns=now_ns + 1), 0)
+
+        # Native-compatible firmware has also used the shorter km.<mask>
+        # framing. Its prefix may be divided by arbitrary serial read bounds.
+        for chunk in (b"k", b"m.", bytes((0b00010,)), b"\r\n>>> "):
+            active.responses.extend(chunk)
+            controller.poll_button_mask(now_ns=now_ns)
+            now_ns += 1_000_000
+        self.assertEqual(controller.poll_button_mask(now_ns=now_ns), 0b00010)
+
     def test_valid_release_report_stops_activation_immediately(self) -> None:
         controller = self.controller()
         controller.start()
@@ -162,17 +272,45 @@ class MakcuAimingTests(unittest.TestCase):
         active.responses.extend(bytes((0,)))
         self.assertFalse(controller.poll_activation(now_ns=now_ns + 1))
 
-    def test_stale_button_report_fails_closed_if_release_is_lost(self) -> None:
+    def test_event_driven_press_remains_active_until_authoritative_release(self) -> None:
         controller = self.controller()
         controller.start()
         active = self.factory.connections[-1]
         pressed_ns = 1_000_000_000
-        active.responses.extend(bytes((0b00010,)))
+        active.responses.extend(b"km.buttons" + bytes((0b00010,)) + b"\r\n>>> ")
         self.assertTrue(controller.poll_activation(now_ns=pressed_ns))
 
-        stale_ns = pressed_ns + int((BUTTON_REPORT_STALE_SECONDS + 0.01) * 1e9)
-        self.assertFalse(controller.poll_activation(now_ns=stale_ns))
-        self.assertEqual(controller.poll_button_mask(now_ns=stale_ns + 1), 0)
+        # Button callbacks are event-driven: silence is a held button, not a
+        # stale sample. This intentionally exceeds the v1.0.9 150 ms timeout.
+        held_ns = pressed_ns + 1_000_000_000
+        self.assertTrue(controller.poll_activation(now_ns=held_ns))
+        self.assertEqual(controller.poll_button_mask(now_ns=held_ns + 1), 0b00010)
+
+        active.responses.extend(b"km.buttons" + bytes((0,)) + b"\r\n>>> ")
+        self.assertFalse(controller.poll_activation(now_ns=held_ns + 2))
+        self.assertEqual(controller.poll_button_mask(now_ns=held_ns + 3), 0)
+
+    def test_continuous_activation_is_bounded_and_requires_release(self) -> None:
+        controller = self.controller()
+        controller.start()
+        active = self.factory.connections[-1]
+        pressed_ns = 1_000_000_000
+        active.responses.extend(b"km.buttons" + bytes((0b00010,)) + b"\r\n>>> ")
+        self.assertTrue(controller.poll_activation(now_ns=pressed_ns))
+
+        expired_ns = pressed_ns + int(
+            (MAX_CONTINUOUS_ACTIVATION_SECONDS + 0.01) * 1_000_000_000
+        )
+        self.assertFalse(controller.poll_activation(now_ns=expired_ns))
+
+        # Another press without an observed release cannot re-authorize output.
+        active.responses.extend(b"km.buttons" + bytes((0b00010,)) + b"\r\n>>> ")
+        self.assertFalse(controller.poll_activation(now_ns=expired_ns + 1))
+
+        active.responses.extend(b"km.buttons" + bytes((0,)) + b"\r\n>>> ")
+        self.assertFalse(controller.poll_activation(now_ns=expired_ns + 2))
+        active.responses.extend(b"km.buttons" + bytes((0b00010,)) + b"\r\n>>> ")
+        self.assertTrue(controller.poll_activation(now_ns=expired_ns + 3))
 
     def test_1000hz_ticks_preserve_fractional_motion_and_stop_when_stale(self) -> None:
         controller = self.controller(
@@ -224,14 +362,16 @@ class MakcuAimingTests(unittest.TestCase):
     def test_detect_makcu_port_rejects_missing_or_multiple_boards(self) -> None:
         with self.assertRaisesRegex(MakcuError, "was not found"):
             detect_makcu_port(ports_provider=lambda: ())
+        second = FakePort("/dev/ttyACM1", MAKCU_VENDOR_ID, MAKCU_PRODUCT_ID)
         with self.assertRaisesRegex(MakcuError, "More than one MAKCU"):
-            detect_makcu_port(ports_provider=lambda: (self.port, self.port))
+            detect_makcu_port(ports_provider=lambda: (self.port, second))
 
-    def test_requested_port_must_be_the_enumerated_makcu_usb_device(self) -> None:
+    def test_requested_port_accepts_missing_metadata_but_rejects_mismatch(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             selected = Path(directory) / "ttyUSB0"
             selected.touch()
             correct = FakePort(str(selected), MAKCU_VENDOR_ID, MAKCU_PRODUCT_ID)
+            metadata_less = FakePort(str(selected), None, None)
             wrong = FakePort(str(selected), 0x1234, 0x5678)
 
             self.assertEqual(
@@ -240,14 +380,55 @@ class MakcuAimingTests(unittest.TestCase):
                 ),
                 str(selected),
             )
+            self.assertEqual(
+                detect_makcu_port(
+                    requested=str(selected), ports_provider=lambda: (metadata_less,)
+                ),
+                str(selected),
+            )
             with self.assertRaisesRegex(MakcuError, "not the expected MAKCU"):
                 detect_makcu_port(
                     requested=str(selected), ports_provider=lambda: (wrong,)
                 )
-            with self.assertRaisesRegex(MakcuError, "not one uniquely enumerated"):
-                detect_makcu_port(
-                    requested=str(selected), ports_provider=lambda: ()
-                )
+            # An explicit device path can be firmware-probed even when pyserial
+            # supplies no USB metadata or omits it from enumeration entirely.
+            self.assertEqual(
+                detect_makcu_port(requested=str(selected), ports_provider=lambda: ()),
+                str(selected),
+            )
+
+    @unittest.skipIf(os.name == "nt", "ttyCH343USB paths are Linux-specific")
+    def test_detects_linux_tty_ch343_path_without_usb_metadata(self) -> None:
+        port = FakePort("/dev/ttyCH343USB0", None, None)
+
+        self.assertEqual(
+            detect_makcu_port(ports_provider=lambda: (port,)),
+            "/dev/ttyCH343USB0",
+        )
+
+    @unittest.skipUnless(os.name == "posix", "system tty discovery is Linux-only")
+    def test_controller_auto_discovery_includes_system_tty_ch343_candidates(self) -> None:
+        candidate = Path("/dev/ttyCH343USB7")
+        list_ports = mock.Mock()
+        list_ports.comports.return_value = ()
+        controller = MakcuAimingController(
+            serial_factory=self.factory,
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+
+        with (
+            mock.patch("aiming.makcu._list_ports", list_ports),
+            mock.patch.object(Path, "glob", return_value=(candidate,)),
+            mock.patch.object(Path, "is_dir", return_value=False),
+        ):
+            controller.start()
+
+        try:
+            self.assertEqual(controller.connected_port, str(candidate))
+            self.assertEqual(self.factory.connections[-1].port, str(candidate))
+        finally:
+            controller.stop()
 
 
 if __name__ == "__main__":
