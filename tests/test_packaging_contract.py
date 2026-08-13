@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 import subprocess
 import unittest
@@ -269,6 +270,7 @@ class PackagingContractTests(unittest.TestCase):
         self.assertIn("Start detection", readme)
         self.assertIn("70-game-detector-makcu.rules", readme)
 
+    @unittest.skipIf(os.name == "nt", "Linux shell syntax is validated on Linux CI")
     def test_linux_build_helper_has_valid_shell_syntax(self) -> None:
         for script in (LINUX_BUILD, MAKCU_ACCESS_INSTALLER):
             with self.subTest(script=script):

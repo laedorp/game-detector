@@ -121,6 +121,7 @@ class QtLauncherTests(unittest.TestCase):
         self.assertIn("without any warranty", text)
         self.assertIn("github.com/laedorp/game-detector", text)
 
+    @unittest.skipIf(os.name == "nt", "Wayland preflight applies only on Linux")
     def test_wayland_screen_capture_is_rejected_before_launch(self) -> None:
         window = self.window(LauncherSettings(source_mode="screen"))
         with (
