@@ -62,7 +62,7 @@ The source dataset identifies its license as **CC BY 4.0**:
 
 https://creativecommons.org/licenses/by/4.0/
 
-Preparation changes made by Game Detector:
+Preparation changes made by ProAim:
 
 - remapped the source labels "0", "Fortnite", "Player"/"player", "bots",
   "enemy", "hello", "people", and "person" to one class named "player";

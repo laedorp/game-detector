@@ -1,18 +1,24 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from numbers import Integral
+from threading import local
 
 import numpy as np
 
 
-_LETTERBOX_WORKSPACE: dict[int, np.ndarray] = {}
+_LETTERBOX_LOCAL = local()
 
 
 def _letterbox_workspace(inference_size: int) -> np.ndarray:
-    workspace = _LETTERBOX_WORKSPACE.get(inference_size)
+    workspaces = getattr(_LETTERBOX_LOCAL, "workspaces", None)
+    if workspaces is None:
+        workspaces = {}
+        _LETTERBOX_LOCAL.workspaces = workspaces
+    workspace = workspaces.get(inference_size)
     if workspace is None:
         workspace = np.empty((inference_size, inference_size, 3), dtype=np.uint8)
-        _LETTERBOX_WORKSPACE[inference_size] = workspace
+        workspaces[inference_size] = workspace
     workspace.fill(114)
     return workspace
 
@@ -62,10 +68,28 @@ def preprocess_frame(
             "OpenCV is not installed. Install the packages from requirements.txt."
         ) from exc
 
+    if isinstance(inference_size, bool) or not isinstance(inference_size, Integral):
+        raise TypeError("inference_size must be a positive integer")
+    inference_size = int(inference_size)
+    if inference_size <= 0:
+        raise ValueError("inference_size must be a positive integer")
+    if crop_size is not None:
+        if isinstance(crop_size, bool) or not isinstance(crop_size, Integral):
+            raise TypeError("crop_size must be a positive integer or None")
+        crop_size = int(crop_size)
+        if crop_size <= 0:
+            raise ValueError("crop_size must be a positive integer or None")
+
+    if not isinstance(frame, np.ndarray):
+        raise TypeError("frame must be a NumPy array")
     if frame.ndim != 3 or frame.shape[2] != 3:
         raise ValueError(f"expected a BGR image with shape HxWx3, got {frame.shape}")
 
     source_height, source_width = frame.shape[:2]
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError(
+            f"expected a non-empty BGR image, got shape {frame.shape}"
+        )
     crop_x = 0
     crop_y = 0
     crop_was_clamped = False

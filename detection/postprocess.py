@@ -11,6 +11,13 @@ from .base import OutputDecodeError
 from .types import Detection
 
 
+# Ultralytics exports can expose thousands of anchors.  Bounding the work before
+# NMS prevents a low confidence threshold or adversarial custom model from
+# turning one frame into seconds of quadratic suppression work.
+MAX_NMS_CANDIDATES = 3_000
+MAX_DETECTIONS = 300
+
+
 class FrameTransformLike(Protocol):
     """Structural contract supplied by ``utils.preprocess.FrameTransform``."""
 
@@ -53,49 +60,150 @@ def class_aware_nms(
         raise ValueError("boxes, scores, and class_ids must have the same length.")
     if not len(boxes):
         return np.empty(0, dtype=np.int64)
+    if not np.isfinite(boxes).all() or not np.isfinite(scores).all():
+        raise ValueError("boxes and scores must contain only finite values.")
+    if not np.issubdtype(class_ids.dtype, np.number):
+        raise ValueError("class_ids must contain integer values.")
+    numeric_class_ids = class_ids.astype(np.float64, copy=False)
+    if (
+        not np.isfinite(numeric_class_ids).all()
+        or not np.equal(numeric_class_ids, np.rint(numeric_class_ids)).all()
+    ):
+        raise ValueError("class_ids must contain finite integer values.")
 
-    kept: list[int] = []
-    for class_id in np.unique(class_ids):
-        candidates = np.flatnonzero(class_ids == class_id)
-        order = candidates[np.argsort(-scores[candidates], kind="stable")]
+    original_indices = np.arange(len(boxes), dtype=np.int64)
+    if len(boxes) > MAX_NMS_CANDIDATES:
+        candidate_order = np.argsort(-scores, kind="stable")[:MAX_NMS_CANDIDATES]
+        boxes = boxes[candidate_order]
+        scores = scores[candidate_order]
+        class_ids = class_ids[candidate_order]
+        original_indices = original_indices[candidate_order]
 
-        while order.size:
-            current = int(order[0])
-            kept.append(current)
-            if order.size == 1:
-                break
+    kept_local: np.ndarray | None = None
+    try:
+        import cv2
 
-            remaining = order[1:]
-            current_box = boxes[current]
-            other_boxes = boxes[remaining]
-
-            inter_x1 = np.maximum(current_box[0], other_boxes[:, 0])
-            inter_y1 = np.maximum(current_box[1], other_boxes[:, 1])
-            inter_x2 = np.minimum(current_box[2], other_boxes[:, 2])
-            inter_y2 = np.minimum(current_box[3], other_boxes[:, 3])
-            inter_w = np.maximum(0.0, inter_x2 - inter_x1)
-            inter_h = np.maximum(0.0, inter_y2 - inter_y1)
-            intersection = inter_w * inter_h
-
-            current_area = max(
-                0.0,
-                float(current_box[2] - current_box[0]),
-            ) * max(0.0, float(current_box[3] - current_box[1]))
-            other_areas = np.maximum(0.0, other_boxes[:, 2] - other_boxes[:, 0]) * np.maximum(
-                0.0,
-                other_boxes[:, 3] - other_boxes[:, 1],
+        nms_batched = getattr(cv2.dnn, "NMSBoxesBatched", None)
+        if nms_batched is not None:
+            xywh = boxes.copy()
+            xywh[:, 2] -= xywh[:, 0]
+            xywh[:, 3] -= xywh[:, 1]
+            indices = nms_batched(
+                xywh.tolist(),
+                scores.tolist(),
+                class_ids.astype(np.int32, copy=False).tolist(),
+                -1.0,
+                iou_threshold,
+                # Limiting OpenCV's top_k here would discard lower-scoring,
+                # non-overlapping boxes before suppression. Apply the output
+                # cap only after all bounded candidates have been considered.
+                top_k=0,
             )
-            union = current_area + other_areas - intersection
-            iou = np.divide(
-                intersection,
-                union,
-                out=np.zeros_like(intersection),
-                where=union > 0.0,
-            )
-            order = remaining[iou <= iou_threshold]
+            kept_local = np.asarray(indices, dtype=np.int64).reshape(-1)
+    except Exception:
+        # The bounded NumPy fallback keeps headless/minimal OpenCV builds usable.
+        kept_local = None
 
-    result = np.asarray(kept, dtype=np.int64)
-    return result[np.argsort(-scores[result], kind="stable")]
+    if kept_local is None:
+        kept: list[int] = []
+        for class_id in np.unique(class_ids):
+            candidates = np.flatnonzero(class_ids == class_id)
+            order = candidates[np.argsort(-scores[candidates], kind="stable")]
+            class_kept = 0
+
+            while order.size and class_kept < MAX_DETECTIONS:
+                current = int(order[0])
+                kept.append(current)
+                class_kept += 1
+                if order.size == 1:
+                    break
+
+                remaining = order[1:]
+                current_box = boxes[current]
+                other_boxes = boxes[remaining]
+
+                inter_x1 = np.maximum(current_box[0], other_boxes[:, 0])
+                inter_y1 = np.maximum(current_box[1], other_boxes[:, 1])
+                inter_x2 = np.minimum(current_box[2], other_boxes[:, 2])
+                inter_y2 = np.minimum(current_box[3], other_boxes[:, 3])
+                inter_w = np.maximum(0.0, inter_x2 - inter_x1)
+                inter_h = np.maximum(0.0, inter_y2 - inter_y1)
+                intersection = inter_w * inter_h
+
+                current_area = max(
+                    0.0,
+                    float(current_box[2] - current_box[0]),
+                ) * max(0.0, float(current_box[3] - current_box[1]))
+                other_areas = np.maximum(
+                    0.0, other_boxes[:, 2] - other_boxes[:, 0]
+                ) * np.maximum(
+                    0.0,
+                    other_boxes[:, 3] - other_boxes[:, 1],
+                )
+                union = current_area + other_areas - intersection
+                iou = np.divide(
+                    intersection,
+                    union,
+                    out=np.zeros_like(intersection),
+                    where=union > 0.0,
+                )
+                order = remaining[iou <= iou_threshold]
+        kept_local = np.asarray(kept, dtype=np.int64)
+
+    result = original_indices[kept_local]
+    # Use the original row as an explicit tie-breaker; OpenCV's internal order
+    # is not part of its API and has changed between releases.
+    order = np.lexsort((result, -scores[kept_local]))
+    return result[order][:MAX_DETECTIONS]
+
+
+def supported_yolo_output_layout(
+    shape: Sequence[object],
+    label_count: int,
+    output_format: str = "auto",
+) -> str | None:
+    """Return the decoder layout for an inspected model output, if supported."""
+
+    output_format = str(output_format).lower()
+    if output_format not in {"auto", "end2end", "traditional"}:
+        return None
+    dimensions = tuple(shape)
+    if (
+        len(dimensions) != 3
+        or isinstance(dimensions[0], (bool, np.bool_))
+        or dimensions[0] != 1
+    ):
+        return None
+    rows, columns = dimensions[1:]
+    for value in (rows, columns):
+        if value is not None and not isinstance(value, (str, int, np.integer)):
+            return None
+        if isinstance(value, (int, np.integer)) and (
+            isinstance(value, (bool, np.bool_)) or int(value) <= 0
+        ):
+            return None
+
+    if output_format in {"auto", "end2end"} and columns == 6:
+        return "end2end"
+    if output_format == "end2end":
+        return None
+
+    attributes = label_count + 4 if label_count > 0 else None
+    if attributes is not None:
+        if columns == attributes:
+            return "traditional_rows"
+        if rows == attributes:
+            return "traditional_columns"
+        return None
+
+    # Without labels the decoder can still safely inspect a fully static matrix,
+    # but a dynamic attribute axis is ambiguous and should be rejected at load.
+    if isinstance(rows, (int, np.integer)) and isinstance(columns, (int, np.integer)):
+        if columns >= 5 and (rows < 5 or columns <= rows):
+            return "traditional_rows"
+        if rows >= 5:
+            return "traditional_columns"
+    return None
 
 
 def _as_prediction_matrix(raw: np.ndarray) -> np.ndarray:
@@ -297,7 +405,7 @@ def decode_yolo_output(
         boxes = boxes[valid]
         scores = scores[valid]
         class_ids = class_ids[valid]
-        order = np.argsort(-scores, kind="stable")
+        order = np.argsort(-scores, kind="stable")[:MAX_DETECTIONS]
         return _to_detections(boxes[order], scores[order], class_ids[order], labels)
 
     predictions = _traditional_predictions(output, len(labels))
@@ -310,9 +418,13 @@ def decode_yolo_output(
     if not np.any(selected):
         return []
 
-    boxes_xywh = boxes_xywh[selected]
-    scores = scores[selected].astype(np.float32, copy=False)
-    class_ids = class_ids[selected].astype(np.int64, copy=False)
+    selected_indices = np.flatnonzero(selected)
+    if len(selected_indices) > MAX_NMS_CANDIDATES:
+        candidate_order = np.argsort(-scores[selected_indices], kind="stable")
+        selected_indices = selected_indices[candidate_order[:MAX_NMS_CANDIDATES]]
+    boxes_xywh = boxes_xywh[selected_indices]
+    scores = scores[selected_indices].astype(np.float32, copy=False)
+    class_ids = class_ids[selected_indices].astype(np.int64, copy=False)
     boxes = np.empty_like(boxes_xywh, dtype=np.float32)
     boxes[:, 0] = boxes_xywh[:, 0] - boxes_xywh[:, 2] / 2.0
     boxes[:, 1] = boxes_xywh[:, 1] - boxes_xywh[:, 3] / 2.0
@@ -335,4 +447,9 @@ def decode_yolo_output(
     scores = scores[kept][valid_source_boxes]
     class_ids = class_ids[kept][valid_source_boxes]
     boxes = boxes[valid_source_boxes]
-    return _to_detections(boxes, scores, class_ids, labels)
+    return _to_detections(
+        boxes[:MAX_DETECTIONS],
+        scores[:MAX_DETECTIONS],
+        class_ids[:MAX_DETECTIONS],
+        labels,
+    )

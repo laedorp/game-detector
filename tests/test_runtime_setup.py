@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 import subprocess
 import sys
 import tempfile
@@ -11,8 +12,11 @@ from detection.runtime_setup import (
     DISTRIBUTION_DIRECTML,
     DISTRIBUTION_NVIDIA,
     DISTRIBUTION_ROCM,
+    RUNTIME_REQUIREMENTS,
+    RUNTIME_ROOT_ENV,
     RuntimeSetupError,
     activate,
+    activate_configured_runtime,
     describe,
     ensure_runtime,
     install_root,
@@ -65,9 +69,14 @@ class EnsureRuntimeTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         self.settings = Path(self.temporary.name)
         self._original_path = list(sys.path)
+        self._original_runtime_root = os.environ.get(RUNTIME_ROOT_ENV)
 
     def tearDown(self) -> None:
         sys.path[:] = self._original_path
+        if self._original_runtime_root is None:
+            os.environ.pop(RUNTIME_ROOT_ENV, None)
+        else:
+            os.environ[RUNTIME_ROOT_ENV] = self._original_runtime_root
         self.temporary.cleanup()
 
     def test_an_already_correct_install_downloads_nothing(self) -> None:
@@ -119,7 +128,7 @@ class EnsureRuntimeTests(unittest.TestCase):
 
         self.assertEqual(len(calls), 1)
         command = calls[0]
-        self.assertIn(DISTRIBUTION_ROCM, command)
+        self.assertIn(RUNTIME_REQUIREMENTS[DISTRIBUTION_ROCM], command)
         self.assertIn("--target", command)
         # The install must land beside the user's settings, never inside the
         # application directory, which may be read-only or shared.
@@ -163,14 +172,44 @@ class EnsureRuntimeTests(unittest.TestCase):
         )
 
         self.assertEqual(sys.path[0], str(target))
+        self.assertEqual(os.environ[RUNTIME_ROOT_ENV], str(target))
+
+    def test_frozen_app_refuses_to_invoke_itself_as_pip(self) -> None:
+        calls = []
+        with self.assertRaisesRegex(RuntimeSetupError, "bundle that matches this GPU"):
+            ensure_runtime(
+                plan_for("nvidia", "linux"),
+                self.settings,
+                runner=lambda command: calls.append(list(command)),
+                already_installed=None,
+                frozen=True,
+            )
+        self.assertEqual(calls, [])
+
+    def test_explicit_interpreter_is_used_for_source_install(self) -> None:
+        calls: list[list[str]] = []
+        ensure_runtime(
+            plan_for("amd", "linux"),
+            self.settings,
+            runner=lambda command: calls.append(list(command)) or completed(),
+            already_installed=None,
+            interpreter="/opt/proaim-python",
+            frozen=False,
+        )
+        self.assertEqual(calls[0][0], "/opt/proaim-python")
 
 
 class ActivateTests(unittest.TestCase):
     def setUp(self) -> None:
         self._original_path = list(sys.path)
+        self._original_runtime_root = os.environ.get(RUNTIME_ROOT_ENV)
 
     def tearDown(self) -> None:
         sys.path[:] = self._original_path
+        if self._original_runtime_root is None:
+            os.environ.pop(RUNTIME_ROOT_ENV, None)
+        else:
+            os.environ[RUNTIME_ROOT_ENV] = self._original_runtime_root
 
     def test_a_missing_directory_is_not_added(self) -> None:
         self.assertFalse(activate(Path("/nonexistent-runtime-directory")))
@@ -181,6 +220,21 @@ class ActivateTests(unittest.TestCase):
             self.assertTrue(activate(target))
             self.assertTrue(activate(target))
             self.assertEqual(sys.path.count(str(target)), 1)
+
+    def test_configured_runtime_environment_is_activated(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            os.environ[RUNTIME_ROOT_ENV] = temporary
+            self.assertTrue(activate_configured_runtime(frozen=False))
+            self.assertEqual(sys.path[0], temporary)
+
+    def test_frozen_bundle_never_activates_external_runtime(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            original_path = list(sys.path)
+            os.environ[RUNTIME_ROOT_ENV] = temporary
+
+            self.assertFalse(activate_configured_runtime(frozen=True))
+            self.assertEqual(sys.path, original_path)
+            self.assertEqual(os.environ[RUNTIME_ROOT_ENV], temporary)
 
 
 class DescribeTests(unittest.TestCase):

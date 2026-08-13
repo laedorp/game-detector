@@ -7,7 +7,7 @@ from time import perf_counter_ns
 from config import AppConfig, parse_args
 
 
-WINDOW_NAME = "Game Detector"
+WINDOW_NAME = "ProAim"
 
 
 def _build_capture(config: AppConfig):
@@ -153,7 +153,82 @@ def _start_optional_aiming(aim_controller, aim_sensor):
     return aim_controller, aim_sensor
 
 
+def _validate_aim_safety(config: AppConfig) -> None:
+    """Reject fail-open aiming configurations even when parse_args was bypassed."""
+
+    if not config.aim:
+        return
+    if not (config.aim_label or "").strip():
+        raise ValueError("Detection-driven aim requires an explicit target label")
+    if not config.ignore_self:
+        raise ValueError(
+            "Detection-driven aim requires the third-person self filter to be enabled"
+        )
+    if config.aim_output == "remote":
+        raise ValueError(
+            "Remote aim is unavailable because no authenticated, physically gated "
+            "receiver is included"
+        )
+    if config.aim_output == "local" and not (config.aim_activate_path or "").strip():
+        raise ValueError("Local aim requires an explicit physical activation device")
+
+
+def _update_aim_target(
+    tracker,
+    detections,
+    frame_shape: tuple[int, ...],
+    *,
+    self_exclusion_safe: bool,
+    aim_runtime_enabled: bool = True,
+):
+    """Select a target, dropping all tracker history when self filtering is unsafe."""
+
+    if tracker is None:
+        return None
+    if not aim_runtime_enabled:
+        tracker.reset()
+        return None
+    if not self_exclusion_safe:
+        tracker.reset()
+        return None
+    return tracker.update(detections, frame_shape)
+
+
+def _aim_status(
+    *,
+    runtime_enabled: bool,
+    self_exclusion_ready: bool,
+    selected_target,
+    engaged: bool,
+    activation_name: str,
+    control_description: str,
+) -> str | None:
+    """Describe live aiming only when its optional output actually started."""
+
+    if not runtime_enabled:
+        return None
+    if not self_exclusion_ready and selected_target is None:
+        return "aim blocked: waiting for confident self-avatar exclusion"
+    if selected_target is None:
+        return (
+            f"aim armed: {activation_name} held, waiting for target"
+            if engaged
+            else "aim: no matching target"
+        )
+    if engaged:
+        return (
+            f"aim active: {activation_name} held, {control_description}"
+            if not self_exclusion_ready
+            else (
+                f"aim active: {activation_name} held, {control_description}, "
+                "tracking selected head"
+            )
+        )
+    return f"aim ready: hold {activation_name} to track selected head"
+
+
 def run(config: AppConfig) -> int:
+    _validate_aim_safety(config)
     try:
         import cv2
     except ImportError as exc:
@@ -171,10 +246,9 @@ def run(config: AppConfig) -> int:
         MakcuAimConfig,
         MakcuAimingController,
         TargetTracker,
-        UdpAimingController,
-        choose_target,
         head_target_point,
     )
+    from aiming.makcu import BUTTON_NAMES
     from utils.metrics import FrameTimings, RollingMetrics
     from utils.preprocess import preprocess_frame
     from utils.render import (
@@ -223,30 +297,29 @@ def run(config: AppConfig) -> int:
     self_filter = SelfAvatarFilter(self_zone) if self_zone is not None else None
     last_ignored_count: int | None = 0 if self_zone is not None else None
     last_ignored_detection = None
-    aim_controller: AimingController | UdpAimingController | MakcuAimingController | None = None
+    aim_controller: AimingController | MakcuAimingController | None = None
     aim_sensor: AimActivationSensor | None = None
     target_tracker: TargetTracker | None = None
+    aim_runtime_enabled = False
+    aim_activation_name = "physical control"
+    aim_control_description = "gated output"
     if config.aim:
         target_tracker = TargetTracker(
             label=config.aim_label,
             head_ratio=config.aim_head_ratio,
-            lost_grace_frames=18,
+            # Output must fail closed on the first missed measurement.  The
+            # general tracker supports prediction grace for visualization,
+            # but carrying a predicted target into a physical output path can
+            # keep stale movement alive when inference drops a frame.
+            lost_grace_frames=0,
         )
         aim_config = AimConfig(
             invert_x=config.aim_invert_x,
             invert_y=config.aim_invert_y,
             head_ratio=config.aim_head_ratio,
         )
-        if config.aim_output == "remote":
-            assert config.aim_host is not None
-            assert config.aim_pairing_key is not None
-            aim_controller = UdpAimingController(
-                config.aim_host,
-                config.aim_port,
-                config.aim_pairing_key,
-                aim_config,
-            )
-        elif config.aim_output == "makcu":
+        if config.aim_output == "makcu":
+            aim_activation_name = BUTTON_NAMES[config.aim_makcu_button]
             aim_controller = MakcuAimingController(
                 MakcuAimConfig(
                     port=config.aim_makcu_port or "",
@@ -261,9 +334,12 @@ def run(config: AppConfig) -> int:
                     head_ratio=config.aim_head_ratio,
                 )
             )
+            aim_control_description = f"{aim_controller.config.output_hz} Hz control"
         else:
             aim_controller = AimingController(aim_config)
-        if config.aim_output == "local" and config.aim_activate_path:
+        if config.aim_output == "local":
+            aim_activation_name = "LT"
+            assert config.aim_activate_path is not None
             aim_sensor = AimActivationSensor(
                 config.aim_activate_path,
                 axis=config.aim_activate_axis,
@@ -271,28 +347,6 @@ def run(config: AppConfig) -> int:
             )
 
     _print_startup(detector, source)
-    if aim_controller is not None:
-        if config.aim_output == "remote":
-            activation = "gaming-PC receiver LT"
-            output = f"remote {config.aim_host}:{config.aim_port}"
-        elif config.aim_output == "makcu":
-            activation = (
-                f"MAKCU mouse button {config.aim_makcu_button} | "
-                f"control loop {aim_controller.config.output_hz} Hz"
-            )
-            output = f"MAKCU {config.aim_makcu_port or 'auto-detect'}"
-        else:
-            activation = (
-                f"LT axis {config.aim_activate_axis} on {config.aim_activate_path}"
-                if aim_sensor is not None
-                else "always active"
-            )
-            output = "local uinput"
-        target = config.aim_label or "highest-confidence detection"
-        print(
-            f"Detection-driven aim: enabled | target {target} | "
-            f"output {output} | activation {activation}"
-        )
     if self_zone is not None:
         print(
             "Self-avatar filter: enabled heuristic | player-like labels | "
@@ -307,6 +361,32 @@ def run(config: AppConfig) -> int:
             aim_controller,
             aim_sensor,
         )
+        aim_runtime_enabled = aim_controller is not None
+        if not aim_runtime_enabled:
+            # A configured but unavailable output must fail closed. In
+            # particular, do not retain a tracker that could still drive the
+            # "aim ready" overlay or draw a selected aim point.
+            target_tracker = None
+        elif config.aim_output == "makcu":
+            activation = (
+                f"MAKCU mouse button {config.aim_makcu_button} | "
+                f"control loop {aim_controller.config.output_hz} Hz"
+            )
+            output = f"MAKCU {config.aim_makcu_port or 'auto-detect'}"
+            print(
+                f"Detection-driven aim: enabled | target {config.aim_label} | "
+                f"output {output} | activation {activation}"
+            )
+        else:
+            activation = (
+                f"LT axis {config.aim_activate_axis} on {config.aim_activate_path}"
+                if aim_sensor is not None
+                else "always active"
+            )
+            print(
+                f"Detection-driven aim: enabled | target {config.aim_label} | "
+                f"output local uinput | activation {activation}"
+            )
         print(f"Capture settings: {_format_settings(source.actual_settings)}")
         _warn_on_capture_mismatch(config, source.actual_settings)
         if config.preview:
@@ -343,10 +423,9 @@ def run(config: AppConfig) -> int:
                 transform=prepared.transform,
                 frame_shape=packet.image.shape,
             )
-            frame_counter = getattr(main, "_diag_frame_counter", 0) + 1
+            postprocess_completed_ns = perf_counter_ns()
             self_exclusion_ready = self_filter is None
             if self_filter is not None:
-                raw_count = len(detections)
                 exclusion = self_filter.apply(
                     detections,
                     packet.image.shape,
@@ -355,26 +434,11 @@ def run(config: AppConfig) -> int:
                 last_ignored_count = exclusion.ignored_count
                 last_ignored_detection = exclusion.ignored_detection
                 self_exclusion_ready = exclusion.aim_safe
-                # Diagnostic: log filter state every ~30 frames
-                if frame_counter % 30 == 0:
-                    filtered_count = len(detections)
-                    ignored_msg = ""
-                    if last_ignored_detection:
-                        x1, y1, x2, y2 = last_ignored_detection.box
-                        h = y2 - y1
-                        w = x2 - x1
-                        ignored_msg = (
-                            " | currently_locked: "
-                            f"{last_ignored_detection.label} "
-                            f"h={int(h)} w={int(w)} conf={last_ignored_detection.confidence:.2f}"
-                        )
-                    print(f"[FILTER] raw={raw_count} after_filter={filtered_count} aim_safe={self_exclusion_ready}{ignored_msg}", flush=True)
 
             # Hard self guard for aim selection: never select a likely self-avatar
             # candidate from the configured bottom zone, even if temporal lock is
             # not currently confident enough to hide it from the preview list.
             aim_detections = detections
-            self_guard_dropped = 0
             if self_zone is not None and detections:
                 guarded: list = []
                 frame_h, frame_w = packet.image.shape[:2]
@@ -399,34 +463,19 @@ def run(config: AppConfig) -> int:
                             # is imperfect for current framing.
                             fallback_candidates.append((bottom_ratio + height_ratio, detection))
                     if drop_for_aim:
-                        self_guard_dropped += 1
                         continue
                     guarded.append(detection)
                 if fallback_candidates and guarded:
                     fallback_target = max(fallback_candidates, key=lambda item: item[0])[1]
                     guarded = [item for item in guarded if item is not fallback_target]
-                    self_guard_dropped += 1
                 aim_detections = tuple(guarded)
-                if frame_counter % 30 == 0 and self_guard_dropped:
-                    print(
-                        f"[AIM_GUARD] dropped_self_like={self_guard_dropped}",
-                        flush=True,
-                    )
-            main._diag_frame_counter = frame_counter
-            if target_tracker is not None and self_exclusion_ready:
-                selected_aim_target = target_tracker.update(
-                    aim_detections,
-                    packet.image.shape,
-                )
-            else:
-                selected_aim_target = (
-                    target_tracker.update((), packet.image.shape)
-                    if target_tracker is not None
-                    else None
-                )
-                # Diagnostic: log when filter blocks aim but tracker still returns a target
-                if target_tracker is not None and frame_counter % 30 == 0:
-                    print(f"[AIM] aim_safe={self_exclusion_ready} selected_target={selected_aim_target is not None}", flush=True)
+            selected_aim_target = _update_aim_target(
+                target_tracker,
+                aim_detections,
+                packet.image.shape,
+                self_exclusion_safe=self_exclusion_ready,
+                aim_runtime_enabled=aim_runtime_enabled,
+            )
             aim_engaged = False
             if aim_controller is not None:
                 active = True
@@ -442,22 +491,14 @@ def run(config: AppConfig) -> int:
                     if isinstance(aim_controller, MakcuAimingController)
                     else active
                 )
-            if config.aim and not self_exclusion_ready and selected_aim_target is None:
-                aim_status = "aim blocked: waiting for confident self-avatar exclusion"
-            elif selected_aim_target is None:
-                aim_status = (
-                    "aim armed: Right held, waiting for target"
-                    if aim_engaged
-                    else "aim: no matching target"
-                )
-            elif aim_engaged:
-                aim_status = (
-                    "aim active: Right held, 1000 Hz control, target grace"
-                    if not self_exclusion_ready
-                    else "aim active: Right held, 1000 Hz control, tracking selected head"
-                )
-            else:
-                aim_status = "aim ready: hold Right to track selected head"
+            aim_status = _aim_status(
+                runtime_enabled=aim_runtime_enabled,
+                self_exclusion_ready=self_exclusion_ready,
+                selected_target=selected_aim_target,
+                engaged=aim_engaged,
+                activation_name=aim_activation_name,
+                control_description=aim_control_description,
+            )
             result_ready_ns = perf_counter_ns()
 
             if prepared.crop_was_clamped and not crop_warning_printed:
@@ -482,7 +523,7 @@ def run(config: AppConfig) -> int:
                         last_ignored_detection,
                     )
                 draw_detections(packet.image, detections)
-                if selected_aim_target is not None:
+                if aim_runtime_enabled and selected_aim_target is not None:
                     draw_aim_target(
                         packet.image,
                         head_target_point(selected_aim_target, config.aim_head_ratio),
@@ -493,7 +534,7 @@ def run(config: AppConfig) -> int:
                     metrics.snapshot(),
                     skipped_frames,
                     ignored_count=last_ignored_count,
-                    aim_status=aim_status if config.aim else None,
+                    aim_status=aim_status,
                 )
             draw_completed_ns = perf_counter_ns()
 
@@ -507,7 +548,8 @@ def run(config: AppConfig) -> int:
                 queue_age_ms=max(0, processing_started_ns - packet.read_completed_ns) / 1e6,
                 preprocess_ms=(preprocessing_completed_ns - preprocessing_started_ns) / 1e6,
                 inference_ms=(inference_completed_ns - inference_started_ns) / 1e6,
-                postprocess_ms=(result_ready_ns - inference_completed_ns) / 1e6,
+                postprocess_ms=(postprocess_completed_ns - inference_completed_ns) / 1e6,
+                control_ms=(result_ready_ns - postprocess_completed_ns) / 1e6,
                 processing_ms=(result_ready_ns - processing_started_ns) / 1e6,
                 freshness_latency_ms=max(0, result_ready_ns - packet.read_completed_ns) / 1e6,
                 observed_pipeline_ms=max(0, result_ready_ns - packet.read_started_ns) / 1e6,

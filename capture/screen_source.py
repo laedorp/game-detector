@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping as MappingABC, Sequence
 import math
+from numbers import Integral
 import os
 from threading import Event, Lock, Thread, current_thread
 from time import perf_counter_ns
@@ -31,14 +32,18 @@ class ScreenCaptureSource(CaptureSource):
         startup_timeout: float = 5.0,
         close_timeout: float = 2.0,
     ) -> None:
-        if isinstance(monitor, bool) or monitor < 0:
+        if (
+            isinstance(monitor, bool)
+            or not isinstance(monitor, Integral)
+            or monitor < 0
+        ):
             raise ValueError("monitor must be a non-negative integer")
         if not math.isfinite(fps) or fps <= 0:
             raise ValueError("fps must be finite and positive")
-        if startup_timeout <= 0:
-            raise ValueError("startup_timeout must be positive")
-        if close_timeout < 0:
-            raise ValueError("close_timeout must be non-negative")
+        if not math.isfinite(startup_timeout) or startup_timeout <= 0:
+            raise ValueError("startup_timeout must be finite and positive")
+        if not math.isfinite(close_timeout) or close_timeout < 0:
+            raise ValueError("close_timeout must be finite and non-negative")
 
         self._monitor = int(monitor)
         self._region = _normalise_region(region) if region is not None else None
@@ -110,9 +115,14 @@ class ScreenCaptureSource(CaptureSource):
         return self._read_latest(timeout)
 
     def close(self) -> None:
+        self._begin_close()
         self._stop_event.set()
-        self._mark_closed()
         self._join_thread()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            self._record_close_timeout(thread.name)
+            return
+        self._mark_closed()
 
     def _capture_loop(self) -> None:
         screenshotter: Any | None = None
@@ -188,7 +198,9 @@ class ScreenCaptureSource(CaptureSource):
                     screenshotter.close()
                 except Exception:
                     pass
-            if not self._stop_event.is_set():
+            if self._stop_event.is_set():
+                self._complete_close_from_worker()
+            else:
                 self._finish()
 
     def _resolve_target(self, screenshotter: Any) -> dict[str, int]:
@@ -240,12 +252,12 @@ def _normalise_region(
             raise ValueError("region must contain x, y, width, and height")
         values = tuple(region)
 
-    if any(isinstance(value, bool) for value in values):
+    if any(
+        isinstance(value, bool) or not isinstance(value, Integral)
+        for value in values
+    ):
         raise ValueError("region values must be integers")
-    try:
-        left, top, width, height = (int(value) for value in values)
-    except (TypeError, ValueError) as exc:
-        raise ValueError("region values must be integers") from exc
+    left, top, width, height = (int(value) for value in values)
     if width <= 0 or height <= 0:
         raise ValueError("region width and height must be positive")
     return left, top, width, height

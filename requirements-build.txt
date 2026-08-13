@@ -4,11 +4,6 @@
 # OpenCV wheel used by this project.
 pyinstaller>=6.22,<7
 
-# The desktop interface. PySide6-Essentials excludes the large optional Qt
-# modules (WebEngine, Charts, 3D) that this application never imports, which
-# keeps the bundle to the Qt libraries actually used.
-PySide6-Essentials>=6.7,<7
-
-# Windows release bundles should run on NVIDIA/AMD GPUs out-of-the-box. The
-# DirectML wheel is only installed on Windows builds and bundled by PyInstaller.
-onnxruntime-directml>=1.22,<2; sys_platform == "win32"
+# A release job installs exactly one requirements-runtime-*.txt file after this
+# file. ONNX Runtime variants all provide the same module and must never be
+# stacked in one build environment.

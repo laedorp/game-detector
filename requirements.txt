@@ -1,9 +1,10 @@
-numpy>=1.26.0
+numpy>=1.26.0,<3
 opencv-python>=4.10.0,<5.0
 openvino>=2026.0,<2027.0
 mss>=10.0.0,<11.0
 pyserial>=3.5,<4
 evdev>=1.9,<2; sys_platform == "linux"
+PySide6-Essentials>=6.7,<7
 
 # ONNX Runtime powers the accelerators OpenVINO cannot drive: AMD and NVIDIA
 # GPUs.  It is deliberately NOT pinned here because the vendor builds all
@@ -11,10 +12,10 @@ evdev>=1.9,<2; sys_platform == "linux"
 # Install exactly one, matching the hardware reported by
 # `python scripts/scan_hardware.py`:
 #
-#   onnxruntime           CPU only, any platform (also fine as a fallback)
-#   onnxruntime-gpu       NVIDIA, CUDA/TensorRT, Linux or Windows
-#   onnxruntime-directml  AMD or NVIDIA on Windows
-#   onnxruntime-rocm      AMD on Linux (RDNA2 often also needs
+#   requirements-runtime-cpu.txt       CPU only, any platform
+#   requirements-runtime-cuda.txt      NVIDIA, CUDA/TensorRT
+#   requirements-runtime-directml.txt  AMD/NVIDIA/Intel on Windows
+#   requirements-runtime-rocm.txt      AMD on Linux (RDNA2 often also needs
 #                         HSA_OVERRIDE_GFX_VERSION=10.3.0)
 #
 # Detection runs on Intel CPU/GPU/NPU through OpenVINO without any of these.

@@ -1,4 +1,4 @@
-"""Fetch the ONNX Runtime build that matches this machine's accelerator.
+"""Plan and, for source installs, fetch the matching ONNX Runtime provider.
 
 The application bundles everything it needs for Intel CPUs, Intel graphics, and
 Intel NPUs.  AMD and NVIDIA GPUs are different: ONNX Runtime publishes a
@@ -6,11 +6,11 @@ Intel NPUs.  AMD and NVIDIA GPUs are different: ONNX Runtime publishes a
 module and therefore cannot be shipped together.  Exactly one can be present, so
 the correct one has to be chosen after the hardware is known.
 
-That is what this module does.  It resolves the right distribution, installs it
-into a writable directory beside the user's settings, and puts that directory on
-``sys.path``.  Installing beside the settings rather than into the application
-keeps a read-only or shared installation working and means an ordinary user
-never needs administrator rights.
+Release builds carry exactly one provider and are published as separate
+hardware-specific bundles. A frozen PyInstaller executable cannot safely act as
+``python -m pip``, so mutation is rejected there. For a source checkout, this
+module can resolve the right distribution, install it beside the user's settings,
+and activate that directory for the app and its child processes.
 
 The vendor *drivers* (ROCm, CUDA, the Intel compute runtime) are deliberately
 out of scope.  They are multi-gigabyte system components that require
@@ -23,6 +23,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -34,6 +35,14 @@ DISTRIBUTION_CPU = "onnxruntime"
 DISTRIBUTION_NVIDIA = "onnxruntime-gpu"
 DISTRIBUTION_DIRECTML = "onnxruntime-directml"
 DISTRIBUTION_ROCM = "onnxruntime-rocm"
+
+RUNTIME_REQUIREMENTS = {
+    DISTRIBUTION_CPU: "onnxruntime==1.28.0",
+    DISTRIBUTION_NVIDIA: "onnxruntime-gpu==1.28.0",
+    DISTRIBUTION_DIRECTML: "onnxruntime-directml==1.24.4",
+    DISTRIBUTION_ROCM: "onnxruntime-rocm==1.22.2.post3",
+}
+RUNTIME_ROOT_ENV = "PROAIM_RUNTIME_ROOT"
 
 CONFLICTING_DISTRIBUTIONS = (
     DISTRIBUTION_CPU,
@@ -73,6 +82,20 @@ def install_root(settings_directory: Path) -> Path:
     """Return the writable directory that holds fetched runtime packages."""
 
     return settings_directory / "runtime"
+
+
+def default_settings_directory() -> Path:
+    """Return ProAim's per-user configuration directory without importing a GUI."""
+
+    if sys.platform == "win32":
+        base = os.environ.get("APPDATA")
+        root = Path(base) if base else Path.home() / "AppData" / "Roaming"
+        return root / "ProAim"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "ProAim"
+    base = os.environ.get("XDG_CONFIG_HOME")
+    root = Path(base).expanduser() if base else Path.home() / ".config"
+    return root / "proaim"
 
 
 def plan_for(vendor: str, system: str) -> RuntimePlan:
@@ -137,19 +160,29 @@ def installed_distribution() -> str | None:
     return None
 
 
-def _pip_command(target: Path, distribution: str) -> list[str]:
-    # A frozen application has no pip of its own, so the caller supplies the
-    # interpreter.  --target keeps the install inside the user's own directory
-    # rather than the application or the system site-packages.
+def _pip_command(
+    target: Path,
+    distribution: str,
+    *,
+    interpreter: str | Path | None = None,
+) -> list[str]:
+    """Build a source-environment installer command.
+
+    A PyInstaller executable is not a general Python interpreter and cannot run
+    ``-m pip``. Frozen builds therefore use prebuilt runtime-specific bundles;
+    this helper is only for a real Python environment with a matching ABI.
+    """
+
+    executable = str(interpreter or sys.executable)
     return [
-        sys.executable,
+        executable,
         "-m",
         "pip",
         "install",
         "--upgrade",
         "--target",
         str(target),
-        distribution,
+        RUNTIME_REQUIREMENTS.get(distribution, distribution),
     ]
 
 
@@ -159,6 +192,8 @@ def ensure_runtime(
     *,
     runner: Callable[[Sequence[str]], subprocess.CompletedProcess] | None = None,
     already_installed: str | None | object = _PROBE,
+    interpreter: str | Path | None = None,
+    frozen: bool | None = None,
 ) -> Path:
     """Install ``plan.distribution`` into the user's runtime directory.
 
@@ -166,6 +201,13 @@ def ensure_runtime(
     installation is left alone so that repeated runs are cheap and offline
     machines keep working.
     """
+
+    is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    if is_frozen:
+        raise RuntimeSetupError(
+            "Packaged ProAim cannot install Python execution providers in place. "
+            "Download the ProAim bundle that matches this GPU, then restart the app."
+        )
 
     current = installed_distribution() if already_installed is _PROBE else already_installed
     target = install_root(settings_directory)
@@ -181,7 +223,7 @@ def ensure_runtime(
         )
 
     target.mkdir(parents=True, exist_ok=True)
-    command = _pip_command(target, plan.distribution)
+    command = _pip_command(target, plan.distribution, interpreter=interpreter)
     execute = runner or (
         lambda argv: subprocess.run(  # noqa: S603 - argv is built here, not user text
             list(argv), capture_output=True, text=True, check=False, timeout=1800
@@ -212,7 +254,34 @@ def activate(target: Path) -> bool:
     if text not in sys.path:
         # Prepend so a fetched vendor build wins over any bundled CPU copy.
         sys.path.insert(0, text)
+    os.environ[RUNTIME_ROOT_ENV] = text
     return True
+
+
+def activate_configured_runtime(
+    settings_directory: Path | None = None,
+    *,
+    frozen: bool | None = None,
+) -> bool:
+    """Activate a source-installed provider for this process and future children.
+
+    Release bundles carry their provider inside the bundle. This path exists for
+    source installations and deliberately does not download or mutate anything.
+    """
+
+    is_frozen = bool(getattr(sys, "frozen", False)) if frozen is None else frozen
+    if is_frozen:
+        # A release bundle carries one audited provider. Never let a stale
+        # source-installed wheel override or mix with those frozen libraries.
+        return False
+
+    configured = os.environ.get(RUNTIME_ROOT_ENV, "").strip()
+    target = (
+        Path(configured).expanduser()
+        if configured
+        else install_root(settings_directory or default_settings_directory())
+    )
+    return activate(target)
 
 
 def describe(plan: RuntimePlan, current: str | None) -> str:

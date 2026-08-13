@@ -13,6 +13,7 @@ application cannot tell which one is running.
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from numbers import Integral
 from pathlib import Path
 from typing import Any
 
@@ -26,7 +27,11 @@ from .base import (
     ModelError,
     OutputDecodeError,
 )
-from .postprocess import FrameTransformLike, decode_yolo_output
+from .postprocess import (
+    FrameTransformLike,
+    decode_yolo_output,
+    supported_yolo_output_layout,
+)
 from .openvino_yolo import Decoder, _load_labels, _normalize_inference_size
 from .types import Detection
 
@@ -34,8 +39,12 @@ from .types import Detection
 # Ordered by expected throughput.  ``CPUExecutionProvider`` is always last and
 # always present, so a session can still be created when nothing else is.
 PROVIDER_PREFERENCE = (
-    "TensorrtExecutionProvider",
     "CUDAExecutionProvider",
+    # TensorRT can outperform CUDA after engine construction, but merely being
+    # listed by ONNX Runtime does not prove the separate TensorRT libraries are
+    # installed. Prefer CUDA for a reliable one-click default; TensorRT remains
+    # available as an explicit advanced choice.
+    "TensorrtExecutionProvider",
     "ROCMExecutionProvider",
     "MIGraphXExecutionProvider",
     "DmlExecutionProvider",
@@ -60,7 +69,12 @@ PROVIDER_ALIASES = {
     "MIGRAPHX": "MIGraphXExecutionProvider",
     "DIRECTML": "DmlExecutionProvider",
     "DML": "DmlExecutionProvider",
+    "OPENVINO": "OpenVINOExecutionProvider",
 }
+
+NVIDIA_EXECUTION_PROVIDERS = frozenset(
+    {"CUDAExecutionProvider", "TensorrtExecutionProvider"}
+)
 
 
 def _load_onnxruntime() -> tuple[Any, str]:
@@ -109,6 +123,48 @@ def _configure_session_options(runtime: Any, options: Any, providers: Sequence[s
         options.inter_op_num_threads = 1
 
 
+def _preload_nvidia_libraries(runtime: Any, providers: Sequence[str]) -> bool:
+    """Ask ONNX Runtime to load bundled CUDA/cuDNN libraries before a session.
+
+    ONNX Runtime 1.21+ can locate the ``nvidia`` site-package libraries that
+    ship beside ``onnxruntime-gpu``.  This is especially important in a frozen
+    bundle, where those libraries are not necessarily on the operating
+    system's default loader path.  Older source installations can still rely
+    on their system loader; session creation and the active-provider check
+    below remain the final authority.
+    """
+
+    if not NVIDIA_EXECUTION_PROVIDERS.intersection(providers):
+        return False
+
+    preload = getattr(runtime, "preload_dlls", None)
+    if not callable(preload):
+        return False
+    try:
+        # An empty directory tells ORT to search its bundled ``nvidia`` Python
+        # packages first, without preferring an unrelated PyTorch install.
+        preload(directory="")
+    except Exception as exc:
+        raise DependencyError(
+            "Could not preload the CUDA/cuDNN libraries bundled with ONNX Runtime: "
+            f"{exc}. Use the matching NVIDIA CUDA build or select DirectML/CPU."
+        ) from exc
+    return True
+
+
+def _require_active_provider(requested: str, active: Sequence[str]) -> None:
+    """Refuse ONNX Runtime's silent fallback when acceleration did not start."""
+
+    if requested in active:
+        return
+    reported = ", ".join(str(provider) for provider in active) or "none"
+    raise DeviceNotAvailableError(
+        f"Requested ONNX Runtime provider {requested!r} did not initialize; "
+        f"the session activated: {reported}. Check the GPU driver and use the "
+        "matching ProAim runtime build, or select another device."
+    )
+
+
 def resolve_providers(
     requested: str, available: Sequence[str]
 ) -> tuple[list[str], str]:
@@ -124,10 +180,22 @@ def resolve_providers(
         raise ValueError("device must not be empty.")
 
     available_set = set(available)
+    available_by_normalized = {
+        str(provider).strip().upper(): str(provider) for provider in available
+    }
+    known_by_normalized = {
+        provider.upper(): provider for provider in PROVIDER_PREFERENCE
+    }
     if normalized in PROVIDER_ALIASES:
         target = PROVIDER_ALIASES[normalized]
-    elif requested in available_set or requested.endswith("ExecutionProvider"):
-        target = requested
+    elif normalized in available_by_normalized:
+        # Launcher settings were historically uppercased, turning for example
+        # ``TensorrtExecutionProvider`` into ``TENSORRTEXECUTIONPROVIDER``.
+        # Provider class names are identifiers, not case-sensitive user input,
+        # so recover the exact spelling reported by the installed runtime.
+        target = available_by_normalized[normalized]
+    elif normalized in known_by_normalized:
+        target = known_by_normalized[normalized]
     else:
         raise DeviceNotAvailableError(
             f"Unknown ONNX Runtime device {requested!r}. Use one of: "
@@ -197,6 +265,7 @@ class OnnxRuntimeYoloDetector(Detector):
             raise DependencyError(f"Could not query ONNX Runtime providers: {exc}") from exc
 
         chain, requested_device = resolve_providers(device, self._available_devices)
+        nvidia_preload_requested = _preload_nvidia_libraries(runtime, chain)
 
         try:
             options = runtime.SessionOptions()
@@ -211,25 +280,74 @@ class OnnxRuntimeYoloDetector(Detector):
             ) from exc
 
         try:
+            active = list(self._session.get_providers())
+        except Exception as exc:
+            raise ModelError(
+                f"Could not inspect active ONNX Runtime providers: {exc}"
+            ) from exc
+        _require_active_provider(requested_device, active)
+
+        try:
             inputs = self._session.get_inputs()
             outputs = self._session.get_outputs()
+            if len(inputs) != 1:
+                raise ModelError(
+                    f"Expected exactly one ONNX model input, found {len(inputs)}."
+                )
+            if len(outputs) != 1:
+                raise ModelError(
+                    f"Expected exactly one decoded YOLO output, found {len(outputs)}."
+                )
             self._input_name = inputs[0].name
             self._output_name = outputs[0].name
             declared = list(inputs[0].shape)
+            output_shape = list(outputs[0].shape)
         except Exception as exc:
+            if isinstance(exc, ModelError):
+                raise
             raise ModelError(f"Could not inspect ONNX model {self.model_path}: {exc}") from exc
 
-        # A static export pins every dimension; a dynamic axis arrives as a
-        # string name.  Only a mismatched *static* size is an error, because a
-        # dynamic graph legitimately accepts the configured size.
-        spatial = [value for value in declared[2:4] if isinstance(value, int)]
-        if spatial and any(value != self.inference_size for value in spatial):
+        input_type = str(getattr(inputs[0], "type", ""))
+        if input_type != "tensor(float)":
             raise ModelError(
-                f"ONNX model expects input {declared}, which does not match the "
-                f"configured inference size {self.inference_size}."
+                "ONNX model input must use float32 tensor(float), "
+                f"but {self._input_name!r} declares {input_type or 'an unknown type'}."
+            )
+        if len(declared) != 4:
+            raise ModelError(
+                f"Expected rank-4 NCHW input [1, 3, H, W], got {declared}."
+            )
+        if declared[0] != 1 or declared[1] != 3:
+            raise ModelError(
+                f"Expected batch-one, three-channel NCHW input [1, 3, H, W], got {declared}."
             )
 
-        active = list(getattr(self._session, "get_providers", lambda: chain)())
+        # A static export pins spatial dimensions; a dynamic axis arrives as a
+        # string or None. Dynamic H/W legitimately accept the configured size.
+        for value in declared[2:4]:
+            if isinstance(value, bool):
+                raise ModelError(f"Invalid ONNX model input shape {declared}.")
+            if isinstance(value, Integral):
+                if int(value) <= 0 or int(value) != self.inference_size:
+                    raise ModelError(
+                        f"ONNX model expects input {declared}, which does not match the "
+                        f"configured inference size {self.inference_size}."
+                    )
+            elif value is not None and not isinstance(value, str):
+                raise ModelError(f"Could not interpret ONNX model input shape {declared}.")
+
+        output_layout = supported_yolo_output_layout(
+            output_shape,
+            len(self.labels),
+            self.output_format,
+        )
+        if output_layout is None:
+            label_detail = f" for {len(self.labels)} loaded label(s)" if self.labels else ""
+            raise ModelError(
+                f"Unsupported ONNX YOLO output shape {output_shape}{label_detail}; "
+                "expected batch 1 in [1, N, 6], [1, N, 4+C], or [1, 4+C, N] layout."
+            )
+
         active_device = active[0] if active else requested_device
         self.device = active_device
         self._runtime_summary: dict[str, Any] = {
@@ -241,10 +359,13 @@ class OnnxRuntimeYoloDetector(Detector):
             "available_devices": list(self._available_devices),
             "provider_chain": chain,
             "active_providers": active,
+            "nvidia_preload_requested": nvidia_preload_requested,
             "input_name": self._input_name,
             "input_shape": declared,
+            "input_type": input_type,
             "output_name": self._output_name,
-            "output_shape": list(outputs[0].shape),
+            "output_shape": output_shape,
+            "output_layout": output_layout,
             "output_format": self.output_format,
         }
 

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install a built Game Detector bundle for the current Linux user."""
+"""Install a built ProAim bundle for the current Linux user."""
 
 from __future__ import annotations
 
@@ -66,6 +66,27 @@ def _write_atomic(path: Path, content: str, mode: int) -> None:
         temporary_path.unlink(missing_ok=True)
 
 
+def _refresh_desktop(applications_dir: Path) -> None:
+    desktop_database = shutil.which("update-desktop-database")
+    if desktop_database:
+        subprocess.run(
+            [desktop_database, str(applications_dir)],
+            check=False,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    for cache_builder_name in ("kbuildsycoca6", "kbuildsycoca5"):
+        cache_builder = shutil.which(cache_builder_name)
+        if cache_builder:
+            subprocess.run(
+                [cache_builder, "--noincremental"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            break
+
+
 def install(bundle: Path) -> Path:
     bundle = bundle.expanduser().resolve()
     executable = bundle / EXECUTABLE_NAME
@@ -89,7 +110,22 @@ def install(bundle: Path) -> Path:
         "assets/game-detector.svg",
     )
 
+    if install_dir.exists() and not _safe_existing_install(install_dir):
+        raise RuntimeError(
+            f"Refusing to replace unmanaged path: {install_dir}. "
+            "Move it aside and run the installer again."
+        )
+    if previous_dir.exists() and not _safe_existing_install(previous_dir):
+        raise RuntimeError(
+            f"Refusing to replace unmanaged backup path: {previous_dir}."
+        )
+
     data_home.mkdir(parents=True, exist_ok=True)
+    # The retained backup is superseded by the current active install. Remove
+    # it before staging the next nearly-gigabyte bundle to reduce peak disk use;
+    # the active copy remains untouched if staging fails.
+    if previous_dir.exists():
+        shutil.rmtree(previous_dir)
     staging_dir = Path(tempfile.mkdtemp(prefix=f".{APP_ID}.new-", dir=data_home))
     try:
         # PyInstaller uses relative symlinks extensively on Linux. Preserve
@@ -97,22 +133,10 @@ def install(bundle: Path) -> Path:
         # native-library loader was tested against.
         shutil.copytree(bundle, staging_dir, dirs_exist_ok=True, symlinks=True)
         (staging_dir / INSTALL_MARKER).write_text(
-            "Managed by Game Detector's per-user installer.\n",
+            "Managed by ProAim's per-user installer.\n",
             encoding="utf-8",
         )
 
-        if install_dir.exists() and not _safe_existing_install(install_dir):
-            raise RuntimeError(
-                f"Refusing to replace unmanaged path: {install_dir}. "
-                "Move it aside and run the installer again."
-            )
-        if previous_dir.exists() and not _safe_existing_install(previous_dir):
-            raise RuntimeError(
-                f"Refusing to replace unmanaged backup path: {previous_dir}."
-            )
-
-        if previous_dir.exists():
-            shutil.rmtree(previous_dir)
         if install_dir.exists():
             os.replace(install_dir, previous_dir)
         os.replace(staging_dir, install_dir)
@@ -141,36 +165,50 @@ def install(bundle: Path) -> Path:
         0o644,
     )
 
-    desktop_database = shutil.which("update-desktop-database")
-    if desktop_database:
-        subprocess.run(
-            [desktop_database, str(applications_dir)],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-    for cache_builder_name in ("kbuildsycoca6", "kbuildsycoca5"):
-        cache_builder = shutil.which(cache_builder_name)
-        if cache_builder:
-            subprocess.run(
-                [cache_builder, "--noincremental"],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            break
+    _refresh_desktop(applications_dir)
     return installed_executable
+
+
+def uninstall() -> tuple[Path, ...]:
+    data_home = _data_home()
+    install_dir = data_home / APP_ID
+    previous_dir = data_home / f"{APP_ID}.previous"
+    applications_dir = data_home / "applications"
+    targets = (install_dir, previous_dir)
+    for target in targets:
+        if target.exists() and not _safe_existing_install(target):
+            raise RuntimeError(f"Refusing to remove unmanaged path: {target}.")
+
+    removed: list[Path] = []
+    for target in targets:
+        if target.exists():
+            shutil.rmtree(target)
+            removed.append(target)
+    for path in (
+        applications_dir / f"{APP_ID}.desktop",
+        data_home / "icons" / "hicolor" / "scalable" / "apps" / f"{APP_ID}.svg",
+    ):
+        if path.exists():
+            path.unlink()
+            removed.append(path)
+    _refresh_desktop(applications_dir)
+    return tuple(removed)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Install the Game Detector app for the current Linux user."
+        description="Install the ProAim app for the current Linux user."
     )
     parser.add_argument(
         "--bundle",
         type=Path,
         default=_default_bundle(),
         help="Path to the built one-folder ProAim bundle.",
+    )
+    parser.add_argument(
+        "--uninstall",
+        action="store_true",
+        help="Remove only marker-verified ProAim installs and menu files.",
     )
     return parser
 
@@ -179,8 +217,15 @@ def main() -> int:
     if not sys.platform.startswith("linux"):
         print("This installer is only for Linux.", file=sys.stderr)
         return 2
+    args = build_parser().parse_args()
     try:
-        installed_executable = install(build_parser().parse_args().bundle)
+        if args.uninstall:
+            removed = uninstall()
+            print("ProAim was removed for this user.")
+            for path in removed:
+                print(f"Removed: {path}")
+            return 0
+        installed_executable = install(args.bundle)
     except (FileNotFoundError, OSError, RuntimeError) as exc:
         print(f"Installation failed: {exc}", file=sys.stderr)
         return 2

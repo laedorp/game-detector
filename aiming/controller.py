@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import math
 from pathlib import Path
 import socket
+import threading
+import time
 from typing import Any
 
 from detection.types import Detection
@@ -14,6 +17,8 @@ from .protocol import AimCommand, encode_aim_command, validate_pairing_key
 
 
 DEFAULT_HEAD_RATIO = 0.12
+LOCAL_TARGET_STALE_SECONDS = 0.15
+LOCAL_WATCHDOG_INTERVAL_SECONDS = 0.025
 
 try:
     import evdev as _evdev
@@ -111,6 +116,23 @@ class AimActivationSensor:
                 break
             if event.type == EV_ABS and event.code == self.axis:
                 self._active = self._pressure(event.value) >= self.threshold
+        # Do not rely solely on edge events. A dropped release event would
+        # otherwise leave the cached state active indefinitely. EVIOCGABS
+        # returns the kernel's current axis value, so resample it every frame
+        # and fail closed if the device can no longer be queried.
+        try:
+            info = self._device.absinfo(self.axis)
+        except OSError as exc:
+            self._active = False
+            raise AimActivationError(
+                f"Activation device state query failed: {exc}"
+            ) from exc
+        if info is None:
+            self._active = False
+            raise AimActivationError(
+                f"Activation axis {self.axis} disappeared from {self.device_path}."
+            )
+        self._active = self._pressure(info.value) >= self.threshold
         return self._active
 
 
@@ -194,14 +216,26 @@ class AimingController:
         *,
         device_name: str = "PXN P5 8K",
         uinput_factory: Any | None = None,
+        clock_ns: Callable[[], int] = time.monotonic_ns,
+        watchdog_interval: float = LOCAL_WATCHDOG_INTERVAL_SECONDS,
     ) -> None:
+        if not math.isfinite(watchdog_interval) or watchdog_interval <= 0.0:
+            raise ValueError("aim watchdog interval must be finite and greater than zero")
         self.config = config or AimConfig()
         self._device_name = device_name
         self._uinput_factory = uinput_factory
+        self._clock_ns = clock_ns
+        self._watchdog_interval = float(watchdog_interval)
         self._uinput: Any | None = None
         self._last_x = self.config.neutral_value
         self._last_y = self.config.neutral_value
         self._last_trigger = self.config.trigger_released_value
+        self._latest_active_update_ns = 0
+        self._output_active = False
+        self._device_lock = threading.Lock()
+        self._stop_event = threading.Event()
+        self._watchdog_thread: threading.Thread | None = None
+        self._worker_error: AimingControllerError | None = None
 
     @staticmethod
     def _clamp(value: float, minimum: float, maximum: float) -> float:
@@ -321,31 +355,57 @@ class AimingController:
     def start(self) -> None:
         if self._uinput is not None:
             return
-        if not Path("/dev/uinput").exists():
+        if self._uinput_factory is None and not Path("/dev/uinput").exists():
             raise AimingControllerError(
                 "/dev/uinput is missing. Load the Linux uinput module before using --aim."
             )
         self._uinput = self._make_uinput(self._require_evdev())
-        self._write_axes(self._last_x, self._last_y, self._last_trigger)
+        self._worker_error = None
+        self._latest_active_update_ns = 0
+        self._output_active = False
+        self._stop_event.clear()
+        self._write_axes(
+            self.config.neutral_value,
+            self.config.neutral_value,
+            self.config.trigger_released_value,
+        )
+        self._watchdog_thread = threading.Thread(
+            target=self._run_watchdog,
+            name="aim-uinput-watchdog",
+            daemon=True,
+        )
+        self._watchdog_thread.start()
 
     def stop(self) -> None:
-        if self._uinput is None:
-            return
-        try:
-            self._write_axes(
-                self.config.neutral_value,
-                self.config.neutral_value,
-                self.config.trigger_released_value,
-            )
-        except OSError:
-            pass
-        try:
-            self._uinput.close()
-        except OSError:
-            pass
-        self._uinput = None
+        self._stop_event.set()
+        worker = self._watchdog_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join(timeout=max(0.25, self._watchdog_interval * 2.0))
+        self._watchdog_thread = None
+        with self._device_lock:
+            device = self._uinput
+            if device is None:
+                return
+            try:
+                self._write_axes_unlocked(
+                    self.config.neutral_value,
+                    self.config.neutral_value,
+                    self.config.trigger_released_value,
+                )
+            except (OSError, ValueError):
+                pass
+            try:
+                device.close()
+            except OSError:
+                pass
+            self._uinput = None
+            self._record_neutral_state()
 
     def _write_axes(self, x: int, y: int, trigger: int) -> None:
+        with self._device_lock:
+            self._write_axes_unlocked(x, y, trigger)
+
+    def _write_axes_unlocked(self, x: int, y: int, trigger: int) -> None:
         if self._uinput is None:
             raise AimingControllerError("Virtual controller is not open")
         self._uinput.write(EV_ABS, self.config.right_x_code, x)
@@ -353,14 +413,55 @@ class AimingController:
         self._uinput.write(EV_ABS, self.config.trigger_code, trigger)
         self._uinput.write(EV_SYN, 0, 0)
 
+    def _record_neutral_state(self) -> None:
+        self._last_x = self.config.neutral_value
+        self._last_y = self.config.neutral_value
+        self._last_trigger = self.config.trigger_released_value
+        self._latest_active_update_ns = 0
+        self._output_active = False
+
+    def _neutralize_unlocked(self) -> None:
+        if self._uinput is None:
+            return
+        if (
+            self._last_x != self.config.neutral_value
+            or self._last_y != self.config.neutral_value
+            or self._last_trigger != self.config.trigger_released_value
+        ):
+            self._write_axes_unlocked(
+                self.config.neutral_value,
+                self.config.neutral_value,
+                self.config.trigger_released_value,
+            )
+        self._record_neutral_state()
+
+    def _watchdog_tick(self, now_ns: int | None = None) -> None:
+        """Neutralize an active local output whose detector state stopped refreshing."""
+
+        current_ns = self._clock_ns() if now_ns is None else int(now_ns)
+        with self._device_lock:
+            if not self._output_active or self._latest_active_update_ns == 0:
+                return
+            age = (current_ns - self._latest_active_update_ns) / 1_000_000_000
+            if age <= LOCAL_TARGET_STALE_SECONDS:
+                return
+            try:
+                self._neutralize_unlocked()
+            except (OSError, ValueError) as exc:
+                self._worker_error = AimingControllerError(
+                    f"Local aim watchdog could not neutralize output: {exc}"
+                )
+
+    def _run_watchdog(self) -> None:
+        while not self._stop_event.wait(self._watchdog_interval):
+            self._watchdog_tick()
+
     def update(
         self,
         target: Detection | None,
         frame_shape: tuple[int, int, int],
         active: bool = True,
     ) -> None:
-        if self._uinput is None:
-            raise AimingControllerError("Aiming controller has not been started")
         has_target, normalized_x, normalized_y = target_aim_vector(
             target,
             frame_shape,
@@ -382,13 +483,26 @@ class AimingController:
                 self.config.minimum_value,
                 self.config.maximum_value,
             )
-            trigger = self.config.trigger_pressed_value
+            # Detection output may move only the two stick axes.  It never
+            # synthesizes a trigger press from target presence.
+            trigger = self.config.trigger_released_value
 
-        if x != self._last_x or y != self._last_y or trigger != getattr(self, "_last_trigger", None):
-            self._write_axes(x, y, trigger)
-            self._last_x = x
-            self._last_y = y
-            self._last_trigger = trigger
+        with self._device_lock:
+            if self._uinput is None:
+                raise AimingControllerError("Aiming controller has not been started")
+            if self._worker_error is not None:
+                raise self._worker_error
+            if x != self._last_x or y != self._last_y or trigger != self._last_trigger:
+                self._write_axes_unlocked(x, y, trigger)
+                self._last_x = x
+                self._last_y = y
+                self._last_trigger = trigger
+            if has_target:
+                self._latest_active_update_ns = self._clock_ns()
+                self._output_active = True
+            else:
+                self._latest_active_update_ns = 0
+                self._output_active = False
 
 
 class UdpAimingController:

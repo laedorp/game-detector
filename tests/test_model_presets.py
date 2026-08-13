@@ -36,6 +36,7 @@ from launcher.settings import (
     MODEL_PRESET_CUSTOM,
     MODEL_PRESET_FORT_PLAYER,
     MODEL_PRESET_FORT_PLAYER_BALANCED,
+    MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
     SETTINGS_VERSION,
     load_settings,
     model_preset,
@@ -82,6 +83,7 @@ class ModelPresetSettingsTests(unittest.TestCase):
             [preset.key for preset in MODEL_PRESETS],
             [
                 MODEL_PRESET_FORT_PLAYER_BALANCED,
+                MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
                 MODEL_PRESET_FORT_PLAYER,
                 MODEL_PRESET_COCO_BALANCED,
                 MODEL_PRESET_COCO_HIGH,
@@ -92,6 +94,10 @@ class ModelPresetSettingsTests(unittest.TestCase):
         self.assertEqual(
             model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED).label,
             "Game players — Balanced 416 (Recommended)",
+        )
+        self.assertEqual(
+            model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED_INT8).label,
+            "Game players — Responsive 416 INT8 (OpenVINO CPU)",
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_FORT_PLAYER).label,
@@ -113,6 +119,10 @@ class ModelPresetSettingsTests(unittest.TestCase):
         self.assertEqual(player.inference_size, 416)
         self.assertIn("player", player.description.lower())
         self.assertEqual(model_preset(MODEL_PRESET_FORT_PLAYER).inference_size, 320)
+        responsive = model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED_INT8)
+        self.assertEqual(responsive.inference_size, 416)
+        self.assertIsNone(responsive.onnx_relative)
+        self.assertIn("cpu", responsive.description.lower())
         balanced = model_preset(MODEL_PRESET_COCO_BALANCED)
         self.assertEqual(balanced.inference_size, 416)
         self.assertIn("person", balanced.description.lower())
@@ -120,15 +130,41 @@ class ModelPresetSettingsTests(unittest.TestCase):
         self.assertEqual(high_end.inference_size, 640)
         self.assertIn("gpu", high_end.description.lower())
 
-    def test_high_end_settings_lock_to_1080p_capture_defaults(self) -> None:
+    def test_high_end_settings_keep_player_semantics_and_1080p_capture_defaults(self) -> None:
         settings = LauncherSettings(model_tier="high")
 
-        self.assertEqual(settings.model_preset, MODEL_PRESET_COCO_HIGH)
+        self.assertEqual(settings.model_preset, MODEL_PRESET_FORT_PLAYER_BALANCED)
         self.assertEqual(settings.capture_width, "1920")
         self.assertEqual(settings.capture_height, "1080")
         self.assertEqual(settings.capture_fps, "100")
         self.assertEqual(settings.screen_fps, "100")
+        self.assertEqual(settings.inference_size, "416")
+
+    def test_high_end_coco_benchmark_remains_an_explicit_choice(self) -> None:
+        settings = LauncherSettings(
+            model_tier="high", model_preset=MODEL_PRESET_COCO_HIGH
+        )
+
+        self.assertEqual(settings.model_preset, MODEL_PRESET_COCO_HIGH)
         self.assertEqual(settings.inference_size, "640")
+
+    def test_int8_player_preset_is_openvino_only_and_not_the_fresh_default(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with mock.patch("launcher.settings.resource_root", return_value=root):
+                int8 = LauncherSettings(
+                    backend="openvino",
+                    model_preset=MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
+                )
+                onnx = LauncherSettings(
+                    backend="onnxruntime",
+                    model_preset=MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
+                )
+
+        self.assertEqual(int8.model_preset, MODEL_PRESET_FORT_PLAYER_BALANCED_INT8)
+        self.assertIn("fort_player_416_int8.xml", int8.model_path)
+        self.assertEqual(onnx.model_preset, DEFAULT_MODEL_PRESET)
+        self.assertIn("fort_player_416.onnx", onnx.model_path)
 
     def test_fresh_settings_choose_recommended_pair_from_resource_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

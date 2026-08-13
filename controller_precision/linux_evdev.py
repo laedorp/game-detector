@@ -711,6 +711,12 @@ class EvdevPrecisionController:
     def _neutral_value(self, code: int, info: Any) -> int:
         minimum = _info_value(info, "min", "minimum")
         maximum = _info_value(info, "max", "maximum")
+        if code == self.config.trigger_axis_code and self.mapper is not None:
+            # The verified trigger may use decreasing polarity (for example,
+            # rest=255 and pressed=0 on the PXN P5 8K).  The declared minimum
+            # is therefore not necessarily neutral.  Cleanup must publish the
+            # exact calibrated rest value before the virtual device closes.
+            return self.mapper.trigger.calibration.rest
         if code in (ABS_HAT0X, ABS_HAT0Y):
             return 0
         if code in (ABS_GAS, ABS_BRAKE):

@@ -1,13 +1,46 @@
-"""Desktop and command-line entry point for Game Detector."""
+"""Desktop, diagnostics, and command-line entry point for ProAim."""
 
 from __future__ import annotations
 
+import json
 import sys
 from typing import Sequence
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    # Source installations may keep a vendor-specific ONNX Runtime beside the
+    # user's settings. Activate it before either GUI or detector imports the
+    # runtime; frozen release bundles already carry their selected provider.
+    from detection.runtime_setup import activate_configured_runtime
+
+    activate_configured_runtime()
     arguments = list(sys.argv[1:] if argv is None else argv)
+    if arguments == ["--runtime-info"]:
+        payload: dict[str, object] = {
+            "frozen": bool(getattr(sys, "frozen", False)),
+            "python": sys.version.split()[0],
+        }
+        try:
+            import openvino
+
+            core = openvino.Core()
+            payload["openvino"] = str(getattr(openvino, "__version__", "unknown"))
+            payload["openvino_devices"] = list(core.available_devices)
+        except Exception as exc:  # pragma: no cover - depends on packaged drivers
+            payload["openvino_error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            import onnxruntime
+
+            payload["onnxruntime"] = str(
+                getattr(onnxruntime, "__version__", "unknown")
+            )
+            payload["onnxruntime_providers"] = list(
+                onnxruntime.get_available_providers()
+            )
+        except Exception as exc:
+            payload["onnxruntime_error"] = f"{type(exc).__name__}: {exc}"
+        print(json.dumps(payload, sort_keys=True))
+        return 0 if "openvino" in payload and "onnxruntime" in payload else 2
     if arguments and arguments[0] == "--controller-precision":
         # Keep the Linux controller worker inside the same source/frozen app
         # while leaving it entirely separate from the detector process.
@@ -27,9 +60,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             sys.argv = original_argv
 
     if not arguments or arguments in (["--gui"], ["--qt"]):
-        # The Qt interface is the default face of the application.  --tk stays
-        # available because the Tk launcher still carries panels the Qt one
-        # does not.
+        # Qt is the supported one-click interface. The older Tk launcher stays
+        # available as a compatibility fallback for source checkouts.
         try:
             from launcher.qt_app import run_gui as run_qt_gui
         except ImportError as exc:
@@ -43,8 +75,17 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if arguments != ["--tk"]:
         print(
-            "Usage: app.py [--gui] | app.py --tk | app.py --cli [detector options] | "
+            "Usage: app.py [--gui] | app.py --tk | app.py --runtime-info | "
+            "app.py --cli [detector options] | "
             "app.py --controller-precision [options]",
+            file=sys.stderr,
+        )
+        return 2
+
+    if bool(getattr(sys, "frozen", False)):
+        print(
+            "The legacy Tk launcher is available only from a source checkout. "
+            "Use ProAim's default Qt interface in this bundle.",
             file=sys.stderr,
         )
         return 2

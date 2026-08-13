@@ -1,0 +1,2 @@
+# Deterministic CPU fallback used by the general Linux bundle and CI.
+onnxruntime==1.28.0

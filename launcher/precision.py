@@ -146,7 +146,7 @@ def precision_readiness(
         return PrecisionReadiness(
             False,
             "The Linux controller support package is unavailable.",
-            f"Install the app's evdev dependency, then reopen Game Detector. Details: {exc}",
+            f"Install the app's evdev dependency, then reopen ProAim. Details: {exc}",
         )
     if not candidate.readable:
         return PrecisionReadiness(

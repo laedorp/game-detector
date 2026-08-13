@@ -1,0 +1,2 @@
+# Linux AMD provider. A compatible system ROCm installation is still required.
+onnxruntime-rocm==1.22.2.post3

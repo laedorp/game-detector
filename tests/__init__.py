@@ -1,1 +1,1 @@
-"""Automated tests for Game Detector."""
+"""Automated tests for ProAim."""

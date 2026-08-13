@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import errno
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -186,6 +187,7 @@ class ControllerDiscoveryTests(unittest.TestCase):
         (device / "capabilities" / "key").write_text(key_mask, encoding="utf-8")
         return event_path
 
+    @unittest.skipIf(os.name == "nt", "Linux by-id symlinks are POSIX-only")
     def test_persistent_by_id_path_is_preferred_and_metadata_is_read(self) -> None:
         self.add_event(
             "event17",
@@ -393,6 +395,32 @@ class EvdevPrecisionControllerTests(unittest.TestCase):
         controller.close()
         self.assertTrue(source.ungrabbed)
         self.assertTrue(source.closed)
+        self.assertTrue(ui.closed)
+
+    def test_close_restores_decreasing_polarity_trigger_to_calibrated_rest(self) -> None:
+        source = FakeSource(
+            axes={
+                ABS_Z: FakeAbsInfo(128, 0, 255),
+                ABS_RZ: FakeAbsInfo(128, 0, 255),
+                ABS_BRAKE: FakeAbsInfo(255, 0, 255),
+            }
+        )
+        controller, _source, ui = self.make_controller(
+            source=source,
+            trigger_calibration=TriggerCalibration(rest=255, pressed=0),
+        )
+
+        controller.open()
+        controller.close()
+
+        final_axes = {
+            code: value
+            for event_type, code, value in ui.writes
+            if event_type == EV_ABS
+        }
+        self.assertEqual(final_axes[ABS_BRAKE], 255)
+        self.assertEqual(final_axes[ABS_Z], 128)
+        self.assertEqual(final_axes[ABS_RZ], 128)
         self.assertTrue(ui.closed)
 
     def test_run_announces_ready_only_after_grab_uinput_and_initial_sync(self) -> None:

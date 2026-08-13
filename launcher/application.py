@@ -1,4 +1,4 @@
-"""Tkinter desktop application for configuring and running Game Detector."""
+"""Legacy Tkinter desktop application for configuring and running ProAim."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import os
 from pathlib import Path
 import queue
 import shlex
-import shutil
 import subprocess
 import threading
 import time
@@ -23,11 +22,12 @@ from detection.devices import (
 from aiming.makcu import MakcuAimConfig, MakcuAimingController, MakcuError
 
 from .process import (
-    external_process_environment,
+    find_moonlight_executable,
     force_stop,
     kill_process,
     request_stop,
     start_detector,
+    start_external_process,
     start_precision_controller,
 )
 from .precision import (
@@ -68,7 +68,7 @@ from .settings import (
 )
 
 
-APP_NAME = "Game Detector"
+APP_NAME = "ProAim"
 POLL_INTERVAL_MS = 100
 LOG_LINE_LIMIT = 5000
 SELF_POSITION_LABELS = {
@@ -757,7 +757,7 @@ class DetectorLauncher:
         )
         self._aim_output_combo.grid(row=1, column=1, columnspan=2, sticky="w", pady=(8, 0))
         self._aim_output_combo.bind("<<ComboboxSelected>>", self._aim_output_changed)
-        ttk.Label(aiming, text="Target label (optional)").grid(
+        ttk.Label(aiming, text="Target label (required when enabled)").grid(
             row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         self._aim_label_entry = ttk.Entry(aiming, textvariable=self.aim_label, width=24)
@@ -1316,16 +1316,43 @@ class DetectorLauncher:
         controller = MakcuAimingController(
             MakcuAimConfig(port=port, activation_button=button)
         )
+        expected_mask = 1 << button
+        saw_neutral = False
         pressed = False
         deadline = time.monotonic() + 10.0
         try:
             controller.start(output_loop=False)
             while time.monotonic() < deadline and not self._makcu_verify_cancel.is_set():
-                active = controller.poll_activation()
-                if active:
+                mask = controller.poll_button_mask()
+                if not saw_neutral:
+                    if mask != 0:
+                        detail = (
+                            "Release every mouse button before verification, then try "
+                            f"again. MAKCU initially reported mask 0x{mask:02X}."
+                        )
+                        self._makcu_verify_result.put((False, port, str(button), detail))
+                        return
+                    saw_neutral = True
+                    time.sleep(0.01)
+                    continue
+                if not pressed and mask == expected_mask:
                     pressed = True
-                elif pressed:
+                elif not pressed and mask != 0:
+                    detail = (
+                        f"Expected only {MAKCU_BUTTON_LABELS[button]}, but MAKCU "
+                        f"reported mask 0x{mask:02X}. Verification was not saved."
+                    )
+                    self._makcu_verify_result.put((False, port, str(button), detail))
+                    return
+                elif pressed and mask == 0:
                     self._makcu_verify_result.put((True, port, str(button), ""))
+                    return
+                elif pressed and mask != expected_mask:
+                    detail = (
+                        f"Button report changed to mask 0x{mask:02X} before release. "
+                        "Verification was not saved."
+                    )
+                    self._makcu_verify_result.put((False, port, str(button), detail))
                     return
                 time.sleep(0.01)
             detail = "Verification cancelled." if self._makcu_verify_cancel.is_set() else (
@@ -1911,7 +1938,7 @@ class DetectorLauncher:
             message = (
                 "Moonlight screen capture needs an X11/Xorg desktop session in this version.\n\n"
                 "Log out, choose an Xorg/X11 session on the login screen, then open "
-                "Moonlight and Game Detector again. If CachyOS/Arch does not show that "
+                "Moonlight and ProAim again. If CachyOS/Arch does not show that "
                 "choice, first install it with: sudo pacman -S plasma-x11-session\n\n"
                 "Cameras and video files still work on Wayland."
             )
@@ -2214,7 +2241,7 @@ class DetectorLauncher:
                 messagebox.showerror(
                     "Controller precision stopped",
                     f"{detail}\n\nIf /dev/uinput is missing, run sudo modprobe uinput, then press "
-                    "Refresh. Game Detector never makes privileged changes automatically.",
+                    "Refresh. ProAim never makes privileged changes automatically.",
                     parent=self.root,
                 )
 
@@ -2249,29 +2276,17 @@ class DetectorLauncher:
             self.video_path.set(selected)
 
     def _open_moonlight(self) -> None:
-        executable = shutil.which("moonlight") or shutil.which("moonlight-qt")
+        executable = find_moonlight_executable()
         if executable is None:
             messagebox.showerror(
                 "Moonlight was not found",
                 "Install Moonlight or open it from your application menu. "
-                "Game Detector will capture the Moonlight window after you start your stream.",
+                "ProAim will capture the Moonlight window after you start your stream.",
                 parent=self.root,
             )
             return
-        options: dict[str, object] = {}
-        if os.name == "nt":
-            options["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0)
-        else:
-            options["start_new_session"] = True
         try:
-            subprocess.Popen(
-                [executable],
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                env=external_process_environment(),
-                **options,
-            )
+            start_external_process([executable])
         except OSError as exc:
             messagebox.showerror(
                 "Could not open Moonlight",
@@ -2353,7 +2368,7 @@ class DetectorLauncher:
             names = " and ".join(running)
             verb = "are" if len(running) > 1 else "is"
             if not messagebox.askyesno(
-                "Exit Game Detector?",
+                "Exit ProAim?",
                 f"{names.capitalize()} {verb} still running. Stop and close the launcher?",
                 parent=self.root,
             ):

@@ -6,11 +6,14 @@ import unittest
 
 import numpy as np
 
+from config import parse_args
 from detection.base import DeviceNotAvailableError, DetectorError, ModelError
 from detection.onnx_yolo import (
     PROVIDER_PREFERENCE,
     OnnxRuntimeYoloDetector,
     _configure_session_options,
+    _preload_nvidia_libraries,
+    _require_active_provider,
     resolve_providers,
 )
 
@@ -29,11 +32,11 @@ class ProviderResolutionTests(unittest.TestCase):
     def test_auto_picks_the_fastest_installed_provider(self) -> None:
         chain, target = resolve_providers("AUTO", ALL_PROVIDERS)
 
-        self.assertEqual(target, "TensorrtExecutionProvider")
-        self.assertEqual(chain[0], "TensorrtExecutionProvider")
+        self.assertEqual(target, "CUDAExecutionProvider")
+        self.assertEqual(chain[0], "CUDAExecutionProvider")
 
     def test_tensorrt_chain_keeps_cuda_before_cpu(self) -> None:
-        chain, target = resolve_providers("AUTO", ALL_PROVIDERS)
+        chain, target = resolve_providers("TENSORRT", ALL_PROVIDERS)
 
         self.assertEqual(target, "TensorrtExecutionProvider")
         self.assertEqual(
@@ -54,8 +57,52 @@ class ProviderResolutionTests(unittest.TestCase):
     def test_generic_gpu_alias_uses_auto_selection(self) -> None:
         chain, target = resolve_providers("GPU", ALL_PROVIDERS)
 
+        self.assertEqual(target, "CUDAExecutionProvider")
+        self.assertEqual(chain[0], "CUDAExecutionProvider")
+
+    def test_full_provider_name_is_case_insensitive_for_old_launcher_settings(self) -> None:
+        chain, target = resolve_providers("TENSORRTEXECUTIONPROVIDER", ALL_PROVIDERS)
+
         self.assertEqual(target, "TensorrtExecutionProvider")
-        self.assertEqual(chain[0], "TensorrtExecutionProvider")
+        self.assertEqual(
+            chain,
+            [
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+        )
+
+    def test_scanner_provider_name_survives_cli_uppercase_boundary(self) -> None:
+        parsed = parse_args(
+            [
+                "--backend",
+                "onnxruntime",
+                "--device",
+                "TensorrtExecutionProvider",
+            ]
+        )
+        self.assertEqual(parsed.device, "TENSORRTEXECUTIONPROVIDER")
+
+        chain, target = resolve_providers(parsed.device, ALL_PROVIDERS)
+        self.assertEqual(target, "TensorrtExecutionProvider")
+        self.assertEqual(chain[:2], ["TensorrtExecutionProvider", "CUDAExecutionProvider"])
+
+    def test_full_provider_names_resolve_case_insensitively(self) -> None:
+        expected = {
+            "cudaexecutionprovider": "CUDAExecutionProvider",
+            "RoCmExecutionProvider": "ROCMExecutionProvider",
+            "DMLEXECUTIONPROVIDER": "DmlExecutionProvider",
+            "cpuexecutionprovider": "CPUExecutionProvider",
+        }
+        for requested, provider in expected.items():
+            with self.subTest(requested=requested):
+                _, target = resolve_providers(requested, ALL_PROVIDERS)
+                self.assertEqual(target, provider)
+
+    def test_known_full_provider_name_reports_not_installed(self) -> None:
+        with self.assertRaisesRegex(DeviceNotAvailableError, "not installed"):
+            resolve_providers("TENSORRTEXECUTIONPROVIDER", CPU_ONLY)
 
     def test_every_chain_ends_with_cpu_so_partial_graphs_still_run(self) -> None:
         for requested in ("ROCM", "CUDA", "DIRECTML"):
@@ -140,10 +187,98 @@ class SessionOptionsTests(unittest.TestCase):
         self.assertFalse(hasattr(options, "inter_op_num_threads"))
 
 
+class NvidiaRuntimePreparationTests(unittest.TestCase):
+    class _Runtime:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, str]] = []
+
+        def preload_dlls(self, **kwargs) -> None:
+            self.calls.append(kwargs)
+
+    def test_cuda_preloads_nvidia_site_package_libraries(self) -> None:
+        runtime = self._Runtime()
+
+        attempted = _preload_nvidia_libraries(
+            runtime,
+            ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        self.assertTrue(attempted)
+        self.assertEqual(runtime.calls, [{"directory": ""}])
+
+    def test_tensorrt_chain_preloads_once(self) -> None:
+        runtime = self._Runtime()
+
+        attempted = _preload_nvidia_libraries(
+            runtime,
+            [
+                "TensorrtExecutionProvider",
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ],
+        )
+
+        self.assertTrue(attempted)
+        self.assertEqual(len(runtime.calls), 1)
+
+    def test_non_nvidia_provider_does_not_preload(self) -> None:
+        runtime = self._Runtime()
+
+        attempted = _preload_nvidia_libraries(
+            runtime,
+            ["DmlExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        self.assertFalse(attempted)
+        self.assertEqual(runtime.calls, [])
+
+    def test_preload_failure_is_actionable(self) -> None:
+        class BrokenRuntime:
+            @staticmethod
+            def preload_dlls(**_kwargs) -> None:
+                raise OSError("missing CUDA DLL")
+
+        with self.assertRaisesRegex(DetectorError, "matching NVIDIA CUDA build"):
+            _preload_nvidia_libraries(
+                BrokenRuntime(),
+                ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+
+    def test_missing_preload_api_keeps_source_install_compatible(self) -> None:
+        self.assertFalse(
+            _preload_nvidia_libraries(
+                object(),
+                ["CUDAExecutionProvider", "CPUExecutionProvider"],
+            )
+        )
+
+    def test_requested_accelerator_must_be_active(self) -> None:
+        with self.assertRaisesRegex(
+            DeviceNotAvailableError,
+            "did not initialize",
+        ):
+            _require_active_provider(
+                "CUDAExecutionProvider",
+                ["CPUExecutionProvider"],
+            )
+
+    def test_requested_accelerator_accepts_active_fallback_chain(self) -> None:
+        _require_active_provider(
+            "CUDAExecutionProvider",
+            ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+
+
 class FakeTensorSpec:
-    def __init__(self, name: str, shape: list) -> None:
+    def __init__(
+        self,
+        name: str,
+        shape: list,
+        tensor_type: str = "tensor(float)",
+    ) -> None:
         self.name = name
         self.shape = shape
+        self.type = tensor_type
 
 
 class FakeSession:
@@ -154,13 +289,30 @@ class FakeSession:
         providers=None,
         *,
         input_shape: list | None = None,
+        input_type: str = "tensor(float)",
+        input_count: int = 1,
+        output_shape: list | None = None,
+        output_count: int = 1,
         output: np.ndarray | None = None,
         fail: Exception | None = None,
     ) -> None:
         self.path = path
         self.providers = list(providers or [])
-        self._inputs = [FakeTensorSpec("images", input_shape or [1, 3, 416, 416])]
-        self._outputs = [FakeTensorSpec("output0", [1, 300, 6])]
+        self._inputs = [
+            FakeTensorSpec(
+                "images" if index == 0 else f"input{index}",
+                input_shape or [1, 3, 416, 416],
+                input_type,
+            )
+            for index in range(input_count)
+        ]
+        self._outputs = [
+            FakeTensorSpec(
+                "output0" if index == 0 else f"output{index}",
+                output_shape or [1, 300, 6],
+            )
+            for index in range(output_count)
+        ]
         self._output = output if output is not None else np.zeros((1, 300, 6), np.float32)
         self._fail = fail
         self.runs = 0
@@ -232,6 +384,38 @@ class DetectorContractTests(unittest.TestCase):
         )
 
         self.assertEqual(detector.inference_size, 416)
+
+    def test_input_contract_requires_rank4_batch1_and_three_channels(self) -> None:
+        invalid_shapes = (
+            [2, 3, 416, 416],
+            [1, 1, 416, 416],
+            [1, 3, 416],
+            [1, 3, 416, 416, 1],
+            ["batch", 3, 416, 416],
+        )
+        for shape in invalid_shapes:
+            with self.subTest(shape=shape), self.assertRaises(ModelError):
+                make_detector(session_kwargs={"input_shape": shape})
+
+    def test_input_contract_requires_float32(self) -> None:
+        with self.assertRaises(ModelError) as raised:
+            make_detector(session_kwargs={"input_type": "tensor(float16)"})
+
+        self.assertIn("float32", str(raised.exception))
+
+    def test_model_must_have_exactly_one_input_and_output(self) -> None:
+        for session_kwargs in ({"input_count": 2}, {"output_count": 2}):
+            with self.subTest(session_kwargs=session_kwargs), self.assertRaises(ModelError):
+                make_detector(session_kwargs=session_kwargs)
+
+    def test_output_shape_must_match_a_supported_decoder_layout(self) -> None:
+        with self.assertRaises(ModelError) as raised:
+            make_detector(
+                labels_path="models/coco80.txt",
+                session_kwargs={"output_shape": [1, 10, 10]},
+            )
+
+        self.assertIn("Unsupported ONNX YOLO output shape", str(raised.exception))
 
     def test_session_failure_is_reported_as_a_detector_error(self) -> None:
         detector = make_detector(session_kwargs={"fail": RuntimeError("gpu fell over")})

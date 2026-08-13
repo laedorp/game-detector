@@ -170,7 +170,8 @@ def draw_metrics(
     lines = [
         f"FPS {snapshot.moving_fps:5.1f}  processed {snapshot.processed_frames}  skipped {skipped_frames}",
         f"capture {latest.capture_ms:5.1f}  pre {latest.preprocess_ms:5.1f}  infer {latest.inference_ms:5.1f} ms",
-        f"post {latest.postprocess_ms:5.1f}  pipeline {latest.observed_pipeline_ms:5.1f} ms",
+        f"post {latest.postprocess_ms:5.1f}  control {latest.control_ms:5.1f} ms",
+        f"pipeline {latest.observed_pipeline_ms:5.1f} ms",
         f"draw {latest.draw_ms:5.1f}  display {latest.display_ms:5.1f} ms",
         f"moving: infer {avg.inference_ms:5.1f}  pipeline {avg.observed_pipeline_ms:5.1f} ms",
     ]
@@ -206,6 +207,7 @@ def console_summary(
     summary = (
         f"FPS {snapshot.moving_fps:.1f} | infer {avg.inference_ms:.1f} ms | "
         f"pre {avg.preprocess_ms:.1f} ms | post {avg.postprocess_ms:.1f} ms | "
+        f"control {avg.control_ms:.1f} ms | "
         f"pipeline {avg.observed_pipeline_ms:.1f} ms | "
         f"draw {avg.draw_ms:.1f} ms | display {avg.display_ms:.1f} ms | "
         f"skipped {skipped_frames}"

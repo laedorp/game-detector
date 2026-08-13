@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+# Model weights and packaged media must never undergo line-ending conversion.
+*.bin binary
+*.onnx binary
+*.pt binary
+*.ico binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.zip binary

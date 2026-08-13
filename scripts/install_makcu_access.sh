@@ -9,6 +9,11 @@ fi
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd -- "$SCRIPT_DIR/.." && pwd)"
 SOURCE_RULE="$PROJECT_DIR/packaging/linux/70-game-detector-makcu.rules"
+# In a built ProAim bundle this helper and the rule live together in setup/.
+# Prefer that layout when the source-tree path is not present.
+if [[ ! -f "$SOURCE_RULE" ]]; then
+    SOURCE_RULE="$SCRIPT_DIR/70-game-detector-makcu.rules"
+fi
 TARGET_RULE="/etc/udev/rules.d/70-game-detector-makcu.rules"
 
 if [[ ! -f "$SOURCE_RULE" ]]; then

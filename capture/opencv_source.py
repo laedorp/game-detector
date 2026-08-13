@@ -48,8 +48,8 @@ class OpenCVCaptureSource(CaptureSource):
             raise ValueError("fps must be finite and positive")
         if buffer_size <= 0:
             raise ValueError("buffer_size must be positive")
-        if close_timeout < 0:
-            raise ValueError("close_timeout must be non-negative")
+        if not math.isfinite(close_timeout) or close_timeout < 0:
+            raise ValueError("close_timeout must be finite and non-negative")
         self._pixel_format = _normalized_pixel_format(pixel_format)
 
         self._source: int | str = str(source) if isinstance(source, Path) else source
@@ -180,6 +180,7 @@ class OpenCVCaptureSource(CaptureSource):
         return packet
 
     def close(self) -> None:
+        self._begin_close()
         self._stop_event.set()
         capture = self._capture
         if capture is not None:
@@ -196,6 +197,10 @@ class OpenCVCaptureSource(CaptureSource):
             and thread.is_alive()
         ):
             thread.join(self._close_timeout)
+
+        if thread is not None and thread.is_alive():
+            self._record_close_timeout(thread.name)
+            return
 
         self._capture = None
         self._mark_closed()
@@ -300,7 +305,10 @@ class OpenCVCaptureSource(CaptureSource):
                 capture.release()
             except Exception:
                 pass
-            if not self._stop_event.is_set():
+            self._capture = None
+            if self._stop_event.is_set():
+                self._complete_close_from_worker()
+            else:
                 self._finish()
 
     def _early_file_failure(self, capture: Any) -> str | None:

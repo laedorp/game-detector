@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 """Read-only validation for model assets included in a desktop release.
 
-This preflight deliberately uses OpenVINO's ``read_model`` API with each XML
-and BIN path supplied explicitly.  It therefore catches truncated, unrelated,
-or otherwise unreadable IR pairs before PyInstaller copies them into a bundle.
+This preflight deliberately uses OpenVINO's ``read_model`` API with each XML/BIN
+pair supplied explicitly and with every bundled ONNX graph. It therefore catches
+truncated, unrelated, wrong-shape, or unsupported models before PyInstaller
+copies them into a bundle. OpenVINO-only optimized variants are declared as such.
 """
 
 from __future__ import annotations
 
 import argparse
 from dataclasses import dataclass
+import hashlib
 from pathlib import Path
 import sys
 from typing import Any, Callable, Sequence
@@ -19,6 +21,7 @@ EXPECTED_INPUT_SHAPE = (1, 3, 320, 320)
 BALANCED_INPUT_SHAPE = (1, 3, 416, 416)
 HIGH_END_INPUT_SHAPE = (1, 3, 640, 640)
 FORT_SOURCE_URL = "https://universe.roboflow.com/aviles-joseph/fort-cuh-mji4f"
+MODEL_MANIFEST = Path("models/RELEASE-MANIFEST.sha256")
 
 COCO80_LABELS = (
     "person",
@@ -112,10 +115,13 @@ class ModelAsset:
     xml_relative: Path
     bin_relative: Path
     labels_relative: Path
+    onnx_relative: Path | None
     expected_labels: tuple[str, ...]
     expected_input_shape: tuple[int, int, int, int]
     attribution_relative: Path | None = None
     attribution_markers: tuple[str, ...] = ()
+    metadata_relative: Path | None = None
+    metadata_markers: tuple[str, ...] = ()
 
 
 PLAYER_LABELS = ("player",)
@@ -128,13 +134,47 @@ PLAYER_ATTRIBUTION_MARKERS = (
     "AGPL-3.0",
 )
 
+# Generic COCO exports retain the metadata written by Ultralytics. Besides
+# documenting the graph's size/classes, these fields preserve the exporter and
+# stated model license next to both packaged IR and ONNX copies.
+ULTRALYTICS_METADATA_MARKERS = (
+    "author: Ultralytics",
+    "version:",
+    "license: AGPL-3.0",
+    "docs: https://docs.ultralytics.com",
+    "task: detect",
+    "names:",
+)
+
 
 RELEASE_MODELS = (
+    ModelAsset(
+        display_name="Responsive INT8 player detector",
+        xml_relative=Path(
+            "models/fort_player_416_int8_openvino_model/fort_player_416_int8.xml"
+        ),
+        bin_relative=Path(
+            "models/fort_player_416_int8_openvino_model/fort_player_416_int8.bin"
+        ),
+        labels_relative=Path("models/fort_player.txt"),
+        onnx_relative=None,
+        expected_labels=PLAYER_LABELS,
+        expected_input_shape=BALANCED_INPUT_SHAPE,
+        attribution_relative=Path(
+            "models/fort_player_416_int8_openvino_model/ATTRIBUTION.md"
+        ),
+        attribution_markers=PLAYER_ATTRIBUTION_MARKERS,
+        metadata_relative=Path(
+            "models/fort_player_416_int8_openvino_model/metadata.yaml"
+        ),
+        metadata_markers=("precision: INT8", "method: NNCF", "output_xml_sha256"),
+    ),
     ModelAsset(
         display_name="Balanced player detector",
         xml_relative=Path("models/fort_player_416_openvino_model/fort_player_416.xml"),
         bin_relative=Path("models/fort_player_416_openvino_model/fort_player_416.bin"),
         labels_relative=Path("models/fort_player.txt"),
+        onnx_relative=Path("models/fort_player_416_onnx/fort_player_416.onnx"),
         expected_labels=PLAYER_LABELS,
         expected_input_shape=BALANCED_INPUT_SHAPE,
         attribution_relative=Path("models/fort_player_416_openvino_model/ATTRIBUTION.md"),
@@ -145,6 +185,7 @@ RELEASE_MODELS = (
         xml_relative=Path("models/fort_player_openvino_model/fort_player.xml"),
         bin_relative=Path("models/fort_player_openvino_model/fort_player.bin"),
         labels_relative=Path("models/fort_player.txt"),
+        onnx_relative=Path("models/fort_player_onnx/fort_player.onnx"),
         expected_labels=PLAYER_LABELS,
         expected_input_shape=EXPECTED_INPUT_SHAPE,
         attribution_relative=Path("models/fort_player_openvino_model/ATTRIBUTION.md"),
@@ -155,35 +196,110 @@ RELEASE_MODELS = (
         xml_relative=Path("models/yolo26n_openvino_model/yolo26n.xml"),
         bin_relative=Path("models/yolo26n_openvino_model/yolo26n.bin"),
         labels_relative=Path("models/coco80.txt"),
+        onnx_relative=Path("models/yolo26n_onnx/yolo26n.onnx"),
         expected_labels=COCO80_LABELS,
         expected_input_shape=EXPECTED_INPUT_SHAPE,
+        metadata_relative=Path("models/yolo26n_openvino_model/metadata.yaml"),
+        metadata_markers=ULTRALYTICS_METADATA_MARKERS
+        + ("imgsz:\n- 320\n- 320",),
     ),
     ModelAsset(
         display_name="Balanced COCO detector",
         xml_relative=Path("models/yolo26n_416_openvino_model/yolo26n_416.xml"),
         bin_relative=Path("models/yolo26n_416_openvino_model/yolo26n_416.bin"),
         labels_relative=Path("models/coco80.txt"),
+        onnx_relative=Path("models/yolo26n_416_onnx/yolo26n_416.onnx"),
         expected_labels=COCO80_LABELS,
         expected_input_shape=BALANCED_INPUT_SHAPE,
+        metadata_relative=Path(
+            "models/yolo26n_416_openvino_model/metadata.yaml"
+        ),
+        metadata_markers=ULTRALYTICS_METADATA_MARKERS
+        + ("imgsz:\n- 416\n- 416",),
     ),
     ModelAsset(
         display_name="High-end YOLO11l detector",
         xml_relative=Path("models/yolo11l_openvino_model/yolo11l.xml"),
         bin_relative=Path("models/yolo11l_openvino_model/yolo11l.bin"),
         labels_relative=Path("models/coco80.txt"),
+        onnx_relative=Path("models/yolo11l_onnx/yolo11l.onnx"),
         expected_labels=COCO80_LABELS,
         expected_input_shape=HIGH_END_INPUT_SHAPE,
+        metadata_relative=Path("models/yolo11l_openvino_model/metadata.yaml"),
+        metadata_markers=ULTRALYTICS_METADATA_MARKERS
+        + ("imgsz:\n- 640\n- 640",),
     ),
-)
-
-
-EXTRA_RELEASE_FILES = (
-    Path("models/yolo11l_onnx/yolo11l.onnx"),
 )
 
 
 class ReleaseAssetError(RuntimeError):
     """Raised when one or more files are unsafe to include in a release."""
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _validate_model_manifest(root: Path, errors: list[str]) -> None:
+    path = root / MODEL_MANIFEST
+    text = _read_text(path, "release model SHA-256 manifest", errors)
+    if text is None:
+        return
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(text.splitlines(), start=1):
+        line = raw_line.strip()
+        if not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2 or len(parts[0]) != 64:
+            errors.append(f"invalid SHA-256 manifest line {line_number} in {path}")
+            continue
+        expected, relative_text = parts
+        try:
+            int(expected, 16)
+        except ValueError:
+            errors.append(f"invalid SHA-256 digest on line {line_number} in {path}")
+            continue
+        relative = Path(relative_text.strip().lstrip("*"))
+        if relative.is_absolute() or ".." in relative.parts:
+            errors.append(f"unsafe SHA-256 path on line {line_number} in {path}")
+            continue
+        normalized = relative.as_posix()
+        if normalized in seen:
+            errors.append(f"duplicate SHA-256 path {normalized!r} in {path}")
+            continue
+        seen.add(normalized)
+        target = root / relative
+        if not _regular_nonempty_file(target, f"manifest artifact {normalized}", errors):
+            continue
+        try:
+            actual = _sha256_file(target)
+        except OSError as exc:
+            errors.append(f"cannot hash manifest artifact {target}: {exc}")
+            continue
+        if actual != expected.lower():
+            errors.append(
+                f"SHA-256 mismatch for {normalized}: expected {expected.lower()}, found {actual}"
+            )
+
+    expected_paths: set[str] = set()
+    for asset in RELEASE_MODELS:
+        expected_paths.update(
+            (asset.xml_relative.as_posix(), asset.bin_relative.as_posix(), asset.labels_relative.as_posix())
+        )
+        if asset.onnx_relative is not None:
+            expected_paths.add(asset.onnx_relative.as_posix())
+        if asset.attribution_relative is not None:
+            expected_paths.add(asset.attribution_relative.as_posix())
+        if asset.metadata_relative is not None:
+            expected_paths.add(asset.metadata_relative.as_posix())
+    missing = sorted(expected_paths - seen)
+    if missing:
+        errors.append("SHA-256 manifest is missing release artifact(s): " + ", ".join(missing))
 
 
 def _regular_nonempty_file(path: Path, description: str, errors: list[str]) -> bool:
@@ -261,6 +377,21 @@ def _validate_attribution(root: Path, asset: ModelAsset, errors: list[str]) -> N
         )
 
 
+def _validate_metadata(root: Path, asset: ModelAsset, errors: list[str]) -> None:
+    if asset.metadata_relative is None:
+        return
+    path = root / asset.metadata_relative
+    text = _read_text(path, f"{asset.display_name} metadata", errors)
+    if text is None:
+        return
+    missing = [marker for marker in asset.metadata_markers if marker not in text]
+    if missing:
+        errors.append(
+            f"{asset.display_name} metadata {path} is missing required marker(s): "
+            + ", ".join(repr(marker) for marker in missing)
+        )
+
+
 def _dimension_value(dimension: Any) -> int | None:
     """Return a static OpenVINO dimension, or ``None`` when it is dynamic."""
 
@@ -331,11 +462,14 @@ def _load_openvino_core() -> Any:
         raise ReleaseAssetError(f"OpenVINO Runtime could not initialize: {exc}") from exc
 
 
-def _all_ir_files_ready(root: Path) -> bool:
+def _all_model_files_ready(root: Path) -> bool:
     """Check whether loading is possible without producing duplicate errors."""
 
     for asset in RELEASE_MODELS:
-        for relative_path in (asset.xml_relative, asset.bin_relative):
+        model_paths = [asset.xml_relative, asset.bin_relative]
+        if asset.onnx_relative is not None:
+            model_paths.append(asset.onnx_relative)
+        for relative_path in model_paths:
             path = root / relative_path
             try:
                 if not path.is_file() or path.stat().st_size <= 0:
@@ -345,12 +479,69 @@ def _all_ir_files_ready(root: Path) -> bool:
     return True
 
 
+def _validate_model_ports(
+    asset: ModelAsset,
+    model: Any,
+    format_name: str,
+    errors: list[str],
+) -> tuple[tuple[int | None, ...], tuple[int | None, ...], str] | None:
+    valid = True
+    input_shape: tuple[int | None, ...] | None = None
+    try:
+        inputs = tuple(model.inputs)
+        outputs = tuple(model.outputs)
+    except Exception as exc:
+        errors.append(f"cannot inspect {asset.display_name} {format_name} model ports: {exc}")
+        return None
+
+    if len(inputs) != 1:
+        errors.append(
+            f"{asset.display_name} {format_name} must have exactly one input, found {len(inputs)}"
+        )
+        valid = False
+    else:
+        try:
+            input_shape = _port_shape(inputs[0])
+        except ValueError as exc:
+            errors.append(f"cannot inspect {asset.display_name} {format_name} input shape: {exc}")
+            valid = False
+        else:
+            if input_shape != asset.expected_input_shape:
+                errors.append(
+                    f"{asset.display_name} {format_name} input shape is {input_shape}; expected static "
+                    f"NCHW {asset.expected_input_shape}"
+                )
+                valid = False
+
+    if len(outputs) != 1:
+        errors.append(
+            f"{asset.display_name} {format_name} must have exactly one YOLO output, found {len(outputs)}"
+        )
+        return None
+    try:
+        output_shape = _port_shape(outputs[0])
+    except ValueError as exc:
+        errors.append(f"cannot inspect {asset.display_name} {format_name} output shape: {exc}")
+        return None
+    layout = _supported_output_layout(output_shape, len(asset.expected_labels))
+    if layout is None:
+        attributes = 4 + len(asset.expected_labels)
+        errors.append(
+            f"{asset.display_name} {format_name} output shape {output_shape} is unsupported; expected "
+            f"batch 1 with [1,N,6], [1,N,{attributes}], or [1,{attributes},N]"
+        )
+        return None
+    if not valid or input_shape is None:
+        return None
+    return input_shape, output_shape, layout
+
+
 def _validate_ir(
     root: Path,
     asset: ModelAsset,
     core: Any,
     errors: list[str],
-) -> str | None:
+) -> tuple[tuple[int | None, ...], tuple[int | None, ...], str] | None:
     xml_path = root / asset.xml_relative
     bin_path = root / asset.bin_relative
     xml_ok = _regular_nonempty_file(xml_path, f"{asset.display_name} XML", errors)
@@ -363,7 +554,6 @@ def _validate_ir(
         return None
     if not (xml_ok and bin_ok):
         return None
-
     try:
         model = core.read_model(model=str(xml_path), weights=str(bin_path))
     except Exception as exc:
@@ -372,52 +562,26 @@ def _validate_ir(
             f"({xml_path.name}, {bin_path.name}): {exc}"
         )
         return None
+    return _validate_model_ports(asset, model, "OpenVINO IR", errors)
 
+
+def _validate_onnx(
+    root: Path,
+    asset: ModelAsset,
+    core: Any,
+    errors: list[str],
+) -> tuple[tuple[int | None, ...], tuple[int | None, ...], str] | None:
+    if asset.onnx_relative is None:
+        return None
+    path = root / asset.onnx_relative
+    if not _regular_nonempty_file(path, f"{asset.display_name} ONNX", errors):
+        return None
     try:
-        inputs = tuple(model.inputs)
-        outputs = tuple(model.outputs)
+        model = core.read_model(model=str(path))
     except Exception as exc:
-        errors.append(f"cannot inspect {asset.display_name} model ports: {exc}")
+        errors.append(f"OpenVINO could not read {asset.display_name} ONNX ({path.name}): {exc}")
         return None
-
-    if len(inputs) != 1:
-        errors.append(
-            f"{asset.display_name} must have exactly one input, found {len(inputs)}"
-        )
-    else:
-        try:
-            input_shape = _port_shape(inputs[0])
-        except ValueError as exc:
-            errors.append(f"cannot inspect {asset.display_name} input shape: {exc}")
-        else:
-            if input_shape != asset.expected_input_shape:
-                errors.append(
-                    f"{asset.display_name} input shape is {input_shape}; expected static "
-                    f"NCHW {asset.expected_input_shape}"
-                )
-
-    if len(outputs) != 1:
-        errors.append(
-            f"{asset.display_name} must have exactly one YOLO output, found {len(outputs)}"
-        )
-        return None
-    try:
-        output_shape = _port_shape(outputs[0])
-    except ValueError as exc:
-        errors.append(f"cannot inspect {asset.display_name} output shape: {exc}")
-        return None
-    layout = _supported_output_layout(output_shape, len(asset.expected_labels))
-    if layout is None:
-        attributes = 4 + len(asset.expected_labels)
-        errors.append(
-            f"{asset.display_name} output shape {output_shape} is unsupported; expected "
-            f"batch 1 with [1,N,6], [1,N,{attributes}], or [1,{attributes},N]"
-        )
-        return None
-    return (
-        f"{asset.display_name}: input {asset.expected_input_shape}, "
-        f"output {output_shape} ({layout})"
-    )
+    return _validate_model_ports(asset, model, "ONNX", errors)
 
 
 def validate_release_assets(
@@ -434,14 +598,13 @@ def validate_release_assets(
 
     root = Path(project_root).expanduser().resolve()
     errors: list[str] = []
+    _validate_model_manifest(root, errors)
     for asset in RELEASE_MODELS:
         _validate_labels(root, asset, errors)
         _validate_attribution(root, asset, errors)
-    for relative_path in EXTRA_RELEASE_FILES:
-        _regular_nonempty_file(root / relative_path, f"release file {relative_path}", errors)
-
+        _validate_metadata(root, asset, errors)
     summaries: list[str] = []
-    if _all_ir_files_ready(root):
+    if _all_model_files_ready(root):
         try:
             core = (core_factory or _load_openvino_core)()
         except ReleaseAssetError as exc:
@@ -450,9 +613,18 @@ def validate_release_assets(
             errors.append(f"OpenVINO Runtime could not initialize: {exc}")
         else:
             for asset in RELEASE_MODELS:
-                summary = _validate_ir(root, asset, core, errors)
-                if summary is not None:
-                    summaries.append(summary)
+                ir = _validate_ir(root, asset, core, errors)
+                onnx = _validate_onnx(root, asset, core, errors)
+                if ir is not None and asset.onnx_relative is None:
+                    summaries.append(
+                        f"{asset.display_name}: input {asset.expected_input_shape}; "
+                        f"IR output {ir[1]} ({ir[2]}); OpenVINO-only"
+                    )
+                elif ir is not None and onnx is not None:
+                    summaries.append(
+                        f"{asset.display_name}: input {asset.expected_input_shape}; "
+                        f"IR output {ir[1]} ({ir[2]}); ONNX output {onnx[1]} ({onnx[2]})"
+                    )
     else:
         # Run the common checks to produce path-specific diagnostics.  A core
         # is intentionally unnecessary when an IR pair is not present yet.
@@ -463,6 +635,10 @@ def validate_release_assets(
             _regular_nonempty_file(
                 root / asset.bin_relative, f"{asset.display_name} BIN", errors
             )
+            if asset.onnx_relative is not None:
+                _regular_nonempty_file(
+                    root / asset.onnx_relative, f"{asset.display_name} ONNX", errors
+                )
 
     if errors:
         unique_errors = tuple(dict.fromkeys(errors))
@@ -497,7 +673,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     print("Release asset preflight passed:")
     for summary in summaries:
         print(f"  - {summary}")
-    print("  - bundled COCO label files are exact and complete")
+    print("  - bundled label files, attributions, metadata, and SHA-256 hashes are exact")
     return 0
 
 

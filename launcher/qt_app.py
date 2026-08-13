@@ -12,7 +12,8 @@ not.
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +22,7 @@ import time
 from typing import Any
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QFont, QIcon
+from PySide6.QtGui import QFont, QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -39,7 +40,6 @@ from PySide6.QtWidgets import (
     QRadioButton,
     QScrollArea,
     QSlider,
-    QSizePolicy,
     QStackedWidget,
     QVBoxLayout,
     QWidget,
@@ -54,15 +54,40 @@ from aiming.makcu import (
 )
 
 from . import qt_theme
-from .process import force_stop, request_stop, start_detector
+from .precision import (
+    DEFAULT_PRECISION_PRESET,
+    PRECISION_PRESETS,
+    ControllerCandidate,
+    candidate_identity,
+    candidate_label,
+    is_controller_ready_line,
+    precision_command,
+    precision_preset,
+    precision_readiness,
+    precision_supported,
+    pxn_controllers,
+    select_saved_candidate,
+    verification_calibration,
+)
+from .process import (
+    find_moonlight_executable,
+    force_stop,
+    kill_process,
+    request_stop,
+    start_detector,
+    start_external_process,
+    start_precision_controller,
+)
 from .settings import (
     AIM_OUTPUT_MAKCU,
+    DEFAULT_MODEL_PRESET,
     MODEL_PRESET_CUSTOM,
     MODEL_PRESET_COCO,
     MODEL_PRESET_COCO_BALANCED,
     MODEL_PRESET_COCO_HIGH,
     MODEL_PRESET_FORT_PLAYER,
     MODEL_PRESET_FORT_PLAYER_BALANCED,
+    MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
     MODEL_PRESETS,
     SETTINGS_VERSION,
     SELF_POSITION_CENTER,
@@ -75,6 +100,7 @@ from .settings import (
     SettingsError,
     launcher_command,
     load_settings,
+    resource_root,
     save_settings,
     settings_path,
 )
@@ -82,6 +108,7 @@ from .settings import (
 
 UNIT = qt_theme.UNIT
 PROAIM_BUILD_TAG = "2026-08-10-makcu-monitor-v1"
+SOURCE_REPOSITORY = "https://github.com/laedorp/game-detector"
 MAKCU_BUTTON_LABELS = BUTTON_NAMES
 AIM_POINT_OPTIONS = (
     ("Upper head", "0.08"),
@@ -108,11 +135,13 @@ MODEL_TIER_OPTIONS = (
 )
 MODEL_TIER_PRESET_KEYS = {
     MODEL_TIER_LOW: (
+        MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
         MODEL_PRESET_FORT_PLAYER,
         MODEL_PRESET_COCO,
     ),
     MODEL_TIER_MID: (
         MODEL_PRESET_FORT_PLAYER_BALANCED,
+        MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
         MODEL_PRESET_FORT_PLAYER,
         MODEL_PRESET_COCO_BALANCED,
     ),
@@ -127,7 +156,10 @@ MODEL_TIER_PRESET_KEYS = {
 MODEL_TIER_DEFAULT_PRESET = {
     MODEL_TIER_LOW: MODEL_PRESET_FORT_PLAYER,
     MODEL_TIER_MID: MODEL_PRESET_FORT_PLAYER_BALANCED,
-    MODEL_TIER_HIGH: MODEL_PRESET_COCO_HIGH,
+    # A faster computer should not silently switch from the clone-specific
+    # player class to generic COCO semantics. YOLO11l remains an explicit
+    # benchmark option within the high tier.
+    MODEL_TIER_HIGH: MODEL_PRESET_FORT_PLAYER_BALANCED,
 }
 HIGH_END_CAPTURE_WIDTH = "1920"
 HIGH_END_CAPTURE_HEIGHT = "1080"
@@ -202,6 +234,9 @@ class LauncherWindow(QMainWindow):
     log_line = Signal(str)
     makcu_verification_done = Signal(bool, str, str, str)
     makcu_verification_progress = Signal(str)
+    makcu_monitor_done = Signal()
+    precision_output_line = Signal(str)
+    precision_reader_done = Signal(object)
 
     def __init__(self, settings: LauncherSettings | None = None) -> None:
         super().__init__()
@@ -212,15 +247,53 @@ class LauncherWindow(QMainWindow):
         self.settings = settings or load_settings(settings_path())
         self.process: subprocess.Popen[str] | None = None
         self._reader: Any | None = None
+        self._stop_requested = False
         self._makcu_verify_thread: threading.Thread | None = None
         self._makcu_verify_cancel = threading.Event()
         self._makcu_monitor_thread: threading.Thread | None = None
         self._makcu_monitor_cancel = threading.Event()
         self._makcu_verified_port = self.settings.aim_makcu_verified_port
         self._makcu_verified_button = self.settings.aim_makcu_verified_button
+        self._closing = False
+
+        self.precision_process: subprocess.Popen[str] | None = None
+        self._precision_reader: threading.Thread | None = None
+        self._precision_mode: str | None = None
+        self._precision_stop_requested = False
+        self._precision_ready = False
+        self._precision_pending_identity = ""
+        self._precision_recent_output: list[str] = []
+        self._precision_candidates: dict[str, ControllerCandidate] = {}
+        self._precision_selected_path = self.settings.precision_device_path
+        self._precision_verified_identity = (
+            self.settings.precision_device_identity
+            if self.settings.precision_mapping_verified
+            else ""
+        )
+        self._precision_trigger_rest = (
+            self.settings.precision_trigger_rest
+            if self.settings.precision_mapping_verified
+            else ""
+        )
+        self._precision_trigger_pressed = (
+            self.settings.precision_trigger_pressed
+            if self.settings.precision_mapping_verified
+            else ""
+        )
+        self._precision_mapping_verified = bool(
+            self.settings.precision_mapping_verified
+            and self._precision_verified_identity
+        )
+        self._precision_supported = precision_supported()
 
         self._build_interface()
         self._load_from_settings()
+        self._refresh_precision_devices(silent=True)
+
+        self._start_key = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
+        self._start_key.activated.connect(self._start)
+        self._stop_key = QShortcut(QKeySequence(Qt.Key.Key_Escape), self)
+        self._stop_key.activated.connect(self._stop)
 
         self._poll = QTimer(self)
         self._poll.timeout.connect(self._poll_process)
@@ -229,6 +302,9 @@ class LauncherWindow(QMainWindow):
         self.log_line.connect(self._append_log)
         self.makcu_verification_done.connect(self._apply_makcu_verification_result)
         self.makcu_verification_progress.connect(self._apply_makcu_verification_progress)
+        self.makcu_monitor_done.connect(self._finish_makcu_monitor)
+        self.precision_output_line.connect(self._handle_precision_output_line)
+        self.precision_reader_done.connect(self._precision_reader_finished)
 
     # -- construction ----------------------------------------------------
     def _build_interface(self) -> None:
@@ -249,6 +325,7 @@ class LauncherWindow(QMainWindow):
         self.stack.addWidget(self._build_capture_section())
         self.stack.addWidget(self._build_detection_section())
         self.stack.addWidget(self._build_hardware_section())
+        self.stack.addWidget(self._build_precision_section())
         right_layout.addWidget(self.stack, 1)
         right_layout.addWidget(self._build_footer())
 
@@ -278,7 +355,9 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(brand)
 
         self.nav_buttons: list[QPushButton] = []
-        for index, text in enumerate(("Capture source", "Detection", "Hardware")):
+        for index, text in enumerate(
+            ("Capture source", "Detection", "Hardware", "Controller precision")
+        ):
             button = QPushButton(text)
             button.setProperty("role", "nav")
             button.setCheckable(True)
@@ -288,6 +367,11 @@ class LauncherWindow(QMainWindow):
             self.nav_buttons.append(button)
 
         layout.addStretch(1)
+        about = QPushButton("About & license")
+        about.setProperty("role", "nav")
+        about.setCursor(Qt.CursorShape.PointingHandCursor)
+        about.clicked.connect(self._show_about)
+        layout.addWidget(about)
         version = _label(f"Settings schema v{SETTINGS_VERSION}", "subtitle")
         version.setContentsMargins(UNIT * 2 + 4, 0, UNIT * 2, 0)
         layout.addWidget(version)
@@ -325,9 +409,42 @@ class LauncherWindow(QMainWindow):
         grid.setColumnStretch(1, 1)
         self.screen_monitor = QLineEdit()
         self.screen_fps = QLineEdit()
+        self.open_moonlight_button = QPushButton("Open Moonlight")
+        self.open_moonlight_button.clicked.connect(self._open_moonlight)
         _field_row(grid, 0, "Monitor number", self.screen_monitor)
         _field_row(grid, 1, "Capture rate (fps)", self.screen_fps)
+        grid.addWidget(self.open_moonlight_button, 1, 2)
         screen_layout.addLayout(grid)
+
+        self.use_screen_region = QCheckBox(
+            "Capture a specific desktop rectangle instead of the full monitor"
+        )
+        self.use_screen_region.toggled.connect(self._update_region_state)
+        screen_layout.addWidget(self.use_screen_region)
+        region_grid = QGridLayout()
+        region_grid.setHorizontalSpacing(UNIT * 2)
+        region_grid.setVerticalSpacing(UNIT + 2)
+        self.screen_x = QLineEdit()
+        self.screen_y = QLineEdit()
+        self.screen_width = QLineEdit()
+        self.screen_height = QLineEdit()
+        self._region_widgets = (
+            self.screen_x,
+            self.screen_y,
+            self.screen_width,
+            self.screen_height,
+        )
+        for column, (label, widget) in enumerate(
+            (
+                ("X", self.screen_x),
+                ("Y", self.screen_y),
+                ("Width", self.screen_width),
+                ("Height", self.screen_height),
+            )
+        ):
+            region_grid.addWidget(_label(label, "fieldLabel"), 0, column)
+            region_grid.addWidget(widget, 1, column)
+        screen_layout.addLayout(region_grid)
         self.screen_card = screen_card
         section.add_card(screen_card)
 
@@ -451,6 +568,10 @@ class LauncherWindow(QMainWindow):
         self.confidence_value = _label("0.25", "subtitle")
         self.confidence.valueChanged.connect(self._sync_confidence_label)
         self.iou_threshold = QLineEdit()
+        self.crop_size = QLineEdit()
+        self.crop_size.setPlaceholderText("Optional centered square crop")
+        self.output_format = QComboBox()
+        self.output_format.addItems(("auto", "end2end", "traditional"))
 
         confidence_row = QWidget()
         confidence_layout = QHBoxLayout(confidence_row)
@@ -462,6 +583,8 @@ class LauncherWindow(QMainWindow):
         _field_row(grid, 0, "Inference size", self.inference_size)
         _field_row(grid, 1, "Confidence", confidence_row)
         _field_row(grid, 2, "IoU threshold", self.iou_threshold)
+        _field_row(grid, 3, "Centered crop (px)", self.crop_size)
+        _field_row(grid, 4, "Model output format", self.output_format)
         layout.addLayout(grid)
         section.add_card(card)
 
@@ -615,8 +738,9 @@ class LauncherWindow(QMainWindow):
 
         card, layout = _card(
             "Automatic selection",
-            "Scanning reports every accelerator present and whether this "
-            "installation can drive it, then selects the fastest usable one.",
+            "Scanning reports every accelerator present and which runtime "
+            "provider is installed, then suggests the fastest path. GPU driver "
+            "initialization is verified when detection starts.",
         )
         row = QHBoxLayout()
         row.setSpacing(UNIT)
@@ -624,7 +748,7 @@ class LauncherWindow(QMainWindow):
         scan.setProperty("role", "primary")
         scan.clicked.connect(self._scan_hardware)
         row.addWidget(scan)
-        self.install_runtime_button = QPushButton("Download GPU runtime")
+        self.install_runtime_button = QPushButton("Show GPU setup instructions")
         self.install_runtime_button.clicked.connect(self._install_runtime)
         self.install_runtime_button.setEnabled(False)
         self.install_runtime_button.setToolTip("Run a hardware scan first.")
@@ -647,6 +771,7 @@ class LauncherWindow(QMainWindow):
         grid.setColumnStretch(1, 1)
         self.backend = QComboBox()
         self.backend.addItems(("openvino", "onnxruntime"))
+        self.backend.currentTextChanged.connect(self._backend_changed)
         self.device = QComboBox()
         self.device.setEditable(True)
         self.device.addItems(("CPU", "AUTO", "GPU", "NPU"))
@@ -666,6 +791,98 @@ class LauncherWindow(QMainWindow):
         _field_row(grid, 2, "Device", self.device)
         layout.addLayout(grid)
         section.add_card(card)
+
+        section.add_stretch()
+        return section
+
+    def _build_precision_section(self) -> QWidget:
+        section = Section(
+            "Controller precision",
+            "Linux-only manual fine control for a PXN P5 8K. This is an "
+            "independent controller worker and does not use detections.",
+        )
+
+        card, layout = _card(
+            "What this does",
+            "While LT is held, the selected curve reshapes only the right-stick "
+            "movement you physically produce. Release LT for normal 1:1 input. "
+            "Start this worker before opening the Moonlight stream.",
+        )
+        section.add_card(card)
+
+        card, layout = _card("PXN controller and read-only mapping check")
+        row = QHBoxLayout()
+        row.setSpacing(UNIT)
+        self.precision_device = QComboBox()
+        self.precision_device.currentIndexChanged.connect(
+            self._precision_selection_changed
+        )
+        self.precision_refresh_button = QPushButton("Refresh")
+        self.precision_refresh_button.clicked.connect(self._refresh_precision_devices)
+        self.precision_verify_button = QPushButton("Verify LT + right stick…")
+        self.precision_verify_button.clicked.connect(self.verify_precision_mapping)
+        row.addWidget(self.precision_device, 1)
+        row.addWidget(self.precision_refresh_button)
+        row.addWidget(self.precision_verify_button)
+        layout.addLayout(row)
+        self.precision_device_status = _label("", "subtitle")
+        self.precision_device_status.setWordWrap(True)
+        self.precision_mapping_status = _label("Mapping not verified", "subtitle")
+        self.precision_mapping_status.setWordWrap(True)
+        layout.addWidget(self.precision_device_status)
+        layout.addWidget(self.precision_mapping_status)
+        section.add_card(card)
+
+        card, layout = _card("LT precision strength")
+        row = QHBoxLayout()
+        row.setSpacing(UNIT)
+        row.addWidget(_label("Preset", "fieldLabel"))
+        self.precision_preset = QComboBox()
+        for preset in PRECISION_PRESETS:
+            self.precision_preset.addItem(preset.label, preset.key)
+        self.precision_preset.currentIndexChanged.connect(
+            self._precision_preset_changed
+        )
+        row.addWidget(self.precision_preset)
+        self.precision_preset_description = _label("", "subtitle")
+        self.precision_preset_description.setWordWrap(True)
+        row.addWidget(self.precision_preset_description, 1)
+        layout.addLayout(row)
+        section.add_card(card)
+
+        card, layout = _card("Start before opening Moonlight")
+        row = QHBoxLayout()
+        row.setSpacing(UNIT)
+        self.precision_start_button = QPushButton("Start controller precision")
+        self.precision_start_button.setProperty("role", "primary")
+        self.precision_start_button.clicked.connect(self.start_precision)
+        self.precision_stop_button = QPushButton("Stop precision")
+        self.precision_stop_button.clicked.connect(self.stop_precision)
+        self.precision_moonlight_button = QPushButton("Open Moonlight")
+        self.precision_moonlight_button.clicked.connect(self._open_moonlight)
+        self.precision_status = _label("Stopped", "status")
+        row.addWidget(self.precision_start_button)
+        row.addWidget(self.precision_stop_button)
+        row.addWidget(self.precision_status, 1)
+        row.addWidget(self.precision_moonlight_button)
+        layout.addLayout(row)
+        section.add_card(card)
+
+        if not self._precision_supported:
+            self.precision_device_status.setText(
+                "Controller precision is available only on Linux."
+            )
+            self.precision_mapping_status.setText("Unavailable on this operating system")
+            for widget in (
+                self.precision_device,
+                self.precision_refresh_button,
+                self.precision_verify_button,
+                self.precision_preset,
+                self.precision_start_button,
+                self.precision_stop_button,
+                self.precision_moonlight_button,
+            ):
+                widget.setEnabled(False)
 
         section.add_stretch()
         return section
@@ -709,12 +926,35 @@ class LauncherWindow(QMainWindow):
         for position, button in enumerate(self.nav_buttons):
             button.setChecked(position == index)
 
+    def _show_about(self) -> None:
+        license_path = resource_root() / "LICENSE"
+        license_location = (
+            str(license_path)
+            if license_path.is_file()
+            else f"{SOURCE_REPOSITORY}/blob/main/LICENSE"
+        )
+        QMessageBox.about(
+            self,
+            "About ProAim",
+            f"ProAim ({PROAIM_BUILD_TAG})\n\n"
+            "Copyright (C) 2026 ProAim contributors.\n"
+            "Licensed under AGPL-3.0-or-later. This program is distributed "
+            "without any warranty; see the license for details.\n\n"
+            f"License: {license_location}\n"
+            f"Source: {SOURCE_REPOSITORY}",
+        )
+
     def _choose_source(self, mode: str) -> None:
         for key, box in self._source_boxes.items():
             box.setChecked(key == mode)
         self.screen_card.setVisible(mode == SOURCE_SCREEN)
         self.camera_card.setVisible(mode == SOURCE_CAMERA)
         self.video_card.setVisible(mode == SOURCE_VIDEO)
+
+    def _update_region_state(self) -> None:
+        enabled = self.use_screen_region.isChecked()
+        for widget in self._region_widgets:
+            widget.setEnabled(enabled)
 
     def _preset_changed(self) -> None:
         key = self.model_preset.currentData()
@@ -723,25 +963,51 @@ class LauncherWindow(QMainWindow):
         self.custom_labels_path.setEnabled(custom)
         self.custom_model_browse.setEnabled(custom)
         self.custom_labels_browse.setEnabled(custom)
+        self.output_format.setEnabled(custom)
         for preset in MODEL_PRESETS:
             if preset.key == key:
                 self.preset_note.setText(preset.description)
                 if preset.inference_size is not None:
                     self.inference_size.setCurrentText(str(preset.inference_size))
+                if preset.bundled:
+                    self.output_format.setCurrentText("auto")
+                    if hasattr(self, "aim_label"):
+                        self.aim_label.setText(
+                            "player"
+                            if preset.key
+                            in (
+                                MODEL_PRESET_FORT_PLAYER,
+                                MODEL_PRESET_FORT_PLAYER_BALANCED,
+                                MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
+                            )
+                            else "person"
+                        )
                 break
 
     def _model_tier_changed(self) -> None:
-        self._refresh_model_preset_options(preferred_key=self.model_preset.currentData())
-        if str(self.model_tier.currentData() or MODEL_TIER_MID) == MODEL_TIER_HIGH:
+        tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
+        self._refresh_model_preset_options(
+            preferred_key=MODEL_TIER_DEFAULT_PRESET.get(tier)
+        )
+        if tier == MODEL_TIER_HIGH:
             self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
             self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
             self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
             self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
 
+    def _backend_changed(self, _backend: str = "") -> None:
+        if not hasattr(self, "model_preset"):
+            return
+        self._refresh_model_preset_options(
+            preferred_key=str(self.model_preset.currentData() or "")
+        )
+
     def _refresh_model_preset_options(self, *, preferred_key: str | None = None) -> None:
         tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
         allowed = set(MODEL_TIER_PRESET_KEYS.get(tier, MODEL_TIER_PRESET_KEYS[MODEL_TIER_MID]))
         allowed.add(MODEL_PRESET_CUSTOM)
+        if self.backend.currentText().strip().lower() == "onnxruntime":
+            allowed.discard(MODEL_PRESET_FORT_PLAYER_BALANCED_INT8)
         current = preferred_key or str(self.model_preset.currentData() or "")
         self.model_preset.blockSignals(True)
         self.model_preset.clear()
@@ -765,6 +1031,12 @@ class LauncherWindow(QMainWindow):
         s = self.settings
         self.screen_monitor.setText(s.screen_monitor)
         self.screen_fps.setText(s.screen_fps)
+        self.use_screen_region.setChecked(s.use_screen_region)
+        self.screen_x.setText(s.screen_x)
+        self.screen_y.setText(s.screen_y)
+        self.screen_width.setText(s.screen_width)
+        self.screen_height.setText(s.screen_height)
+        self._update_region_state()
         self.camera_index.setText(s.camera_index)
         self.capture_width.setText(s.capture_width)
         self.capture_height.setText(s.capture_height)
@@ -773,6 +1045,8 @@ class LauncherWindow(QMainWindow):
         self._set_confidence_slider_value(s.confidence)
         self.iou_threshold.setText(s.iou_threshold)
         self.inference_size.setCurrentText(s.inference_size)
+        self.crop_size.setText(s.crop_size)
+        self.output_format.setCurrentText(s.output_format)
         self.preview.setChecked(s.preview)
         self.draw.setChecked(s.draw)
         self.backend.setCurrentText(s.backend)
@@ -785,9 +1059,13 @@ class LauncherWindow(QMainWindow):
         self.aim_point.setCurrentText(aim_point)
         self.aim_invert_x.setChecked(s.aim_invert_x)
         self.aim_invert_y.setChecked(s.aim_invert_y)
+        self.aim_makcu_port.blockSignals(True)
+        self.aim_makcu_button.blockSignals(True)
         self.aim_makcu_port.setText(s.aim_makcu_port)
         makcu_button = min(max(self._parse_int(s.aim_makcu_button, default=1), 0), 4)
         self.aim_makcu_button.setCurrentIndex(makcu_button)
+        self.aim_makcu_port.blockSignals(False)
+        self.aim_makcu_button.blockSignals(False)
         self._set_strength_slider_value(s.aim_makcu_strength)
         self._set_smoothing_slider_value(s.aim_makcu_smoothing_alpha)
         self.aim_makcu_max_step.setText(s.aim_makcu_max_step)
@@ -800,16 +1078,29 @@ class LauncherWindow(QMainWindow):
         if tier_index >= 0:
             self.model_tier.setCurrentIndex(tier_index)
         preferred_model = s.model_preset
-        if preferred_model not in MODEL_TIER_PRESET_KEYS.get(tier_value, ()):
+        if (
+            preferred_model != MODEL_PRESET_CUSTOM
+            and preferred_model not in MODEL_TIER_PRESET_KEYS.get(tier_value, ())
+        ):
             preferred_model = MODEL_TIER_DEFAULT_PRESET.get(tier_value, s.model_preset)
         self._refresh_model_preset_options(preferred_key=preferred_model)
         self._preset_changed()
+        if preferred_model == MODEL_PRESET_CUSTOM:
+            # Tier initialization may temporarily select a bundled preset. Put
+            # the custom decoder and size back after the final preset is active.
+            self.inference_size.setCurrentText(s.inference_size)
+            self.output_format.setCurrentText(s.output_format)
         if tier_value == MODEL_TIER_HIGH:
             self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
             self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
             self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
             self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
         self._choose_source(s.source_mode)
+        precision_index = self.precision_preset.findData(s.precision_preset)
+        if precision_index < 0:
+            precision_index = self.precision_preset.findData(DEFAULT_PRECISION_PRESET)
+        self.precision_preset.setCurrentIndex(max(precision_index, 0))
+        self._precision_preset_changed()
         self._makcu_verification_selection_changed()
         self._update_aim_state()
 
@@ -824,6 +1115,11 @@ class LauncherWindow(QMainWindow):
         s.source_mode = mode
         s.screen_monitor = self.screen_monitor.text()
         s.screen_fps = self.screen_fps.text()
+        s.use_screen_region = self.use_screen_region.isChecked()
+        s.screen_x = self.screen_x.text()
+        s.screen_y = self.screen_y.text()
+        s.screen_width = self.screen_width.text()
+        s.screen_height = self.screen_height.text()
         s.camera_index = self.camera_index.text()
         s.capture_width = self.capture_width.text()
         s.capture_height = self.capture_height.text()
@@ -832,6 +1128,8 @@ class LauncherWindow(QMainWindow):
         s.confidence = f"{self._confidence_from_slider():.2f}"
         s.iou_threshold = self.iou_threshold.text()
         s.inference_size = self.inference_size.currentText()
+        s.crop_size = self.crop_size.text().strip()
+        s.output_format = self.output_format.currentText()
         s.preview = self.preview.isChecked()
         s.draw = self.draw.isChecked()
         s.backend = self.backend.currentText()
@@ -855,11 +1153,474 @@ class LauncherWindow(QMainWindow):
         s.aim_makcu_derivative_damping_seconds = (
             self.settings.aim_makcu_derivative_damping_seconds
         )
-        s.aim_makcu_verified_port = self._makcu_verified_port
-        s.aim_makcu_verified_button = self._makcu_verified_button
+        s.aim_makcu_verified_port = (
+            self._makcu_verified_port if self._makcu_verification_matches() else ""
+        )
+        s.aim_makcu_verified_button = (
+            self._makcu_verified_button if self._makcu_verification_matches() else ""
+        )
         s.ignore_self = self.ignore_self.isChecked()
         s.self_position = str(self.self_position.currentData() or SELF_POSITION_LEFT)
+        precision_candidate = self._selected_precision_candidate()
+        precision_path = (
+            str(precision_candidate.path)
+            if precision_candidate is not None
+            else self._precision_selected_path
+        )
+        precision_verified = bool(
+            precision_candidate is not None
+            and self._precision_mapping_verified
+            and self._precision_verified_identity
+            and candidate_identity(precision_candidate) == self._precision_verified_identity
+        )
+        if precision_candidate is None and self._precision_verified_identity:
+            # Keep a device-bound record while the same controller is simply
+            # unplugged; selecting a different device clears it below.
+            precision_verified = self._precision_mapping_verified
+        s.precision_device_path = precision_path
+        s.precision_device_identity = (
+            self._precision_verified_identity if precision_verified else ""
+        )
+        s.precision_mapping_verified = precision_verified
+        s.precision_preset = str(
+            self.precision_preset.currentData() or DEFAULT_PRECISION_PRESET
+        )
+        s.precision_trigger_rest = (
+            self._precision_trigger_rest if precision_verified else ""
+        )
+        s.precision_trigger_pressed = (
+            self._precision_trigger_pressed if precision_verified else ""
+        )
         return s
+
+    # -- controller precision -------------------------------------------
+    def _selected_precision_candidate(self) -> ControllerCandidate | None:
+        candidate = self.precision_device.currentData()
+        return candidate if isinstance(candidate, ControllerCandidate) else None
+
+    def _refresh_precision_devices(self, _checked: bool = False, *, silent: bool = False) -> None:
+        if not self._precision_supported:
+            return
+        process = self.precision_process
+        if process is not None and process.poll() is None:
+            if not silent:
+                self.precision_status.setText(
+                    "Stop controller precision before refreshing devices."
+                )
+            return
+        try:
+            candidates = pxn_controllers()
+        except OSError as exc:
+            candidates = ()
+            self.precision_device_status.setText(f"Could not scan controllers: {exc}")
+
+        self._precision_candidates = {
+            candidate_label(candidate): candidate for candidate in candidates
+        }
+        selected = select_saved_candidate(candidates, self._precision_selected_path)
+        self.precision_device.blockSignals(True)
+        self.precision_device.clear()
+        if not candidates:
+            self.precision_device.addItem("No PXN P5 8K found", None)
+        else:
+            for candidate in candidates:
+                self.precision_device.addItem(candidate_label(candidate), candidate)
+        selected_index = self.precision_device.findData(selected)
+        if selected_index >= 0:
+            self.precision_device.setCurrentIndex(selected_index)
+        elif candidates:
+            self.precision_device.setCurrentIndex(-1)
+        self.precision_device.blockSignals(False)
+
+        if selected is None:
+            if candidates:
+                self.precision_device_status.setText(
+                    "Choose the PXN P5 8K you want to verify."
+                )
+            else:
+                self.precision_device_status.setText(
+                    "PXN P5 8K not found. Connect it by USB, then press Refresh."
+                )
+            if self._precision_verified_identity:
+                self.precision_mapping_status.setText(
+                    "A verified controller is saved; reconnect that same device to continue."
+                )
+            else:
+                self.precision_mapping_status.setText("Mapping not verified")
+        else:
+            self._precision_selected_path = str(selected.path)
+            identity_matches = bool(
+                self._precision_mapping_verified
+                and self._precision_verified_identity
+                and candidate_identity(selected) == self._precision_verified_identity
+            )
+            if not identity_matches:
+                self._clear_precision_verification()
+            self.precision_device_status.setText(
+                f"Found {candidate_label(selected)}"
+            )
+            self.precision_mapping_status.setText(
+                "Mapping verified for this controller — ready to start."
+                if identity_matches
+                else "Mapping not verified. Run the read-only LT + right-stick check once."
+            )
+        self._update_precision_controls()
+
+    def _clear_precision_verification(self) -> None:
+        self._precision_verified_identity = ""
+        self._precision_trigger_rest = ""
+        self._precision_trigger_pressed = ""
+        self._precision_mapping_verified = False
+
+    def _precision_selection_changed(self, _index: int = -1) -> None:
+        candidate = self._selected_precision_candidate()
+        if candidate is None:
+            self._update_precision_controls()
+            return
+        new_identity = candidate_identity(candidate)
+        self._precision_selected_path = str(candidate.path)
+        if new_identity != self._precision_verified_identity:
+            self._clear_precision_verification()
+            self.precision_mapping_status.setText(
+                "Mapping not verified. Run the read-only LT + right-stick check once."
+            )
+        else:
+            self._precision_mapping_verified = True
+            self.precision_mapping_status.setText(
+                "Mapping verified for this controller — ready to start."
+            )
+        self.precision_device_status.setText(
+            f"Selected {candidate_label(candidate)}"
+        )
+        self._update_precision_controls()
+
+    def _precision_preset_changed(self, _index: int = -1) -> None:
+        key = str(self.precision_preset.currentData() or DEFAULT_PRECISION_PRESET)
+        self.precision_preset_description.setText(precision_preset(key).description)
+
+    def _update_precision_controls(self) -> None:
+        if not self._precision_supported:
+            return
+        process = self.precision_process
+        busy = process is not None and process.poll() is None
+        candidate = self._selected_precision_candidate()
+        verified = bool(
+            candidate is not None
+            and self._precision_mapping_verified
+            and self._precision_verified_identity
+            and candidate_identity(candidate) == self._precision_verified_identity
+        )
+        self.precision_device.setEnabled(bool(self._precision_candidates) and not busy)
+        self.precision_refresh_button.setEnabled(not busy)
+        self.precision_verify_button.setEnabled(
+            candidate is not None and candidate.readable and not busy
+        )
+        self.precision_preset.setEnabled(not busy)
+        self.precision_start_button.setEnabled(verified and not busy)
+        self.precision_stop_button.setEnabled(busy and not self._precision_stop_requested)
+        self.precision_moonlight_button.setEnabled(
+            busy
+            and self._precision_mode == "run"
+            and self._precision_ready
+            and not self._precision_stop_requested
+        )
+
+    def verify_precision_mapping(self) -> None:
+        if not self._precision_supported:
+            QMessageBox.critical(
+                self, "Linux required", "Controller precision is available only on Linux."
+            )
+            return
+        candidate = self._selected_precision_candidate()
+        if candidate is None:
+            QMessageBox.warning(
+                self,
+                "PXN controller not selected",
+                "Connect the PXN P5 8K, press Refresh, and select it first.",
+            )
+            return
+        if not candidate.readable:
+            QMessageBox.critical(
+                self,
+                "Controller permission needed",
+                "This desktop session cannot read the PXN controller. Reconnect it "
+                "while signed in, then press Refresh.",
+            )
+            return
+        try:
+            command = precision_command(
+                candidate, mode="verify", verification_seconds=4.0
+            )
+        except ValueError as exc:
+            QMessageBox.critical(self, "Cannot verify mapping", str(exc))
+            return
+
+        QMessageBox.information(
+            self,
+            "Read-only mapping check",
+            "This check only observes your physical controller. After closing this "
+            "message, repeatedly squeeze and release LT, then move only the right "
+            "stick in full circles when prompted. Keep all other controls still.",
+        )
+        self._clear_precision_verification()
+        self.precision_mapping_status.setText(
+            "Checking LT and right-stick mapping (read-only)…"
+        )
+        self._start_precision_child(
+            command,
+            mode="verify",
+            pending_identity=candidate_identity(candidate),
+        )
+
+    def start_precision(self) -> None:
+        if not self._precision_supported:
+            return
+        if self.precision_process is not None and self.precision_process.poll() is None:
+            return
+        candidate = self._selected_precision_candidate()
+        if candidate is None:
+            QMessageBox.warning(
+                self,
+                "PXN controller not selected",
+                "Connect the PXN P5 8K and press Refresh.",
+            )
+            return
+        identity = candidate_identity(candidate)
+        if not (
+            self._precision_mapping_verified
+            and self._precision_verified_identity
+            and identity == self._precision_verified_identity
+        ):
+            QMessageBox.warning(
+                self,
+                "Verify the controller mapping first",
+                "Run the read-only LT + right-stick check for this controller before starting.",
+            )
+            return
+        readiness = precision_readiness(candidate)
+        if not readiness.ready:
+            detail = f"{readiness.summary}\n\n{readiness.action}".strip()
+            self.precision_status.setText(readiness.summary)
+            QMessageBox.critical(self, "Controller precision is not ready", detail)
+            return
+        try:
+            trigger_rest = (
+                int(self._precision_trigger_rest)
+                if self._precision_trigger_rest.strip()
+                else None
+            )
+            trigger_pressed = (
+                int(self._precision_trigger_pressed)
+                if self._precision_trigger_pressed.strip()
+                else None
+            )
+            command = precision_command(
+                candidate,
+                mode="run",
+                preset_key=str(
+                    self.precision_preset.currentData() or DEFAULT_PRECISION_PRESET
+                ),
+                parent_pid=os.getpid(),
+                trigger_rest=trigger_rest,
+                trigger_pressed=trigger_pressed,
+            )
+        except (TypeError, ValueError) as exc:
+            QMessageBox.critical(self, "Cannot start controller precision", str(exc))
+            return
+        self._start_precision_child(command, mode="run", pending_identity=identity)
+
+    def _start_precision_child(
+        self,
+        command: list[str],
+        *,
+        mode: str,
+        pending_identity: str,
+    ) -> bool:
+        try:
+            process = start_precision_controller(command)
+        except OSError as exc:
+            self.precision_status.setText("Could not start")
+            QMessageBox.critical(
+                self,
+                "Could not start controller helper",
+                f"The controller helper could not be started.\n\n{exc}",
+            )
+            return False
+        self.precision_process = process
+        self._precision_mode = mode
+        self._precision_pending_identity = pending_identity
+        self._precision_stop_requested = False
+        self._precision_ready = False
+        self._precision_recent_output = []
+        self.precision_status.setText(
+            "Checking mapping…" if mode == "verify" else "Starting…"
+        )
+        self._append_log(
+            "Checking controller mapping…"
+            if mode == "verify"
+            else "Starting controller precision…"
+        )
+
+        def pump() -> None:
+            stream = process.stdout
+            if stream is not None:
+                try:
+                    for line in stream:
+                        self.precision_output_line.emit(line)
+                except (OSError, ValueError) as exc:
+                    self.precision_output_line.emit(
+                        f"Controller log reader stopped: {exc}\n"
+                    )
+                finally:
+                    try:
+                        stream.close()
+                    except OSError:
+                        pass
+            self.precision_reader_done.emit(process)
+
+        self._precision_reader = threading.Thread(
+            target=pump, name="controller-precision-log-reader", daemon=True
+        )
+        self._precision_reader.start()
+        self._update_precision_controls()
+        return True
+
+    def _handle_precision_output_line(self, line: str) -> None:
+        if is_controller_ready_line(line):
+            process = self.precision_process
+            if (
+                process is not None
+                and process.poll() is None
+                and self._precision_mode == "run"
+                and not self._precision_stop_requested
+            ):
+                self._precision_ready = True
+                self.precision_status.setText(
+                    "Active — hold LT for fine manual control"
+                )
+                self._append_log("[Controller] Virtual input is ready.")
+                self._update_precision_controls()
+            return
+        self._precision_recent_output.append(line)
+        if len(self._precision_recent_output) > 80:
+            del self._precision_recent_output[:-80]
+        self._append_log(f"[Controller] {line.rstrip()}")
+
+    def _precision_reader_finished(self, process: object) -> None:
+        if process is not self.precision_process:
+            return
+        self._precision_reader = None
+        self._poll_precision_process()
+
+    def _poll_precision_process(self) -> None:
+        process = self.precision_process
+        if process is None:
+            return
+        return_code = process.poll()
+        if return_code is None:
+            return
+        self._finish_precision_process(process, return_code)
+
+    def _finish_precision_process(
+        self, process: subprocess.Popen[str], return_code: int
+    ) -> None:
+        if self.precision_process is not process:
+            return
+        mode = self._precision_mode
+        pending_identity = self._precision_pending_identity
+        stop_requested = self._precision_stop_requested
+        became_ready = self._precision_ready
+        self.precision_process = None
+        self._precision_reader = None
+        self._precision_mode = None
+        self._precision_pending_identity = ""
+        self._precision_stop_requested = False
+        self._precision_ready = False
+
+        if mode == "verify":
+            candidate = self._selected_precision_candidate()
+            calibration = verification_calibration("".join(self._precision_recent_output))
+            same_device = bool(
+                candidate is not None
+                and pending_identity
+                and candidate_identity(candidate) == pending_identity
+            )
+            if return_code == 0 and same_device and calibration is not None and not stop_requested:
+                self._precision_verified_identity = pending_identity
+                self._precision_trigger_rest = str(calibration[0])
+                self._precision_trigger_pressed = str(calibration[1])
+                self._precision_mapping_verified = True
+                self.precision_mapping_status.setText(
+                    "Mapping verified for this controller — ready to start."
+                )
+                self.precision_status.setText("Mapping verified")
+                if not self._closing:
+                    QMessageBox.information(
+                        self,
+                        "Controller mapping verified",
+                        "LT and the right-stick axes matched the expected PXN mapping.",
+                    )
+            else:
+                self._clear_precision_verification()
+                self.precision_mapping_status.setText(
+                    "Mapping not verified. Repeat the check and move only the requested controls."
+                )
+                self.precision_status.setText(
+                    "Mapping check stopped" if stop_requested else "Mapping check failed"
+                )
+                if not stop_requested and not self._closing:
+                    QMessageBox.warning(
+                        self,
+                        "Mapping not verified",
+                        "The expected LT and right-stick axes were not observed.",
+                    )
+        elif stop_requested and return_code in (0, 130, -2, -15):
+            self.precision_status.setText("Stopped")
+        elif not became_ready:
+            self.precision_status.setText("Could not start")
+            if not self._closing:
+                QMessageBox.critical(
+                    self,
+                    "Controller precision could not start",
+                    "The controller was not reported active. Check the connection and permissions.",
+                )
+        elif return_code == 0:
+            self.precision_status.setText("Stopped")
+        else:
+            self.precision_status.setText(f"Stopped with error ({return_code})")
+
+        try:
+            save_settings(self.collect(), settings_path())
+        except OSError:
+            pass
+        self._update_precision_controls()
+
+    def stop_precision(self) -> None:
+        process = self.precision_process
+        if process is None or process.poll() is not None or self._precision_stop_requested:
+            return
+        self._precision_stop_requested = True
+        self.precision_status.setText("Stopping…")
+        self._update_precision_controls()
+        request_stop(process)
+        QTimer.singleShot(
+            3000, lambda current=process: self._force_stop_precision_if_current(current)
+        )
+        QTimer.singleShot(
+            6000, lambda current=process: self._kill_precision_if_current(current)
+        )
+
+    def _force_stop_precision_if_current(
+        self, process: subprocess.Popen[str]
+    ) -> None:
+        if self.precision_process is process and process.poll() is None:
+            self._append_log("Controller helper did not exit; terminating it.")
+            force_stop(process)
+
+    def _kill_precision_if_current(self, process: subprocess.Popen[str]) -> None:
+        if self.precision_process is process and process.poll() is None:
+            self._append_log("Controller helper still did not exit; forcing shutdown.")
+            kill_process(process)
 
     # -- actions ---------------------------------------------------------
     def _browse_video(self) -> None:
@@ -868,6 +1629,30 @@ class LauncherWindow(QMainWindow):
         )
         if chosen:
             self.video_path.setText(chosen)
+
+    def _open_moonlight(self) -> None:
+        executable = find_moonlight_executable()
+        if not executable:
+            QMessageBox.information(
+                self,
+                "Moonlight was not found",
+                "Install Moonlight or open it from your application menu. ProAim "
+                "captures the stream after it is running.",
+            )
+            return
+        try:
+            start_external_process([executable])
+        except OSError as exc:
+            QMessageBox.critical(
+                self,
+                "Could not open Moonlight",
+                f"Moonlight was found but could not be opened.\n\n{exc}",
+            )
+            return
+        self._set_status(
+            "Moonlight opened — start your stream, then start detection.", "ok"
+        )
+        self._append_log("Opened Moonlight. Start the stream before detection.")
 
     def _browse_aim_makcu_port(self) -> None:
         chosen, _ = QFileDialog.getOpenFileName(
@@ -897,7 +1682,8 @@ class LauncherWindow(QMainWindow):
         self._set_status(f"Detected MAKCU at {detected}.", "ok")
 
     def _selected_makcu_button(self) -> int:
-        return int(self.aim_makcu_button.currentData() or 1)
+        selected = self.aim_makcu_button.currentData()
+        return 1 if selected is None else int(selected)
 
     def _makcu_verification_matches(self) -> bool:
         return bool(
@@ -933,10 +1719,21 @@ class LauncherWindow(QMainWindow):
     def _makcu_verification_selection_changed(self) -> None:
         button = MAKCU_BUTTON_LABELS[self._selected_makcu_button()]
         self.verify_makcu_button.setText(f"Verify {button} Mouse…")
+        if not self._makcu_verification_matches():
+            # A verification record is bound to one exact board path and
+            # button.  Do not retain it after either selection changes.
+            self._makcu_verified_port = ""
+            self._makcu_verified_button = ""
         self._refresh_makcu_verification_status()
 
     def _update_aim_state(self) -> None:
         enabled = self.aim.isChecked()
+        if enabled:
+            # Detection output must never run without the third-person guard.
+            # Keep the relationship visible in the UI instead of silently
+            # adding a hidden command-line option.
+            self.ignore_self.setChecked(True)
+        self.ignore_self.setEnabled(not enabled)
         for widget in (
             self.aim_label,
             self.aim_point,
@@ -1033,8 +1830,13 @@ class LauncherWindow(QMainWindow):
             self.makcu_verification_progress.emit(f"Monitor error: {exc}")
         finally:
             controller.stop()
-            self._makcu_monitor_thread = None
-            self._update_aim_state()
+            self.makcu_monitor_done.emit()
+
+    def _finish_makcu_monitor(self) -> None:
+        """Finish monitor UI work on Qt's main thread."""
+
+        self._makcu_monitor_thread = None
+        self._update_aim_state()
 
     def verify_makcu_activation(self) -> None:
         if self.process is not None and self.process.poll() is None:
@@ -1059,6 +1861,8 @@ class LauncherWindow(QMainWindow):
 
         button = self._selected_makcu_button()
         button_name = MAKCU_BUTTON_LABELS[button]
+        self._makcu_verified_port = ""
+        self._makcu_verified_button = ""
         self._makcu_verify_cancel.clear()
         self.aim_makcu_verification_status.setText(
             f"Waiting for {button_name} press… (no game stream required)"
@@ -1085,6 +1889,9 @@ class LauncherWindow(QMainWindow):
         next_progress = time.monotonic() + 1.0
         saw_any_button_report = False
         last_mask = 0
+        baseline_observed = False
+        pressed = False
+        expected_mask = 1 << button
         try:
             controller.start(output_loop=False)
             self.makcu_verification_progress.emit(
@@ -1092,43 +1899,58 @@ class LauncherWindow(QMainWindow):
             )
             while time.monotonic() < deadline and not self._makcu_verify_cancel.is_set():
                 mask = controller.poll_button_mask()
-                if mask:
-                    saw_any_button_report = True
-                    last_mask = mask
-                    detected_button = next(
-                        (
-                            index
-                            for index in range(len(MAKCU_BUTTON_LABELS))
-                            if mask & (1 << index)
-                        ),
-                        None,
-                    )
-                    if detected_button is not None:
-                        detected_name = MAKCU_BUTTON_LABELS[detected_button]
-                        selected_name = MAKCU_BUTTON_LABELS[button]
-                        self.makcu_verification_progress.emit(
-                            f"Detected {detected_name} (mask 0x{mask:02X}). Finishing verification…"
+                if not baseline_observed:
+                    if mask:
+                        detail = (
+                            "Release every mouse button before verification, then try again. "
+                            f"MAKCU initially reported mask 0x{mask:02X}."
                         )
-                        if detected_button == button:
-                            detail = f"Detected selected {selected_name} (mask 0x{mask:02X})."
-                        else:
-                            detail = (
-                                f"Selected {selected_name}, but MAKCU reported {detected_name} "
-                                f"(mask 0x{mask:02X}). Activation was auto-mapped to {detected_name}."
-                            )
                         self.makcu_verification_done.emit(
-                            True,
-                            port,
-                            str(detected_button),
-                            detail,
+                            False, port, str(button), detail
                         )
                         return
-                    else:
+                    baseline_observed = True
+                    self.makcu_verification_progress.emit(
+                        f"Ready for one {button_name} click — press and release it now."
+                    )
+                elif not pressed and mask:
+                    saw_any_button_report = True
+                    last_mask = mask
+                    if mask != expected_mask:
                         detail = (
-                            f"MAKCU reported button mask 0x{mask:02X}, which does not map "
-                            "to a supported activation button."
+                            f"Expected only {button_name} (mask 0x{expected_mask:02X}), "
+                            f"but MAKCU reported mask 0x{mask:02X}. No button was verified."
                         )
-                    self.makcu_verification_done.emit(False, port, str(button), detail)
+                        self.makcu_verification_done.emit(False, port, str(button), detail)
+                        return
+                    self.makcu_verification_progress.emit(
+                        f"Detected {button_name} (mask 0x{mask:02X}). Release it to finish verification…"
+                    )
+                    pressed = True
+                elif pressed and mask == 0:
+                    detail = (
+                        f"Detected a complete {button_name} press and release "
+                        f"(mask 0x{last_mask:02X})."
+                    )
+                    self.makcu_verification_done.emit(
+                        True,
+                        port,
+                        str(button),
+                        detail,
+                    )
+                    return
+                elif pressed and mask != expected_mask:
+                    detail = (
+                        f"The button mask changed from the expected {button_name} "
+                        f"mask 0x{expected_mask:02X} to 0x{mask:02X} before release. "
+                        "No button was verified."
+                    )
+                    self.makcu_verification_done.emit(
+                        False,
+                        port,
+                        str(button),
+                        detail,
+                    )
                     return
                 now = time.monotonic()
                 if now >= next_progress:
@@ -1292,17 +2114,64 @@ class LauncherWindow(QMainWindow):
             self._set_status(hint, "warn")
             QMessageBox.information(self, "Runtime setup needed", hint)
             return
+        current_preset = str(self.model_preset.currentData() or "")
+        precision = str(selected.get("precision", "")).strip().lower()
         self.backend.setCurrentText(str(selected.get("backend", "openvino")))
         self.device.setCurrentText(str(selected.get("device", "CPU")))
-        self.inference_size.setCurrentText(str(selected.get("inference_size", "320")))
         suggested_tier = str(selected.get("tier", MODEL_TIER_MID))
         tier_index = self.model_tier.findData(suggested_tier)
         if tier_index >= 0:
-            self.model_tier.setCurrentIndex(tier_index)
-            self._refresh_model_preset_options(
-                preferred_key=MODEL_TIER_DEFAULT_PRESET.get(suggested_tier, self.model_preset.currentData())
+            # Hardware choice controls the runtime, not the detector's class
+            # semantics. Keep a player detector, COCO detector, or custom model
+            # within the same family when moving between performance tiers.
+            preferred_preset = self._compatible_preset_for_tier(
+                current_preset, suggested_tier
             )
+            if (
+                self.backend.currentText().strip().lower() == "openvino"
+                and self.device.currentText().strip().upper() == "CPU"
+                and precision == "int8"
+                and current_preset
+                in (
+                    MODEL_PRESET_FORT_PLAYER,
+                    MODEL_PRESET_FORT_PLAYER_BALANCED,
+                    MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
+                )
+            ):
+                preferred_preset = MODEL_PRESET_FORT_PLAYER_BALANCED_INT8
+            self.model_tier.blockSignals(True)
+            self.model_tier.setCurrentIndex(tier_index)
+            self.model_tier.blockSignals(False)
+            self._refresh_model_preset_options(
+                preferred_key=preferred_preset
+            )
+            if suggested_tier == MODEL_TIER_HIGH:
+                self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
+                self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
+                self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
+                self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
         self._set_status("Applied detected accelerator selection.", "ok")
+
+    def _compatible_preset_for_tier(self, current: str, tier: str) -> str:
+        allowed = set(
+            MODEL_TIER_PRESET_KEYS.get(tier, MODEL_TIER_PRESET_KEYS[MODEL_TIER_MID])
+        )
+        allowed.add(MODEL_PRESET_CUSTOM)
+        if current in allowed:
+            return current
+        if current in (MODEL_PRESET_FORT_PLAYER, MODEL_PRESET_FORT_PLAYER_BALANCED):
+            return (
+                MODEL_PRESET_FORT_PLAYER
+                if tier == MODEL_TIER_LOW
+                else MODEL_PRESET_FORT_PLAYER_BALANCED
+            )
+        if current in (
+            MODEL_PRESET_COCO,
+            MODEL_PRESET_COCO_BALANCED,
+            MODEL_PRESET_COCO_HIGH,
+        ):
+            return MODEL_PRESET_COCO if tier == MODEL_TIER_LOW else MODEL_PRESET_COCO_BALANCED
+        return MODEL_TIER_DEFAULT_PRESET.get(tier, DEFAULT_MODEL_PRESET)
 
     def _scan_hardware(self) -> None:
         from detection.hardware import describe, scan_and_recommend
@@ -1325,7 +2194,10 @@ class LauncherWindow(QMainWindow):
 
         self.detected_accelerator.clear()
         for plan in plans:
-            state = "ready" if plan.ready else "needs setup"
+            if plan.ready and plan.backend == "onnxruntime":
+                state = "provider found; verify at start"
+            else:
+                state = "ready" if plan.ready else "needs setup"
             text = f"{plan.accelerator.label} -> {plan.backend}/{plan.device} ({state})"
             backend = str(plan.backend).lower()
             device = str(plan.device).upper()
@@ -1343,6 +2215,7 @@ class LauncherWindow(QMainWindow):
                     "backend": plan.backend,
                     "device": plan.device,
                     "inference_size": plan.inference_size,
+                    "precision": plan.precision,
                     "ready": plan.ready,
                     "setup_hint": plan.setup_hint,
                     "tier": tier,
@@ -1351,7 +2224,7 @@ class LauncherWindow(QMainWindow):
 
         ready = [plan for plan in plans if plan.ready]
         if not ready:
-            self._set_status("No usable inference device was found. See scan report for setup hints.", "error")
+            self._set_status("No inference runtime was found. See scan report for setup hints.", "error")
             return
         best = ready[0]
         for index in range(self.detected_accelerator.count()):
@@ -1366,7 +2239,7 @@ class LauncherWindow(QMainWindow):
         self._set_status("Hardware scan complete. Choose a detected accelerator and click Use selection.", "ok")
 
     def _offer_runtime_download(self, profile, plans) -> None:
-        """Enable the download button when a GPU needs a runtime we can fetch."""
+        """Offer setup guidance when a detected GPU needs another runtime."""
 
         from detection.hardware import AcceleratorKind, Vendor
         from detection.runtime_setup import plan_for
@@ -1385,24 +2258,18 @@ class LauncherWindow(QMainWindow):
             self._runtime_plan = None
             self.install_runtime_button.setEnabled(False)
             self.install_runtime_button.setToolTip(
-                "No downloadable GPU runtime is needed on this machine."
+                "No additional GPU runtime is needed on this machine."
             )
             return
 
         self._runtime_plan = plan_for(gpus[0].vendor.value, profile.system)
         self.install_runtime_button.setEnabled(True)
         self.install_runtime_button.setToolTip(
-            f"Download {self._runtime_plan.distribution} for {gpus[0].label}."
+            f"Show setup instructions for {self._runtime_plan.distribution}."
         )
 
     def _install_runtime(self) -> None:
-        from detection.runtime_setup import (
-            RuntimeSetupError,
-            describe,
-            ensure_runtime,
-            installed_distribution,
-        )
-        from .settings import settings_path
+        from detection.runtime_setup import describe, installed_distribution
 
         plan = getattr(self, "_runtime_plan", None)
         if plan is None:
@@ -1411,38 +2278,20 @@ class LauncherWindow(QMainWindow):
         summary = describe(plan, installed_distribution())
         if plan.needs_driver:
             summary += (
-                "\n\nThe download provides the Python runtime only. The vendor "
-                "driver must be installed separately; it needs administrator "
-                "rights, so this application will not install it for you."
+                "\n\nThe vendor driver must be installed separately; it needs "
+                "administrator rights, so this application will not install it for you."
             )
-        confirmed = QMessageBox.question(
-            self,
-            "Download GPU runtime",
-            f"{summary}\n\nDownload it now?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes,
+        summary += (
+            "\n\nUse the matching prebuilt ProAim release for the easiest setup. "
+            "Source developers can install the named package in their virtual "
+            "environment, then reopen ProAim and scan again."
         )
-        if confirmed is not QMessageBox.StandardButton.Yes:
-            return
-
-        self.install_runtime_button.setEnabled(False)
-        self._set_status(f"Downloading {plan.distribution}…", "warn")
-        QApplication.processEvents()
-        try:
-            target = ensure_runtime(plan, settings_path().parent)
-        except RuntimeSetupError as exc:
-            self._set_status(str(exc), "error")
-            QMessageBox.critical(self, "Download failed", str(exc))
-            self.install_runtime_button.setEnabled(True)
-            return
-
-        self._set_status(f"{plan.distribution} installed into {target}.", "ok")
         QMessageBox.information(
             self,
-            "Download complete",
-            f"{plan.distribution} is installed.\n\nRun the hardware scan again "
-            "to select the GPU.",
+            "GPU runtime setup",
+            summary,
         )
+        self._set_status("GPU runtime setup instructions shown.", "ok")
 
     def _set_status(self, text: str, state: str = "") -> None:
         self.status.setText(text)
@@ -1456,9 +2305,49 @@ class LauncherWindow(QMainWindow):
         self.log.appendPlainText(text.rstrip())
 
     def _start(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
+        if self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive():
+            QMessageBox.information(
+                self,
+                "MAKCU verification in progress",
+                "Finish the MAKCU button check before starting detection.",
+            )
+            return
         settings = self.collect()
+        if (
+            settings.source_mode == SOURCE_SCREEN
+            and os.name == "posix"
+            and os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland"
+        ):
+            message = (
+                "Moonlight screen capture needs an X11/Xorg desktop session in this version.\n\n"
+                "Log out, choose an Xorg/X11 session, then reopen Moonlight and ProAim. "
+                "Cameras and video files still work on Wayland."
+            )
+            self._set_status("Moonlight capture needs X11/Xorg.", "error")
+            QMessageBox.critical(self, "X11/Xorg session required", message)
+            return
+        if settings.aim:
+            if not settings.aim_label.strip():
+                QMessageBox.warning(
+                    self,
+                    "Choose a target label",
+                    "MAKCU aim requires an explicit target label such as player or person.",
+                )
+                self._set_status("Choose a target label before starting.", "warn")
+                return
+            if not self._makcu_verification_matches():
+                QMessageBox.warning(
+                    self,
+                    "Verify MAKCU activation first",
+                    "The selected MAKCU board and activation button must pass a complete "
+                    "physical press-and-release check before aim can be enabled.",
+                )
+                self._set_status("MAKCU activation is not verified.", "warn")
+                return
         try:
-            arguments = settings.detector_arguments()
+            settings.detector_arguments()
         except SettingsError as exc:
             QMessageBox.warning(self, "Check the settings", str(exc))
             self._set_status(str(exc), "warn")
@@ -1479,6 +2368,7 @@ class LauncherWindow(QMainWindow):
 
         self.log.clear()
         self._set_status("Detection running.", "ok")
+        self._stop_requested = False
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self._start_reader()
@@ -1499,12 +2389,28 @@ class LauncherWindow(QMainWindow):
         self._reader.start()
 
     def _stop(self) -> None:
-        if self.process is None:
+        if self.process is None or self.process.poll() is not None or self._stop_requested:
             return
-        request_stop(self.process)
+        process = self.process
+        self._stop_requested = True
+        request_stop(process)
         self._set_status("Stopping…", "warn")
+        self.stop_button.setEnabled(False)
+        QTimer.singleShot(3000, lambda current=process: self._force_stop_if_current(current))
+        QTimer.singleShot(6000, lambda current=process: self._kill_if_current(current))
+
+    def _force_stop_if_current(self, process: subprocess.Popen[str]) -> None:
+        if self.process is process and process.poll() is None:
+            self._append_log("Detector did not exit; terminating it.")
+            force_stop(process)
+
+    def _kill_if_current(self, process: subprocess.Popen[str]) -> None:
+        if self.process is process and process.poll() is None:
+            self._append_log("Detector still did not exit; forcing shutdown.")
+            kill_process(process)
 
     def _poll_process(self) -> None:
+        self._poll_precision_process()
         if self.process is None:
             return
         if self.process.poll() is None:
@@ -1513,20 +2419,51 @@ class LauncherWindow(QMainWindow):
         self.process = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        if code == 0:
+        if self._stop_requested and code in (0, 130, -2, -15):
+            self._set_status("Stopped.", "ok")
+        elif code == 0:
             self._set_status("Detection finished.", "ok")
         else:
             self._set_status(f"Detection exited with code {code}.", "error")
+        self._stop_requested = False
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
+        self._closing = True
         self._makcu_verify_cancel.set()
         self._makcu_monitor_cancel.set()
-        if self.process is not None and self.process.poll() is None:
-            request_stop(self.process)
-            try:
-                self.process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                force_stop(self.process)
+        running = [
+            process
+            for process in (self.process, self.precision_process)
+            if process is not None and process.poll() is None
+        ]
+        for process in running:
+            request_stop(process)
+        deadline = time.monotonic() + 3.0
+        while any(process.poll() is None for process in running) and time.monotonic() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        remaining = [process for process in running if process.poll() is None]
+        for process in remaining:
+            force_stop(process)
+        deadline = time.monotonic() + 2.0
+        while any(process.poll() is None for process in remaining) and time.monotonic() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.02)
+        for process in remaining:
+            if process.poll() is None:
+                kill_process(process)
+        for thread in (
+            self._makcu_verify_thread,
+            self._makcu_monitor_thread,
+            self._reader,
+            self._precision_reader,
+        ):
+            if (
+                isinstance(thread, threading.Thread)
+                and thread.is_alive()
+                and thread is not threading.current_thread()
+            ):
+                thread.join(timeout=0.5)
         event.accept()
 
 
