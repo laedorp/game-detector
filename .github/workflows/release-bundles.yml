@@ -105,7 +105,15 @@ jobs:
       - name: Install Linux Qt runtime libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y libegl1 libgl1
+          sudo apt-get install -y --no-install-recommends \
+            libegl1 \
+            libgl1 \
+            libxcb-cursor0 \
+            libxcb-icccm4 \
+            libxcb-keysyms1 \
+            libxcb-shape0 \
+            libxkbcommon-x11-0 \
+            ocl-icd-libopencl1
 
       - name: Install Python dependencies
         run: |
