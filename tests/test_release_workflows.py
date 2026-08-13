@@ -87,6 +87,13 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         self.assertIn("QT_QPA_PLATFORM: offscreen", source)
         self.assertIn("if: runner.os == 'Linux'", source)
         self.assertIn("sudo apt-get install -y libegl1 libgl1", source)
+        self.assertIn("timeout-minutes: 30", source)
+        self.assertIn("- name: Compile Python sources", source)
+        self.assertIn("- name: Run unit tests", source)
+        self.assertIn("- name: Validate release assets", source)
+        self.assertIn("- name: Smoke-test source CLI", source)
+        self.assertIn("- name: Report source runtime", source)
+        self.assertNotIn("- name: Compile and test", source)
 
     def test_release_builds_are_gated_by_cross_platform_tests(self) -> None:
         source = _source(RELEASE_WORKFLOW)
@@ -112,6 +119,13 @@ class ReleaseWorkflowContractTests(unittest.TestCase):
         # source-test and oldest-supported Linux build runners explicit.
         self.assertIn("sudo apt-get install -y libegl1 libgl1", test_job)
         self.assertIn("sudo apt-get install -y libegl1 libgl1", linux_job)
+        self.assertIn("timeout-minutes: 30", test_job)
+        self.assertIn("- name: Compile Python sources", test_job)
+        self.assertIn("- name: Run unit tests", test_job)
+        self.assertIn("- name: Validate release assets", test_job)
+        self.assertIn("- name: Smoke-test source CLI", test_job)
+        self.assertIn("- name: Report source runtime", test_job)
+        self.assertNotIn("- name: Run unit and release-contract tests", test_job)
 
     def test_linux_helper_allows_only_driver_library_for_cuda_bundle(self) -> None:
         source = _source(LINUX_BUILD)

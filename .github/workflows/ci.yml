@@ -17,6 +17,7 @@ concurrency:
 jobs:
   test:
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -54,25 +55,15 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-build.txt
           python -m pip install -r requirements-runtime-${{ matrix.runtime_variant }}.txt
-      - name: Compile and test
-        if: runner.os != 'Windows'
+      - name: Compile Python sources
+        run: python -m compileall -q app.py config.py main.py aiming capture controller_precision detection launcher scripts tests utils
+      - name: Run unit tests
         env:
           QT_QPA_PLATFORM: offscreen
-        run: |
-          python -m compileall -q app.py config.py main.py aiming capture controller_precision detection launcher scripts tests utils
-          python -m unittest discover -s tests
-          python scripts/validate_release_assets.py
-          python app.py --cli --help
-          python app.py --runtime-info
-      - name: Compile and test
-        if: runner.os == 'Windows'
-        shell: pwsh
-        env:
-          QT_QPA_PLATFORM: offscreen
-        run: |
-          $PSNativeCommandUseErrorActionPreference = $true
-          python -m compileall -q app.py config.py main.py aiming capture controller_precision detection launcher scripts tests utils
-          python -m unittest discover -s tests
-          python scripts/validate_release_assets.py
-          python app.py --cli --help
-          python app.py --runtime-info
+        run: python -m unittest discover -s tests -v
+      - name: Validate release assets
+        run: python scripts/validate_release_assets.py
+      - name: Smoke-test source CLI
+        run: python app.py --cli --help
+      - name: Report source runtime
+        run: python app.py --runtime-info
