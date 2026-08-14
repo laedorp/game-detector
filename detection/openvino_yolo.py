@@ -9,6 +9,13 @@ from typing import Any
 
 import numpy as np
 
+from utils.inference_size import (
+    InferenceSize,
+    InferenceSizeLike,
+    compact_inference_size,
+    normalize_inference_size,
+)
+
 from .base import (
     DependencyError,
     Detector,
@@ -70,21 +77,10 @@ def _partial_shape_values(port: Any) -> list[int | None]:
     return [_dimension_value(dimension) for dimension in partial_shape]
 
 
-def _normalize_inference_size(inference_size: int | Sequence[int]) -> int:
-    if isinstance(inference_size, bool):
-        raise ValueError("inference_size must be a positive integer.")
-    if isinstance(inference_size, int):
-        size = inference_size
-    else:
-        values = tuple(int(value) for value in inference_size)
-        if len(values) != 2 or values[0] != values[1]:
-            raise ValueError(
-                "inference_size must be a positive integer or an equal (height, width) pair."
-            )
-        size = values[0]
-    if size <= 0:
-        raise ValueError(f"inference_size must be positive, got {size}.")
-    return size
+def _normalize_inference_size(inference_size: InferenceSizeLike) -> InferenceSize:
+    """Compatibility import for callers that historically used this module."""
+
+    return normalize_inference_size(inference_size)
 
 
 def _load_labels(path: str | Path | None) -> tuple[str, ...]:
@@ -153,7 +149,7 @@ class OpenVINOYoloDetector(Detector):
         model_path: str | Path,
         labels_path: str | Path | None = None,
         device: str = "CPU",
-        inference_size: int | Sequence[int] = 320,
+        inference_size: InferenceSizeLike = 320,
         confidence: float = 0.25,
         iou: float = 0.45,
         output_format: str = "auto",
@@ -164,7 +160,10 @@ class OpenVINOYoloDetector(Detector):
         if not self.model_path.is_file():
             raise FileNotFoundError(f"OpenVINO model file not found: {self.model_path}")
         self.labels = _load_labels(labels_path)
-        self.inference_size = _normalize_inference_size(inference_size)
+        self.input_size = _normalize_inference_size(inference_size)
+        # Preserve the long-standing scalar attribute for square callers while
+        # all tensor operations use the canonical (height, width) pair.
+        self.inference_size = compact_inference_size(self.input_size)
         self.confidence = float(confidence)
         self.iou = float(iou)
         self.output_format = str(output_format).lower()
@@ -221,7 +220,8 @@ class OpenVINOYoloDetector(Detector):
                 f"Expected NCHW input [1, 3, H, W], but shape {original_shape} appears NHWC."
             )
 
-        target_shape = [1, 3, self.inference_size, self.inference_size]
+        input_height, input_width = self.input_size
+        target_shape = [1, 3, input_height, input_width]
         if original_shape != target_shape:
             try:
                 model.reshape(target_shape)
@@ -294,7 +294,7 @@ class OpenVINOYoloDetector(Detector):
         if isinstance(iterations, bool) or iterations < 0:
             raise ValueError("warmup iterations must be a non-negative integer.")
         tensor = np.zeros(
-            (1, 3, self.inference_size, self.inference_size),
+            (1, 3, *self.input_size),
             dtype=np.float32,
         )
         for _ in range(iterations):
@@ -302,7 +302,7 @@ class OpenVINOYoloDetector(Detector):
 
     def infer(self, tensor: np.ndarray) -> np.ndarray:
         array = np.asarray(tensor)
-        expected_shape = (1, 3, self.inference_size, self.inference_size)
+        expected_shape = (1, 3, *self.input_size)
         if array.shape != expected_shape:
             raise ValueError(f"Inference tensor must have shape {expected_shape}, got {array.shape}.")
         if array.dtype != np.float32:

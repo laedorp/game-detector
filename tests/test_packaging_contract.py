@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -27,11 +28,6 @@ REQUIRED_MODEL_ASSETS = (
     "models/fort_player_openvino_model/ATTRIBUTION.md",
     "models/fort_player_onnx/fort_player.onnx",
     "models/fort_player_onnx/ATTRIBUTION.md",
-    "models/fort_player_416_openvino_model/fort_player_416.xml",
-    "models/fort_player_416_openvino_model/fort_player_416.bin",
-    "models/fort_player_416_openvino_model/ATTRIBUTION.md",
-    "models/fort_player_416_onnx/fort_player_416.onnx",
-    "models/fort_player_416_onnx/ATTRIBUTION.md",
     "models/fort_player_416_int8_openvino_model/fort_player_416_int8.xml",
     "models/fort_player_416_int8_openvino_model/fort_player_416_int8.bin",
     "models/fort_player_416_int8_openvino_model/metadata.yaml",
@@ -54,6 +50,8 @@ REQUIRED_ROOT_ASSETS = (
     "LICENSE",
     "README.md",
     "THIRD_PARTY_NOTICES.md",
+    "docs/DEPENDENCY_LOCKS.md",
+    "docs/MODEL_ACCURACY_EVALUATION.md",
     "docs/MODEL_BENCHMARKS.md",
     "docs/RELEASE_CHECKLIST.md",
 )
@@ -84,8 +82,31 @@ class PackagingContractTests(unittest.TestCase):
         self.assertIn('"models/yolo26n_openvino_model"', source)
         self.assertIn('"models/yolo11l_openvino_model"', source)
         self.assertIn('"models/yolo11l_onnx"', source)
-        self.assertIn('"models/fort_player_416_openvino_model"', source)
         self.assertIn('"models/fort_player_openvino_model"', source)
+        self.assertIn("load_release_default_contract", source)
+        self.assertIn("RELEASE_DEFAULT_MEMBER_PATHS", source)
+
+    def test_release_default_paths_are_pointer_driven_not_duplicated_in_code(self) -> None:
+        contract = json.loads(
+            (PROJECT_ROOT / "models" / "RELEASE-DEFAULT.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        spec = SPEC_PATH.read_text(encoding="utf-8")
+        validator = RELEASE_PREFLIGHT.read_text(encoding="utf-8")
+        settings = (PROJECT_ROOT / "launcher" / "settings.py").read_text(
+            encoding="utf-8"
+        )
+        self.assertTrue(contract["content_sha256"])
+        self.assertEqual(contract["detail_crop_size_source_pixels"], 0)
+        self.assertTrue(all(value is False for value in contract["qualification"].values()))
+        for role, record in contract["artifacts"].items():
+            with self.subTest(role=role):
+                self.assertTrue((PROJECT_ROOT / record["path"]).is_file())
+                if role in {"onnx", "openvino_xml", "openvino_bin"}:
+                    self.assertNotIn(record["path"], spec)
+                    self.assertNotIn(record["path"], validator)
+                    self.assertNotIn(record["path"], settings)
 
     def test_license_and_readme_are_required_and_bundled_at_bundle_root(self) -> None:
         source = SPEC_PATH.read_text(encoding="utf-8")
@@ -97,7 +118,12 @@ class PackagingContractTests(unittest.TestCase):
                 self.assertIn(f"(str(PROJECT_ROOT / '{asset}'), '.')", normalized)
         self.assertIn("THIRD_PARTY_NOTICES = PROJECT_ROOT / 'THIRD_PARTY_NOTICES.md'", normalized)
         self.assertIn("(str(THIRD_PARTY_NOTICES), '.')", normalized)
-        for document in ("MODEL_BENCHMARKS.md", "RELEASE_CHECKLIST.md"):
+        for document in (
+            "DEPENDENCY_LOCKS.md",
+            "MODEL_ACCURACY_EVALUATION.md",
+            "MODEL_BENCHMARKS.md",
+            "RELEASE_CHECKLIST.md",
+        ):
             self.assertIn(document, source)
         self.assertIn('"docs"', source)
 
@@ -161,6 +187,31 @@ class PackagingContractTests(unittest.TestCase):
             pyserial_license,
         )
         self.assertIn("THIS SOFTWARE IS PROVIDED", pyserial_license)
+
+    def test_windows_dxcam_capture_is_installed_and_frozen_with_its_license(self) -> None:
+        requirements = (PROJECT_ROOT / "requirements.txt").read_text(encoding="utf-8")
+        spec = SPEC_PATH.read_text(encoding="utf-8")
+        windows_build = WINDOWS_BUILD.read_text(encoding="utf-8")
+        notices = (PROJECT_ROOT / "THIRD_PARTY_NOTICES.md").read_text(
+            encoding="utf-8"
+        )
+        dxcam_license = (
+            PROJECT_ROOT / "packaging" / "licenses" / "dxcam-0.3.0-MIT.txt"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('dxcam==0.3.0; sys_platform == "win32"', requirements)
+        self.assertIn('find_spec("dxcam")', spec)
+        self.assertIn('dxcam_root.rglob("*.py")', spec)
+        self.assertIn('"dxcam.processor._numpy_kernels"', spec)
+        self.assertIn('collect_dynamic_libs("dxcam")', spec)
+        self.assertIn('collect_data_files("dxcam")', spec)
+        self.assertIn('"licenses/third-party/dxcam"', spec)
+        self.assertIn('license_distributions.extend(["dxcam", "comtypes"])', spec)
+        self.assertIn("find_spec('dxcam')", windows_build)
+        self.assertIn("metadata.version('dxcam') == '0.3.0'", windows_build)
+        self.assertIn("DXcam (Windows bundles)", notices)
+        self.assertIn("Copyright (c) 2022 Rain", dxcam_license)
+        self.assertIn("Permission is hereby granted", dxcam_license)
 
     def test_generic_yolo_metadata_is_bundled_beside_ir_and_onnx(self) -> None:
         source = SPEC_PATH.read_text(encoding="utf-8")

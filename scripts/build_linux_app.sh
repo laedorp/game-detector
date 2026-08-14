@@ -16,6 +16,7 @@ case "$RUNTIME_VARIANT" in
         ;;
 esac
 export PROAIM_RUNTIME_VARIANT="$RUNTIME_VARIANT"
+DEPENDENCY_MANIFEST_SOURCE=""
 
 if [[ "$(uname -s)" != "Linux" ]]; then
     echo "This helper builds the Linux app. Use build_windows_app.ps1 on Windows." >&2
@@ -31,6 +32,24 @@ if [[ ! -x "$PROJECT_PYTHON" ]]; then
     echo "Python environment not found at: $PROJECT_PYTHON" >&2
     echo "Create .venv and install requirements-build.txt first." >&2
     exit 2
+fi
+
+if [[ "$RUNTIME_VARIANT" == "cpu" ]]; then
+    # The published Linux CPU bundle has an exact CPython/package contract.
+    # Manual Linux CUDA/ROCm builds remain hardware-specific experiments and do
+    # not claim this Windows-CUDA/Linux-CPU release lock.
+    DEPENDENCY_PROFILE="linux-cpu-py313"
+    DEPENDENCY_METADATA_DIR="$PROJECT_DIR/.release-metadata"
+    BOOTSTRAP_REPORT="${PROAIM_PIP_BOOTSTRAP_REPORT:-$DEPENDENCY_METADATA_DIR/pip-bootstrap-$DEPENDENCY_PROFILE.json}"
+    DEPENDENCY_REPORT="${PROAIM_PIP_DEPENDENCY_REPORT:-$DEPENDENCY_METADATA_DIR/pip-dependencies-$DEPENDENCY_PROFILE.json}"
+    DEPENDENCY_MANIFEST_SOURCE="$DEPENDENCY_METADATA_DIR/$DEPENDENCY_PROFILE-DEPENDENCY-MANIFEST.json"
+    install -d "$DEPENDENCY_METADATA_DIR"
+    "$PROJECT_PYTHON" "$PROJECT_DIR/scripts/write_dependency_manifest.py" \
+        --project-root "$PROJECT_DIR" \
+        --profile "$DEPENDENCY_PROFILE" \
+        --pip-report "$BOOTSTRAP_REPORT" \
+        --pip-report "$DEPENDENCY_REPORT" \
+        --output "$DEPENDENCY_MANIFEST_SOURCE"
 fi
 
 "$PROJECT_PYTHON" "$PROJECT_DIR/scripts/validate_release_assets.py" \
@@ -89,6 +108,10 @@ install -m 0644 "$PROJECT_DIR/README.md" \
 install -m 0644 "$PROJECT_DIR/THIRD_PARTY_NOTICES.md" \
     "$PROJECT_DIR/dist/ProAim/THIRD_PARTY_NOTICES.md"
 install -d "$PROJECT_DIR/dist/ProAim/docs"
+install -m 0644 "$PROJECT_DIR/docs/DEPENDENCY_LOCKS.md" \
+    "$PROJECT_DIR/dist/ProAim/docs/DEPENDENCY_LOCKS.md"
+install -m 0644 "$PROJECT_DIR/docs/MODEL_ACCURACY_EVALUATION.md" \
+    "$PROJECT_DIR/dist/ProAim/docs/MODEL_ACCURACY_EVALUATION.md"
 install -m 0644 "$PROJECT_DIR/docs/MODEL_BENCHMARKS.md" \
     "$PROJECT_DIR/dist/ProAim/docs/MODEL_BENCHMARKS.md"
 install -m 0644 "$PROJECT_DIR/docs/RELEASE_CHECKLIST.md" \
@@ -109,9 +132,18 @@ install -m 0644 "$QT_LGPL_LICENSE" \
 install -m 0644 "$PROJECT_DIR/packaging/licenses/GPL-3.0-only.txt" \
     "$PROJECT_DIR/dist/ProAim/licenses/GPL-3.0-only.txt"
 
-"$PROJECT_PYTHON" "$PROJECT_DIR/scripts/write_build_info.py" \
-    --bundle "$PROJECT_DIR/dist/ProAim" \
+BUILD_INFO_ARGS=(
+    --bundle "$PROJECT_DIR/dist/ProAim"
     --runtime-variant "$RUNTIME_VARIANT"
+)
+if [[ -n "$DEPENDENCY_MANIFEST_SOURCE" ]]; then
+    install -m 0644 "$DEPENDENCY_MANIFEST_SOURCE" \
+        "$PROJECT_DIR/dist/ProAim/DEPENDENCY-MANIFEST.json"
+    BUILD_INFO_ARGS+=(
+        --dependency-manifest "$PROJECT_DIR/dist/ProAim/DEPENDENCY-MANIFEST.json"
+    )
+fi
+"$PROJECT_PYTHON" "$PROJECT_DIR/scripts/write_build_info.py" "${BUILD_INFO_ARGS[@]}"
 
 VALIDATE_BUNDLE_ARGS=("$PROJECT_DIR/dist/ProAim")
 if [[ "$RUNTIME_VARIANT" == "cuda" ]]; then

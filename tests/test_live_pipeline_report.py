@@ -1,0 +1,705 @@
+from __future__ import annotations
+
+from dataclasses import replace
+import json
+from pathlib import Path
+import tempfile
+from time import perf_counter_ns, sleep
+from types import SimpleNamespace
+import unittest
+from unittest import mock
+
+import numpy as np
+
+from capture.base import CaptureStats, FramePacket
+from config import parse_args
+from detection.hardware import DirectMLAdapter
+from detection.types import Detection
+from main import run
+from utils.live_report import build_live_report, write_json_atomic_new
+from utils.metrics import FrameTimings, RollingMetrics
+from utils.preview import PreviewStats
+from utils.inference_size import normalize_inference_size
+
+
+class _FakeDetector:
+    instances: list["_FakeDetector"] = []
+    detection_batches: list[list[Detection]] = []
+    fail_infer_call: int | None = None
+    inference_delay_seconds: float = 0.0
+
+    def __init__(self, **arguments) -> None:
+        self.arguments = arguments
+        height, width = normalize_inference_size(arguments["inference_size"])
+        self.available_devices = ("CPU",)
+        self.infer_calls = 0
+        self.postprocess_calls = 0
+        self.tensor_shapes: list[tuple[int, ...]] = []
+        self.runtime_summary = {
+            "runtime": "test-runtime",
+            "openvino_version": "1",
+            "model_path": str(arguments["model_path"]),
+            "requested_device": arguments["device"],
+            "device": arguments["device"],
+            "input_shape": [1, 3, height, width],
+        }
+        self.__class__.instances.append(self)
+
+    def warmup(self) -> None:
+        return None
+
+    def infer(self, _tensor):
+        self.infer_calls += 1
+        self.tensor_shapes.append(tuple(_tensor.shape))
+        if self.inference_delay_seconds:
+            sleep(self.inference_delay_seconds)
+        if self.fail_infer_call == self.infer_calls:
+            raise RuntimeError("synthetic detail inference failure")
+        return np.zeros((1, 0, 6), dtype=np.float32)
+
+    def postprocess(self, _raw, *, transform, frame_shape):
+        del transform, frame_shape
+        index = self.postprocess_calls
+        self.postprocess_calls += 1
+        if index < len(self.detection_batches):
+            return list(self.detection_batches[index])
+        return []
+
+
+class _FakeSource:
+    description = "synthetic live source"
+
+    def __init__(
+        self,
+        *,
+        static: bool = False,
+        shape: tuple[int, int, int] = (32, 32, 3),
+    ) -> None:
+        self.static = static
+        self.shape = shape
+        self.started = False
+        self.closed = False
+        self.read_calls = 0
+        self.read_timeouts: list[float | None] = []
+        self.error = None
+        self.ended = False
+
+    @property
+    def actual_settings(self):
+        return {
+            "backend": "fake-latest-only",
+            "width": self.shape[1],
+            "height": self.shape[0],
+            "fps": 120.0,
+        }
+
+    @property
+    def stats(self) -> CaptureStats:
+        delivered = 0 if self.static else self.read_calls
+        return CaptureStats(
+            frames_read=delivered,
+            frames_delivered=delivered,
+            frames_overwritten=2 if delivered else 0,
+            read_failures=0,
+        )
+
+    def start(self) -> None:
+        self.started = True
+
+    def read(self, timeout: float | None = None):
+        self.read_calls += 1
+        self.read_timeouts.append(timeout)
+        if self.static:
+            sleep(float(timeout or 0.0))
+            return None
+        completed_ns = perf_counter_ns()
+        return FramePacket(
+            image=np.zeros(self.shape, dtype=np.uint8),
+            sequence=self.read_calls - 1,
+            read_started_ns=completed_ns - 100_000,
+            read_completed_ns=completed_ns,
+        )
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class _CloseTimeoutSource(_FakeSource):
+    def close(self) -> None:
+        super().close()
+        self.error = (
+            "Timed out waiting for capture-worker to stop; "
+            "the capture source is still closing."
+        )
+
+
+class _ArtifactMutatingSource(_FakeSource):
+    def __init__(self, artifact: Path) -> None:
+        super().__init__()
+        self.artifact = artifact
+
+    def read(self, timeout: float | None = None):
+        packet = super().read(timeout)
+        self.artifact.write_bytes(b"mutated model")
+        return packet
+
+
+class _StuckPreview:
+    mode = "threaded"
+    stats: dict[str, object] = {}
+
+    def start(self) -> None:
+        return None
+
+    def poll(self) -> bool:
+        return True
+
+    def submit(self, _frame) -> bool:
+        return True
+
+    def should_continue(self) -> bool:
+        return True
+
+    def stop(self) -> bool:
+        return False
+
+    def raise_if_failed(self) -> None:
+        return None
+
+
+def _sample(value: float) -> FrameTimings:
+    return FrameTimings(*(value for _ in FrameTimings.__dataclass_fields__))
+
+
+class LiveReportUnitTests(unittest.TestCase):
+    def test_cli_parses_bounds_and_full_provider_gate(self) -> None:
+        config = parse_args(
+            [
+                "--backend",
+                "onnxruntime",
+                "--metrics-json",
+                "result.json",
+                "--max-frames",
+                "25",
+                "--max-seconds",
+                "3.5",
+                "--require-full-provider",
+            ]
+        )
+
+        self.assertEqual(config.metrics_json, Path("result.json"))
+        self.assertEqual(config.max_frames, 25)
+        self.assertEqual(config.max_seconds, 3.5)
+        self.assertTrue(config.require_full_provider)
+
+        for arguments in (("--max-frames", "0"), ("--max-seconds", "0")):
+            with self.subTest(arguments=arguments), self.assertRaises(SystemExit):
+                parse_args(list(arguments))
+        with self.assertRaises(SystemExit):
+            parse_args(["--require-full-provider"])
+
+    def test_atomic_writer_refuses_overwrite_and_leaves_no_temporary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "nested" / "metrics.json"
+
+            written = write_json_atomic_new(destination, {"schema": 1})
+
+            self.assertEqual(written, destination)
+            self.assertEqual(json.loads(destination.read_text(encoding="utf-8")), {"schema": 1})
+            self.assertFalse(list(destination.parent.glob(".*.tmp")))
+            original = destination.read_bytes()
+            with self.assertRaisesRegex(ValueError, "Refusing to overwrite"):
+                write_json_atomic_new(destination, {"schema": 2})
+            self.assertEqual(destination.read_bytes(), original)
+
+    def test_report_records_every_timing_and_omits_aim_secrets(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model.onnx"
+            labels = root / "labels.txt"
+            model.write_bytes(b"model")
+            labels.write_text("player\n", encoding="utf-8")
+            config = parse_args(
+                [
+                    "--model",
+                    str(model),
+                    "--labels",
+                    str(labels),
+                    "--backend",
+                    "onnxruntime",
+                    "--device",
+                    "DIRECTML:1",
+                    "--inference-size",
+                    "416",
+                    "--no-preview",
+                    "--max-frames",
+                    "3",
+                ]
+            )
+            config = replace(
+                config,
+                aim_pairing_key="do-not-leak",
+                aim_activate_path="/private/controller/device",
+                aim_makcu_port="/private/serial/device",
+            )
+            metrics = RollingMetrics(4)
+            for index in range(1, 4):
+                metrics.record(_sample(float(index)), index * 1_000_000)
+            runtime = {
+                "runtime": "ONNX Runtime",
+                "requested_device_input": "DIRECTML:1",
+                "requested_provider": "DmlExecutionProvider",
+                "active_providers": ["DmlExecutionProvider", "CPUExecutionProvider"],
+                "provider_option_overrides": {
+                    "DmlExecutionProvider": {"device_id": "1"}
+                },
+                "provider_options": {
+                    "DmlExecutionProvider": {"device_id": "1"}
+                },
+            }
+
+            report = build_live_report(
+                config=config,
+                detector_summary=runtime,
+                source_description="Windows screen monitor 1",
+                source_settings={
+                    "backend": "dxcam-dxgi",
+                    "preferred_backend": "dxcam-dxgi",
+                    "fallback_reason": None,
+                    "width": 1920,
+                    "height": 1080,
+                },
+                capture_stats=CaptureStats(20, 3, 17, 0),
+                preview_mode="disabled",
+                preview_stats=PreviewStats(0, 0, 0),
+                metrics=metrics.snapshot(),
+                elapsed_seconds=0.25,
+                started_utc="2026-08-13T00:00:00.000Z",
+                completed_utc="2026-08-13T00:00:00.250Z",
+                termination_reason="max_frames",
+                directml_adapter_factory=lambda: (
+                    DirectMLAdapter(1, "GeForce RTX 5060 Laptop GPU", "10de", "2d59", 8),
+                ),
+            )
+
+            self.assertEqual(report["schema_version"], 2)
+            self.assertEqual(report["pipeline"]["processed_frames"], 3)
+            self.assertEqual(report["pipeline"]["elapsed_fps"], 12.0)
+            self.assertEqual(report["pipeline"]["update_fps"], 1000.0)
+            self.assertEqual(report["capture"]["frames_overwritten"], 17)
+            self.assertEqual(report["source"]["backend"], "dxcam-dxgi")
+            self.assertEqual(report["directml_adapter"]["effective_index"], 1)
+            self.assertFalse(report["directml_adapter"]["requested_provider_mismatch"])
+            self.assertEqual(
+                report["directml_adapter"]["descriptor"]["name"],
+                "GeForce RTX 5060 Laptop GPU",
+            )
+            expected_fields = set(FrameTimings.__dataclass_fields__)
+            for summary in ("mean", "p50", "p95", "p99"):
+                self.assertEqual(
+                    set(report["pipeline"]["timings"][summary]), expected_fields
+                )
+            serialized = json.dumps(report)
+            self.assertNotIn("do-not-leak", serialized)
+            self.assertNotIn("/private/controller/device", serialized)
+            self.assertNotIn("/private/serial/device", serialized)
+
+    def test_runtime_provider_index_cannot_be_masked_by_configured_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            model = root / "model.onnx"
+            labels = root / "labels.txt"
+            model.write_bytes(b"model")
+            labels.write_text("player\n", encoding="utf-8")
+            config = parse_args(
+                [
+                    "--model",
+                    str(model),
+                    "--labels",
+                    str(labels),
+                    "--backend",
+                    "onnxruntime",
+                    "--device",
+                    "DIRECTML:1",
+                    "--no-preview",
+                ]
+            )
+            metrics = RollingMetrics(2).snapshot()
+            report = build_live_report(
+                config=config,
+                detector_summary={
+                    "runtime": "ONNX Runtime",
+                    "requested_device_input": "DIRECTML:1",
+                    "requested_provider": "DmlExecutionProvider",
+                    "active_providers": ["DmlExecutionProvider"],
+                    "provider_option_overrides": {
+                        "DmlExecutionProvider": {"device_id": "1"}
+                    },
+                    "provider_options": {
+                        "DmlExecutionProvider": {"device_id": "0"}
+                    },
+                },
+                source_description="screen",
+                source_settings={"backend": "dxcam-dxgi"},
+                capture_stats=CaptureStats(),
+                preview_mode="disabled",
+                preview_stats=PreviewStats(0, 0, 0),
+                metrics=metrics,
+                elapsed_seconds=0.0,
+                started_utc="2026-08-13T00:00:00.000Z",
+                completed_utc="2026-08-13T00:00:00.000Z",
+                termination_reason="source_ended",
+                directml_adapter_factory=lambda: (),
+            )
+
+            adapter = report["directml_adapter"]
+            self.assertEqual(adapter["requested_index"], 1)
+            self.assertEqual(adapter["configured_index"], 1)
+            self.assertEqual(adapter["provider_reported_index"], 0)
+            self.assertEqual(adapter["effective_index"], 1)
+            self.assertTrue(adapter["requested_provider_mismatch"])
+            self.assertEqual(
+                adapter["qualification_status"],
+                "failed_provider_index_mismatch",
+            )
+
+
+class LivePipelineIntegrationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.root = Path(self.temporary.name)
+        self.model = self.root / "model.xml"
+        self.model.write_text("<model />", encoding="utf-8")
+        self.model.with_suffix(".bin").write_bytes(b"weights")
+        self.labels = self.root / "labels.txt"
+        self.labels.write_text("player\n", encoding="utf-8")
+        self.video = self.root / "capture.mp4"
+        self.video.write_bytes(b"placeholder")
+        _FakeDetector.instances.clear()
+        _FakeDetector.detection_batches = []
+        _FakeDetector.fail_infer_call = None
+        _FakeDetector.inference_delay_seconds = 0.0
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def _config(self, report: Path, *extra: str):
+        return parse_args(
+            [
+                "--source",
+                str(self.video),
+                "--model",
+                str(self.model),
+                "--labels",
+                str(self.labels),
+                "--inference-size",
+                "32",
+                "--no-preview",
+                "--metrics-json",
+                str(report),
+                *extra,
+            ]
+        )
+
+    def _run_with(self, source: _FakeSource, config) -> int:
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+        ):
+            return run(config)
+
+    def test_max_frames_uses_the_real_pipeline_and_is_exact(self) -> None:
+        report_path = self.root / "three-frames.json"
+        source = _FakeSource()
+
+        result = self._run_with(
+            source,
+            self._config(report_path, "--max-frames", "3"),
+        )
+
+        self.assertEqual(result, 0)
+        self.assertTrue(source.closed)
+        self.assertEqual(source.read_calls, 3)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["termination"]["reason"], "max_frames")
+        self.assertEqual(report["pipeline"]["processed_frames"], 3)
+        self.assertEqual(report["capture"]["frames_delivered"], 3)
+        self.assertEqual(
+            report["model_artifact"]["companions"][0]["sha256"],
+            "9a129038d9a00aed0cf6a7ea059ca50a813449061ab87848cf1a13eafdf33b2c",
+        )
+        detector = _FakeDetector.instances[0]
+        self.assertEqual(detector.infer_calls, 3)
+        self.assertEqual(detector.postprocess_calls, 3)
+        self.assertFalse(report["detail_pass"]["enabled"])
+        self.assertEqual(report["config"]["inference"]["detail_crop_size"], None)
+        for summary in ("mean", "p50", "p95", "p99"):
+            timings = report["pipeline"]["timings"][summary]
+            self.assertEqual(timings["detail_preprocess_ms"], 0.0)
+            self.assertEqual(timings["detail_inference_ms"], 0.0)
+            self.assertEqual(timings["detail_postprocess_ms"], 0.0)
+
+    def test_detail_pass_runs_same_model_twice_and_reports_actual_geometry(self) -> None:
+        report_path = self.root / "detail.json"
+        source = _FakeSource(shape=(72, 128, 3))
+        _FakeDetector.inference_delay_seconds = 0.001
+
+        result = self._run_with(
+            source,
+            self._config(
+                report_path,
+                "--detail-crop-size",
+                "64",
+                "--max-frames",
+                "2",
+            ),
+        )
+
+        self.assertEqual(result, 0)
+        detector = _FakeDetector.instances[0]
+        self.assertEqual(detector.infer_calls, 4)
+        self.assertEqual(detector.postprocess_calls, 4)
+        self.assertEqual(detector.tensor_shapes, [(1, 3, 32, 32)] * 4)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        detail = report["detail_pass"]
+        self.assertTrue(detail["enabled"])
+        self.assertEqual(detail["requested_crop_size"], 64)
+        self.assertEqual(detail["duplicate_iou_threshold"], 0.5)
+        self.assertEqual(detail["unmatched_detail_reference_height"], 1080.0)
+        self.assertEqual(detail["unmatched_detail_max_reference_height"], 96.0)
+        self.assertEqual(detail["frames_applied"], 2)
+        self.assertEqual(detail["crop_policy"], "centered_model_aspect_roi")
+        self.assertEqual(detail["last_plan"]["applied_crop_width"], 64)
+        self.assertEqual(detail["last_plan"]["applied_crop_height"], 64)
+        self.assertEqual(detail["last_plan"]["source_width"], 128)
+        self.assertEqual(detail["last_plan"]["source_height"], 72)
+        self.assertEqual(detail["last_plan"]["effective_linear_magnification"], 2.0)
+        timings = report["pipeline"]["timings"]["mean"]
+        self.assertGreater(timings["detail_preprocess_ms"], 0.0)
+        self.assertGreater(timings["detail_inference_ms"], 0.0)
+        self.assertGreaterEqual(timings["detail_postprocess_ms"], 0.0)
+
+    def test_detail_pass_failure_fails_closed_before_report_publication(self) -> None:
+        report_path = self.root / "detail-failure.json"
+        source = _FakeSource(shape=(72, 128, 3))
+        _FakeDetector.fail_infer_call = 2
+
+        with self.assertRaisesRegex(RuntimeError, "detail inference failure"):
+            self._run_with(
+                source,
+                self._config(
+                    report_path,
+                    "--detail-crop-size",
+                    "64",
+                    "--max-frames",
+                    "1",
+                ),
+            )
+
+        self.assertTrue(source.closed)
+        self.assertFalse(report_path.exists())
+
+    def test_capture_close_timeout_fails_before_report_publication(self) -> None:
+        report_path = self.root / "capture-close-timeout.json"
+        source = _CloseTimeoutSource()
+
+        with self.assertRaisesRegex(RuntimeError, "capture shutdown.*Timed out"):
+            self._run_with(
+                source,
+                self._config(report_path, "--max-frames", "1"),
+            )
+
+        self.assertTrue(source.closed)
+        self.assertFalse(report_path.exists())
+
+    def test_preview_close_timeout_fails_before_report_publication(self) -> None:
+        report_path = self.root / "preview-close-timeout.json"
+        source = _FakeSource()
+        config = replace(
+            self._config(report_path, "--max-frames", "1"),
+            preview=True,
+        )
+
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("utils.preview.create_preview_window", return_value=_StuckPreview()),
+            self.assertRaisesRegex(RuntimeError, "preview shutdown.*bounded timeout"),
+        ):
+            run(config)
+
+        self.assertTrue(source.closed)
+        self.assertFalse(report_path.exists())
+
+    def test_model_mutation_fails_before_report_publication(self) -> None:
+        report_path = self.root / "mutated-model.json"
+        source = _ArtifactMutatingSource(self.model)
+
+        with self.assertRaisesRegex(RuntimeError, "Model artifact changed"):
+            self._run_with(
+                source,
+                self._config(report_path, "--max-frames", "1"),
+            )
+
+        self.assertTrue(source.closed)
+        self.assertFalse(report_path.exists())
+
+    def test_redundant_square_detail_pass_is_skipped(self) -> None:
+        report_path = self.root / "detail-redundant.json"
+        source = _FakeSource(shape=(32, 32, 3))
+
+        result = self._run_with(
+            source,
+            self._config(
+                report_path,
+                "--detail-crop-size",
+                "64",
+                "--max-frames",
+                "1",
+            ),
+        )
+
+        self.assertEqual(result, 0)
+        detector = _FakeDetector.instances[0]
+        self.assertEqual(detector.infer_calls, 1)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["detail_pass"]["frames_redundant"], 1)
+        self.assertEqual(report["detail_pass"]["frames_applied"], 0)
+
+    def test_aim_and_self_filter_each_receive_the_merged_result_once(self) -> None:
+        report_path = self.root / "detail-aim.json"
+        source = _FakeSource(shape=(72, 128, 3))
+        primary = Detection(0, "player", 0.60, (40, 15, 70, 60))
+        detail = Detection(0, "player", 0.90, (41, 16, 71, 61))
+        _FakeDetector.detection_batches = [[primary], [detail]]
+
+        class FakeTracker:
+            instances: list["FakeTracker"] = []
+
+            def __init__(self, **_kwargs) -> None:
+                self.updates: list[list[Detection]] = []
+                self.__class__.instances.append(self)
+
+            def update(self, detections, _frame_shape, **_kwargs):
+                copied = list(detections)
+                self.updates.append(copied)
+                return copied[0] if copied else None
+
+            def reset(self) -> None:
+                return None
+
+        class FakeController:
+            instances: list["FakeController"] = []
+
+            def __init__(self, _config) -> None:
+                self.updates: list[Detection | None] = []
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, target, _frame_shape, *, active=True) -> None:
+                self.updates.append(target if active else None)
+
+        class FakeSensor:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def read(self) -> bool:
+                return True
+
+        class FakeSelfFilter:
+            instances: list["FakeSelfFilter"] = []
+
+            def __init__(self, _zone) -> None:
+                self.calls: list[list[Detection]] = []
+                self.__class__.instances.append(self)
+
+            def apply(self, detections, _frame_shape):
+                copied = list(detections)
+                self.calls.append(copied)
+                return SimpleNamespace(
+                    detections=copied,
+                    ignored_count=0,
+                    ignored_detection=None,
+                    aim_safe=True,
+                )
+
+        config = self._config(
+            report_path,
+            "--detail-crop-size",
+            "64",
+            "--max-frames",
+            "1",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "local",
+            "--aim-activate-path",
+            "/synthetic/controller",
+        )
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("aiming.AimingController", FakeController),
+            mock.patch("aiming.AimActivationSensor", FakeSensor),
+            mock.patch("aiming.TargetTracker", FakeTracker),
+            mock.patch("utils.self_filter.SelfAvatarFilter", FakeSelfFilter),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(FakeSelfFilter.instances[0].calls, [[detail]])
+        self.assertEqual(FakeTracker.instances[0].updates, [[detail]])
+        self.assertEqual(FakeController.instances[0].updates, [detail])
+
+    def test_max_seconds_stops_a_static_source_on_the_bounded_read(self) -> None:
+        report_path = self.root / "static.json"
+        source = _FakeSource(static=True)
+        started = perf_counter_ns()
+
+        result = self._run_with(
+            source,
+            self._config(report_path, "--max-seconds", "0.03"),
+        )
+        elapsed = (perf_counter_ns() - started) / 1e9
+
+        self.assertEqual(result, 0)
+        self.assertLess(elapsed, 0.5)
+        self.assertTrue(source.read_timeouts)
+        self.assertLessEqual(max(float(value or 0.0) for value in source.read_timeouts), 0.25)
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["termination"]["reason"], "max_seconds")
+        self.assertEqual(report["pipeline"]["processed_frames"], 0)
+        self.assertGreaterEqual(report["pipeline"]["elapsed_seconds"], 0.02)
+
+    def test_existing_report_is_rejected_before_detector_or_capture_start(self) -> None:
+        report_path = self.root / "already-there.json"
+        report_path.write_text("keep", encoding="utf-8")
+        source = _FakeSource()
+
+        with self.assertRaisesRegex(ValueError, "Refusing to overwrite"):
+            self._run_with(
+                source,
+                self._config(report_path, "--max-frames", "1"),
+            )
+
+        self.assertFalse(source.started)
+        self.assertFalse(_FakeDetector.instances)
+        self.assertEqual(report_path.read_text(encoding="utf-8"), "keep")
+
+
+if __name__ == "__main__":
+    unittest.main()

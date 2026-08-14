@@ -26,7 +26,9 @@ from launcher.settings import (
     SettingsError,
     model_preset,
     model_preset_paths,
+    release_default_model_contract,
 )
+from utils.inference_size import normalize_inference_size
 
 
 def make_bundled_tree(root: Path, backend: str) -> tuple[Path, Path]:
@@ -44,6 +46,18 @@ def make_bundled_tree(root: Path, backend: str) -> tuple[Path, Path]:
 
 
 class PresetFormatTests(unittest.TestCase):
+    def test_release_default_contract_is_derived_from_launcher_default(self) -> None:
+        contract = release_default_model_contract()
+        preset = model_preset(DEFAULT_MODEL_PRESET)
+
+        self.assertEqual(contract["preset"], DEFAULT_MODEL_PRESET)
+        self.assertEqual(contract["model_path"], preset.model_for("onnxruntime"))
+        self.assertEqual(contract["labels_path"], preset.labels_relative)
+        self.assertEqual(
+            contract["input_shape_hw"],
+            list(normalize_inference_size(preset.inference_size)),
+        )
+
     def test_every_portable_bundled_preset_offers_both_model_formats(self) -> None:
         for preset in MODEL_PRESETS:
             if not preset.bundled or preset.key == MODEL_PRESET_FORT_PLAYER_BALANCED_INT8:

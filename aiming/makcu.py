@@ -34,6 +34,11 @@ MAKCU_BAUD_CHANGE = bytes((0xDE, 0xAD, 0x05, 0x00, 0xA5, 0x00, 0x09, 0x3D, 0x00)
 BUTTON_NAMES = ("Left", "Right", "Middle", "Side 4", "Side 5")
 DEFAULT_OUTPUT_HZ = 1000
 REFERENCE_CONTROL_HZ = 60.0
+# Aim tuning is expressed in 1080p-reference pixels.  Scaling visual error to
+# this coordinate space keeps identical normalized offsets equivalent when a
+# Moonlight stream or capture backend negotiates 720p, 1080p, or 4K.
+REFERENCE_FRAME_WIDTH = 1920.0
+REFERENCE_FRAME_HEIGHT = 1080.0
 TARGET_STALE_SECONDS = 0.15
 # MAKCU button telemetry is edge-driven: the board sends a frame when the
 # physical state changes, not as a heartbeat.  The one-argument command is
@@ -47,7 +52,6 @@ MAX_CONTINUOUS_ACTIVATION_SECONDS = 10.0
 CLOSE_RANGE_SLOWDOWN_PIXELS = 130.0
 MIN_CLOSE_RANGE_SCALE = 0.72
 THREADED_RATE_SMOOTHING_ALPHA = 0.82
-THREADED_TICK_STEP_FRACTION = 0.78
 PREDICTION_LEAD_SECONDS = 0.028
 DERIVATIVE_DAMPING_SECONDS = 0.016
 MAX_SAMPLE_AGE_LEAD_SECONDS = 0.055
@@ -56,7 +60,13 @@ MAX_TRACKED_VELOCITY_PX_PER_SEC = 2600.0
 ERROR_JUMP_RESET_PIXELS = 240.0
 LOW_CONFIDENCE_GAIN_FLOOR = 0.45
 MAX_VERTICAL_RATE_RATIO = 0.48
-MAX_VERTICAL_TICK_STEP = 6
+# ``stop()`` owns one end-to-end deadline.  The output worker normally exits in
+# a few milliseconds because serial reads and writes use 50 ms timeouts, but a
+# broken USB driver is allowed only this long before shutdown raises and leaves
+# the still-live worker/connection visible for diagnostics.  Daemon breaker
+# threads keep even a pathological native ``close()`` call inside this bound.
+MAKCU_STOP_TIMEOUT_SECONDS = 0.75
+MAKCU_STOP_PHASE_GRACE_SECONDS = 0.10
 
 
 class MakcuError(RuntimeError):
@@ -317,18 +327,7 @@ def makcu_target_delta(
 ) -> tuple[int, int]:
     """Return one bounded relative mouse correction for the current frame."""
 
-    if target is None:
-        return 0, 0
-    height, width = frame_shape[:2]
-    if width <= 0 or height <= 0:
-        return 0, 0
-    target_x, target_y = head_target_point(target, config.head_ratio)
-    error_x = target_x - width / 2.0
-    error_y = target_y - height / 2.0
-    if config.invert_x:
-        error_x = -error_x
-    if config.invert_y:
-        error_y = -error_y
+    error_x, error_y = _target_error_pixels(target, frame_shape, config)
     delta_x = 0 if abs(error_x) <= config.deadzone_pixels else round(error_x * config.strength)
     delta_y = 0 if abs(error_y) <= config.deadzone_pixels else round(error_y * config.strength)
     limit = config.max_step
@@ -345,18 +344,7 @@ def _makcu_target_rate(
 ) -> tuple[float, float]:
     """Return mouse counts per second for the current visual error."""
 
-    if target is None:
-        return 0.0, 0.0
-    height, width = frame_shape[:2]
-    if width <= 0 or height <= 0:
-        return 0.0, 0.0
-    target_x, target_y = head_target_point(target, config.head_ratio)
-    error_x = target_x - width / 2.0
-    error_y = target_y - height / 2.0
-    if config.invert_x:
-        error_x = -error_x
-    if config.invert_y:
-        error_y = -error_y
+    error_x, error_y = _target_error_pixels(target, frame_shape, config)
     correction_x = 0.0 if abs(error_x) <= config.deadzone_pixels else error_x * config.strength
     correction_y = 0.0 if abs(error_y) <= config.deadzone_pixels else error_y * config.strength
     limit = float(config.max_step)
@@ -371,14 +359,16 @@ def _target_error_pixels(
     frame_shape: tuple[int, ...],
     config: MakcuAimConfig,
 ) -> tuple[float, float]:
+    """Return error in resolution-independent 1920x1080 reference pixels."""
+
     if target is None:
         return 0.0, 0.0
     height, width = frame_shape[:2]
     if width <= 0 or height <= 0:
         return 0.0, 0.0
     target_x, target_y = head_target_point(target, config.head_ratio)
-    error_x = target_x - width / 2.0
-    error_y = target_y - height / 2.0
+    error_x = (target_x - width / 2.0) * (REFERENCE_FRAME_WIDTH / width)
+    error_y = (target_y - height / 2.0) * (REFERENCE_FRAME_HEIGHT / height)
     if config.invert_x:
         error_x = -error_x
     if config.invert_y:
@@ -397,7 +387,14 @@ class MakcuAimingController:
         ports_provider: Callable[[], Iterable[Any]] | None = None,
         sleep: Callable[[float], None] = time.sleep,
         threaded_output: bool = True,
+        stop_timeout: float = MAKCU_STOP_TIMEOUT_SECONDS,
     ) -> None:
+        if (
+            isinstance(stop_timeout, bool)
+            or not math.isfinite(stop_timeout)
+            or stop_timeout <= 0.0
+        ):
+            raise ValueError("MAKCU stop timeout must be finite and greater than zero")
         self.config = config or MakcuAimConfig()
         self._serial_factory = serial_factory
         self._ports_provider = ports_provider
@@ -410,9 +407,12 @@ class MakcuAimingController:
         self._activation_requires_release = False
         self._button_parser = _ButtonStreamParser()
         self._serial_lock = threading.Lock()
+        self._connection_close_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._output_thread: threading.Thread | None = None
+        self._shutdown_threads: list[threading.Thread] = []
+        self._stop_timeout = float(stop_timeout)
         self._worker_error: MakcuError | None = None
         self._latest_target: Detection | None = None
         self._latest_frame_shape: tuple[int, int, int] = (0, 0, 0)
@@ -422,9 +422,15 @@ class MakcuAimingController:
         self._fractional_y = 0.0
         self._smoothed_rate_x = 0.0
         self._smoothed_rate_y = 0.0
-        self._previous_error_x = 0.0
-        self._previous_error_y = 0.0
-        self._previous_error_ns = 0
+        self._latest_measurement_ns = 0
+        self._latest_velocity_x = 0.0
+        self._latest_velocity_y = 0.0
+        self._latest_sample_id = 0
+        self._processed_sample_id = 0
+        self._control_error_x = 0.0
+        self._control_error_y = 0.0
+        self._measurement_error_x = 0.0
+        self._measurement_error_y = 0.0
         self.connected_port: str | None = None
 
     def _require_serial(self) -> None:
@@ -526,6 +532,10 @@ class MakcuAimingController:
 
     def start(self, *, output_loop: bool | None = None) -> None:
         if self._serial is not None:
+            if self._stop_event.is_set():
+                raise MakcuError(
+                    "MAKCU cannot restart because its previous shutdown is incomplete"
+                )
             return
         self._require_serial()
         port = self._find_port()
@@ -544,13 +554,19 @@ class MakcuAimingController:
         self._fractional_y = 0.0
         self._smoothed_rate_x = 0.0
         self._smoothed_rate_y = 0.0
-        self._previous_error_x = 0.0
-        self._previous_error_y = 0.0
-        self._previous_error_ns = 0
+        self._latest_measurement_ns = 0
+        self._latest_velocity_x = 0.0
+        self._latest_velocity_y = 0.0
+        self._latest_sample_id = 0
+        self._processed_sample_id = 0
+        self._control_error_x = 0.0
+        self._control_error_y = 0.0
+        self._measurement_error_x = 0.0
+        self._measurement_error_y = 0.0
+        self._stop_event.clear()
         self._command(BUTTON_STREAM_COMMAND)
         should_start_output = self._threaded_output if output_loop is None else output_loop
         if should_start_output:
-            self._stop_event.clear()
             self._output_thread = threading.Thread(
                 target=self._run_output_loop,
                 name="makcu-1000hz-output",
@@ -629,16 +645,76 @@ class MakcuAimingController:
         target: Detection | None,
         frame_shape: tuple[int, int, int],
         active: bool = True,
+        *,
+        measurement_ns: int | None = None,
     ) -> None:
         if self._serial is None:
             raise MakcuError("MAKCU serial connection is not open")
         if self._worker_error is not None:
             raise self._worker_error
+        published_ns = time.perf_counter_ns()
+        if measurement_ns is not None and (
+            isinstance(measurement_ns, bool) or not isinstance(measurement_ns, int)
+        ):
+            raise TypeError("measurement_ns must be an integer monotonic timestamp")
+        source_ns = published_ns if measurement_ns is None else measurement_ns
+        if source_ns < 0:
+            raise ValueError("measurement_ns cannot be negative")
+        error_x, error_y = _target_error_pixels(target, frame_shape, self.config)
         with self._state_lock:
+            if self._latest_measurement_ns and source_ns < self._latest_measurement_ns:
+                raise ValueError("measurement_ns must not move backwards")
+            velocity_x = self._latest_velocity_x
+            velocity_y = self._latest_velocity_y
+            same_time_geometry_changed = (
+                self._latest_measurement_ns
+                and source_ns == self._latest_measurement_ns
+                and (
+                    error_x != self._measurement_error_x
+                    or error_y != self._measurement_error_y
+                )
+            )
+            if (
+                target is not None
+                and self._latest_target is not None
+                and self._latest_measurement_ns
+                and source_ns > self._latest_measurement_ns
+            ):
+                delta_t = (source_ns - self._latest_measurement_ns) / 1_000_000_000
+                delta_x = error_x - self._measurement_error_x
+                delta_y = error_y - self._measurement_error_y
+                sample_discontinuity = (
+                    delta_t > TARGET_STALE_SECONDS
+                    or abs(delta_x) > ERROR_JUMP_RESET_PIXELS
+                    or abs(delta_y) > ERROR_JUMP_RESET_PIXELS
+                )
+                if sample_discontinuity:
+                    velocity_x = 0.0
+                    velocity_y = 0.0
+                else:
+                    velocity_x = delta_x / delta_t
+                    velocity_y = delta_y / delta_t
+                    velocity_x = min(
+                        max(velocity_x, -MAX_TRACKED_VELOCITY_PX_PER_SEC),
+                        MAX_TRACKED_VELOCITY_PX_PER_SEC,
+                    )
+                    velocity_y = min(
+                        max(velocity_y, -MAX_TRACKED_VELOCITY_PX_PER_SEC),
+                        MAX_TRACKED_VELOCITY_PX_PER_SEC,
+                    )
+            elif target is None or self._latest_target is None or same_time_geometry_changed:
+                velocity_x = 0.0
+                velocity_y = 0.0
             self._latest_target = target
             self._latest_frame_shape = frame_shape
             self._latest_active = bool(active)
-            self._latest_update_ns = time.perf_counter_ns()
+            self._latest_update_ns = published_ns
+            self._latest_measurement_ns = source_ns
+            self._latest_velocity_x = velocity_x
+            self._latest_velocity_y = velocity_y
+            self._measurement_error_x = error_x
+            self._measurement_error_y = error_y
+            self._latest_sample_id += 1
         if self._output_thread is None:
             self._output_tick(1.0 / REFERENCE_CONTROL_HZ)
 
@@ -671,42 +747,49 @@ class MakcuAimingController:
             frame_shape = self._latest_frame_shape
             active = self._latest_active
             updated_ns = self._latest_update_ns
-        stale = updated_ns == 0 or (current_ns - updated_ns) / 1_000_000_000 > TARGET_STALE_SECONDS
+            measurement_ns = self._latest_measurement_ns
+            velocity_x = self._latest_velocity_x
+            velocity_y = self._latest_velocity_y
+            sample_id = self._latest_sample_id
+        publication_stale = (
+            updated_ns == 0
+            or (current_ns - updated_ns) / 1_000_000_000 > TARGET_STALE_SECONDS
+        )
+        measurement_stale = (
+            measurement_ns > 0
+            and current_ns >= measurement_ns
+            and (current_ns - measurement_ns) / 1_000_000_000
+            > TARGET_STALE_SECONDS
+        )
+        stale = publication_stale or measurement_stale
         if not active or not button_pressed or target is None or stale:
             self._fractional_x = 0.0
             self._fractional_y = 0.0
             self._smoothed_rate_x = 0.0
             self._smoothed_rate_y = 0.0
-            self._previous_error_x = 0.0
-            self._previous_error_y = 0.0
-            self._previous_error_ns = 0
+            self._control_error_x = 0.0
+            self._control_error_y = 0.0
+            self._processed_sample_id = sample_id
             return
         rate_x, rate_y = _makcu_target_rate(target, frame_shape, self.config)
         if self._output_thread is not None:
             error_x, error_y = _target_error_pixels(target, frame_shape, self.config)
-            previous_error_x = self._previous_error_x
-            previous_error_y = self._previous_error_y
+            previous_error_x = self._control_error_x
+            previous_error_y = self._control_error_y
 
-            velocity_x = 0.0
-            velocity_y = 0.0
-            if self._previous_error_ns:
-                delta_t = (current_ns - self._previous_error_ns) / 1_000_000_000
-                if delta_t > 0.0:
-                    velocity_x = (error_x - self._previous_error_x) / delta_t
-                    velocity_y = (error_y - self._previous_error_y) / delta_t
-
-            # Sudden detector jumps can otherwise convert into one-frame flicks.
-            if (
-                abs(error_x - self._previous_error_x) > ERROR_JUMP_RESET_PIXELS
-                or abs(error_y - self._previous_error_y) > ERROR_JUMP_RESET_PIXELS
+            # Reset momentum once per new detector sample, never once per 1 kHz
+            # output tick. Velocity is computed from source-frame timestamps in
+            # update(), so a held sample does not turn into a 1 ms derivative
+            # burst followed by zero.
+            new_sample = sample_id != self._processed_sample_id
+            if new_sample and (
+                abs(error_x - previous_error_x) > ERROR_JUMP_RESET_PIXELS
+                or abs(error_y - previous_error_y) > ERROR_JUMP_RESET_PIXELS
             ):
                 self._smoothed_rate_x = 0.0
                 self._smoothed_rate_y = 0.0
                 self._fractional_x = 0.0
                 self._fractional_y = 0.0
-
-            velocity_x = min(max(velocity_x, -MAX_TRACKED_VELOCITY_PX_PER_SEC), MAX_TRACKED_VELOCITY_PX_PER_SEC)
-            velocity_y = min(max(velocity_y, -MAX_TRACKED_VELOCITY_PX_PER_SEC), MAX_TRACKED_VELOCITY_PX_PER_SEC)
 
             # Only fully settle when near center and the target is not moving,
             # so we avoid trailing a moving head.
@@ -721,19 +804,19 @@ class MakcuAimingController:
                 self._smoothed_rate_y = 0.0
                 self._fractional_x = 0.0
                 self._fractional_y = 0.0
-                self._previous_error_x = error_x
-                self._previous_error_y = error_y
-                self._previous_error_ns = current_ns
+                self._control_error_x = error_x
+                self._control_error_y = error_y
+                self._processed_sample_id = sample_id
                 return
 
-            self._previous_error_x = error_x
-            self._previous_error_y = error_y
-            self._previous_error_ns = current_ns
+            self._control_error_x = error_x
+            self._control_error_y = error_y
+            self._processed_sample_id = sample_id
 
             # Predict ahead by control lead plus bounded sample age so the
             # control point lands where the moving head is now, not where the
             # detector last saw it.
-            sample_age_s = max((current_ns - updated_ns) / 1_000_000_000, 0.0)
+            sample_age_s = max((current_ns - measurement_ns) / 1_000_000_000, 0.0)
             lead_s = self.config.prediction_lead_seconds + min(
                 sample_age_s,
                 self.config.max_sample_age_lead_seconds,
@@ -746,11 +829,11 @@ class MakcuAimingController:
 
             correction_x = (
                 predicted_x * self.config.strength * gain_scale
-                - velocity_x * self.config.derivative_damping_seconds
+                + velocity_x * self.config.derivative_damping_seconds
             )
             correction_y = (
                 predicted_y * self.config.strength * gain_scale
-                - velocity_y * self.config.derivative_damping_seconds
+                + velocity_y * self.config.derivative_damping_seconds
             )
             limit = float(self.config.max_step)
             rate_x = min(max(correction_x, -limit), limit) * REFERENCE_CONTROL_HZ
@@ -774,15 +857,23 @@ class MakcuAimingController:
                 scale = max(distance / CLOSE_RANGE_SLOWDOWN_PIXELS, MIN_CLOSE_RANGE_SCALE)
                 rate_x *= scale
                 rate_y *= scale
-            alpha = self.config.smoothing_alpha
+            # Interpret the user value at the historical 60 Hz reference rate,
+            # then convert it to the actual tick duration. Response therefore
+            # stays the same at 100, 1000, or 2000 Hz.
+            alpha = 1.0 - math.pow(
+                1.0 - self.config.smoothing_alpha,
+                max(elapsed, 0.0) * REFERENCE_CONTROL_HZ,
+            )
             self._smoothed_rate_x += (rate_x - self._smoothed_rate_x) * alpha
             self._smoothed_rate_y += (rate_y - self._smoothed_rate_y) * alpha
             rate_x = self._smoothed_rate_x
             rate_y = self._smoothed_rate_y
         self._fractional_x += rate_x * elapsed
         self._fractional_y += rate_y * elapsed
-        delta_x = math.trunc(self._fractional_x)
-        delta_y = math.trunc(self._fractional_y)
+        raw_delta_x = math.trunc(self._fractional_x)
+        raw_delta_y = math.trunc(self._fractional_y)
+        delta_x = raw_delta_x
+        delta_y = raw_delta_y
         if self._output_thread is not None:
             tick_limit = max(
                 1,
@@ -791,35 +882,205 @@ class MakcuAimingController:
                         self.config.max_step
                         * elapsed
                         * REFERENCE_CONTROL_HZ
-                        * THREADED_TICK_STEP_FRACTION
                     )
                 ),
             )
-            vertical_tick_limit = min(tick_limit, MAX_VERTICAL_TICK_STEP)
+            vertical_tick_limit = max(
+                1,
+                math.ceil(
+                    self.config.max_step
+                    * MAX_VERTICAL_RATE_RATIO
+                    * elapsed
+                    * REFERENCE_CONTROL_HZ
+                ),
+            )
+            vertical_tick_limit = min(tick_limit, vertical_tick_limit)
             delta_x = min(max(delta_x, -tick_limit), tick_limit)
             delta_y = min(max(delta_y, -vertical_tick_limit), vertical_tick_limit)
-        self._fractional_x -= delta_x
-        self._fractional_y -= delta_y
+        # Retain only the true sub-count remainder. If a delayed scheduler tick
+        # hits a safety clamp, do not replay the discarded integer backlog on
+        # later ticks after the visual error may already have changed.
+        self._fractional_x -= raw_delta_x
+        self._fractional_y -= raw_delta_y
         if delta_x or delta_y:
             self._command(f"km.move({delta_x},{delta_y})")
 
+    def _disarm_for_shutdown(self) -> None:
+        """Remove every software authorization before touching blocking I/O."""
+
+        with self._state_lock:
+            self._button_mask = 0
+            self._button_state_known = False
+            self._activation_started_ns = 0
+            self._activation_requires_release = True
+            self._latest_target = None
+            self._latest_active = False
+            self._latest_update_ns = 0
+
+    def _close_connection(self, connection: Any, closed: threading.Event) -> None:
+        """Cancel pending pyserial operations and close from a daemon breaker."""
+
+        # Serialize native close itself so the graceful and breaker threads can
+        # never race two close calls.  The breaker can still cancel/close a
+        # write stuck under _serial_lock because that lock is intentionally not
+        # involved here.
+        with self._connection_close_lock:
+            # PySerial documents cancel_read/cancel_write for calls from another
+            # thread.  Not every serial-compatible test/driver implements them,
+            # so absence and disconnect errors are harmless; close remains the
+            # authoritative operation.
+            for operation_name in ("cancel_read", "cancel_write"):
+                operation = getattr(connection, operation_name, None)
+                if not callable(operation):
+                    continue
+                try:
+                    operation()
+                except Exception:  # noqa: BLE001 - contain driver failures
+                    pass
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 - stop() reports an incomplete close
+                return
+        closed.set()
+
+    def _graceful_connection_shutdown(
+        self,
+        connection: Any,
+        closed: threading.Event,
+    ) -> None:
+        """Disable button telemetry and close after the output worker exits."""
+
+        try:
+            with self._serial_lock:
+                connection.write(b"km.buttons(0)\r")
+                connection.flush()
+        except Exception:  # noqa: BLE001 - closing is the bounded fallback
+            # Closing the port is the fail-closed fallback when the optional
+            # stream-disable command cannot be delivered.
+            pass
+        with self._connection_close_lock:
+            try:
+                connection.close()
+            except Exception:  # noqa: BLE001 - stop() reports an incomplete close
+                return
+        closed.set()
+
+    def _start_shutdown_thread(
+        self,
+        target: Callable[[], None],
+        *,
+        name: str,
+    ) -> threading.Thread:
+        thread = threading.Thread(target=target, name=name, daemon=True)
+        self._shutdown_threads.append(thread)
+        thread.start()
+        return thread
+
+    @staticmethod
+    def _wait_for_threads(
+        threads: Iterable[threading.Thread],
+        *,
+        deadline: float,
+    ) -> None:
+        """Give several cooperating threads fair slices of one shared deadline."""
+
+        candidates = tuple(dict.fromkeys(threads))
+        while True:
+            live = [
+                thread
+                for thread in candidates
+                if thread is not threading.current_thread() and thread.is_alive()
+            ]
+            remaining = deadline - time.monotonic()
+            if not live or remaining <= 0.0:
+                return
+            slice_seconds = min(0.01, remaining / len(live))
+            for thread in live:
+                thread.join(timeout=max(0.0, slice_seconds))
+
     def stop(self) -> None:
+        """Stop output and serial I/O within ``stop_timeout`` or fail explicitly.
+
+        The timeout covers worker exit, the normal ``km.buttons(0)`` command,
+        cancellation, and serial close.  If native I/O remains stuck, this
+        method raises :class:`MakcuError` and deliberately retains references to
+        every live worker instead of claiming the controller has stopped.
+        """
+
         connection = self._serial
         if connection is None:
             return
+        deadline = time.monotonic() + self._stop_timeout
         self._stop_event.set()
+        self._disarm_for_shutdown()
+        self._shutdown_threads = [
+            thread for thread in self._shutdown_threads if thread.is_alive()
+        ]
         worker = self._output_thread
-        if worker is not None and worker is not threading.current_thread():
-            worker.join(timeout=0.25)
+        worker_grace = min(
+            MAKCU_STOP_PHASE_GRACE_SECONDS,
+            self._stop_timeout / 3.0,
+        )
+        if (
+            worker is not None
+            and worker is not threading.current_thread()
+            and worker.is_alive()
+        ):
+            worker.join(timeout=worker_grace)
+
+        closed = threading.Event()
+        if worker is None or not worker.is_alive():
+            graceful = self._start_shutdown_thread(
+                lambda: self._graceful_connection_shutdown(connection, closed),
+                name="makcu-graceful-shutdown",
+            )
+            io_grace = min(
+                MAKCU_STOP_PHASE_GRACE_SECONDS,
+                max(0.0, deadline - time.monotonic()) / 2.0,
+            )
+            graceful.join(timeout=io_grace)
+
+        # A live output worker or stuck graceful write may hold _serial_lock.
+        # Never wait on that lock from the caller: pyserial cancellation/close
+        # is specifically performed from another thread to break pending I/O.
+        if not closed.is_set():
+            self._start_shutdown_thread(
+                lambda: self._close_connection(connection, closed),
+                name="makcu-forced-serial-close",
+            )
+
+        self._wait_for_threads(
+            (
+                *((worker,) if worker is not None else ()),
+                *self._shutdown_threads,
+            ),
+            deadline=deadline,
+        )
+        live_worker = worker is not None and worker.is_alive()
+        live_shutdown = [
+            thread for thread in self._shutdown_threads if thread.is_alive()
+        ]
+        if live_worker or live_shutdown or not closed.is_set():
+            problems: list[str] = []
+            if live_worker:
+                problems.append("the 1 kHz output worker is still running")
+            if live_shutdown:
+                problems.append("serial cancellation/close is still running")
+            if not closed.is_set():
+                problems.append("the serial connection did not confirm close")
+            error = MakcuError(
+                "MAKCU shutdown did not finish within "
+                f"{self._stop_timeout:g} seconds; output was disarmed, but "
+                + "; ".join(problems)
+            )
+            self._worker_error = error
+            # Keep _output_thread, _serial, connected_port, and live shutdown
+            # thread references truthful so a caller cannot mistake this for a
+            # completed close or silently restart over the old worker.
+            raise error
+
         self._output_thread = None
-        try:
-            self._command("km.buttons(0)")
-        except MakcuError:
-            pass
-        try:
-            connection.close()
-        except OSError:
-            pass
+        self._shutdown_threads.clear()
         self._serial = None
         self.connected_port = None
         with self._state_lock:
@@ -834,7 +1095,13 @@ class MakcuAimingController:
         self._fractional_y = 0.0
         self._smoothed_rate_x = 0.0
         self._smoothed_rate_y = 0.0
-        self._previous_error_x = 0.0
-        self._previous_error_y = 0.0
-        self._previous_error_ns = 0
+        self._latest_measurement_ns = 0
+        self._latest_velocity_x = 0.0
+        self._latest_velocity_y = 0.0
+        self._latest_sample_id = 0
+        self._processed_sample_id = 0
+        self._control_error_x = 0.0
+        self._control_error_y = 0.0
+        self._measurement_error_x = 0.0
+        self._measurement_error_y = 0.0
         self._button_parser.reset()

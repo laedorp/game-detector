@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 import hashlib
+import json
 import tempfile
 import unittest
 
@@ -15,6 +16,10 @@ from scripts.validate_release_assets import (
     ReleaseAssetError,
     ULTRALYTICS_METADATA_MARKERS,
     validate_release_assets,
+)
+from utils.release_model_contract import (
+    canonical_json_bytes,
+    make_release_default_contract,
 )
 
 
@@ -85,7 +90,10 @@ class FakeCore:
             "fort_player.onnx": "fort_player.xml",
             "fort_player_416.onnx": "fort_player_416.xml",
         }
-        outcome = self.models[aliases.get(model_path.name, model_path.name)]
+        lookup = aliases.get(model_path.name, model_path.name)
+        if model_path.suffix == ".onnx" and lookup == model_path.name:
+            lookup = model_path.with_suffix(".xml").name
+        outcome = self.models[lookup]
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -173,6 +181,52 @@ class ReleaseAssetValidationTests(unittest.TestCase):
             "precision: INT8\nmethod: NNCF\noutput_xml_sha256: fixture\n",
             encoding="utf-8",
         )
+        self._write_default_contract()
+        self._write_model_manifest()
+
+    def _file_record(self, relative: str) -> dict[str, object]:
+        path = self.root / relative
+        return {
+            "path": relative,
+            "bytes": path.stat().st_size,
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+
+    def _write_default_contract(
+        self,
+        *,
+        shape: tuple[int, int] = (416, 416),
+        onnx: str = "models/fort_player_416_onnx/fort_player_416.onnx",
+        xml: str = "models/fort_player_416_openvino_model/fort_player_416.xml",
+        binary: str = "models/fort_player_416_openvino_model/fort_player_416.bin",
+        labels: str = "models/fort_player.txt",
+        attribution: str = "models/fort_player_416_openvino_model/ATTRIBUTION.md",
+        detail_crop_size_source_pixels: int = 0,
+    ) -> None:
+        contract = make_release_default_contract(
+            label=f"Game players — Selected {shape[0]}×{shape[1]} (Recommended)",
+            description="Fixture release-default player detector.",
+            input_shape_nchw=[1, 3, *shape],
+            detail_crop_size_source_pixels=detail_crop_size_source_pixels,
+            artifacts={
+                "onnx": self._file_record(onnx),
+                "openvino_xml": self._file_record(xml),
+                "openvino_bin": self._file_record(binary),
+                "labels": self._file_record(labels),
+                "attribution": self._file_record(attribution),
+            },
+            provenance={
+                "kind": "existing_release_default_migration",
+                "candidate_content_sha256": None,
+                "candidate_manifest_sha256": None,
+                "tournament_selection_sha256": None,
+            },
+        )
+        (self.root / "models" / "RELEASE-DEFAULT.json").write_bytes(
+            canonical_json_bytes(contract)
+        )
+
+    def _write_model_manifest(self) -> None:
         manifest_paths: set[Path] = set()
         for asset in RELEASE_MODELS:
             manifest_paths.update(
@@ -184,6 +238,14 @@ class ReleaseAssetValidationTests(unittest.TestCase):
                 manifest_paths.add(asset.attribution_relative)
             if asset.metadata_relative is not None:
                 manifest_paths.add(asset.metadata_relative)
+        contract = json.loads(
+            (self.root / "models" / "RELEASE-DEFAULT.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        manifest_paths.update(
+            Path(record["path"]) for record in contract["artifacts"].values()
+        )
         lines = []
         for relative in sorted(manifest_paths, key=lambda value: value.as_posix()):
             digest = hashlib.sha256((self.root / relative).read_bytes()).hexdigest()
@@ -209,7 +271,11 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         # The two player detectors are end-to-end; the COCO pair in this fixture
         # uses the traditional layout, while the high-end YOLO11l bundle keeps
         # the dynamic end-to-end path exercised.
-        player_summaries = [text for text in summaries if "player detector" in text]
+        player_summaries = [
+            text
+            for text in summaries
+            if "player detector" in text or text.startswith("Game players — Selected")
+        ]
         coco_summaries = [text for text in summaries if "COCO detector" in text]
         high_end_summaries = [text for text in summaries if "YOLO11l detector" in text]
         self.assertEqual(len(player_summaries), 3)
@@ -244,6 +310,40 @@ class ReleaseAssetValidationTests(unittest.TestCase):
 
         self.assertTrue(all("end-to-end [1,N,6]" in item for item in summaries))
 
+    def test_pointer_selects_a_new_rectangular_model_without_validator_edits(self) -> None:
+        release = self.root / "models" / "release-defaults" / ("a" * 64)
+        release.mkdir(parents=True)
+        (release / "candidate.xml").write_text("<net/>", encoding="utf-8")
+        (release / "candidate.bin").write_bytes(b"rectangular weights")
+        (release / "candidate.onnx").write_bytes(b"rectangular onnx")
+        (release / "labels.txt").write_text("player\n", encoding="utf-8")
+        (release / "ATTRIBUTION.md").write_text(
+            "FORT-Cuh\ncreativecommons.org/licenses/by/4.0\nAGPL-3.0\n",
+            encoding="utf-8",
+        )
+        prefix = f"models/release-defaults/{'a' * 64}"
+        self._write_default_contract(
+            shape=(384, 640),
+            onnx=f"{prefix}/candidate.onnx",
+            xml=f"{prefix}/candidate.xml",
+            binary=f"{prefix}/candidate.bin",
+            labels=f"{prefix}/labels.txt",
+            attribution=f"{prefix}/ATTRIBUTION.md",
+            detail_crop_size_source_pixels=768,
+        )
+        self._write_model_manifest()
+        core = FakeCore()
+        core.models["candidate.xml"] = FakeModel(
+            input_shape=(1, 3, 384, 640), output_shapes=((1, 300, 6),)
+        )
+
+        summaries = validate_release_assets(self.root, core_factory=lambda: core)
+
+        selected = [item for item in summaries if "Selected 384×640" in item]
+        self.assertEqual(len(selected), 1)
+        self.assertIn("input (1, 3, 384, 640)", selected[0])
+        self.assertIn("detail ROI requested width 768 source px", selected[0])
+
     def test_rejects_empty_or_missing_ir_without_constructing_openvino(self) -> None:
         balanced_bin = (
             self.root
@@ -273,7 +373,7 @@ class ReleaseAssetValidationTests(unittest.TestCase):
 
     def test_rejects_a_nonempty_onnx_graph_openvino_cannot_read(self) -> None:
         message = self.assert_fails(
-            "OpenVINO could not read Balanced player detector ONNX",
+            "OpenVINO could not read Game players — Selected 416×416 (Recommended) ONNX",
             FakeCore(onnx_failure=RuntimeError("corrupt protobuf")),
         )
         self.assertIn("corrupt protobuf", message)
@@ -338,6 +438,17 @@ class ReleaseAssetValidationTests(unittest.TestCase):
 
         metadata.write_bytes(valid_metadata)
 
+    def test_rejects_local_paths_in_bundled_model_metadata(self) -> None:
+        metadata = (
+            self.root / "models" / "yolo26n_openvino_model" / "metadata.yaml"
+        )
+        metadata.write_text(
+            "\n".join(ULTRALYTICS_METADATA_MARKERS)
+            + "\ndescription: trained on /home/private/dataset.yaml\n",
+            encoding="utf-8",
+        )
+        self.assert_fails("contains a local or nonportable path", FakeCore())
+
     def test_rejects_a_missing_or_tampered_hash_manifest(self) -> None:
         manifest = self.root / "models" / "RELEASE-MANIFEST.sha256"
         valid_manifest = manifest.read_bytes()
@@ -348,6 +459,30 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         model = self.root / "models" / "fort_player_openvino_model" / "fort_player.bin"
         model.write_bytes(b"tampered weights")
         self.assert_fails("SHA-256 mismatch for models/fort_player_openvino_model/fort_player.bin")
+
+    def test_rejects_a_missing_or_false_like_release_default_pointer(self) -> None:
+        pointer = self.root / "models" / "RELEASE-DEFAULT.json"
+        valid_pointer = pointer.read_bytes()
+        pointer.unlink()
+        self.assert_fails("release-default model contract is invalid")
+
+        pointer.write_bytes(valid_pointer)
+        value = json.loads(pointer.read_text(encoding="utf-8"))
+        value["qualification"] = {
+            key: 0 for key in value["qualification"]
+        }
+        from utils.release_model_contract import contract_content_hash
+
+        value["content_sha256"] = contract_content_hash(value)
+        pointer.write_bytes(canonical_json_bytes(value))
+        self.assert_fails("qualification")
+
+        pointer.write_bytes(valid_pointer)
+        value = json.loads(pointer.read_text(encoding="utf-8"))
+        value["detail_crop_size_source_pixels"] = -1
+        value["content_sha256"] = contract_content_hash(value)
+        pointer.write_bytes(canonical_json_bytes(value))
+        self.assert_fails("detail crop")
 
 if __name__ == "__main__":
     unittest.main()

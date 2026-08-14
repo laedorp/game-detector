@@ -1,13 +1,16 @@
 .venv/
 .venv-export/
+/.release-venv/
 __pycache__/
 *.pyc
 .pytest_cache/
 .ruff_cache/
 /build/
 /dist/
+/.release-metadata/
 .vscode/
 /datasets/
 /runs/
 /yolo11*.pt
+/yolo26s.pt
 /launcher/Untitled-1.txt

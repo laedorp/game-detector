@@ -10,6 +10,9 @@ on:
 permissions:
   contents: read
 
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -24,18 +27,24 @@ jobs:
         include:
           - os: ubuntu-24.04
             runtime_variant: cpu
+            lock_profile: linux-cpu-py313
+            lock_file: requirements-locks/linux-cpu-py313.txt
           - os: windows-2022
             runtime_variant: directml
+            lock_profile: windows-directml-py313
+            lock_file: requirements-locks/windows-directml-py313.txt
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
-          python-version: "3.13"
+          python-version: "3.13.14"
           cache: pip
           cache-dependency-path: |
             requirements.txt
             requirements-build.txt
             requirements-runtime-${{ matrix.runtime_variant }}.txt
+            requirements-locks/bootstrap-py313.txt
+            ${{ matrix.lock_file }}
       - name: Install Linux Qt runtime libraries
         if: runner.os == 'Linux'
         run: |
@@ -46,15 +55,41 @@ jobs:
         if: runner.os == 'Windows'
         run: |
           $PSNativeCommandUseErrorActionPreference = $true
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-build.txt
-          python -m pip install -r requirements-runtime-${{ matrix.runtime_variant }}.txt
+          python -m venv .release-venv
+          New-Item -ItemType Directory -Path .release-metadata -Force | Out-Null
+          $ReleasePython = (Resolve-Path ".release-venv\Scripts\python.exe").Path
+          & $ReleasePython -m pip install --disable-pip-version-check --require-hashes --no-compile --force-reinstall `
+            --report ".release-metadata\pip-bootstrap-${{ matrix.lock_profile }}.json" `
+            -r requirements-locks/bootstrap-py313.txt
+          & $ReleasePython -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall `
+            --report ".release-metadata\pip-dependencies-${{ matrix.lock_profile }}.json" `
+            -r requirements-locks/bootstrap-py313.txt `
+            -r "${{ matrix.lock_file }}"
+          & $ReleasePython scripts/write_dependency_manifest.py `
+            --profile "${{ matrix.lock_profile }}" `
+            --pip-report ".release-metadata\pip-bootstrap-${{ matrix.lock_profile }}.json" `
+            --pip-report ".release-metadata\pip-dependencies-${{ matrix.lock_profile }}.json" `
+            --output ".release-metadata\${{ matrix.lock_profile }}-DEPENDENCY-MANIFEST.json"
+          (Resolve-Path ".release-venv\Scripts").Path | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Install Python dependencies
         if: runner.os != 'Windows'
         run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-build.txt
-          python -m pip install -r requirements-runtime-${{ matrix.runtime_variant }}.txt
+          set -euo pipefail
+          python -m venv .release-venv
+          mkdir -p .release-metadata
+          .release-venv/bin/python -m pip install --disable-pip-version-check --require-hashes --no-compile --force-reinstall \
+            --report ".release-metadata/pip-bootstrap-${{ matrix.lock_profile }}.json" \
+            -r requirements-locks/bootstrap-py313.txt
+          .release-venv/bin/python -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall \
+            --report ".release-metadata/pip-dependencies-${{ matrix.lock_profile }}.json" \
+            -r requirements-locks/bootstrap-py313.txt \
+            -r "${{ matrix.lock_file }}"
+          .release-venv/bin/python scripts/write_dependency_manifest.py \
+            --profile "${{ matrix.lock_profile }}" \
+            --pip-report ".release-metadata/pip-bootstrap-${{ matrix.lock_profile }}.json" \
+            --pip-report ".release-metadata/pip-dependencies-${{ matrix.lock_profile }}.json" \
+            --output ".release-metadata/${{ matrix.lock_profile }}-DEPENDENCY-MANIFEST.json"
+          echo "$PWD/.release-venv/bin" >> "$GITHUB_PATH"
       - name: Compile Python sources
         run: python -m compileall -q app.py config.py main.py aiming capture controller_precision detection launcher scripts tests utils
       - name: Run unit tests

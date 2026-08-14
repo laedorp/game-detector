@@ -19,13 +19,33 @@ Principal runtime components include:
 | ONNX Runtime | MIT and bundled third-party notices | https://onnxruntime.ai/ |
 | PySide6 / Qt for Python | LGPL-3.0-only, GPL-2.0-only, or GPL-3.0-only | https://doc.qt.io/qtforpython-6/ |
 | MSS | MIT | https://github.com/BoboTiG/python-mss |
+| DXcam (Windows bundles) | MIT | https://github.com/ra1nty/DXcam |
 | pySerial | BSD-3-Clause | https://github.com/pyserial/pyserial |
 | python-evdev (Linux) | BSD-3-Clause | https://python-evdev.readthedocs.io/ |
+| NVIDIA CUDA NVRTC (`nvidia-cuda-nvrtc`) | NVIDIA proprietary; review the NVIDIA CUDA Toolkit End User License Agreement | https://docs.nvidia.com/cuda/eula/index.html |
+| NVIDIA CUDA runtime (`nvidia-cuda-runtime`) | NVIDIA proprietary; review the NVIDIA CUDA Toolkit End User License Agreement | https://docs.nvidia.com/cuda/eula/index.html |
+| NVIDIA cuFFT (`nvidia-cufft`) | NVIDIA proprietary; review the NVIDIA CUDA Toolkit End User License Agreement | https://docs.nvidia.com/cuda/eula/index.html |
+| NVIDIA cuRAND (`nvidia-curand`) | NVIDIA proprietary; review the NVIDIA CUDA Toolkit End User License Agreement | https://docs.nvidia.com/cuda/eula/index.html |
+| NVIDIA cuBLAS (`nvidia-cublas`) | NVIDIA proprietary; review the NVIDIA CUDA Toolkit End User License Agreement | https://docs.nvidia.com/cuda/eula/index.html |
+| NVIDIA nvJitLink (`nvidia-nvjitlink`) | NVIDIA proprietary; review the NVIDIA CUDA Toolkit End User License Agreement | https://docs.nvidia.com/cuda/eula/index.html |
+| NVIDIA cuDNN (`nvidia-cudnn-cu13`) | NVIDIA proprietary; review the NVIDIA cuDNN Software License Agreement | https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html |
 
 Because the pySerial 3.5 wheel does not include the full license payload,
 `packaging/licenses/pyserial-3.5-BSD-3-Clause.txt` reproduces the upstream
 pySerial 3.5 source distribution's `LICENSE.txt` verbatim. It is copied into
 release bundles under `licenses/third-party/pyserial/`.
+
+DXcam is included only in Windows bundles. Its MIT license is copied under
+`licenses/third-party/dxcam/` in addition to any metadata retained from the
+installed wheel.
+
+NVIDIA CUDA libraries are included only in CUDA-specific bundles. Each such
+bundle must retain the installed wheels' declared license/EULA/notice files and
+an exact `NVIDIA-REDISTRIBUTION-MANIFEST.json` inventory of the package
+metadata, legal payloads, and native libraries. That mechanical inventory does
+not itself establish redistribution rights. Before publishing a CUDA bundle,
+the release approver must review the license payloads from the exact installed
+wheel versions and the current CUDA and cuDNN agreements linked above.
 
 The bundled player models are derived from FORT-Cuh v1, whose supplied
 metadata identifies a CC BY 4.0 license. Their required attribution and data

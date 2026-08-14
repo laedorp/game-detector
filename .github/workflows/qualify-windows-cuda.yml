@@ -1,0 +1,370 @@
+name: Qualify Windows CUDA on physical GPU
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published v* release tag whose exact commit is being qualified
+        required: true
+        type: string
+      source_build_run_id:
+        description: Successful manual Build Windows app run ID at the exact tag commit
+        required: true
+        type: string
+      cuda_zip_sha256:
+        description: SHA-256 of ProAim-Windows-x64-NVIDIA-CUDA.zip from that build run
+        required: true
+        type: string
+      qualified_gpu:
+        description: Exact nvidia-smi product name of the physical GPU being observed
+        required: true
+        type: string
+      observer_name:
+        description: Full name of the person watching Task Manager during all three GPU passes
+        required: true
+        type: string
+      physical_confirmation:
+        description: Precommit text; it must also be retyped locally after all GPU runs finish
+        required: true
+        type: string
+      legal_review_acknowledgement:
+        description: Type PHYSICAL QUALIFICATION ONLY - NVIDIA LEGAL REVIEW REMAINS REQUIRED
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: physical-cuda-qualification-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  collect-physical-evidence:
+    name: Run frozen candidate on an interactive physical NVIDIA GPU
+    runs-on: [self-hosted, Windows, X64, proaim-cuda-qualification]
+    timeout-minutes: 45
+    outputs:
+      raw_artifact_id: ${{ steps.raw-artifact.outputs.artifact-id }}
+      raw_content_manifest_sha256: ${{ steps.raw-content.outputs.raw_content_manifest_sha256 }}
+      tag_commit: ${{ steps.source.outputs.tag_commit }}
+    env:
+      REPOSITORY_INPUT: ${{ github.repository }}
+      TAG_INPUT: ${{ inputs.tag }}
+      BUILD_RUN_INPUT: ${{ inputs.source_build_run_id }}
+      CUDA_ZIP_SHA_INPUT: ${{ inputs.cuda_zip_sha256 }}
+      QUALIFIED_GPU_INPUT: ${{ inputs.qualified_gpu }}
+    steps:
+      - name: Require dispatch from protected main workflow source
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Physical qualification must be dispatched from refs/heads/main."
+          }
+
+      - name: Check out exact qualification workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up qualification Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Verify tag, release, source build run, and build artifact
+        id: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_cuda_release_attachment.py verify-source `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --source-build-run-id $env:BUILD_RUN_INPUT `
+            --output verified-source.json
+          $Source = Get-Content -LiteralPath verified-source.json -Raw | ConvertFrom-Json
+          if ([string]$Source.tag_commit -ne $env:GITHUB_SHA) {
+            throw "The existing tag commit must equal this qualification workflow head SHA."
+          }
+          "tag_commit=$($Source.tag_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "build_artifact_id=$($Source.build_artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download exact CUDA build artifact by verified numeric ID
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.source.outputs.build_artifact_id }}
+          path: downloaded-cuda-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Safely inspect and extract exact candidate
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_cuda_release_attachment.py inspect-candidate `
+            --downloaded-directory downloaded-cuda-artifact `
+            --cuda-zip-sha256 $env:CUDA_ZIP_SHA_INPUT `
+            --tag-commit $env:GITHUB_SHA `
+            --extract-directory extracted-candidate `
+            --output candidate-inspection.json
+
+      - name: Record nvidia-smi telemetry while all full-provider passes run
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $GpuNames = @(& nvidia-smi.exe --query-gpu=name --format=csv,noheader)
+          if ($LASTEXITCODE -ne 0 -or $GpuNames.Count -ne 1) {
+            throw "Qualification requires a dedicated runner with exactly one NVIDIA GPU."
+          }
+          $ExistingProAim = @(Get-Process -Name "ProAimCLI" -ErrorAction SilentlyContinue)
+          if ($ExistingProAim.Count -ne 0) {
+            throw "Qualification requires no pre-existing ProAimCLI process."
+          }
+          $ExpectedGpu = $env:QUALIFIED_GPU_INPUT.Trim()
+          if ($GpuNames[0].Trim() -ne $ExpectedGpu) {
+            throw "The runner's only NVIDIA GPU does not equal the qualified_gpu input."
+          }
+          $CudaVisible = if ([string]::IsNullOrWhiteSpace($env:CUDA_VISIBLE_DEVICES)) { $null } else { $env:CUDA_VISIBLE_DEVICES }
+          $NvidiaVisible = if ([string]::IsNullOrWhiteSpace($env:NVIDIA_VISIBLE_DEVICES)) { $null } else { $env:NVIDIA_VISIBLE_DEVICES }
+          if ($null -ne $CudaVisible -or $null -ne $NvidiaVisible) {
+            throw "Qualification forbids CUDA/NVIDIA device remapping environment variables."
+          }
+          $RunnerInvariant = [ordered]@{
+            schema_version = 1
+            status = "passed_before_gpu_runs"
+            checked_at_utc = [DateTime]::UtcNow.ToString("o")
+            nvidia_gpu_count = 1
+            nvidia_gpu_names = @($GpuNames[0].Trim())
+            preexisting_proaim_cli_count = 0
+            cuda_visible_devices = $null
+            nvidia_visible_devices = $null
+            telemetry_interval_milliseconds = 500
+          }
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "CUDA-RUNNER-INVARIANT.json"),
+            (($RunnerInvariant | ConvertTo-Json -Depth 8) + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $Telemetry = Join-Path $PWD "nvidia-smi-telemetry.jsonl"
+          $Stop = Join-Path $PWD "stop-nvidia-telemetry"
+          $Recorder = (Resolve-Path -LiteralPath "packaging\windows\Record-ProAimCudaTelemetry.ps1").Path
+          $TelemetryStdout = Join-Path $PWD "nvidia-telemetry-recorder.stdout.txt"
+          $TelemetryStderr = Join-Path $PWD "nvidia-telemetry-recorder.stderr.txt"
+          $TelemetryProcess = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList @(
+              "-NoProfile",
+              "-NonInteractive",
+              "-ExecutionPolicy", "Bypass",
+              "-File", ('"{0}"' -f $Recorder),
+              "-OutputPath", ('"{0}"' -f $Telemetry),
+              "-StopFile", ('"{0}"' -f $Stop),
+              "-IntervalMilliseconds", [string]$RunnerInvariant.telemetry_interval_milliseconds
+            ) `
+            -PassThru `
+            -RedirectStandardOutput $TelemetryStdout `
+            -RedirectStandardError $TelemetryStderr
+          $QualificationFailure = $null
+          try {
+            $Bundle = (Resolve-Path -LiteralPath "downloaded-cuda-artifact\ProAim-Windows-x64-NVIDIA-CUDA.zip").Path
+            $Helper = (Resolve-Path -LiteralPath "extracted-candidate\ProAim\Qualify-ProAimGpu.ps1").Path
+            & $Helper -Provider CUDA `
+              -BundleArchivePath $Bundle `
+              -EvidenceDirectory (Join-Path $PWD "software-evidence") `
+              -RunLive `
+              -SkipReadyPrompt
+            if ($TelemetryProcess.HasExited) {
+              $EarlyTelemetryError = Get-Content -LiteralPath $TelemetryStderr -Raw -ErrorAction SilentlyContinue
+              throw "NVIDIA telemetry recorder exited before qualification completed: $EarlyTelemetryError"
+            }
+          } catch {
+            $QualificationFailure = $_
+          } finally {
+            [System.IO.File]::WriteAllText($Stop, "stop", [System.Text.UTF8Encoding]::new($false))
+            if (-not $TelemetryProcess.WaitForExit(30000)) {
+              Stop-Process -Id $TelemetryProcess.Id -Force
+              throw "NVIDIA telemetry recorder did not stop within 30 seconds."
+            }
+          }
+          if ($null -ne $QualificationFailure) {
+            throw $QualificationFailure
+          }
+          if ($TelemetryProcess.ExitCode -ne 0) {
+            $TelemetryError = Get-Content -LiteralPath $TelemetryStderr -Raw -ErrorAction SilentlyContinue
+            throw "NVIDIA telemetry recorder failed with exit code $($TelemetryProcess.ExitCode): $TelemetryError"
+          }
+          foreach ($RecorderFile in @($TelemetryStdout, $TelemetryStderr, $Stop)) {
+            if (Test-Path -LiteralPath $RecorderFile -PathType Leaf) {
+              Remove-Item -LiteralPath $RecorderFile -Force
+            }
+          }
+          if (-not (Test-Path -LiteralPath $Telemetry -PathType Leaf)) {
+            throw "NVIDIA telemetry recorder did not create its evidence file."
+          }
+
+      - name: Collect local typed observation after all physical GPU runs
+        shell: pwsh
+        env:
+          QUALIFIED_GPU_INPUT: ${{ inputs.qualified_gpu }}
+          OBSERVER_NAME_INPUT: ${{ inputs.observer_name }}
+          PHYSICAL_CONFIRMATION_INPUT: ${{ inputs.physical_confirmation }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "packaging\windows\Complete-ProAimPhysicalObservation.ps1" `
+            -OutputPath (Join-Path $PWD "LOCAL-PHYSICAL-OBSERVATION.json") `
+            -Tag $env:TAG_INPUT `
+            -QualifiedGpu $env:QUALIFIED_GPU_INPUT `
+            -ExpectedObserverName $env:OBSERVER_NAME_INPUT `
+            -ExpectedTypedConfirmation $env:PHYSICAL_CONFIRMATION_INPUT `
+            -GitHubActor $env:GITHUB_ACTOR `
+            -GitHubRunId $env:GITHUB_RUN_ID
+
+      - name: Assemble exact raw evidence file set
+        shell: pwsh
+        run: |
+          $Raw = New-Item -ItemType Directory -Path "raw-qualification" -ErrorAction Stop
+          Move-Item -LiteralPath "software-evidence" -Destination (Join-Path $Raw.FullName "software-evidence")
+          Copy-Item -LiteralPath "candidate-inspection.json" -Destination $Raw.FullName
+          Copy-Item -LiteralPath "verified-source.json" -Destination $Raw.FullName
+          Copy-Item -LiteralPath "nvidia-smi-telemetry.jsonl" -Destination $Raw.FullName
+          Copy-Item -LiteralPath "CUDA-RUNNER-INVARIANT.json" -Destination $Raw.FullName
+          Copy-Item -LiteralPath "LOCAL-PHYSICAL-OBSERVATION.json" -Destination $Raw.FullName
+
+      - name: Create exact raw-content manifest before upload
+        id: raw-content
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_cuda_release_attachment.py write-content-manifest `
+            --root "raw-qualification" `
+            --output-name "RAW-CONTENT-MANIFEST.json" `
+            --kind "proaim-cuda-raw-qualification" `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --tag-commit $env:GITHUB_SHA `
+            --source-build-run-id $env:BUILD_RUN_INPUT `
+            --qualification-run-id $env:GITHUB_RUN_ID `
+            --qualification-run-attempt $env:GITHUB_RUN_ATTEMPT `
+            --result "raw-content-result.json"
+          $Result = Get-Content -LiteralPath "raw-content-result.json" -Raw | ConvertFrom-Json
+          "raw_content_manifest_sha256=$($Result.manifest_sha256)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload immutable raw physical evidence for protected review
+        id: raw-artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: raw-proaim-cuda-qualification-${{ github.run_id }}
+          path: raw-qualification
+          if-no-files-found: error
+          retention-days: 7
+
+  seal-physical-attestation:
+    name: Protected review and seal of typed physical attestation
+    needs: collect-physical-evidence
+    runs-on: windows-2022
+    timeout-minutes: 15
+    environment:
+      name: cuda-physical-attestation
+    permissions:
+      actions: read
+      contents: read
+    env:
+      REPOSITORY_INPUT: ${{ github.repository }}
+      TAG_INPUT: ${{ inputs.tag }}
+      BUILD_RUN_INPUT: ${{ inputs.source_build_run_id }}
+      CUDA_ZIP_SHA_INPUT: ${{ inputs.cuda_zip_sha256 }}
+      QUALIFIED_GPU_INPUT: ${{ inputs.qualified_gpu }}
+      OBSERVER_NAME_INPUT: ${{ inputs.observer_name }}
+      PHYSICAL_CONFIRMATION_INPUT: ${{ inputs.physical_confirmation }}
+      LEGAL_REVIEW_ACK_INPUT: ${{ inputs.legal_review_acknowledgement }}
+    steps:
+      - name: Require preconfigured physical-attestation environment guard
+        shell: pwsh
+        env:
+          ENVIRONMENT_GUARD: ${{ secrets.CUDA_PHYSICAL_ATTESTATION_GUARD }}
+          ENVIRONMENT_POLICY_VERSION: ${{ vars.CUDA_PHYSICAL_ATTESTATION_POLICY_VERSION }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ENVIRONMENT_GUARD)) {
+            throw "cuda-physical-attestation must define its environment-only guard secret."
+          }
+          if ($env:ENVIRONMENT_POLICY_VERSION -ne "required-reviewers-v1") {
+            throw "cuda-physical-attestation must define required-reviewers-v1 policy."
+          }
+          if ($env:LEGAL_REVIEW_ACK_INPUT -ne "PHYSICAL QUALIFICATION ONLY - NVIDIA LEGAL REVIEW REMAINS REQUIRED") {
+            throw "Physical qualification cannot be represented as NVIDIA legal approval."
+          }
+
+      - name: Check out exact attestation workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up sealing Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Download exact raw evidence reviewed by the environment approver
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.collect-physical-evidence.outputs.raw_artifact_id }}
+          path: raw-qualification
+
+      - name: Validate all evidence and seal the physical GPU attestation
+        shell: pwsh
+        env:
+          RAW_CONTENT_MANIFEST_SHA256: ${{ needs.collect-physical-evidence.outputs.raw_content_manifest_sha256 }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Arguments = @(
+            "seal-evidence",
+            "--raw-directory", "raw-qualification",
+            "--output-directory", "sealed-evidence",
+            "--output-record", "sealed-evidence-result.json",
+            "--repository", $env:REPOSITORY_INPUT,
+            "--tag", $env:TAG_INPUT,
+            "--source-build-run-id", $env:BUILD_RUN_INPUT,
+            "--cuda-zip-sha256", $env:CUDA_ZIP_SHA_INPUT,
+            "--qualified-gpu", $env:QUALIFIED_GPU_INPUT,
+            "--observer-name", $env:OBSERVER_NAME_INPUT,
+            "--typed-confirmation", $env:PHYSICAL_CONFIRMATION_INPUT,
+            "--github-actor", $env:GITHUB_ACTOR,
+            "--github-run-id", $env:GITHUB_RUN_ID,
+            "--github-run-attempt", $env:GITHUB_RUN_ATTEMPT,
+            "--github-head-sha", $env:GITHUB_SHA,
+            "--raw-content-manifest-sha256", $env:RAW_CONTENT_MANIFEST_SHA256
+          )
+          python scripts/manage_cuda_release_attachment.py @Arguments
+
+      - name: Upload the only qualification artifact accepted by publication
+        id: sealed-artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ProAim-Windows-CUDA-Qualification-Evidence
+          path: sealed-evidence/ProAim-Windows-CUDA-Qualification-Evidence.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record immutable evidence hashes
+        shell: pwsh
+        env:
+          SEALED_ARTIFACT_DIGEST: ${{ steps.sealed-artifact.outputs.artifact-digest }}
+        run: |
+          $Result = Get-Content -LiteralPath "sealed-evidence-result.json" -Raw | ConvertFrom-Json
+          @"
+          ## Physical Windows CUDA evidence sealed
+
+          - Evidence run ID: ``$env:GITHUB_RUN_ID``
+          - GitHub Actions artifact digest: ``$env:SEALED_ARTIFACT_DIGEST``
+          - Inner evidence ZIP SHA-256: ``$($Result.evidence_archive.sha256)``
+          - qualification-manifest.json SHA-256: ``$($Result.qualification_manifest_sha256)``
+          - PHYSICAL-GPU-ATTESTATION.json SHA-256: ``$($Result.physical_attestation_sha256)``
+          - Candidate SHA-256: ``$env:CUDA_ZIP_SHA_INPUT``
+          - GPU: ``$env:QUALIFIED_GPU_INPUT``
+          - Scope: physical/runtime evidence only; NVIDIA redistribution permission still requires separate human legal approval
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

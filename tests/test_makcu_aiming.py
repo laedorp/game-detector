@@ -4,6 +4,8 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import tempfile
+import threading
+import time
 import unittest
 from unittest import mock
 
@@ -85,6 +87,86 @@ class FakeSerialFactory:
         return connection
 
 
+class StalledReadSerial(FakeSerial):
+    """Model a driver blocked in ``in_waiting`` while holding _serial_lock."""
+
+    def __init__(
+        self,
+        state: dict[str, int],
+        *,
+        unblock_on_cancel: bool,
+        **options,
+    ) -> None:
+        super().__init__(state, **options)
+        self.unblock_on_cancel = unblock_on_cancel
+        self.read_entered = threading.Event()
+        self.release_read = threading.Event()
+        self.cancel_read_calls = 0
+        self.cancel_write_calls = 0
+
+    @property
+    def in_waiting(self) -> int:
+        if b"km.buttons(1)\r" in self.writes:
+            self.read_entered.set()
+            self.release_read.wait(2.0)
+        return len(self.responses)
+
+    def cancel_read(self) -> None:
+        self.cancel_read_calls += 1
+        if self.unblock_on_cancel:
+            self.release_read.set()
+
+    def cancel_write(self) -> None:
+        self.cancel_write_calls += 1
+
+    def close(self) -> None:
+        if self.unblock_on_cancel:
+            self.release_read.set()
+        super().close()
+
+
+class StalledReadSerialFactory(FakeSerialFactory):
+    def __init__(self, *, unblock_on_cancel: bool) -> None:
+        super().__init__()
+        self.unblock_on_cancel = unblock_on_cancel
+        self.connections: list[StalledReadSerial] = []
+
+    def __call__(self, **options) -> StalledReadSerial:
+        connection = StalledReadSerial(
+            self.state,
+            unblock_on_cancel=self.unblock_on_cancel,
+            **options,
+        )
+        self.connections.append(connection)
+        return connection
+
+
+class StalledCloseSerial(FakeSerial):
+    """Model a native close that does not honor the configured I/O timeout."""
+
+    def __init__(self, state: dict[str, int], **options) -> None:
+        super().__init__(state, **options)
+        self.close_entered = threading.Event()
+        self.release_close = threading.Event()
+
+    def close(self) -> None:
+        if b"km.buttons(1)\r" in self.writes:
+            self.close_entered.set()
+            self.release_close.wait(2.0)
+        super().close()
+
+
+class StalledCloseSerialFactory(FakeSerialFactory):
+    def __init__(self) -> None:
+        super().__init__()
+        self.connections: list[StalledCloseSerial] = []
+
+    def __call__(self, **options) -> StalledCloseSerial:
+        connection = StalledCloseSerial(self.state, **options)
+        self.connections.append(connection)
+        return connection
+
+
 class MakcuAimingTests(unittest.TestCase):
     def setUp(self) -> None:
         self.factory = FakeSerialFactory()
@@ -112,6 +194,135 @@ class MakcuAimingTests(unittest.TestCase):
         controller.stop()
         self.assertIn(b"km.buttons(0)\r", active.writes)
         self.assertTrue(active.closed)
+
+    def test_normal_threaded_stop_disables_stream_closes_and_can_restart(self) -> None:
+        controller = MakcuAimingController(
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=True,
+        )
+        controller.start()
+        first = self.factory.connections[-1]
+
+        controller.stop()
+
+        self.assertIn(b"km.buttons(0)\r", first.writes)
+        self.assertTrue(first.closed)
+        self.assertIsNone(controller._output_thread)
+        self.assertIsNone(controller._serial)
+
+        controller.start()
+        second = self.factory.connections[-1]
+        self.assertIsNot(second, first)
+        controller.stop()
+        self.assertTrue(second.closed)
+
+    def test_stop_cancels_stalled_serial_read_and_joins_worker(self) -> None:
+        factory = StalledReadSerialFactory(unblock_on_cancel=True)
+        controller = MakcuAimingController(
+            serial_factory=factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=True,
+            stop_timeout=0.25,
+        )
+        controller.start()
+        active = factory.connections[-1]
+        self.assertTrue(active.read_entered.wait(1.0))
+
+        started = time.monotonic()
+        controller.stop()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertGreaterEqual(active.cancel_read_calls, 1)
+        self.assertGreaterEqual(active.cancel_write_calls, 1)
+        self.assertTrue(active.closed)
+        self.assertIsNone(controller._output_thread)
+        self.assertIsNone(controller._serial)
+
+    def test_stop_times_out_disarmed_and_retains_uncooperative_worker(self) -> None:
+        factory = StalledReadSerialFactory(unblock_on_cancel=False)
+        controller = MakcuAimingController(
+            serial_factory=factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=True,
+            stop_timeout=0.12,
+        )
+        controller.start()
+        active = factory.connections[-1]
+        self.assertTrue(active.read_entered.wait(1.0))
+        # If the blocked read eventually delivers a physical press after stop
+        # has begun, the disarmed target state must still prevent movement.
+        active.responses.extend(bytes((0b00010,)))
+        worker = controller._output_thread
+        assert worker is not None
+        with controller._state_lock:
+            controller._latest_target = Detection(
+                0,
+                "player",
+                0.9,
+                (1000, 400, 1100, 700),
+            )
+            controller._latest_active = True
+
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(
+                MakcuError,
+                "shutdown did not finish.*output worker is still running",
+            ):
+                controller.stop()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.4)
+            self.assertIs(controller._output_thread, worker)
+            self.assertTrue(worker.is_alive())
+            self.assertIs(controller._serial, active)
+            self.assertIsNone(controller._latest_target)
+            self.assertFalse(controller._latest_active)
+            with self.assertRaisesRegex(MakcuError, "shutdown is incomplete"):
+                controller.start()
+        finally:
+            active.release_read.set()
+            worker.join(1.0)
+            self.assertFalse(
+                any(write.startswith(b"km.move(") for write in active.writes)
+            )
+            controller.stop()
+
+    def test_stop_bounds_stalled_native_close_and_keeps_shutdown_threads(self) -> None:
+        factory = StalledCloseSerialFactory()
+        controller = MakcuAimingController(
+            serial_factory=factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+            stop_timeout=0.12,
+        )
+        controller.start()
+        active = factory.connections[-1]
+
+        started = time.monotonic()
+        try:
+            with self.assertRaisesRegex(
+                MakcuError,
+                "shutdown did not finish.*serial cancellation/close is still running",
+            ):
+                controller.stop()
+            elapsed = time.monotonic() - started
+
+            self.assertLess(elapsed, 0.4)
+            self.assertTrue(active.close_entered.is_set())
+            self.assertTrue(any(thread.is_alive() for thread in controller._shutdown_threads))
+            self.assertIs(controller._serial, active)
+        finally:
+            active.release_close.set()
+            for thread in controller._shutdown_threads:
+                thread.join(1.0)
+            controller.stop()
 
     def test_right_button_gates_bounded_detection_movement(self) -> None:
         controller = self.controller(MakcuAimConfig(strength=0.25, max_step=80))
@@ -337,12 +548,346 @@ class MakcuAimingTests(unittest.TestCase):
         controller._output_tick(0.001, now_ns=stale_now)
         self.assertEqual(len(active.writes), before_stale)
 
+    def test_velocity_uses_detector_sample_times_and_persists_between_ticks(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=0.5,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.03,
+                derivative_damping_seconds=0.008,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        first_ns = 1_000_000_000
+        first = Detection(0, "player", 0.9, (950, 540, 970, 640))
+        second = Detection(0, "player", 0.9, (956.6, 540, 976.6, 640))
+        controller.update(first, (1080, 1920, 3), measurement_ns=first_ns)
+        controller._output_tick(0.001, now_ns=first_ns + 1_000_000)
+        controller.update(
+            second,
+            (1080, 1920, 3),
+            measurement_ns=first_ns + 33_000_000,
+        )
+
+        controller._output_tick(0.001, now_ns=first_ns + 34_000_000)
+        first_tick_rate = controller._smoothed_rate_x
+        controller._output_tick(0.001, now_ns=first_ns + 35_000_000)
+        second_tick_rate = controller._smoothed_rate_x
+
+        self.assertAlmostEqual(controller._latest_velocity_x, 200.0, delta=0.01)
+        self.assertGreater(first_tick_rate, 0.0)
+        self.assertLess(
+            abs(second_tick_rate - first_tick_rate),
+            abs(first_tick_rate) * 0.05,
+        )
+
+    def test_old_source_measurement_expires_even_if_just_published(self) -> None:
+        controller = self.controller(MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        target = Detection(0, "player", 0.9, (1060, 480, 1260, 980))
+        now_ns = 3_000_000_000
+        controller.update(
+            target,
+            (1080, 1920, 3),
+            measurement_ns=now_ns - round((TARGET_STALE_SECONDS + 0.01) * 1e9),
+        )
+        before = len(active.writes)
+
+        controller._output_tick(0.001, now_ns=now_ns)
+
+        self.assertEqual(len(active.writes), before)
+
+    def test_smoothing_response_is_invariant_to_output_rate(self) -> None:
+        alpha = 0.78
+
+        def response_after_10ms(rate_hz: int) -> float:
+            controller = self.controller(
+                MakcuAimConfig(
+                    strength=0.5,
+                    max_step=1000,
+                    output_hz=rate_hz,
+                    smoothing_alpha=alpha,
+                    prediction_lead_seconds=0.0,
+                    derivative_damping_seconds=0.0,
+                    head_ratio=0.0,
+                )
+            )
+            controller.start(output_loop=False)
+            controller._output_thread = object()
+            active = self.factory.connections[-1]
+            active.responses.extend(bytes((0b00010,)))
+            target = Detection(0, "player", 0.9, (1150, 540, 1170, 640))
+            base_ns = 2_000_000_000
+            controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+            period = 1.0 / rate_hz
+            for index in range(round(0.01 * rate_hz)):
+                controller._output_tick(
+                    period,
+                    now_ns=base_ns + round((index + 1) * period * 1e9),
+                )
+            return controller._smoothed_rate_x
+
+        self.assertAlmostEqual(response_after_10ms(100), response_after_10ms(1000), delta=1.0)
+
+    def test_vertical_motion_is_time_based_across_output_rates(self) -> None:
+        def movement_after_50ms(rate_hz: int) -> int:
+            controller = self.controller(
+                MakcuAimConfig(
+                    strength=1.0,
+                    max_step=160,
+                    output_hz=rate_hz,
+                    deadzone_pixels=0.0,
+                    smoothing_alpha=1.0,
+                    prediction_lead_seconds=0.0,
+                    derivative_damping_seconds=0.0,
+                    head_ratio=0.0,
+                )
+            )
+            controller.start(output_loop=False)
+            controller._output_thread = object()
+            active = self.factory.connections[-1]
+            active.responses.extend(bytes((0b00010,)))
+            target = Detection(0, "player", 0.9, (955, 900, 965, 920))
+            base_ns = 4_000_000_000
+            controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+            period = 1.0 / rate_hz
+            for index in range(round(0.05 * rate_hz)):
+                controller._output_tick(
+                    period,
+                    now_ns=base_ns + round((index + 1) * period * 1e9),
+                )
+            movement = 0
+            for write in active.writes:
+                if not write.startswith(b"km.move("):
+                    continue
+                _x, y = write.decode("ascii").strip()[8:-1].split(",")
+                movement += int(y)
+            controller._output_thread = None
+            controller.stop()
+            return movement
+
+        self.assertAlmostEqual(
+            movement_after_50ms(100),
+            movement_after_50ms(1000),
+            delta=1,
+        )
+
+    def test_saturated_horizontal_motion_is_time_based_across_output_rates(self) -> None:
+        def movement_after_100ms(rate_hz: int) -> int:
+            controller = self.controller(
+                MakcuAimConfig(
+                    strength=4.0,
+                    max_step=160,
+                    output_hz=rate_hz,
+                    deadzone_pixels=0.0,
+                    smoothing_alpha=1.0,
+                    prediction_lead_seconds=0.0,
+                    derivative_damping_seconds=0.0,
+                    head_ratio=0.0,
+                )
+            )
+            controller.start(output_loop=False)
+            controller._output_thread = object()
+            active = self.factory.connections[-1]
+            active.responses.extend(bytes((0b00010,)))
+            target = Detection(0, "player", 0.9, (1800, 540, 1820, 560))
+            base_ns = 6_000_000_000
+            controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+            period = 1.0 / rate_hz
+            for index in range(round(0.1 * rate_hz)):
+                controller._output_tick(
+                    period,
+                    now_ns=base_ns + round((index + 1) * period * 1e9),
+                )
+            movement = 0
+            for write in active.writes:
+                if not write.startswith(b"km.move("):
+                    continue
+                x, _y = write.decode("ascii").strip()[8:-1].split(",")
+                movement += int(x)
+            controller._output_thread = None
+            controller.stop()
+            return movement
+
+        movements = [movement_after_100ms(rate) for rate in (100, 1000, 2000)]
+        self.assertLessEqual(max(movements) - min(movements), 1)
+
+    def test_positive_target_velocity_never_produces_reverse_center_correction(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=0.5,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.028,
+                derivative_damping_seconds=0.016,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        first = Detection(0, "player", 0.9, (943.4, 540, 963.4, 560))
+        centered = Detection(0, "player", 0.9, (950, 540, 970, 560))
+        base_ns = 7_000_000_000
+        controller.update(first, (1080, 1920, 3), measurement_ns=base_ns)
+        controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+        controller.update(
+            centered,
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 33_000_000,
+        )
+
+        controller._output_tick(0.001, now_ns=base_ns + 34_000_000)
+
+        self.assertGreater(controller._latest_velocity_x, 0.0)
+        self.assertGreaterEqual(controller._smoothed_rate_x, 0.0)
+
+    def test_clamped_delayed_tick_does_not_replay_integer_backlog(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=4.0,
+                max_step=10,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        far = Detection(0, "player", 0.9, (1800, 540, 1820, 560))
+        centered = Detection(0, "player", 0.9, (950, 540, 970, 560))
+        base_ns = 8_000_000_000
+        controller.update(far, (1080, 1920, 3), measurement_ns=base_ns)
+        controller._output_tick(0.01, now_ns=base_ns + 10_000_000)
+        first_moves = [write for write in active.writes if write.startswith(b"km.move(")]
+        controller.update(
+            centered,
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 11_000_000,
+        )
+        controller._output_tick(0.001, now_ns=base_ns + 12_000_000)
+        all_moves = [write for write in active.writes if write.startswith(b"km.move(")]
+
+        self.assertEqual(len(all_moves), len(first_moves))
+        self.assertLess(abs(controller._fractional_x), 1.0)
+
+    def test_large_target_jump_resets_sample_velocity(self) -> None:
+        controller = self.controller(MakcuAimConfig(head_ratio=0.0))
+        controller.start(output_loop=False)
+        first = Detection(0, "player", 0.9, (950, 540, 970, 640))
+        switched = Detection(0, "player", 0.9, (1290, 540, 1310, 640))
+
+        controller.update(first, (1080, 1920, 3), measurement_ns=1_000_000_000)
+        controller.update(
+            switched,
+            (1080, 1920, 3),
+            measurement_ns=1_033_000_000,
+        )
+
+        self.assertEqual(controller._latest_velocity_x, 0.0)
+        self.assertEqual(controller._latest_velocity_y, 0.0)
+
+    def test_measurement_timestamp_requires_strict_integer_type(self) -> None:
+        controller = self.controller()
+        controller.start(output_loop=False)
+        target = Detection(0, "player", 0.9, (950, 540, 970, 640))
+
+        for invalid in (True, 1.5):
+            with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                TypeError,
+                "integer monotonic timestamp",
+            ):
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=invalid,
+                )
+
+    def test_backwards_measurement_timestamp_cannot_overwrite_newer_target(self) -> None:
+        controller = self.controller(MakcuAimConfig(head_ratio=0.0))
+        controller.start(output_loop=False)
+        first = Detection(0, "player", 0.9, (950, 540, 970, 640))
+        newer = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        late_old = Detection(0, "player", 0.9, (970, 540, 990, 640))
+        controller.update(first, (1080, 1920, 3), measurement_ns=5_000_000_000)
+        controller.update(newer, (1080, 1920, 3), measurement_ns=5_100_000_000)
+
+        with self.assertRaisesRegex(ValueError, "must not move backwards"):
+            controller.update(
+                late_old,
+                (1080, 1920, 3),
+                measurement_ns=5_050_000_000,
+            )
+
+        self.assertIs(controller._latest_target, newer)
+        self.assertEqual(controller._latest_measurement_ns, 5_100_000_000)
+
+    def test_changed_geometry_at_same_timestamp_resets_velocity(self) -> None:
+        controller = self.controller(MakcuAimConfig(head_ratio=0.0))
+        controller.start(output_loop=False)
+        first = Detection(0, "player", 0.9, (950, 540, 970, 640))
+        moving = Detection(0, "player", 0.9, (970, 540, 990, 640))
+        duplicate_time_change = Detection(0, "player", 0.9, (990, 540, 1010, 640))
+        controller.update(first, (1080, 1920, 3), measurement_ns=5_000_000_000)
+        controller.update(moving, (1080, 1920, 3), measurement_ns=5_100_000_000)
+        self.assertGreater(controller._latest_velocity_x, 0.0)
+
+        controller.update(
+            duplicate_time_change,
+            (1080, 1920, 3),
+            measurement_ns=5_100_000_000,
+        )
+
+        self.assertEqual(controller._latest_velocity_x, 0.0)
+        self.assertEqual(controller._latest_velocity_y, 0.0)
+
     def test_target_delta_uses_head_point_deadzone_and_maximum_step(self) -> None:
         config = MakcuAimConfig(strength=1.0, max_step=20, deadzone_pixels=2.0)
         far = Detection(0, "player", 0.9, (1800, 900, 1920, 1080))
         centered = Detection(0, "player", 0.9, (958, 538, 962, 558))
         self.assertEqual(makcu_target_delta(far, (1080, 1920, 3), config), (20, 20))
         self.assertEqual(makcu_target_delta(centered, (1080, 1920, 3), config), (0, 0))
+
+    def test_target_delta_is_resolution_invariant_for_normalized_offset(self) -> None:
+        config = MakcuAimConfig(
+            strength=0.5,
+            max_step=1000,
+            deadzone_pixels=0.0,
+            head_ratio=0.0,
+        )
+        deltas = []
+        for height, width in ((720, 1280), (1080, 1920), (2160, 3840)):
+            target_x = width * 0.60
+            target_y = height * 0.40
+            target = Detection(
+                0,
+                "player",
+                0.9,
+                (target_x - 5, target_y, target_x + 5, target_y + 20),
+            )
+            deltas.append(
+                makcu_target_delta(target, (height, width, 3), config)
+            )
+
+        self.assertEqual(deltas, [(96, -54), (96, -54), (96, -54)])
 
     def test_gain_above_one_is_supported_but_bounded(self) -> None:
         config = MakcuAimConfig(strength=2.0, max_step=640)

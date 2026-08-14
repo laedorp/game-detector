@@ -33,6 +33,8 @@ PLAYER_LABEL_WORDS = frozenset(
     }
 )
 OTHER_PLAYER_LABEL_WORDS = frozenset({"bot", "enemy", "npc", "opponent"})
+SHOULDER_SWAP_BOTTOM = 0.88
+SHOULDER_SWAP_MIN_HEIGHT = 0.25
 
 
 @dataclass(frozen=True, slots=True)
@@ -267,9 +269,44 @@ class SelfAvatarFilter:
         # opponent or a duplicate box overlaps the track.  Both cases keep all
         # detections and age the lock rather than risk hiding the wrong one.
         if len(matches) != 1:
+            shoulder_handoffs = tuple(
+                candidate
+                for candidate in tracking_candidates
+                if _is_shoulder_handoff_candidate(candidate.box, self.zone)
+            )
+            if len(matches) == 0 and len(shoulder_handoffs) == 1:
+                candidate = shoulder_handoffs[0]
+                if (
+                    self._handoff_box is None
+                    or self._handoff_class != candidate.class_key
+                    or _association_score(self._handoff_box, candidate.box) is None
+                ):
+                    self._handoff_box = candidate.box
+                    self._handoff_class = candidate.class_key
+                    self._handoff_hits = 1
+                else:
+                    self._handoff_box = candidate.box
+                    self._handoff_hits += 1
+                self._lost_frames = 0
+                if self._handoff_hits >= self.handoff_confirm_frames:
+                    self._locked_box = candidate.box
+                    self._clear_handoff()
+                    return _remove_candidate(detections, candidate)
+                return ExclusionResult(detections, 0, aim_safe=False)
+
             self._clear_handoff()
             self._lost_frames += 1
-            aim_safe = len(matches) == 0 and not candidates
+            # A third-person camera can swap the avatar from one shoulder to
+            # the other in a single frame. A large, bottom-anchored same-class
+            # box on the opposite side is a plausible self handoff even though
+            # it lies outside the user's acquisition zone. Keep detections for
+            # preview, but fail aim closed until the old lock expires and this
+            # candidate is reacquired deliberately.
+            plausible_handoff = any(
+                _is_bottom_avatar_shape(candidate.box)
+                for candidate in tracking_candidates
+            )
+            aim_safe = len(matches) == 0 and not candidates and not plausible_handoff
             if self._lost_frames > self.lost_grace_frames:
                 self._locked_box = None
                 self._locked_class = None
@@ -511,6 +548,32 @@ def _normalized_box(
 
 def _box_area(box: tuple[float, float, float, float]) -> float:
     return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
+
+def _is_bottom_avatar_shape(box: tuple[float, float, float, float]) -> bool:
+    """Whether a normalized track could be the shoulder-swapped self avatar."""
+
+    height = max(0.0, box[3] - box[1])
+    return box[3] >= SHOULDER_SWAP_BOTTOM and height >= SHOULDER_SWAP_MIN_HEIGHT
+
+
+def _is_shoulder_handoff_candidate(
+    box: tuple[float, float, float, float],
+    zone: NormalizedBottomZone,
+) -> bool:
+    """Whether a track is in the configured zone mirrored across screen center."""
+
+    if not _is_bottom_avatar_shape(box):
+        return False
+    width = max(0.0, box[2] - box[0])
+    height = max(0.0, box[3] - box[1])
+    if width < MIN_SELF_BOX_WIDTH or height <= 0.0:
+        return False
+    if width / height > MAX_SELF_BOX_ASPECT_RATIO:
+        return False
+    mirrored_left = 1.0 - (zone.left + zone.width)
+    anchor_x = (box[0] + box[2]) * 0.5
+    return mirrored_left <= anchor_x <= mirrored_left + zone.width
 
 
 def _box_iou(

@@ -5,10 +5,30 @@ import os
 import re
 import shutil
 from pathlib import Path
+import sys
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.inference_size import (
+    InferenceSize,
+    compact_inference_size,
+    parse_inference_size,
+    validate_yolo_inference_size,
+)
 
 
 class ExportArtifactError(RuntimeError):
     """Raised when an OpenVINO export does not contain one safe IR pair."""
+
+
+def _image_size(value: str) -> InferenceSize:
+    try:
+        return validate_yolo_inference_size(parse_inference_size(value))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _artifact_basename(value: str) -> str:
@@ -25,7 +45,17 @@ def build_parser() -> argparse.ArgumentParser:
         description="Download/export a YOLO detect model to an OpenVINO IR directory."
     )
     parser.add_argument("--weights", default="yolo26n.pt", help="Ultralytics weights or local .pt file.")
-    parser.add_argument("--imgsz", type=int, default=320, help="Square export size (default: 320).")
+    parser.add_argument(
+        "--imgsz",
+        type=_image_size,
+        default=(320, 320),
+        metavar="N|HEIGHTxWIDTH",
+        help=(
+            "Export input dimensions: legacy N means a square, or use explicit "
+            "HEIGHTxWIDTH tensor order; each dimension must be divisible by 32 "
+            "(default: 320)."
+        ),
+    )
     parser.add_argument(
         "--output",
         type=Path,
@@ -153,9 +183,6 @@ def normalize_ir_basename(directory: Path, basename: str) -> tuple[Path, Path]:
 
 def main() -> None:
     args = build_parser().parse_args()
-    if args.imgsz <= 0:
-        raise SystemExit("--imgsz must be greater than zero")
-
     output = args.output.expanduser().resolve()
     if _path_lexists(output):
         raise SystemExit(f"Output already exists: {output}")
@@ -179,7 +206,7 @@ def main() -> None:
     exported = Path(
         model.export(
             format="openvino",
-            imgsz=args.imgsz,
+            imgsz=compact_inference_size(args.imgsz),
             batch=1,
             dynamic=args.dynamic,
             device="cpu",

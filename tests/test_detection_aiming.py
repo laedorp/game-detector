@@ -5,6 +5,9 @@ import contextlib
 import io
 from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
+
+import numpy as np
 
 from aiming.protocol import decode_aim_command
 from aiming.controller import (
@@ -26,6 +29,7 @@ from main import (
     _update_aim_target,
     _validate_aim_safety,
 )
+from utils.render import draw_aim_target
 
 
 @dataclass(frozen=True)
@@ -100,6 +104,22 @@ class FailingAimController:
 
 
 class AimingControllerTests(unittest.TestCase):
+    def test_aim_overlay_names_the_configured_physical_gate(self) -> None:
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+        with (
+            patch("cv2.circle"),
+            patch("cv2.drawMarker"),
+            patch("cv2.putText") as put_text,
+        ):
+            draw_aim_target(
+                frame,
+                (50.0, 40.0),
+                active=False,
+                activation_name="Left",
+            )
+
+        self.assertEqual(put_text.call_args.args[1], "HEAD TARGET - HOLD LEFT")
+
     def test_default_head_point_is_twelve_percent_down_player_box(self) -> None:
         target = Detection(0, "person", 0.9, (700, 200, 900, 800))
         self.assertEqual(head_target_point(target), (800.0, 272.0))
@@ -169,6 +189,60 @@ class AimingControllerTests(unittest.TestCase):
                 )
             )
 
+        for output in ("LOCAL", "garbage", None):
+            with self.subTest(output=output), self.assertRaisesRegex(
+                ValueError, "Unsupported safe aim output"
+            ):
+                _validate_aim_safety(
+                    SimpleNamespace(
+                        aim=True,
+                        aim_label="person",
+                        aim_output=output,
+                        aim_activate_path="/dev/input/event0",
+                        aim_activate_threshold=0.35,
+                        ignore_self=True,
+                    )
+                )
+
+        for threshold in (-1.0, 0.0, float("nan"), float("inf"), 1.01, True):
+            with self.subTest(threshold=threshold), self.assertRaisesRegex(
+                ValueError, "activation threshold"
+            ):
+                _validate_aim_safety(
+                    SimpleNamespace(
+                        aim=True,
+                        aim_label="person",
+                        aim_output="local",
+                        aim_activate_path="/dev/input/event0",
+                        aim_activate_threshold=threshold,
+                        ignore_self=True,
+                    )
+                )
+
+    def test_activation_sensor_rejects_fail_open_thresholds(self) -> None:
+        for threshold in (-1.0, 0.0, float("nan"), float("inf"), 1.01, True):
+            with self.subTest(threshold=threshold), self.assertRaisesRegex(
+                ValueError, "activation threshold"
+            ):
+                AimActivationSensor("/dev/input/fake", threshold=threshold)
+
+        self.assertEqual(
+            AimActivationSensor("/dev/input/fake", threshold=0.35).threshold,
+            0.35,
+        )
+
+    def test_aim_activation_threshold_cli_is_strictly_positive_and_bounded(self) -> None:
+        for threshold in ("-1", "0", "nan", "inf", "1.01"):
+            with self.subTest(threshold=threshold), contextlib.redirect_stderr(
+                io.StringIO()
+            ), self.assertRaises(SystemExit):
+                parse_args(["--aim-activate-threshold", threshold])
+
+        self.assertEqual(
+            parse_args(["--aim-activate-threshold", "0.42"]).aim_activate_threshold,
+            0.42,
+        )
+
     def test_activation_sensor_resamples_axis_state_after_a_lost_release_event(self) -> None:
         device = ResampledAxisDevice(255)
         sensor = AimActivationSensor("/dev/input/fake", threshold=0.35)
@@ -198,6 +272,28 @@ class AimingControllerTests(unittest.TestCase):
         )
 
         self.assertIs(selected, lower_confidence_center)
+
+    def test_target_selection_rejects_barely_confident_center_speck(self) -> None:
+        weak_center_speck = Detection(
+            0,
+            "person",
+            0.251,
+            (959, 539.76, 961, 541.76),
+        )
+        credible_nearby_player = Detection(
+            0,
+            "person",
+            0.95,
+            (900, 500, 1000, 900),
+        )
+
+        selected = choose_target(
+            [weak_center_speck, credible_nearby_player],
+            label="person",
+            frame_shape=(1080, 1920, 3),
+        )
+
+        self.assertIs(selected, credible_nearby_player)
 
     def test_target_tracker_keeps_same_player_and_bridges_three_misses(self) -> None:
         tracker = TargetTracker(label="person", lost_grace_frames=3)
@@ -276,6 +372,149 @@ class AimingControllerTests(unittest.TestCase):
         self.assertLess(smoothed.x1, jittered.x1)
         self.assertGreater(smoothed.y1, jittered.y1)
         self.assertLess(smoothed.y1, (first.y1 + jittered.y1) / 2)
+
+    def test_target_tracker_requires_confirmation_before_far_reacquisition(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=0)
+        original = Detection(0, "person", 0.9, (250, 250, 450, 850))
+        rival = Detection(0, "person", 0.9, (850, 250, 1050, 850))
+
+        self.assertIs(
+            tracker.update(
+                [original],
+                (1080, 1920, 3),
+                measurement_ns=1_000_000_000,
+            ),
+            original,
+        )
+        self.assertIsNone(
+            tracker.update(
+                [rival],
+                (1080, 1920, 3),
+                measurement_ns=1_033_000_000,
+            )
+        )
+        self.assertIsNotNone(
+            tracker.update(
+                [rival],
+                (1080, 1920, 3),
+                measurement_ns=1_066_000_000,
+            )
+        )
+
+    def test_target_tracker_association_keeps_exact_identity_over_confidence(self) -> None:
+        tracker = TargetTracker(label="person")
+        original = Detection(0, "person", 0.95, (700, 250, 900, 850))
+        moved = Detection(0, "person", 0.95, (730, 250, 930, 850))
+        stale_duplicate = Detection(0, "person", 0.251, (700, 250, 900, 850))
+        tracker.update(
+            [original],
+            (1080, 1920, 3),
+            measurement_ns=1_000_000_000,
+        )
+
+        tracked = tracker.update(
+            [moved, stale_duplicate],
+            (1080, 1920, 3),
+            measurement_ns=1_033_000_000,
+        )
+
+        assert tracked is not None
+        self.assertEqual(tracked.confidence, stale_duplicate.confidence)
+        self.assertEqual(tracked.x1, original.x1)
+
+    def test_target_tracker_identity_beats_high_confidence_nearby_rival(self) -> None:
+        tracker = TargetTracker(label="person")
+        original = Detection(0, "person", 0.9, (700, 250, 900, 850))
+        tracked_low_confidence = Detection(0, "person", 0.30, (710, 250, 910, 850))
+        nearby_rival = Detection(0, "person", 0.99, (750, 250, 950, 850))
+        tracker.update(
+            [original],
+            (1080, 1920, 3),
+            measurement_ns=1_000_000_000,
+        )
+
+        tracked = tracker.update(
+            [nearby_rival, tracked_low_confidence],
+            (1080, 1920, 3),
+            measurement_ns=1_033_000_000,
+        )
+
+        assert tracked is not None
+        self.assertEqual(tracked.confidence, tracked_low_confidence.confidence)
+        self.assertLess(head_target_point(tracked)[0], 825.0)
+
+    def test_target_tracker_velocity_is_time_based_across_detector_rates(self) -> None:
+        def run(rate_hz: int) -> tuple[float, float]:
+            tracker = TargetTracker(label="person")
+            speed = 600.0
+            sample_count = round(1.0 * rate_hz)
+            target = None
+            for index in range(sample_count + 1):
+                elapsed = index / rate_hz
+                center_x = 600.0 + speed * elapsed
+                target = tracker.update(
+                    [
+                        Detection(
+                            0,
+                            "person",
+                            0.9,
+                            (center_x - 50, 300, center_x + 50, 800),
+                        )
+                    ],
+                    (1080, 1920, 3),
+                    measurement_ns=1_000_000_000 + round(elapsed * 1e9),
+                )
+            assert target is not None
+            return head_target_point(target)[0], tracker._box_velocity[0]
+
+        center_25, velocity_25 = run(25)
+        center_100, velocity_100 = run(100)
+
+        self.assertAlmostEqual(center_25, center_100, delta=1.0)
+        self.assertAlmostEqual(velocity_25, velocity_100, delta=30.0)
+
+    def test_target_tracker_prediction_grace_is_time_based_across_rates(self) -> None:
+        target = Detection(0, "person", 0.9, (700, 250, 900, 850))
+
+        def last_predicted_time(rate_hz: int) -> float:
+            tracker = TargetTracker(label="person", lost_grace_frames=3)
+            base_ns = 1_000_000_000
+            tracker.update([target], (1080, 1920, 3), measurement_ns=base_ns)
+            last_seconds = 0.0
+            for index in range(1, rate_hz + 1):
+                seconds = index / rate_hz
+                prediction = tracker.update(
+                    [],
+                    (1080, 1920, 3),
+                    measurement_ns=base_ns + round(seconds * 1e9),
+                )
+                if prediction is None:
+                    break
+                last_seconds = seconds
+            return last_seconds
+
+        last_25 = last_predicted_time(25)
+        last_100 = last_predicted_time(100)
+
+        self.assertGreaterEqual(last_25, 0.04)
+        self.assertLessEqual(last_100, 0.05)
+        self.assertAlmostEqual(last_25, last_100, delta=0.011)
+
+    def test_target_tracker_rejects_backwards_measurement_timestamp(self) -> None:
+        tracker = TargetTracker(label="person")
+        target = Detection(0, "person", 0.9, (700, 250, 900, 850))
+        tracker.update(
+            [target],
+            (1080, 1920, 3),
+            measurement_ns=2_000_000_000,
+        )
+
+        with self.assertRaisesRegex(ValueError, "must not move backwards"):
+            tracker.update(
+                [target],
+                (1080, 1920, 3),
+                measurement_ns=1_999_999_999,
+            )
 
     def test_real_uinput_shape_uses_valid_pxn_identity_and_axis_ranges(self) -> None:
         controller = AimingController()

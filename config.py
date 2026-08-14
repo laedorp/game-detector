@@ -9,6 +9,11 @@ from typing import Literal, Sequence
 
 from controller_precision.codes import ABS_BRAKE
 from aiming.controller import DEFAULT_HEAD_RATIO
+from utils.inference_size import (
+    InferenceSize,
+    parse_inference_size,
+    validate_yolo_inference_size,
+)
 
 
 SourceKind = Literal["device", "file", "screen"]
@@ -33,13 +38,19 @@ class AppConfig:
     device: str
     capture_size: tuple[int, int] | None
     capture_fps: float | None
-    inference_size: int
+    # NCHW spatial dimensions in unambiguous tensor order: (height, width).
+    inference_size: InferenceSize
     crop_size: int | None
+    # Optional second inference over a centered, model-aspect source ROI. The
+    # integer is the requested maximum source-pixel width.
+    # It uses the exact same model and static input shape as the primary pass.
+    detail_crop_size: int | None
     confidence: float
     iou_threshold: float
     output_format: Literal["auto", "end2end", "traditional"]
     preview: bool
     draw: bool
+    preview_fps: float
     stats_window: int
     screen_monitor: int
     screen_region: tuple[int, int, int, int] | None
@@ -74,6 +85,13 @@ class AppConfig:
     aim_activate_path: str | None = None
     aim_activate_axis: int = ABS_BRAKE
     aim_activate_threshold: float = 0.35
+    # Optional live-pipeline qualification controls.  They are deliberately
+    # absent from launcher profiles: release testers pass them to the normal
+    # frozen CLI, while ordinary one-click behavior remains unbounded.
+    metrics_json: Path | None = None
+    max_frames: int | None = None
+    max_seconds: float | None = None
+    require_full_provider: bool = False
 
 
 def _fourcc(value: str) -> str:
@@ -90,6 +108,13 @@ def _positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
+
+
+def _inference_size(value: str) -> InferenceSize:
+    try:
+        return validate_yolo_inference_size(parse_inference_size(value))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def _non_negative_int(value: str) -> int:
@@ -265,16 +290,31 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--inference-size",
-        type=_positive_int,
-        default=320,
-        metavar="N",
-        help="Square model input size (default: 320).",
+        type=_inference_size,
+        default=(320, 320),
+        metavar="N|HEIGHTxWIDTH",
+        help=(
+            "Model input dimensions: legacy N means a square, or use explicit "
+            "HEIGHTxWIDTH tensor order; each dimension must be divisible by 32 "
+            "(default: 320)."
+        ),
     )
     parser.add_argument(
         "--crop-size",
         type=_positive_int,
         metavar="N",
         help="Centered square crop size in source pixels before inference.",
+    )
+    parser.add_argument(
+        "--detail-crop-size",
+        type=_positive_int,
+        metavar="SOURCE_WIDTH_PIXELS",
+        help=(
+            "Advanced: add a second inference over a centered ROI up to this "
+            "source-pixel width while retaining the full-frame primary pass. "
+            "ROI height matches the model input aspect, so rectangular models "
+            "use their full tensor. Disabled by default."
+        ),
     )
     parser.add_argument(
         "--confidence",
@@ -304,11 +344,56 @@ def build_parser() -> argparse.ArgumentParser:
         help="Show raw preview without boxes or timing overlay.",
     )
     parser.add_argument(
+        "--preview-fps",
+        type=_positive_float,
+        default=15.0,
+        metavar="FPS",
+        help=(
+            "Maximum preview refresh rate (default: 15). Detection and control "
+            "continue at full speed between preview refreshes."
+        ),
+    )
+    parser.add_argument(
         "--stats-window",
         type=_window_size,
         default=120,
         metavar="N",
         help="Number of recent processed frames used for moving statistics.",
+    )
+    parser.add_argument(
+        "--metrics-json",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Write an atomic, non-overwriting JSON report for this normal live "
+            "pipeline run. Pairing keys and physical device paths are omitted."
+        ),
+    )
+    parser.add_argument(
+        "--max-frames",
+        type=_positive_int,
+        metavar="N",
+        help=(
+            "Stop after exactly N processed frames. When combined with "
+            "--max-seconds, whichever bound is reached first stops the run."
+        ),
+    )
+    parser.add_argument(
+        "--max-seconds",
+        type=_positive_float,
+        metavar="SECONDS",
+        help=(
+            "Stop the live pipeline after this many elapsed seconds. When "
+            "combined with --max-frames, whichever bound is reached first wins."
+        ),
+    )
+    parser.add_argument(
+        "--require-full-provider",
+        action="store_true",
+        help=(
+            "ONNX Runtime qualification only: fail session creation if any graph "
+            "node would fall back to CPU."
+        ),
     )
     parser.add_argument(
         "--screen-monitor",
@@ -446,9 +531,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--aim-activate-threshold",
-        type=_finite_float,
+        type=_positive_unit_float,
         default=0.35,
-        help="Normalized LT pressure threshold to activate aim (default: 0.35).",
+        help="Normalized LT pressure threshold in (0,1] to activate aim (default: 0.35).",
     )
     parser.add_argument(
         "--self-zone-left",
@@ -494,6 +579,13 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         parser.error("--aim-makcu-prediction-lead-seconds must be between 0 and 0.25")
     if not 0.0 <= args.aim_makcu_derivative_damping_seconds <= 0.25:
         parser.error("--aim-makcu-derivative-damping-seconds must be between 0 and 0.25")
+    if args.require_full_provider and args.backend != "onnxruntime":
+        parser.error("--require-full-provider requires --backend onnxruntime")
+    if args.crop_size is not None and args.detail_crop_size is not None:
+        parser.error(
+            "--crop-size and --detail-crop-size cannot be combined; the detail "
+            "mode requires a full-frame primary pass"
+        )
     if args.aim:
         args.aim_label = (args.aim_label or "").strip()
         if not args.aim_label:
@@ -530,11 +622,13 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         capture_fps=args.capture_fps,
         inference_size=args.inference_size,
         crop_size=args.crop_size,
+        detail_crop_size=args.detail_crop_size,
         confidence=args.confidence,
         iou_threshold=args.iou_threshold,
         output_format=args.output_format,
         preview=preview,
         draw=draw,
+        preview_fps=args.preview_fps,
         stats_window=args.stats_window,
         screen_monitor=screen_monitor,
         screen_region=args.screen_region,
@@ -562,4 +656,8 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         aim_activate_path=args.aim_activate_path,
         aim_activate_axis=args.aim_activate_axis,
         aim_activate_threshold=args.aim_activate_threshold,
+        metrics_json=(args.metrics_json.expanduser() if args.metrics_json else None),
+        max_frames=args.max_frames,
+        max_seconds=args.max_seconds,
+        require_full_provider=args.require_full_provider,
     )

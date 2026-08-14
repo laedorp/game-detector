@@ -3,11 +3,15 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import queue
 import stat
 import tempfile
+import threading
 import unittest
 from unittest import mock
 
+from aiming.makcu import MakcuError
+from launcher.application import DetectorLauncher
 from launcher.process import (
     external_process_environment,
     find_moonlight_executable,
@@ -30,6 +34,56 @@ from launcher.settings import (
     load_settings,
     save_settings,
 )
+
+
+class LauncherMakcuWorkerTests(unittest.TestCase):
+    def worker(self) -> DetectorLauncher:
+        launcher = DetectorLauncher.__new__(DetectorLauncher)
+        launcher._makcu_verify_cancel = threading.Event()
+        launcher._makcu_verify_result = queue.Queue()
+        return launcher
+
+    def test_shutdown_failure_overrides_tk_success_with_one_result(self) -> None:
+        launcher = self.worker()
+        verifier = mock.Mock()
+        verifier.poll_button_mask.side_effect = [0, 0b00010, 0]
+        verifier.stop.side_effect = MakcuError("serial worker did not stop")
+
+        with mock.patch(
+            "launcher.application.MakcuAimingController", return_value=verifier
+        ):
+            launcher._verify_makcu_activation_worker("/dev/ttyACM0", 1)
+
+        verified, port, button, detail = launcher._makcu_verify_result.get_nowait()
+        self.assertFalse(verified)
+        self.assertEqual((port, button), ("/dev/ttyACM0", "1"))
+        self.assertIn("shutdown failed", detail.lower())
+        self.assertIn("serial worker did not stop", detail)
+        with self.assertRaises(queue.Empty):
+            launcher._makcu_verify_result.get_nowait()
+        verifier.start.assert_called_once_with(output_loop=False)
+        verifier.stop.assert_called_once_with()
+
+    def test_cancelled_tk_verification_keeps_one_normal_result(self) -> None:
+        launcher = self.worker()
+        launcher._makcu_verify_cancel.set()
+        verifier = mock.Mock()
+
+        with mock.patch(
+            "launcher.application.MakcuAimingController", return_value=verifier
+        ):
+            launcher._verify_makcu_activation_worker("/dev/ttyACM0", 1)
+
+        result = launcher._makcu_verify_result.get_nowait()
+        self.assertEqual(
+            result,
+            (False, "/dev/ttyACM0", "1", "Verification cancelled."),
+        )
+        with self.assertRaises(queue.Empty):
+            launcher._makcu_verify_result.get_nowait()
+        verifier.start.assert_called_once_with(output_loop=False)
+        verifier.poll_button_mask.assert_not_called()
+        verifier.stop.assert_called_once_with()
 
 
 class LauncherSettingsTests(unittest.TestCase):
@@ -126,6 +180,28 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertIn("--no-preview", args)
         self.assertNotIn("--no-draw", args)
 
+    def test_preview_rate_is_bounded_without_throttling_detection(self) -> None:
+        args = self.settings(preview=True, preview_fps="30").detector_arguments()
+
+        self.assertEqual(args[args.index("--preview-fps") + 1], "30")
+
+        with self.assertRaisesRegex(SettingsError, "(?i)preview fps"):
+            self.settings(preview=True, preview_fps="0").detector_arguments()
+
+    def test_detail_pass_is_opt_in_and_uses_source_pixel_crop(self) -> None:
+        ordinary = self.settings().detector_arguments()
+        detail = self.settings(detail_crop_size="768").detector_arguments()
+
+        self.assertNotIn("--detail-crop-size", ordinary)
+        self.assertEqual(
+            detail[detail.index("--detail-crop-size") + 1],
+            "768",
+        )
+
+    def test_detail_pass_cannot_combine_with_legacy_primary_crop(self) -> None:
+        with self.assertRaisesRegex(SettingsError, "either.*crop.*detail"):
+            self.settings(crop_size="720", detail_crop_size="640").detector_arguments()
+
     def test_aim_activation_arguments(self) -> None:
         args = self.settings(
             aim=True,
@@ -148,6 +224,19 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertIn("--aim-activate-threshold", args)
         self.assertEqual(args[args.index("--aim-activate-threshold") + 1], "0.42")
 
+    def test_aim_activation_threshold_rejects_fail_open_values(self) -> None:
+        for threshold in ("-1", "0", "nan", "inf", "1.01"):
+            with self.subTest(threshold=threshold), self.assertRaisesRegex(
+                SettingsError, "(?i)activation threshold"
+            ):
+                self.settings(
+                    aim=True,
+                    aim_label="player",
+                    ignore_self=True,
+                    aim_activate_path="/dev/input/event0",
+                    aim_activate_threshold=threshold,
+                ).detector_arguments()
+
     def test_aim_requires_a_nonblank_target_label(self) -> None:
         for label in ("", "   "):
             with self.subTest(label=label), self.assertRaisesRegex(
@@ -161,6 +250,18 @@ class LauncherSettingsTests(unittest.TestCase):
                     aim_makcu_button="1",
                     aim_makcu_verified_port="/dev/serial/by-id/makcu",
                     aim_makcu_verified_button="1",
+                ).detector_arguments()
+
+    def test_bundled_generic_models_cannot_drive_clone_aim_output(self) -> None:
+        for preset in ("coco_high", "coco_balanced", "coco"):
+            with self.subTest(preset=preset), self.assertRaisesRegex(
+                SettingsError, "generic.*not validated"
+            ):
+                self.settings(
+                    model_preset=preset,
+                    aim=True,
+                    aim_label="person",
+                    ignore_self=True,
                 ).detector_arguments()
 
     def test_remote_aim_is_rejected_until_a_safe_receiver_exists(self) -> None:
@@ -264,6 +365,17 @@ class LauncherSettingsTests(unittest.TestCase):
         ).detector_arguments()
 
         self.assertEqual(args[args.index("--device") + 1], "TENSORRT")
+
+    def test_directml_adapter_binding_survives_launcher_arguments(self) -> None:
+        onnx_model = self.root / "detector.onnx"
+        onnx_model.write_bytes(b"onnx")
+        args = self.settings(
+            backend="onnxruntime",
+            model_path=str(onnx_model),
+            device="DIRECTML:1",
+        ).detector_arguments()
+
+        self.assertEqual(args[args.index("--device") + 1], "DIRECTML:1")
 
     def test_frozen_command_reuses_executable(self) -> None:
         settings = self.settings(source_mode="video", video_path=str(self.video))
@@ -398,6 +510,75 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertFalse(loaded.ignore_self)
         self.assertEqual(loaded.self_position, SELF_POSITION_LEFT)
         self.assertEqual(loaded.model_preset, MODEL_PRESET_CUSTOM)
+        # This partial fixture has no serialized runtime choice, so its
+        # reconstructed CPU default is not treated as explicit consent.
+        self.assertFalse(loaded.hardware_selection_configured)
+
+    def test_existing_profile_migrates_as_explicit_but_fresh_profile_does_not(self) -> None:
+        existing = LauncherSettings.from_mapping(
+            {"version": 6, "backend": "onnxruntime", "device": "CUDA"}
+        )
+        fresh = LauncherSettings()
+
+        self.assertTrue(existing.hardware_selection_configured)
+        self.assertEqual((existing.backend, existing.device), ("onnxruntime", "CUDA"))
+        self.assertFalse(fresh.hardware_selection_configured)
+
+    def test_empty_or_partial_legacy_objects_do_not_authenticate_default_cpu(self) -> None:
+        for payload in ({}, {"version": 6}, {"version": 6, "source_mode": "screen"}):
+            with self.subTest(payload=payload):
+                loaded = LauncherSettings.from_mapping(payload)
+                self.assertEqual((loaded.backend, loaded.device), ("openvino", "CPU"))
+                self.assertFalse(loaded.hardware_selection_configured)
+
+    def test_malformed_runtime_cannot_authenticate_or_hide_gpu_discovery(self) -> None:
+        cases = (
+            {"version": 6, "backend": "garbage", "device": "CUDA"},
+            {
+                "version": SETTINGS_VERSION,
+                "backend": "garbage",
+                "device": "CUDA",
+                "hardware_selection_configured": True,
+            },
+            {
+                "version": SETTINGS_VERSION,
+                "backend": "onnxruntime",
+                "device": "",
+                "hardware_selection_configured": True,
+            },
+        )
+        for payload in cases:
+            with self.subTest(payload=payload):
+                loaded = LauncherSettings.from_mapping(payload)
+                self.assertFalse(loaded.hardware_selection_configured)
+                if payload.get("backend") == "garbage" or payload["version"] == SETTINGS_VERSION:
+                    self.assertEqual(
+                        (loaded.backend, loaded.device), ("openvino", "CPU")
+                    )
+
+    def test_malformed_current_hardware_sentinel_cannot_be_legacy_authenticated(self) -> None:
+        for sentinel in ("false", 0, None):
+            with self.subTest(sentinel=sentinel):
+                loaded = LauncherSettings.from_mapping(
+                    {
+                        "version": SETTINGS_VERSION,
+                        "backend": "onnxruntime",
+                        "device": "DIRECTML:1",
+                        "hardware_selection_configured": sentinel,
+                    }
+                )
+
+                self.assertFalse(loaded.hardware_selection_configured)
+                self.assertEqual((loaded.backend, loaded.device), ("openvino", "CPU"))
+
+        current_without_sentinel = LauncherSettings.from_mapping(
+            {
+                "version": SETTINGS_VERSION,
+                "backend": "openvino",
+                "device": "CPU",
+            }
+        )
+        self.assertFalse(current_without_sentinel.hardware_selection_configured)
 
     def test_bundled_paths_are_saved_semantically(self) -> None:
         target = self.root / "settings.json"
@@ -416,7 +597,18 @@ class LauncherSettingsTests(unittest.TestCase):
     def test_bad_json_falls_back_to_defaults(self) -> None:
         target = self.root / "settings.json"
         target.write_text("not json", encoding="utf-8")
-        self.assertEqual(load_settings(target).source_mode, "screen")
+        loaded = load_settings(target)
+        self.assertEqual(loaded.source_mode, "screen")
+        self.assertFalse(loaded.hardware_selection_configured)
+
+    def test_non_object_settings_are_fresh_for_safe_gpu_discovery(self) -> None:
+        target = self.root / "settings.json"
+        target.write_text("[]\n", encoding="utf-8")
+
+        loaded = load_settings(target)
+
+        self.assertEqual((loaded.backend, loaded.device), ("openvino", "CPU"))
+        self.assertFalse(loaded.hardware_selection_configured)
 
 
 class ExternalProcessTests(unittest.TestCase):

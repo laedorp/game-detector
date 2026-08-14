@@ -13,8 +13,10 @@ not.
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import sys
 import threading
@@ -44,6 +46,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+from utils.inference_size import format_inference_size
 
 from aiming.makcu import (
     BUTTON_NAMES,
@@ -100,6 +104,7 @@ from .settings import (
     SettingsError,
     launcher_command,
     load_settings,
+    model_preset_detail_crop_text,
     resource_root,
     save_settings,
     settings_path,
@@ -107,7 +112,27 @@ from .settings import (
 
 
 UNIT = qt_theme.UNIT
-PROAIM_BUILD_TAG = "2026-08-10-makcu-monitor-v1"
+
+
+def _build_tag() -> str:
+    """Return immutable frozen identity or a neutral source-checkout label."""
+
+    if not bool(getattr(sys, "frozen", False)):
+        return "source checkout"
+    build_info = Path(sys.executable).resolve().parent / "BUILD-INFO.json"
+    try:
+        record = json.loads(build_info.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "frozen build (identity unavailable)"
+    if not isinstance(record, dict):
+        return "frozen build (identity unavailable)"
+    commit = str(record.get("commit", "unknown")).strip()
+    variant = str(record.get("runtime_variant", "unknown")).strip()
+    short_commit = commit[:12] if commit and commit != "unknown" else "unknown commit"
+    return f"{variant} · {short_commit}"
+
+
+PROAIM_BUILD_TAG = _build_tag()
 SOURCE_REPOSITORY = "https://github.com/laedorp/game-detector"
 MAKCU_BUTTON_LABELS = BUTTON_NAMES
 AIM_POINT_OPTIONS = (
@@ -129,9 +154,9 @@ MODEL_TIER_LOW = "low"
 MODEL_TIER_MID = "mid"
 MODEL_TIER_HIGH = "high"
 MODEL_TIER_OPTIONS = (
-    ("Low-end PC", MODEL_TIER_LOW),
-    ("Mid-tier PC", MODEL_TIER_MID),
-    ("High-end PC", MODEL_TIER_HIGH),
+    ("Responsive", MODEL_TIER_LOW),
+    ("Balanced (Recommended)", MODEL_TIER_MID),
+    ("Advanced / benchmark", MODEL_TIER_HIGH),
 )
 MODEL_TIER_PRESET_KEYS = {
     MODEL_TIER_LOW: (
@@ -146,8 +171,8 @@ MODEL_TIER_PRESET_KEYS = {
         MODEL_PRESET_COCO_BALANCED,
     ),
     MODEL_TIER_HIGH: (
-        MODEL_PRESET_COCO_HIGH,
         MODEL_PRESET_FORT_PLAYER_BALANCED,
+        MODEL_PRESET_COCO_HIGH,
         MODEL_PRESET_COCO_BALANCED,
         MODEL_PRESET_FORT_PLAYER,
         MODEL_PRESET_COCO,
@@ -161,9 +186,152 @@ MODEL_TIER_DEFAULT_PRESET = {
     # benchmark option within the high tier.
     MODEL_TIER_HIGH: MODEL_PRESET_FORT_PLAYER_BALANCED,
 }
-HIGH_END_CAPTURE_WIDTH = "1920"
-HIGH_END_CAPTURE_HEIGHT = "1080"
-HIGH_END_CAPTURE_FPS = "100"
+
+
+def _has_exact_directml_binding(profile: object, plan: object) -> bool:
+    """Return whether a DirectML plan names its exact matching DXGI adapter."""
+
+    device = str(getattr(plan, "device", "")).strip().upper()
+    if not device.startswith(("DIRECTML", "DML")):
+        return True
+    match = re.fullmatch(r"(?:DIRECTML|DML):(\d+)", device)
+    if match is None:
+        return False
+    index = int(match.group(1))
+    adapters = [
+        item
+        for item in getattr(profile, "directml_adapters", ())
+        if getattr(item, "index", None) == index
+    ]
+    if len(adapters) != 1:
+        return False
+    adapter = adapters[0]
+    accelerator = getattr(plan, "accelerator", None)
+    identifier_matches = bool(
+        str(getattr(accelerator, "identifier", "")).strip()
+        and str(getattr(adapter, "identifier", "")).casefold()
+        == str(getattr(accelerator, "identifier", "")).casefold()
+    )
+    name_matches = bool(
+        str(getattr(accelerator, "name", "")).strip()
+        and str(getattr(adapter, "name", "")).casefold().strip()
+        == str(getattr(accelerator, "name", "")).casefold().strip()
+    )
+    return identifier_matches or name_matches
+
+
+def _is_gpu_accelerator(accelerator: object) -> bool:
+    kind = getattr(accelerator, "kind", "")
+    return str(getattr(kind, "value", kind)).strip().lower() == "gpu"
+
+
+def _plan_has_one_physical_gpu(profile: object, plan: object) -> bool:
+    """Reject a provider-only claim that has no unique scanned GPU behind it."""
+
+    accelerator = getattr(plan, "accelerator", None)
+    matches = [
+        item
+        for item in getattr(profile, "accelerators", ())
+        if _is_gpu_accelerator(item) and item == accelerator
+    ]
+    return len(matches) == 1
+
+
+def _plan_names_gpu_device(plan: object) -> bool:
+    backend = str(getattr(plan, "backend", "")).strip().lower()
+    device = str(getattr(plan, "device", "")).strip().upper()
+    if backend == "openvino":
+        return device == "GPU" or bool(re.fullmatch(r"GPU\.\d+", device))
+    if backend != "onnxruntime":
+        return False
+    return device in {"CUDA", "TENSORRT", "ROCM", "MIGRAPHX"} or bool(
+        re.fullmatch(r"(?:DIRECTML|DML):\d+", device)
+    )
+
+
+def _accelerator_vendor(accelerator: object) -> str:
+    vendor = getattr(accelerator, "vendor", "")
+    return str(getattr(vendor, "value", vendor)).strip().lower()
+
+
+def _provider_device_is_unambiguous(profile: object, plan: object) -> bool:
+    """Reject generic provider device zero when multiple compatible GPUs exist."""
+
+    device = str(getattr(plan, "device", "")).strip().upper()
+    backend = str(getattr(plan, "backend", "")).strip().lower()
+    if device.startswith(("DIRECTML", "DML")):
+        return _has_exact_directml_binding(profile, plan)
+    if backend == "openvino":
+        vendor = "intel"
+    elif device in {"CUDA", "TENSORRT"}:
+        vendor = "nvidia"
+    elif device in {"ROCM", "MIGRAPHX"}:
+        vendor = "amd"
+    else:
+        return False
+    compatible = [
+        item
+        for item in getattr(profile, "accelerators", ())
+        if _is_gpu_accelerator(item) and _accelerator_vendor(item) == vendor
+    ]
+    return len(compatible) == 1
+
+
+def _qualifying_discrete_gpu(profile: object, plan: object) -> bool:
+    """Return whether a plan is backed by a confidently discrete GPU."""
+
+    accelerator = getattr(plan, "accelerator", None)
+    if not _plan_has_one_physical_gpu(profile, plan):
+        return False
+    placement = getattr(accelerator, "discrete", None)
+    if placement is True:
+        return True
+    if placement is False:
+        return False
+    # WMI's AdapterRAM is often truncated on GPUs above 2 GiB. For an exactly
+    # matched DirectML adapter, DXGI's dedicated-memory value is the stronger
+    # signal and also prevents a hybrid laptop's integrated GPU from turning a
+    # unique RTX/Radeon selection into a false ambiguity.
+    identifier = str(getattr(accelerator, "identifier", "")).casefold().strip()
+    name = str(getattr(accelerator, "name", "")).casefold().strip()
+    matching_adapters = [
+        item
+        for item in getattr(profile, "directml_adapters", ())
+        if (
+            identifier
+            and str(getattr(item, "identifier", "")).casefold().strip()
+            == identifier
+        )
+        or (
+            name
+            and str(getattr(item, "name", "")).casefold().strip() == name
+        )
+    ]
+    return bool(
+        len(matching_adapters) == 1
+        and int(getattr(matching_adapters[0], "dedicated_vram", 0))
+        > 1_500_000_000
+    )
+
+
+def _unique_ready_gpu_plan(profile: object, plans: Sequence[object]) -> object | None:
+    """Choose only one unambiguous, ready physical GPU recommendation.
+
+    Provider presence alone is insufficient for DirectML: its default adapter
+    may differ from the GPU WMI reported. An automatic selection therefore
+    requires a verified WMI-to-DXGI match encoded as ``DIRECTML:<index>``.
+    """
+
+    candidates = []
+    for plan in plans:
+        if (
+            bool(getattr(plan, "ready", False))
+            and _qualifying_discrete_gpu(profile, plan)
+            and _plan_names_gpu_device(plan)
+            and _provider_device_is_unambiguous(profile, plan)
+        ):
+            candidates.append(plan)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _label(text: str, role: str = "") -> QLabel:
@@ -191,9 +359,11 @@ def _card(title: str, subtitle: str = "") -> tuple[QFrame, QVBoxLayout]:
     return frame, outer
 
 
-def _field_row(layout: QGridLayout, row: int, text: str, widget: QWidget) -> None:
-    layout.addWidget(_label(text, "fieldLabel"), row, 0, Qt.AlignmentFlag.AlignVCenter)
+def _field_row(layout: QGridLayout, row: int, text: str, widget: QWidget) -> QLabel:
+    label = _label(text, "fieldLabel")
+    layout.addWidget(label, row, 0, Qt.AlignmentFlag.AlignVCenter)
     layout.addWidget(widget, row, 1)
+    return label
 
 
 class Section(QWidget):
@@ -237,6 +407,8 @@ class LauncherWindow(QMainWindow):
     makcu_monitor_done = Signal()
     precision_output_line = Signal(str)
     precision_reader_done = Signal(object)
+    first_hardware_scan_done = Signal(object, object)
+    first_hardware_scan_failed = Signal(str)
 
     def __init__(self, settings: LauncherSettings | None = None) -> None:
         super().__init__()
@@ -244,7 +416,23 @@ class LauncherWindow(QMainWindow):
         self.resize(1080, 760)
         self.setMinimumSize(880, 620)
 
-        self.settings = settings or load_settings(settings_path())
+        settings_were_supplied = settings is not None
+        # Let the loader adopt the pre-rename GameDetector profile when the
+        # current ProAim file does not exist. Passing the current path here
+        # would disable that intentional one-time fallback.
+        self.settings = settings if settings is not None else load_settings()
+        self._hardware_selection_configured = bool(
+            self.settings.hardware_selection_configured or settings_were_supplied
+        )
+        if settings_were_supplied:
+            # Passing a settings object is an explicit embedding/test choice,
+            # not a fresh profile loaded from disk.
+            self.settings.hardware_selection_configured = True
+        self._changing_hardware_selection = False
+        self._first_hardware_scan_active = False
+        self._first_hardware_scan_thread: threading.Thread | None = None
+        self._first_hardware_scan_cancel = threading.Event()
+        self._hardware_start_notice = ""
         self.process: subprocess.Popen[str] | None = None
         self._reader: Any | None = None
         self._stop_requested = False
@@ -288,6 +476,10 @@ class LauncherWindow(QMainWindow):
 
         self._build_interface()
         self._load_from_settings()
+        # Connect after loading so restoring a saved value is not mistaken for
+        # a new user choice. Programmatic fallback changes are guarded below.
+        self.backend.currentTextChanged.connect(self._hardware_selection_edited)
+        self.device.currentTextChanged.connect(self._hardware_selection_edited)
         self._refresh_precision_devices(silent=True)
 
         self._start_key = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
@@ -305,6 +497,14 @@ class LauncherWindow(QMainWindow):
         self.makcu_monitor_done.connect(self._finish_makcu_monitor)
         self.precision_output_line.connect(self._handle_precision_output_line)
         self.precision_reader_done.connect(self._precision_reader_finished)
+        self.first_hardware_scan_done.connect(self._finish_first_hardware_scan)
+        self.first_hardware_scan_failed.connect(self._fail_first_hardware_scan)
+
+        if not settings_were_supplied and not self._hardware_selection_configured:
+            # Let the first window paint before discovery starts. The scan itself
+            # runs off the UI thread because Windows hardware enumeration can
+            # legitimately take several seconds on a hybrid laptop.
+            QTimer.singleShot(0, self._begin_first_hardware_scan)
 
     # -- construction ----------------------------------------------------
     def _build_interface(self) -> None:
@@ -401,7 +601,9 @@ class LauncherWindow(QMainWindow):
         section.add_card(card)
 
         screen_card, screen_layout = _card(
-            "Screen capture", "X11 only. Keep the preview off the captured area."
+            "Screen capture",
+            "Windows uses low-latency DXGI Desktop Duplication; Linux screen "
+            "capture requires X11. Keep the preview off the captured area.",
         )
         grid = QGridLayout()
         grid.setHorizontalSpacing(UNIT * 2)
@@ -503,7 +705,7 @@ class LauncherWindow(QMainWindow):
         for preset in MODEL_PRESETS:
             self.model_preset.addItem(preset.label, preset.key)
         self.model_preset.currentIndexChanged.connect(self._preset_changed)
-        _field_row(grid, 0, "Performance tier", self.model_tier)
+        _field_row(grid, 0, "Workload", self.model_tier)
         _field_row(grid, 1, "Detector", self.model_preset)
 
         self.custom_model_path = QLineEdit()
@@ -543,7 +745,8 @@ class LauncherWindow(QMainWindow):
         layout.addLayout(actions)
 
         tier_hint = _label(
-            "Pick Low, Mid, or High first, then choose a model tuned for that performance class.",
+            "Balanced uses the trained 416px player model. Responsive favors update rate; "
+            "Advanced exposes slower comparison models only when you explicitly choose them.",
             "subtitle",
         )
         tier_hint.setWordWrap(True)
@@ -570,6 +773,18 @@ class LauncherWindow(QMainWindow):
         self.iou_threshold = QLineEdit()
         self.crop_size = QLineEdit()
         self.crop_size.setPlaceholderText("Optional centered square crop")
+        self.detail_crop_size = QLineEdit()
+        self.detail_crop_size.setPlaceholderText(
+            "Off (experimental, max source width)"
+        )
+        self.detail_crop_size.setToolTip(
+            "Runs the same model a second time on a centered ROI whose aspect "
+            "matches the static model input; this value is its maximum source "
+            "width. "
+            "Only unmatched small/medium detail detections are added; large "
+            "players remain owned by the full-frame pass. Leave blank for the "
+            "ordinary single-pass pipeline."
+        )
         self.output_format = QComboBox()
         self.output_format.addItems(("auto", "end2end", "traditional"))
 
@@ -580,11 +795,17 @@ class LauncherWindow(QMainWindow):
         confidence_layout.addWidget(self.confidence, 1)
         confidence_layout.addWidget(self.confidence_value)
 
-        _field_row(grid, 0, "Inference size", self.inference_size)
+        _field_row(grid, 0, "Inference size (H×W)", self.inference_size)
         _field_row(grid, 1, "Confidence", confidence_row)
         _field_row(grid, 2, "IoU threshold", self.iou_threshold)
         _field_row(grid, 3, "Centered crop (px)", self.crop_size)
-        _field_row(grid, 4, "Model output format", self.output_format)
+        self.detail_crop_label = _field_row(
+            grid,
+            4,
+            "Detail ROI max width (experimental)",
+            self.detail_crop_size,
+        )
+        _field_row(grid, 5, "Model output format", self.output_format)
         layout.addLayout(grid)
         section.add_card(card)
 
@@ -595,8 +816,21 @@ class LauncherWindow(QMainWindow):
         )
         self.preview = QCheckBox("Show preview window")
         self.draw = QCheckBox("Draw boxes on the preview")
+        self.preview_fps = QComboBox()
+        self.preview_fps.addItems(("15", "30", "60"))
+        self.preview_fps.setEditable(True)
         layout.addWidget(self.preview)
         layout.addWidget(self.draw)
+        preview_grid = QGridLayout()
+        preview_grid.setColumnStretch(1, 1)
+        _field_row(preview_grid, 0, "Preview refresh (fps)", self.preview_fps)
+        layout.addLayout(preview_grid)
+        preview_hint = _label(
+            "Detection stays full speed; only the optional preview is rate-limited.",
+            "subtitle",
+        )
+        preview_hint.setWordWrap(True)
+        layout.addWidget(preview_hint)
         section.add_card(card)
 
         card, layout = _card(
@@ -722,7 +956,7 @@ class LauncherWindow(QMainWindow):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        build_note = _label(f"MAKCU verifier build: {PROAIM_BUILD_TAG}", "subtitle")
+        build_note = _label(f"ProAim build: {PROAIM_BUILD_TAG}", "subtitle")
         layout.addWidget(build_note)
         section.add_card(card)
 
@@ -739,8 +973,10 @@ class LauncherWindow(QMainWindow):
         card, layout = _card(
             "Automatic selection",
             "Scanning reports every accelerator present and which runtime "
-            "provider is installed, then suggests the fastest path. GPU driver "
-            "initialization is verified when detection starts.",
+            "provider is installed, then suggests a compatible path. GPU driver "
+            "initialization is verified when detection starts. On hybrid Windows "
+            "laptops, DirectML may use the primary adapter even when a different "
+            "GPU row is selected; confirm the active GPU in Task Manager.",
         )
         row = QHBoxLayout()
         row.setSpacing(UNIT)
@@ -956,7 +1192,7 @@ class LauncherWindow(QMainWindow):
         for widget in self._region_widgets:
             widget.setEnabled(enabled)
 
-    def _preset_changed(self) -> None:
+    def _preset_changed(self, _index: int = -1, *, apply_workload: bool = True) -> None:
         key = self.model_preset.currentData()
         custom = key == MODEL_PRESET_CUSTOM
         self.custom_model_path.setEnabled(custom)
@@ -968,7 +1204,9 @@ class LauncherWindow(QMainWindow):
             if preset.key == key:
                 self.preset_note.setText(preset.description)
                 if preset.inference_size is not None:
-                    self.inference_size.setCurrentText(str(preset.inference_size))
+                    self.inference_size.setCurrentText(
+                        format_inference_size(preset.inference_size)
+                    )
                 if preset.bundled:
                     self.output_format.setCurrentText("auto")
                     if hasattr(self, "aim_label"):
@@ -983,17 +1221,50 @@ class LauncherWindow(QMainWindow):
                             else "person"
                         )
                 break
+        if apply_workload and hasattr(self, "detail_crop_size"):
+            # A direct combo-box choice applies the preset's complete workload.
+            # Programmatic refresh/load callers pass apply_workload=False and
+            # restore the persisted value after the model list is rebuilt.
+            self.detail_crop_size.setText(model_preset_detail_crop_text(str(key)))
+        if (
+            not custom
+            and str(self.model_tier.currentData() or MODEL_TIER_MID)
+            != MODEL_TIER_HIGH
+            and hasattr(self, "detail_crop_size")
+            and not self.detail_crop_size.text().strip()
+        ):
+            self.detail_crop_size.clear()
+        self._update_detail_pass_visibility()
 
     def _model_tier_changed(self) -> None:
         tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
+        if (
+            tier != MODEL_TIER_HIGH
+            and self.model_preset.currentData() != MODEL_PRESET_CUSTOM
+            and hasattr(self, "detail_crop_size")
+        ):
+            self.detail_crop_size.setText(
+                model_preset_detail_crop_text(str(self.model_preset.currentData()))
+            )
         self._refresh_model_preset_options(
             preferred_key=MODEL_TIER_DEFAULT_PRESET.get(tier)
         )
-        if tier == MODEL_TIER_HIGH:
-            self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
-            self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
-            self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
-            self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
+        if hasattr(self, "detail_crop_size"):
+            self.detail_crop_size.setText(
+                model_preset_detail_crop_text(str(self.model_preset.currentData()))
+            )
+        self._update_detail_pass_visibility()
+
+    def _update_detail_pass_visibility(self) -> None:
+        if not hasattr(self, "detail_crop_size"):
+            return
+        tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
+        custom = self.model_preset.currentData() == MODEL_PRESET_CUSTOM
+        visible = tier == MODEL_TIER_HIGH or custom or bool(
+            self.detail_crop_size.text().strip()
+        )
+        self.detail_crop_label.setVisible(visible)
+        self.detail_crop_size.setVisible(visible)
 
     def _backend_changed(self, _backend: str = "") -> None:
         if not hasattr(self, "model_preset"):
@@ -1014,12 +1285,12 @@ class LauncherWindow(QMainWindow):
         for preset in MODEL_PRESETS:
             if preset.key in allowed:
                 self.model_preset.addItem(preset.label, preset.key)
-        self.model_preset.blockSignals(False)
         index = self.model_preset.findData(current)
         if index < 0:
             index = 0
         self.model_preset.setCurrentIndex(index)
-        self._preset_changed()
+        self.model_preset.blockSignals(False)
+        self._preset_changed(apply_workload=False)
 
     def _tier_for_preset(self, preset_key: str) -> str:
         for tier, keys in MODEL_TIER_PRESET_KEYS.items():
@@ -1049,6 +1320,7 @@ class LauncherWindow(QMainWindow):
         self.output_format.setCurrentText(s.output_format)
         self.preview.setChecked(s.preview)
         self.draw.setChecked(s.draw)
+        self.preview_fps.setCurrentText(s.preview_fps)
         self.backend.setCurrentText(s.backend)
         self.device.setCurrentText(s.device)
         self.custom_model_path.setText(s.model_path)
@@ -1074,6 +1346,10 @@ class LauncherWindow(QMainWindow):
         if position_index >= 0:
             self.self_position.setCurrentIndex(position_index)
         tier_value = s.model_tier if s.model_tier in MODEL_TIER_PRESET_KEYS else self._tier_for_preset(s.model_preset)
+        if s.detail_crop_size and s.model_preset != MODEL_PRESET_CUSTOM:
+            # An active persisted detail pass is advanced workload. Promote
+            # its presentation rather than hiding a setting that will run.
+            tier_value = MODEL_TIER_HIGH
         tier_index = self.model_tier.findData(tier_value)
         if tier_index >= 0:
             self.model_tier.setCurrentIndex(tier_index)
@@ -1084,17 +1360,14 @@ class LauncherWindow(QMainWindow):
         ):
             preferred_model = MODEL_TIER_DEFAULT_PRESET.get(tier_value, s.model_preset)
         self._refresh_model_preset_options(preferred_key=preferred_model)
-        self._preset_changed()
+        self._preset_changed(apply_workload=False)
+        self.detail_crop_size.setText(s.detail_crop_size)
+        self._update_detail_pass_visibility()
         if preferred_model == MODEL_PRESET_CUSTOM:
             # Tier initialization may temporarily select a bundled preset. Put
             # the custom decoder and size back after the final preset is active.
             self.inference_size.setCurrentText(s.inference_size)
             self.output_format.setCurrentText(s.output_format)
-        if tier_value == MODEL_TIER_HIGH:
-            self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
-            self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
-            self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
-            self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
         self._choose_source(s.source_mode)
         precision_index = self.precision_preset.findData(s.precision_preset)
         if precision_index < 0:
@@ -1129,9 +1402,11 @@ class LauncherWindow(QMainWindow):
         s.iou_threshold = self.iou_threshold.text()
         s.inference_size = self.inference_size.currentText()
         s.crop_size = self.crop_size.text().strip()
+        s.detail_crop_size = self.detail_crop_size.text().strip()
         s.output_format = self.output_format.currentText()
         s.preview = self.preview.isChecked()
         s.draw = self.draw.isChecked()
+        s.preview_fps = self.preview_fps.currentText().strip()
         s.backend = self.backend.currentText()
         s.device = self.device.currentText()
         s.model_tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
@@ -1795,11 +2070,14 @@ class LauncherWindow(QMainWindow):
         self._update_aim_state()
 
     def _monitor_makcu_buttons_worker(self, port: str) -> None:
-        controller = MakcuAimingController(MakcuAimConfig(port=port, activation_button=1))
+        controller: MakcuAimingController | None = None
         deadline = time.monotonic() + 10.0
         last_mask = -1
         saw_nonzero = False
         try:
+            controller = MakcuAimingController(
+                MakcuAimConfig(port=port, activation_button=1)
+            )
             controller.start(output_loop=False)
             while time.monotonic() < deadline and not self._makcu_monitor_cancel.is_set():
                 mask = controller.poll_button_mask()
@@ -1826,11 +2104,20 @@ class LauncherWindow(QMainWindow):
                     self.makcu_verification_progress.emit(
                         "Monitor finished with no click reports. Mouse clicks are not reaching MAKCU input."
                     )
-        except (MakcuError, OSError, ValueError) as exc:
+        except Exception as exc:
             self.makcu_verification_progress.emit(f"Monitor error: {exc}")
         finally:
-            controller.stop()
-            self.makcu_monitor_done.emit()
+            try:
+                if controller is not None:
+                    controller.stop()
+            except Exception as exc:
+                self.makcu_verification_progress.emit(
+                    f"Monitor shutdown failed: {exc}"
+                )
+            finally:
+                # Never strand the Qt controls in their busy state, including
+                # when bounded MAKCU shutdown reports a stuck driver/worker.
+                self.makcu_monitor_done.emit()
 
     def _finish_makcu_monitor(self) -> None:
         """Finish monitor UI work on Qt's main thread."""
@@ -1881,9 +2168,8 @@ class LauncherWindow(QMainWindow):
         self._makcu_verify_thread.start()
 
     def _verify_makcu_activation_worker(self, port: str, button: int) -> None:
-        controller = MakcuAimingController(
-            MakcuAimConfig(port=port, activation_button=button)
-        )
+        controller: MakcuAimingController | None = None
+        result: tuple[bool, str, str, str] | None = None
         deadline = time.monotonic() + 10.0
         button_name = MAKCU_BUTTON_LABELS[button]
         next_progress = time.monotonic() + 1.0
@@ -1893,6 +2179,9 @@ class LauncherWindow(QMainWindow):
         pressed = False
         expected_mask = 1 << button
         try:
+            controller = MakcuAimingController(
+                MakcuAimConfig(port=port, activation_button=button)
+            )
             controller.start(output_loop=False)
             self.makcu_verification_progress.emit(
                 f"Listening for {button_name}… click the physical mouse connected through MAKCU."
@@ -1905,9 +2194,7 @@ class LauncherWindow(QMainWindow):
                             "Release every mouse button before verification, then try again. "
                             f"MAKCU initially reported mask 0x{mask:02X}."
                         )
-                        self.makcu_verification_done.emit(
-                            False, port, str(button), detail
-                        )
+                        result = (False, port, str(button), detail)
                         return
                     baseline_observed = True
                     self.makcu_verification_progress.emit(
@@ -1921,7 +2208,7 @@ class LauncherWindow(QMainWindow):
                             f"Expected only {button_name} (mask 0x{expected_mask:02X}), "
                             f"but MAKCU reported mask 0x{mask:02X}. No button was verified."
                         )
-                        self.makcu_verification_done.emit(False, port, str(button), detail)
+                        result = (False, port, str(button), detail)
                         return
                     self.makcu_verification_progress.emit(
                         f"Detected {button_name} (mask 0x{mask:02X}). Release it to finish verification…"
@@ -1932,7 +2219,7 @@ class LauncherWindow(QMainWindow):
                         f"Detected a complete {button_name} press and release "
                         f"(mask 0x{last_mask:02X})."
                     )
-                    self.makcu_verification_done.emit(
+                    result = (
                         True,
                         port,
                         str(button),
@@ -1945,7 +2232,7 @@ class LauncherWindow(QMainWindow):
                         f"mask 0x{expected_mask:02X} to 0x{mask:02X} before release. "
                         "No button was verified."
                     )
-                    self.makcu_verification_done.emit(
+                    result = (
                         False,
                         port,
                         str(button),
@@ -1974,11 +2261,30 @@ class LauncherWindow(QMainWindow):
                     )
                 )
             )
-            self.makcu_verification_done.emit(False, port, str(button), detail)
-        except (MakcuError, OSError, ValueError) as exc:
-            self.makcu_verification_done.emit(False, port, str(button), str(exc))
+            result = (False, port, str(button), detail)
+        except Exception as exc:
+            result = (False, port, str(button), str(exc))
         finally:
-            controller.stop()
+            try:
+                if controller is not None:
+                    controller.stop()
+            except Exception as exc:
+                # A successful button exchange is not safe to persist when the
+                # serial owner could not be shut down deterministically.
+                result = (
+                    False,
+                    port,
+                    str(button),
+                    f"MAKCU shutdown failed after verification: {exc}",
+                )
+            if result is None:
+                result = (
+                    False,
+                    port,
+                    str(button),
+                    "MAKCU verification ended without a result.",
+                )
+            self.makcu_verification_done.emit(*result)
 
     def _apply_makcu_verification_progress(self, message: str) -> None:
         self.aim_makcu_verification_status.setText(message)
@@ -2116,8 +2422,10 @@ class LauncherWindow(QMainWindow):
             return
         current_preset = str(self.model_preset.currentData() or "")
         precision = str(selected.get("precision", "")).strip().lower()
-        self.backend.setCurrentText(str(selected.get("backend", "openvino")))
-        self.device.setCurrentText(str(selected.get("device", "CPU")))
+        self._set_runtime_selection(
+            str(selected.get("backend", "openvino")),
+            str(selected.get("device", "CPU")),
+        )
         suggested_tier = str(selected.get("tier", MODEL_TIER_MID))
         tier_index = self.model_tier.findData(suggested_tier)
         if tier_index >= 0:
@@ -2145,12 +2453,27 @@ class LauncherWindow(QMainWindow):
             self._refresh_model_preset_options(
                 preferred_key=preferred_preset
             )
-            if suggested_tier == MODEL_TIER_HIGH:
-                self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
-                self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
-                self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
-                self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
+        self._mark_hardware_selection_configured()
         self._set_status("Applied detected accelerator selection.", "ok")
+
+    def _set_runtime_selection(self, backend: str, device: str) -> None:
+        """Update runtime widgets without treating an internal fallback as consent."""
+
+        self._changing_hardware_selection = True
+        try:
+            self.backend.setCurrentText(backend)
+            self.device.setCurrentText(device)
+        finally:
+            self._changing_hardware_selection = False
+
+    def _hardware_selection_edited(self, _text: str = "") -> None:
+        if not self._changing_hardware_selection:
+            self._mark_hardware_selection_configured()
+
+    def _mark_hardware_selection_configured(self) -> None:
+        self._hardware_selection_configured = True
+        self.settings.hardware_selection_configured = True
+        self._hardware_start_notice = ""
 
     def _compatible_preset_for_tier(self, current: str, tier: str) -> str:
         allowed = set(
@@ -2174,7 +2497,7 @@ class LauncherWindow(QMainWindow):
         return MODEL_TIER_DEFAULT_PRESET.get(tier, DEFAULT_MODEL_PRESET)
 
     def _scan_hardware(self) -> None:
-        from detection.hardware import describe, scan_and_recommend
+        from detection.hardware import scan_and_recommend
 
         try:
             profile, plans = scan_and_recommend()
@@ -2182,8 +2505,95 @@ class LauncherWindow(QMainWindow):
             QMessageBox.critical(self, "Hardware scan failed", str(exc))
             return
 
+        self._show_hardware_scan(profile, plans, automatic=False)
+
+    def _begin_first_hardware_scan(self) -> None:
+        """Discover a fresh profile's GPU without blocking the Qt event loop."""
+
+        if (
+            self._closing
+            or self._hardware_selection_configured
+            or self._first_hardware_scan_active
+        ):
+            return
+        self._first_hardware_scan_active = True
+        self._first_hardware_scan_cancel.clear()
+        self.hardware_report.setPlainText("Scanning hardware and installed runtimes…")
+        self._set_status("Scanning for a safely bound GPU accelerator…", "warn")
+
+        def scan() -> None:
+            from detection.hardware import scan_and_recommend
+
+            try:
+                profile, plans = scan_and_recommend()
+            except Exception as exc:
+                if self._first_hardware_scan_cancel.is_set() or self._closing:
+                    return
+                try:
+                    self.first_hardware_scan_failed.emit(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                except RuntimeError:
+                    # Qt may already have destroyed the native window while a
+                    # platform scan was winding down.
+                    pass
+                return
+            if self._first_hardware_scan_cancel.is_set() or self._closing:
+                return
+            try:
+                self.first_hardware_scan_done.emit(profile, plans)
+            except RuntimeError:
+                pass
+
+        self._first_hardware_scan_thread = threading.Thread(
+            target=scan,
+            name="proaim-first-hardware-scan",
+            daemon=True,
+        )
+        self._first_hardware_scan_thread.start()
+
+    def _finish_first_hardware_scan(self, profile: object, plans: object) -> None:
+        self._first_hardware_scan_active = False
+        if self._closing or self._first_hardware_scan_cancel.is_set():
+            return
+        # A manual edit made while discovery was running always wins.
+        automatic = not self._hardware_selection_configured
+        self._show_hardware_scan(profile, tuple(plans), automatic=automatic)
+
+    def _fail_first_hardware_scan(self, detail: str) -> None:
+        self._first_hardware_scan_active = False
+        if (
+            self._closing
+            or self._first_hardware_scan_cancel.is_set()
+            or self._hardware_selection_configured
+        ):
+            return
+        self._set_runtime_selection("openvino", "CPU")
+        self._hardware_start_notice = (
+            "Automatic GPU discovery failed. CPU/OpenVINO remains selected. "
+            "Review Hardware settings before starting detection."
+        )
+        self.hardware_report.setPlainText(
+            f"Automatic hardware scan failed:\n{detail}\n\n"
+            f"{self._hardware_start_notice}"
+        )
+        self._set_status(self._hardware_start_notice, "warn")
+
+    def _show_hardware_scan(
+        self,
+        profile: object,
+        plans: Sequence[object],
+        *,
+        automatic: bool,
+    ) -> None:
+        from detection.hardware import describe
+
         report = describe(profile, plans)
-        pending = [plan for plan in plans if not plan.ready and plan.setup_hint]
+        pending = [
+            plan
+            for plan in plans
+            if not getattr(plan, "ready", False) and getattr(plan, "setup_hint", "")
+        ]
         if pending:
             report += "\n\nNot yet usable on this machine:\n" + "\n".join(
                 f"  - {plan.accelerator.label}: {plan.setup_hint}" for plan in pending
@@ -2195,18 +2605,44 @@ class LauncherWindow(QMainWindow):
         self.detected_accelerator.clear()
         for plan in plans:
             if plan.ready and plan.backend == "onnxruntime":
-                state = "provider found; verify at start"
+                if str(plan.device).upper().startswith(("DIRECTML", "DML")):
+                    if _has_exact_directml_binding(profile, plan):
+                        state = (
+                            "provider starts with exact DXGI index; confirm the "
+                            "physical GPU in Task Manager"
+                        )
+                    else:
+                        state = "default DXGI adapter; manual confirmation required"
+                else:
+                    state = "provider found; verify at start"
             else:
                 state = "ready" if plan.ready else "needs setup"
             text = f"{plan.accelerator.label} -> {plan.backend}/{plan.device} ({state})"
+            if (
+                plan.backend == "onnxruntime"
+                and str(plan.device).upper().startswith(("DIRECTML", "DML"))
+            ):
+                adapter = str(plan.device).partition(":")[2]
+                adapter_text = f"DXGI adapter {adapter}" if adapter else "default DXGI adapter"
+                text = (
+                    f"DirectML ({adapter_text}; {plan.accelerator.label}) "
+                    f"-> {plan.backend}/{plan.device} ({state})"
+                )
             backend = str(plan.backend).lower()
             device = str(plan.device).upper()
             if backend == "openvino" and device == "CPU":
                 tier = MODEL_TIER_LOW
             elif backend == "onnxruntime" and (
-                "TENSORRT" in device or "CUDA" in device or "ROCM" in device or "DML" in device
+                "TENSORRT" in device
+                or "CUDA" in device
+                or "ROCM" in device
+                or "DIRECTML" in device
+                or device == "DML"
             ):
-                tier = MODEL_TIER_HIGH
+                # A faster accelerator changes the runtime, not the intended
+                # detector workload. Keep the responsive player model as the
+                # one-click choice; the 640px COCO benchmark remains explicit.
+                tier = MODEL_TIER_MID
             else:
                 tier = MODEL_TIER_MID
             self.detected_accelerator.addItem(
@@ -2219,12 +2655,17 @@ class LauncherWindow(QMainWindow):
                     "ready": plan.ready,
                     "setup_hint": plan.setup_hint,
                     "tier": tier,
+                    "_plan": plan,
                 },
             )
 
         ready = [plan for plan in plans if plan.ready]
         if not ready:
-            self._set_status("No inference runtime was found. See scan report for setup hints.", "error")
+            message = "No inference runtime was found. See scan report for setup hints."
+            if automatic:
+                self._set_runtime_selection("openvino", "CPU")
+                self._hardware_start_notice = message
+            self._set_status(message, "error")
             return
         best = ready[0]
         for index in range(self.detected_accelerator.count()):
@@ -2236,7 +2677,51 @@ class LauncherWindow(QMainWindow):
             ):
                 self.detected_accelerator.setCurrentIndex(index)
                 break
-        self._set_status("Hardware scan complete. Choose a detected accelerator and click Use selection.", "ok")
+
+        if not automatic:
+            self._set_status(
+                "Hardware scan complete. Choose a detected accelerator and click Use selection.",
+                "ok",
+            )
+            return
+
+        selected_plan = _unique_ready_gpu_plan(profile, plans)
+        if selected_plan is not None:
+            for index in range(self.detected_accelerator.count()):
+                data = self.detected_accelerator.itemData(index)
+                if isinstance(data, dict) and data.get("_plan") is selected_plan:
+                    self.detected_accelerator.setCurrentIndex(index)
+                    break
+            self._apply_detected_accelerator()
+            self._set_status(
+                "Applied the only safely identified ready GPU. Provider use is "
+                "verified when detection starts.",
+                "ok",
+            )
+            return
+
+        self._set_runtime_selection("openvino", "CPU")
+        ready_gpu_count = sum(
+            1
+            for plan in plans
+            if bool(getattr(plan, "ready", False))
+            and _qualifying_discrete_gpu(profile, plan)
+        )
+        if ready_gpu_count:
+            reason = (
+                "The scan did not find exactly one ready GPU with an unambiguous "
+                "device binding."
+            )
+        else:
+            reason = "No ready GPU runtime was found."
+        self._hardware_start_notice = (
+            f"{reason} CPU/OpenVINO remains selected. Choose a Hardware entry "
+            "explicitly before detection, or confirm the CPU fallback when prompted."
+        )
+        self.hardware_report.appendPlainText(
+            f"\nAutomatic GPU selection:\n  {self._hardware_start_notice}"
+        )
+        self._set_status(self._hardware_start_notice, "warn")
 
     def _offer_runtime_download(self, profile, plans) -> None:
         """Offer setup guidance when a detected GPU needs another runtime."""
@@ -2304,6 +2789,42 @@ class LauncherWindow(QMainWindow):
     def _append_log(self, text: str) -> None:
         self.log.appendPlainText(text.rstrip())
 
+    def _confirm_hardware_before_start(self) -> bool:
+        """Require explicit consent when first-run GPU selection was inconclusive."""
+
+        if self._hardware_selection_configured:
+            return True
+        if self._first_hardware_scan_active:
+            QMessageBox.information(
+                self,
+                "Hardware scan in progress",
+                "Wait for the first-run GPU scan to finish before starting detection.",
+            )
+            self._set_status("Hardware scan is still running.", "warn")
+            return False
+
+        detail = self._hardware_start_notice or (
+            "Hardware has not been configured yet. CPU/OpenVINO is the safe fallback."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Confirm CPU fallback",
+            f"{detail}\n\nContinue detection with CPU/OpenVINO?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._select_section(2)
+            self._set_status(
+                "Choose a detected accelerator in Hardware before starting.",
+                "warn",
+            )
+            return False
+        self._set_runtime_selection("openvino", "CPU")
+        self._mark_hardware_selection_configured()
+        self._set_status("CPU/OpenVINO fallback explicitly accepted.", "warn")
+        return True
+
     def _start(self) -> None:
         if self.process is not None and self.process.poll() is None:
             return
@@ -2313,6 +2834,8 @@ class LauncherWindow(QMainWindow):
                 "MAKCU verification in progress",
                 "Finish the MAKCU button check before starting detection.",
             )
+            return
+        if not self._confirm_hardware_before_start():
             return
         settings = self.collect()
         if (
@@ -2429,6 +2952,7 @@ class LauncherWindow(QMainWindow):
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self._closing = True
+        self._first_hardware_scan_cancel.set()
         self._makcu_verify_cancel.set()
         self._makcu_monitor_cancel.set()
         running = [
@@ -2457,6 +2981,7 @@ class LauncherWindow(QMainWindow):
             self._makcu_monitor_thread,
             self._reader,
             self._precision_reader,
+            self._first_hardware_scan_thread,
         ):
             if (
                 isinstance(thread, threading.Thread)

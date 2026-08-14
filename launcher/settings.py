@@ -11,12 +11,21 @@ from dataclasses import asdict, dataclass, field, fields
 import json
 import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
 import secrets
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
+
+from utils.inference_size import (
+    InferenceSizeLike,
+    format_inference_size,
+    normalize_inference_size,
+    parse_inference_size,
+    validate_yolo_inference_size,
+)
+from utils.release_model_contract import load_release_default_contract
 
 SOURCE_SCREEN = "screen"
 SOURCE_CAMERA = "camera"
@@ -35,10 +44,14 @@ SELF_POSITION_GEOMETRY = {
     SELF_POSITION_CENTER: ("0.33", "0.34", "0.10"),
     SELF_POSITION_RIGHT: ("0.48", "0.34", "0.10"),
 }
-# Version 4 makes bundled detector choices semantic.  A settings file records
+# Version 4 made bundled detector choices semantic. Version 5 added independent
+# preview pacing; version 6 added the opt-in centered detail pass; version 7
+# records whether the user has explicitly chosen (or safely auto-selected) an
+# inference runtime; version 8 binds a fresh profile's optional detail workload
+# to the release-default pointer while preserving every persisted profile. A settings file records
 # the preset key rather than paths into a particular checkout/PyInstaller
 # extraction directory, so its model and labels always move together.
-SETTINGS_VERSION = 4
+SETTINGS_VERSION = 8
 
 MODEL_PRESET_FORT_PLAYER_BALANCED = "fort_player_balanced"
 MODEL_PRESET_FORT_PLAYER_BALANCED_INT8 = "fort_player_balanced_int8"
@@ -48,9 +61,6 @@ MODEL_PRESET_COCO_HIGH = "coco_high"
 MODEL_PRESET_COCO = "coco"
 MODEL_PRESET_CUSTOM = "custom"
 DEFAULT_MODEL_PRESET = MODEL_PRESET_FORT_PLAYER_BALANCED
-HIGH_END_CAPTURE_WIDTH = "1920"
-HIGH_END_CAPTURE_HEIGHT = "1080"
-HIGH_END_CAPTURE_FPS = "100"
 
 # These tokens were written by settings versions 1--3.  Keep them as migration
 # constants: existing profiles that used the old bundled detector must continue
@@ -59,6 +69,22 @@ BUNDLED_MODEL = "@bundled/yolo26n.xml"
 BUNDLED_LABELS = "@bundled/coco80.txt"
 
 
+_INITIAL_RESOURCE_ROOT = Path(
+    getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent)
+).resolve()
+_RELEASE_DEFAULT_POINTER = load_release_default_contract(_INITIAL_RESOURCE_ROOT)
+_RELEASE_DEFAULT_ARTIFACTS = _RELEASE_DEFAULT_POINTER["artifacts"]
+_RELEASE_DEFAULT_SHAPE = _RELEASE_DEFAULT_POINTER["input_shape_nchw"]
+_RELEASE_DEFAULT_HEIGHT = int(_RELEASE_DEFAULT_SHAPE[2])
+_RELEASE_DEFAULT_WIDTH = int(_RELEASE_DEFAULT_SHAPE[3])
+_RELEASE_DEFAULT_INFERENCE_SIZE: InferenceSizeLike = (
+    _RELEASE_DEFAULT_HEIGHT
+    if _RELEASE_DEFAULT_HEIGHT == _RELEASE_DEFAULT_WIDTH
+    else (_RELEASE_DEFAULT_HEIGHT, _RELEASE_DEFAULT_WIDTH)
+)
+_RELEASE_DEFAULT_DETAIL_CROP_SIZE = int(
+    _RELEASE_DEFAULT_POINTER["detail_crop_size_source_pixels"]
+)
 @dataclass(frozen=True, slots=True)
 class ModelPreset:
     """A model choice shown in the launcher.
@@ -73,11 +99,14 @@ class ModelPreset:
     description: str
     model_relative: str | None
     labels_relative: str | None
-    inference_size: int | None
+    inference_size: InferenceSizeLike | None
     # The same trained weights in ONNX form.  OpenVINO cannot drive AMD or
     # NVIDIA GPUs, so a preset must be able to hand ONNX Runtime an .onnx graph
     # instead of an OpenVINO .xml when the hardware scan selects that backend.
     onnx_relative: str | None = None
+    # Zero disables the second pass. A positive value is the requested source
+    # ROI width; runtime derives the height from the static model aspect ratio.
+    detail_crop_size_source_pixels: int = 0
 
     @property
     def bundled(self) -> bool:
@@ -92,14 +121,13 @@ class ModelPreset:
 MODEL_PRESETS = (
     ModelPreset(
         key=MODEL_PRESET_FORT_PLAYER_BALANCED,
-        label="Game players — Balanced 416 (Recommended)",
-        description=(
-            "Purpose-trained one-class player detector for stylized game characters."
-        ),
-        model_relative="models/fort_player_416_openvino_model/fort_player_416.xml",
-        labels_relative="models/fort_player.txt",
-        inference_size=416,
-        onnx_relative="models/fort_player_416_onnx/fort_player_416.onnx",
+        label=str(_RELEASE_DEFAULT_POINTER["preset"]["label"]),
+        description=str(_RELEASE_DEFAULT_POINTER["preset"]["description"]),
+        model_relative=str(_RELEASE_DEFAULT_ARTIFACTS["openvino_xml"]["path"]),
+        labels_relative=str(_RELEASE_DEFAULT_ARTIFACTS["labels"]["path"]),
+        inference_size=_RELEASE_DEFAULT_INFERENCE_SIZE,
+        onnx_relative=str(_RELEASE_DEFAULT_ARTIFACTS["onnx"]["path"]),
+        detail_crop_size_source_pixels=_RELEASE_DEFAULT_DETAIL_CROP_SIZE,
     ),
     ModelPreset(
         key=MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
@@ -138,9 +166,10 @@ MODEL_PRESETS = (
     ),
     ModelPreset(
         key=MODEL_PRESET_COCO_HIGH,
-        label="Ultralytics YOLO11l — High-end 1080p test (GPU)",
+        label="Benchmark only — YOLO11l 640 (slow, generic COCO)",
         description=(
-            "Fixed Ultralytics YOLO11l test profile for powerful GPUs and 1080p capture."
+            "Accuracy benchmark for explicit testing. It is much heavier than the "
+            "clone-trained player models and is not recommended for responsive tracking."
         ),
         model_relative="models/yolo11l_openvino_model/yolo11l.xml",
         labels_relative="models/coco80.txt",
@@ -187,6 +216,13 @@ def model_preset(value: str) -> ModelPreset:
     return _MODEL_PRESETS_BY_KEY.get(value, _MODEL_PRESETS_BY_KEY[DEFAULT_MODEL_PRESET])
 
 
+def model_preset_detail_crop_text(value: str) -> str:
+    """Return the preset workload's CLI text (empty means detail disabled)."""
+
+    crop = model_preset(value).detail_crop_size_source_pixels
+    return str(crop) if crop > 0 else ""
+
+
 def model_preset_paths(value: str, backend: str = "openvino") -> tuple[str, str]:
     """Resolve both files for a bundled preset in one operation.
 
@@ -206,6 +242,50 @@ def model_preset_paths(value: str, backend: str = "openvino") -> tuple[str, str]
         )
     root = resource_root()
     return str(root / model_relative), str(root / preset.labels_relative)
+
+
+def release_default_model_contract() -> dict[str, object]:
+    """Return the canonical bundled ONNX model deployed as the release default.
+
+    Paths in this contract are resource-root-relative POSIX paths. Build
+    tooling deliberately derives them from the same preset catalog used by the
+    launcher instead of maintaining a second model/shape table.
+    """
+
+    preset = _MODEL_PRESETS_BY_KEY[DEFAULT_MODEL_PRESET]
+    model_relative = preset.model_for("onnxruntime")
+    labels_relative = preset.labels_relative
+    if model_relative is None or labels_relative is None or preset.inference_size is None:
+        raise ValueError(
+            f"Release default preset {preset.key!r} must provide ONNX, labels, and input size"
+        )
+    for description, value in (
+        ("model", model_relative),
+        ("labels", labels_relative),
+    ):
+        normalized = PurePosixPath(value)
+        if (
+            not value
+            or "\\" in value
+            or normalized.is_absolute()
+            or normalized.as_posix() != value
+            or any(part in {"", ".", ".."} for part in value.split("/"))
+        ):
+            raise ValueError(
+                f"Release default {description} path must be canonical resource-relative POSIX"
+            )
+    if PurePosixPath(model_relative).suffix.lower() != ".onnx":
+        raise ValueError("Release default model must be an ONNX graph")
+    height, width = validate_yolo_inference_size(preset.inference_size)
+    return {
+        "preset": preset.key,
+        "model_path": model_relative,
+        "labels_path": labels_relative,
+        "input_shape_hw": [height, width],
+        "detail_crop_size_source_pixels": preset.detail_crop_size_source_pixels,
+        "pointer_content_sha256": _RELEASE_DEFAULT_POINTER["content_sha256"],
+        "qualification": dict(_RELEASE_DEFAULT_POINTER["qualification"]),
+    }
 
 
 def default_model_path() -> str:
@@ -299,8 +379,15 @@ class LauncherSettings:
     # OpenVINO cannot drive AMD or NVIDIA GPUs; those run through ONNX
     # Runtime, and the hardware scan sets this automatically.
     backend: str = "openvino"
+    # False is a fresh-profile sentinel used only by the Qt launcher. Existing
+    # profiles migrate to True so a new release never overwrites an explicit
+    # device choice merely because this field did not exist when it was saved.
+    hardware_selection_configured: bool = False
     inference_size: str = "320"
     crop_size: str = ""
+    detail_crop_size: str = field(
+        default_factory=lambda: model_preset_detail_crop_text(DEFAULT_MODEL_PRESET)
+    )
     confidence: str = "0.25"
     iou_threshold: str = "0.45"
     output_format: str = "auto"
@@ -310,6 +397,7 @@ class LauncherSettings:
     self_position: str = SELF_POSITION_LEFT
     preview: bool = True
     draw: bool = True
+    preview_fps: str = "15"
     aim: bool = False
     aim_label: str = ""
     aim_invert_x: bool = False
@@ -376,12 +464,17 @@ class LauncherSettings:
             )
             self.output_format = "auto"
             assert preset.inference_size is not None
-            self.inference_size = str(preset.inference_size)
-        if self.model_tier == "high":
-            self.capture_width = HIGH_END_CAPTURE_WIDTH
-            self.capture_height = HIGH_END_CAPTURE_HEIGHT
-            self.capture_fps = HIGH_END_CAPTURE_FPS
-            self.screen_fps = HIGH_END_CAPTURE_FPS
+            self.inference_size = format_inference_size(preset.inference_size)
+        else:
+            # Canonicalize valid custom values before they are serialized,
+            # while preserving malformed profile text for the ordinary form
+            # validation message instead of silently changing it.
+            try:
+                self.inference_size = format_inference_size(
+                    parse_inference_size(self.inference_size)
+                )
+            except (TypeError, ValueError):
+                pass
         if self.precision_mapping_verified and not self.precision_device_identity.strip():
             self.precision_mapping_verified = False
 
@@ -412,9 +505,64 @@ class LauncherSettings:
                 converted[name] = str(value)
 
         version = _settings_version(values.get("version"))
+        # Loading a persisted profile must never opt it into a newly selected
+        # release workload. Only a genuinely fresh LauncherSettings instance
+        # inherits the pointer's detail crop; an old/partial profile without
+        # this field retains the historical full-frame-only behavior.
+        if "detail_crop_size" not in converted:
+            converted["detail_crop_size"] = ""
+        hardware_selection_key_present = "hardware_selection_configured" in values
+        if "hardware_selection_configured" not in converted:
+            if hardware_selection_key_present:
+                # The current sentinel is security-sensitive.  A non-boolean
+                # value must never fall through to legacy inference and turn a
+                # malformed profile into implicit consent for CPU (or any
+                # other runtime).  Reset only the runtime choice so the rest of
+                # the user's profile can still be recovered.
+                converted["hardware_selection_configured"] = False
+                converted["backend"] = "openvino"
+                converted["device"] = "CPU"
+            elif version < SETTINGS_VERSION:
+                # Preserve a pre-v7 runtime only when the serialized object
+                # really contains a usable device/backend choice. Empty or
+                # partial JSON is not evidence that default CPU was
+                # intentional; treating it as a fresh profile lets Qt discover
+                # one safely bound GPU and still requires confirmation before
+                # a CPU fallback.
+                legacy_backend = str(converted.get("backend", "")).strip().lower()
+                legacy_device = str(converted.get("device", "")).strip()
+                converted["hardware_selection_configured"] = bool(
+                    legacy_backend in {"openvino", "onnxruntime"} and legacy_device
+                )
+            else:
+                # A current/future profile missing the sentinel is incomplete,
+                # not a legacy runtime selection.
+                converted["hardware_selection_configured"] = False
+        if converted.get("hardware_selection_configured") is True:
+            # A hand-edited/corrupted v7 file must not authenticate a runtime
+            # value that the launcher cannot represent. Preserve valid explicit
+            # choices, but send malformed ones through fresh-profile discovery.
+            serialized_backend = str(converted.get("backend", "openvino")).strip().lower()
+            serialized_device = str(converted.get("device", "CPU")).strip()
+            if (
+                serialized_backend not in {"openvino", "onnxruntime"}
+                or not serialized_device
+            ):
+                converted["hardware_selection_configured"] = False
+                converted["backend"] = "openvino"
+                converted["device"] = "CPU"
+        elif str(converted.get("backend", "openvino")).strip().lower() not in {
+            "openvino",
+            "onnxruntime",
+        }:
+            # Do not carry malformed legacy runtime pairs into the form.  They
+            # are not an intentional CPU choice and must remain eligible for
+            # fresh-profile hardware discovery.
+            converted["backend"] = "openvino"
+            converted["device"] = "CPU"
         model_value = converted.get("model_path", "")
         labels_value = converted.get("labels_path", "")
-        if version < SETTINGS_VERSION:
+        if version < 4:
             # Versions 1--3 had one bundled model (COCO).  Missing paths and
             # the two semantic tokens both represent that default.  Any real
             # path was user-selected and therefore becomes Custom.
@@ -475,13 +623,12 @@ class LauncherSettings:
 
         preset = model_preset(self.model_preset)
         output_format = "auto" if preset.bundled else self.output_format.lower()
-        inference_size_value = _positive_int(self.inference_size, "inference size")
+        inference_size_value = _inference_size(self.inference_size)
         if preset.bundled and preset.inference_size is not None:
-            # Bundled presets are exported at fixed square sizes; allowing a
-            # stale/edited size value can produce internal anchor mismatches at
-            # compile time (for example 416-exported constants vs 640 runtime
-            # feature maps). Always run bundled presets at their trained size.
-            inference_size_value = preset.inference_size
+            # Bundled presets are exported at fixed static HxW shapes; allowing
+            # stale/edited dimensions can produce internal anchor mismatches at
+            # compile time. Always run them at their exact deployment shape.
+            inference_size_value = normalize_inference_size(preset.inference_size)
         args = [
             "--model",
             str(model),
@@ -492,7 +639,7 @@ class LauncherSettings:
             "--backend",
             _backend_name(self.backend),
             "--inference-size",
-            str(inference_size_value),
+            format_inference_size(inference_size_value),
             "--confidence",
             _unit_float_text(self.confidence, "confidence"),
             "--iou-threshold",
@@ -506,8 +653,21 @@ class LauncherSettings:
         ]
 
         crop = self.crop_size.strip()
+        detail_crop = self.detail_crop_size.strip()
+        if crop and detail_crop:
+            raise SettingsError(
+                "Choose either the legacy centered crop or the detail pass, not "
+                "both. The detail pass keeps a full-frame primary inference."
+            )
         if crop:
             args.extend(("--crop-size", str(_positive_int(crop, "crop size"))))
+        if detail_crop:
+            args.extend(
+                (
+                    "--detail-crop-size",
+                    str(_positive_int(detail_crop, "detail crop size")),
+                )
+            )
 
         if self.ignore_self:
             position = _choice(
@@ -569,9 +729,27 @@ class LauncherSettings:
 
         if not self.preview:
             args.append("--no-preview")
-        elif not self.draw:
-            args.append("--no-draw")
+        else:
+            args.extend(
+                (
+                    "--preview-fps",
+                    _positive_float_text(self.preview_fps, "preview FPS"),
+                )
+            )
+            if not self.draw:
+                args.append("--no-draw")
         if self.aim:
+            if self.model_preset in {
+                MODEL_PRESET_COCO_HIGH,
+                MODEL_PRESET_COCO_BALANCED,
+                MODEL_PRESET_COCO,
+            }:
+                raise SettingsError(
+                    "The bundled COCO models are generic and are not validated "
+                    "for clone-player aim output. Choose "
+                    f"{_MODEL_PRESETS_BY_KEY[DEFAULT_MODEL_PRESET].label!r} or Fast 320 "
+                    "before enabling aim output."
+                )
             aim_label = self.aim_label.strip()
             if not aim_label:
                 raise SettingsError(
@@ -656,7 +834,15 @@ class LauncherSettings:
                 if self.aim_activate_axis is not None:
                     args.extend(("--aim-activate-axis", str(self.aim_activate_axis)))
                 if self.aim_activate_threshold.strip():
-                    args.extend(("--aim-activate-threshold", self.aim_activate_threshold))
+                    args.extend(
+                        (
+                            "--aim-activate-threshold",
+                            _positive_unit_float_text(
+                                self.aim_activate_threshold,
+                                "aim activation threshold",
+                            ),
+                        )
+                    )
         return args
 
     def resolved_model_files(self) -> tuple[str, str]:
@@ -708,6 +894,10 @@ def load_settings(path: Path | None = None) -> LauncherSettings:
         return LauncherSettings()
     except (OSError, UnicodeError, json.JSONDecodeError):
         # A damaged preference file must never keep the launcher from opening.
+        # Its contents are unavailable, so the default CPU value is not an
+        # authenticated user choice. Treat this exactly like a fresh profile:
+        # Qt may scan for one safely bound GPU and otherwise requires explicit
+        # CPU confirmation before Start.
         return LauncherSettings()
     if not isinstance(raw, Mapping):
         return LauncherSettings()
@@ -787,6 +977,16 @@ def _positive_int(value: str, label: str) -> int:
     if parsed <= 0:
         raise SettingsError(f"{label.capitalize()} must be greater than zero.")
     return parsed
+
+
+def _inference_size(value: str) -> tuple[int, int]:
+    try:
+        return validate_yolo_inference_size(parse_inference_size(value))
+    except (TypeError, ValueError) as exc:
+        raise SettingsError(
+            "Inference size must be N or HEIGHTxWIDTH, with both dimensions "
+            "divisible by 32 (for example 416 or 384x640)."
+        ) from exc
 
 
 def _non_negative_int(value: str, label: str) -> int:

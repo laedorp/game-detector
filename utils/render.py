@@ -55,6 +55,7 @@ def draw_aim_target(
     point: tuple[float, float],
     *,
     active: bool,
+    activation_name: str = "physical control",
 ) -> None:
     """Mark the exact selected head point and whether activation is held."""
 
@@ -75,7 +76,8 @@ def draw_aim_target(
         line_width,
         cv2.LINE_AA,
     )
-    label = "HEAD AIM ACTIVE" if active else "HEAD TARGET - HOLD RIGHT"
+    gate = str(activation_name).strip() or "physical control"
+    label = "HEAD AIM ACTIVE" if active else f"HEAD TARGET - HOLD {gate.upper()}"
     cv2.putText(
         frame,
         label,
@@ -166,15 +168,31 @@ def draw_metrics(
     import cv2
 
     avg = snapshot.average
+    p50 = snapshot.p50
+    p95 = snapshot.p95
     latest = snapshot.latest
     lines = [
         f"FPS {snapshot.moving_fps:5.1f}  processed {snapshot.processed_frames}  skipped {skipped_frames}",
-        f"capture {latest.capture_ms:5.1f}  pre {latest.preprocess_ms:5.1f}  infer {latest.inference_ms:5.1f} ms",
+        f"capture {latest.capture_ms:5.1f}  queue {latest.queue_age_ms:5.1f}  infer {latest.inference_ms:5.1f} ms",
         f"post {latest.postprocess_ms:5.1f}  control {latest.control_ms:5.1f} ms",
-        f"pipeline {latest.observed_pipeline_ms:5.1f} ms",
-        f"draw {latest.draw_ms:5.1f}  display {latest.display_ms:5.1f} ms",
-        f"moving: infer {avg.inference_ms:5.1f}  pipeline {avg.observed_pipeline_ms:5.1f} ms",
+        f"processing {latest.processing_ms:5.1f}  fresh {latest.freshness_latency_ms:5.1f} ms",
+        f"capture-to-result {latest.observed_pipeline_ms:5.1f} ms",
+        f"draw {latest.draw_ms:5.1f}  preview service {latest.preview_service_ms:5.1f} ms",
+        f"moving: infer p50 {p50.inference_ms:5.1f} p95 {p95.inference_ms:5.1f} ms",
+        f"fresh p50 {p50.freshness_latency_ms:5.1f} p95 {p95.freshness_latency_ms:5.1f} ms",
     ]
+    if (
+        latest.detail_preprocess_ms
+        or latest.detail_inference_ms
+        or latest.detail_postprocess_ms
+    ):
+        lines.insert(
+            3,
+            "detail "
+            f"pre {latest.detail_preprocess_ms:5.1f}  "
+            f"infer {latest.detail_inference_ms:5.1f}  "
+            f"post/merge {latest.detail_postprocess_ms:5.1f} ms",
+        )
     if ignored_count is not None:
         lines.append(f"self-avatar filter: ignored {ignored_count} this frame")
     if aim_status is not None:
@@ -204,14 +222,27 @@ def console_summary(
     ignored_count: int | None = None,
 ) -> str:
     avg = snapshot.average
+    p50 = snapshot.p50
+    p95 = snapshot.p95
     summary = (
         f"FPS {snapshot.moving_fps:.1f} | infer {avg.inference_ms:.1f} ms | "
         f"pre {avg.preprocess_ms:.1f} ms | post {avg.postprocess_ms:.1f} ms | "
         f"control {avg.control_ms:.1f} ms | "
-        f"pipeline {avg.observed_pipeline_ms:.1f} ms | "
-        f"draw {avg.draw_ms:.1f} ms | display {avg.display_ms:.1f} ms | "
+        f"capture {avg.capture_ms:.1f} ms | queue {avg.queue_age_ms:.1f} ms | "
+        f"processing {avg.processing_ms:.1f} ms | fresh {avg.freshness_latency_ms:.1f} ms | "
+        f"fresh p50 {p50.freshness_latency_ms:.1f} / p95 {p95.freshness_latency_ms:.1f} ms | "
+        f"infer p50 {p50.inference_ms:.1f} / p95 {p95.inference_ms:.1f} ms | "
+        f"capture-to-result {avg.observed_pipeline_ms:.1f} ms | "
+        f"draw {avg.draw_ms:.1f} ms | preview service avg/frame "
+        f"{avg.preview_service_ms:.1f} ms | "
         f"skipped {skipped_frames}"
     )
+    if avg.detail_preprocess_ms or avg.detail_inference_ms or avg.detail_postprocess_ms:
+        summary += (
+            f" | detail pre {avg.detail_preprocess_ms:.1f} ms"
+            f" / infer {avg.detail_inference_ms:.1f} ms"
+            f" / post+merge {avg.detail_postprocess_ms:.1f} ms"
+        )
     if ignored_count is not None:
         summary += f" | self ignored {ignored_count}"
     return summary

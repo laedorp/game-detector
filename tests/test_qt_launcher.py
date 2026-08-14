@@ -1,21 +1,41 @@
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
+import tempfile
+import threading
 import unittest
 from unittest import mock
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
+from aiming.makcu import MakcuError
 from controller_precision.linux_evdev import ControllerCandidate
+from detection.hardware import (
+    Accelerator,
+    AcceleratorKind,
+    DirectMLAdapter,
+    HardwareProfile,
+    ProcessorInfo,
+    Recommendation,
+    Vendor,
+)
 from launcher.precision import candidate_identity
-from launcher.qt_app import LauncherWindow
+from launcher.qt_app import (
+    LauncherWindow,
+    PROAIM_BUILD_TAG,
+    _has_exact_directml_binding,
+    _unique_ready_gpu_plan,
+)
+import launcher.qt_app as qt_app
 from launcher.settings import (
     AIM_OUTPUT_MAKCU,
     LauncherSettings,
     MODEL_PRESET_CUSTOM,
+    MODEL_PRESET_FORT_PLAYER_BALANCED,
     MODEL_PRESET_FORT_PLAYER_BALANCED_INT8,
 )
 
@@ -30,6 +50,38 @@ def controller() -> ControllerCandidate:
         serial="test-serial",
         phys="usb-test/input0",
         readable=True,
+    )
+
+
+def hardware_profile(
+    *gpus: Accelerator,
+    adapters: tuple[DirectMLAdapter, ...] = (),
+) -> HardwareProfile:
+    cpu = Accelerator(AcceleratorKind.CPU, Vendor.INTEL, "Test CPU")
+    return HardwareProfile(
+        system="windows",
+        processor=ProcessorInfo("Test CPU", 16),
+        accelerators=(cpu, *gpus),
+        runtime_devices=("CPU",),
+        directml_adapters=adapters,
+    )
+
+
+def recommendation(
+    accelerator: Accelerator,
+    *,
+    backend: str,
+    device: str,
+    ready: bool = True,
+) -> Recommendation:
+    return Recommendation(
+        accelerator=accelerator,
+        backend=backend,
+        device=device,
+        precision="fp32",
+        inference_size=416,
+        ready=ready,
+        reason="test",
     )
 
 
@@ -87,6 +139,7 @@ class QtLauncherTests(unittest.TestCase):
             screen_width="1600",
             screen_height="900",
             crop_size="720",
+            detail_crop_size="640",
             output_format="traditional",
         )
         window = self.window(settings)
@@ -105,6 +158,7 @@ class QtLauncherTests(unittest.TestCase):
             ("-1920", "25", "1600", "900"),
         )
         self.assertEqual(collected.crop_size, "720")
+        self.assertEqual(collected.detail_crop_size, "640")
         self.assertEqual(collected.output_format, "traditional")
         self.assertEqual(window._start_key.key().toString(), "F5")
         self.assertEqual(window._stop_key.key().toString(), "Esc")
@@ -120,6 +174,60 @@ class QtLauncherTests(unittest.TestCase):
         self.assertIn("AGPL-3.0-or-later", text)
         self.assertIn("without any warranty", text)
         self.assertIn("github.com/laedorp/game-detector", text)
+        self.assertIn(PROAIM_BUILD_TAG, text)
+        self.assertNotIn("2026-08-10-makcu-monitor-v1", text)
+
+    def test_build_tag_is_neutral_in_source_and_uses_frozen_build_info(self) -> None:
+        with mock.patch.object(qt_app.sys, "frozen", False, create=True):
+            self.assertEqual(qt_app._build_tag(), "source checkout")
+
+        payload = '{"commit":"0123456789abcdef","runtime_variant":"directml"}'
+        with (
+            mock.patch.object(qt_app.sys, "frozen", True, create=True),
+            mock.patch.object(qt_app.Path, "read_text", return_value=payload),
+        ):
+            self.assertEqual(qt_app._build_tag(), "directml · 0123456789ab")
+
+    def test_detail_pass_control_is_only_exposed_for_advanced_or_custom(self) -> None:
+        window = self.window()
+
+        self.assertTrue(window.detail_crop_size.isHidden())
+        advanced_index = window.model_tier.findData("high")
+        window.model_tier.setCurrentIndex(advanced_index)
+        self.assertFalse(window.detail_crop_size.isHidden())
+
+        balanced_index = window.model_tier.findData("mid")
+        window.model_tier.setCurrentIndex(balanced_index)
+        self.assertTrue(window.detail_crop_size.isHidden())
+
+        custom_index = window.model_preset.findData(MODEL_PRESET_CUSTOM)
+        window.model_preset.setCurrentIndex(custom_index)
+        self.assertFalse(window.detail_crop_size.isHidden())
+
+    def test_persisted_detail_pass_is_presented_as_advanced_workload(self) -> None:
+        window = self.window(LauncherSettings(detail_crop_size="768"))
+
+        self.assertEqual(window.model_tier.currentData(), "high")
+        self.assertEqual(window.detail_crop_size.text(), "768")
+        self.assertFalse(window.detail_crop_size.isHidden())
+
+    def test_explicit_recommended_choice_applies_its_complete_detail_workload(self) -> None:
+        window = self.window()
+        custom_index = window.model_preset.findData(MODEL_PRESET_CUSTOM)
+        recommended_index = window.model_preset.findData(
+            MODEL_PRESET_FORT_PLAYER_BALANCED
+        )
+        with mock.patch(
+            "launcher.qt_app.model_preset_detail_crop_text",
+            side_effect=lambda key: (
+                "768" if key == MODEL_PRESET_FORT_PLAYER_BALANCED else ""
+            ),
+        ):
+            window.model_preset.setCurrentIndex(custom_index)
+            window.model_preset.setCurrentIndex(recommended_index)
+
+        self.assertEqual(window.detail_crop_size.text(), "768")
+        self.assertFalse(window.detail_crop_size.isHidden())
 
     @unittest.skipIf(os.name == "nt", "Wayland preflight applies only on Linux")
     def test_wayland_screen_capture_is_rejected_before_launch(self) -> None:
@@ -176,6 +284,81 @@ class QtLauncherTests(unittest.TestCase):
         self.assertEqual(window._makcu_verified_port, "/dev/ttyACM0")
         self.assertEqual(window._makcu_verified_button, "1")
         self.assertTrue(window._makcu_verification_matches())
+
+    def test_makcu_shutdown_failure_overrides_verified_result_once(self) -> None:
+        settings = LauncherSettings(
+            aim=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_label="player",
+            aim_makcu_port="/dev/ttyACM0",
+            aim_makcu_button="1",
+        )
+        window = self.window(settings)
+        verifier = FakeMakcuVerifier([0, 0b00010, 0])
+        verifier.stop = mock.Mock(  # type: ignore[method-assign]
+            side_effect=MakcuError("serial worker did not stop")
+        )
+        results: list[tuple[bool, str, str, str]] = []
+        window.makcu_verification_done.connect(
+            lambda verified, port, button, detail: results.append(
+                (verified, port, button, detail)
+            )
+        )
+
+        with (
+            mock.patch("launcher.qt_app.MakcuAimingController", return_value=verifier),
+            mock.patch("launcher.qt_app.save_settings") as save,
+            mock.patch("launcher.qt_app.QMessageBox.critical") as critical,
+        ):
+            window._verify_makcu_activation_worker("/dev/ttyACM0", 1)
+
+        self.assertEqual(len(results), 1)
+        self.assertFalse(results[0][0])
+        self.assertIn("shutdown failed", results[0][3].lower())
+        self.assertIn("serial worker did not stop", results[0][3])
+        self.assertEqual(window._makcu_verified_port, "")
+        self.assertEqual(window._makcu_verified_button, "")
+        verifier.stop.assert_called_once_with()
+        save.assert_not_called()
+        critical.assert_called_once()
+
+    def test_makcu_monitor_shutdown_failure_still_emits_done_once(self) -> None:
+        window = self.window()
+        window._makcu_monitor_cancel.set()
+        verifier = FakeMakcuVerifier([])
+        verifier.stop = mock.Mock(  # type: ignore[method-assign]
+            side_effect=MakcuError("serial close timed out")
+        )
+        progress: list[str] = []
+        completions: list[bool] = []
+        window.makcu_verification_progress.connect(progress.append)
+        window.makcu_monitor_done.connect(lambda: completions.append(True))
+
+        with mock.patch(
+            "launcher.qt_app.MakcuAimingController", return_value=verifier
+        ):
+            window._monitor_makcu_buttons_worker("/dev/ttyACM0")
+
+        self.assertEqual(completions, [True])
+        self.assertTrue(any("shutdown failed" in message.lower() for message in progress))
+        self.assertTrue(any("serial close timed out" in message for message in progress))
+        verifier.stop.assert_called_once_with()
+
+    def test_cancelled_makcu_monitor_completes_normally_once(self) -> None:
+        window = self.window()
+        window._makcu_monitor_cancel.set()
+        verifier = FakeMakcuVerifier([])
+        completions: list[bool] = []
+        window.makcu_monitor_done.connect(lambda: completions.append(True))
+
+        with mock.patch(
+            "launcher.qt_app.MakcuAimingController", return_value=verifier
+        ):
+            window._monitor_makcu_buttons_worker("/dev/ttyACM0")
+
+        self.assertEqual(completions, [True])
+        self.assertTrue(verifier.started)
+        self.assertTrue(verifier.stopped)
 
     def test_makcu_press_without_release_never_binds_verification(self) -> None:
         settings = LauncherSettings(
@@ -251,6 +434,271 @@ class QtLauncherTests(unittest.TestCase):
 
         self.assertEqual(window.model_preset.currentData(), "fort_player_balanced")
         self.assertEqual(window.inference_size.currentText(), "416")
+
+    def test_fresh_profile_schedules_nonblocking_first_hardware_scan(self) -> None:
+        callbacks: list[object] = []
+        settings = LauncherSettings()
+        with (
+            mock.patch("launcher.qt_app.load_settings", return_value=settings),
+            mock.patch("launcher.qt_app.pxn_controllers", return_value=()),
+            mock.patch(
+                "launcher.qt_app.QTimer.singleShot",
+                side_effect=lambda _delay, callback: callbacks.append(callback),
+            ),
+        ):
+            window = LauncherWindow()
+        self.addCleanup(window.close)
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertEqual(callbacks[0].__name__, "_begin_first_hardware_scan")
+        self.assertFalse(window._hardware_selection_configured)
+        self.assertIsNone(window.process)
+
+    def test_explicit_loaded_runtime_is_never_scheduled_for_auto_replacement(self) -> None:
+        settings = LauncherSettings(
+            backend="onnxruntime",
+            device="CUDA",
+            hardware_selection_configured=True,
+        )
+        with (
+            mock.patch("launcher.qt_app.load_settings", return_value=settings),
+            mock.patch("launcher.qt_app.pxn_controllers", return_value=()),
+            mock.patch("launcher.qt_app.QTimer.singleShot") as single_shot,
+        ):
+            window = LauncherWindow()
+        self.addCleanup(window.close)
+
+        single_shot.assert_not_called()
+        self.assertEqual(window.backend.currentText(), "onnxruntime")
+        self.assertEqual(window.device.currentText(), "CUDA")
+
+    def test_default_qt_load_adopts_legacy_profile_without_auto_replacement(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            current = root / "proaim" / "settings.json"
+            legacy = root / "game-detector" / "settings.json"
+            legacy.parent.mkdir(parents=True)
+            legacy.write_text(
+                json.dumps(
+                    {
+                        "version": 6,
+                        "backend": "onnxruntime",
+                        "device": "CUDA",
+                        "screen_width": "1777",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                mock.patch(
+                    "launcher.settings._settings_paths",
+                    return_value=(current, legacy),
+                ),
+                mock.patch("launcher.qt_app.pxn_controllers", return_value=()),
+                mock.patch("launcher.qt_app.QTimer.singleShot") as single_shot,
+            ):
+                window = LauncherWindow()
+        self.addCleanup(window.close)
+
+        self.assertEqual(window.backend.currentText(), "onnxruntime")
+        self.assertEqual(window.device.currentText(), "CUDA")
+        self.assertEqual(window.screen_width.text(), "1777")
+        self.assertTrue(window._hardware_selection_configured)
+        single_shot.assert_not_called()
+
+    def test_first_run_applies_only_exact_unique_directml_gpu(self) -> None:
+        gpu = Accelerator(
+            AcceleratorKind.GPU,
+            Vendor.NVIDIA,
+            "RTX 5060 Laptop GPU",
+            "10de:2d59",
+            True,
+        )
+        adapter = DirectMLAdapter(1, gpu.name, "10de", "2d59", 8 << 30)
+        profile = hardware_profile(gpu, adapters=(adapter,))
+        cpu_plan = recommendation(
+            profile.accelerators[0], backend="openvino", device="CPU"
+        )
+        gpu_plan = recommendation(
+            gpu, backend="onnxruntime", device="DIRECTML:1"
+        )
+        window = self.window(LauncherSettings(aim=True))
+        window._hardware_selection_configured = False
+        window.settings.hardware_selection_configured = False
+
+        with mock.patch("launcher.qt_app.start_detector") as start:
+            window._show_hardware_scan(
+                profile,
+                (gpu_plan, cpu_plan),
+                automatic=True,
+            )
+
+        self.assertIs(_unique_ready_gpu_plan(profile, (gpu_plan, cpu_plan)), gpu_plan)
+        self.assertTrue(_has_exact_directml_binding(profile, gpu_plan))
+        self.assertEqual(window.backend.currentText(), "onnxruntime")
+        self.assertEqual(window.device.currentText(), "DIRECTML:1")
+        self.assertTrue(window._hardware_selection_configured)
+        self.assertTrue(window.aim.isChecked())
+        self.assertIsNone(window.process)
+        start.assert_not_called()
+
+    def test_unbound_or_multiple_ready_gpus_keep_unconfigured_cpu_fallback(self) -> None:
+        first = Accelerator(
+            AcceleratorKind.GPU, Vendor.AMD, "Radeon RX 6950 XT", "1002:73a5", True
+        )
+        second = Accelerator(
+            AcceleratorKind.GPU, Vendor.NVIDIA, "RTX 5060", "10de:2d59", True
+        )
+        adapters = (
+            DirectMLAdapter(0, first.name, "1002", "73a5", 16 << 30),
+            DirectMLAdapter(1, second.name, "10de", "2d59", 8 << 30),
+        )
+        profile = hardware_profile(first, second, adapters=adapters)
+        cpu_plan = recommendation(
+            profile.accelerators[0], backend="openvino", device="CPU"
+        )
+        cases = (
+            (recommendation(first, backend="onnxruntime", device="DIRECTML"),),
+            (
+                recommendation(first, backend="onnxruntime", device="DIRECTML:0"),
+                recommendation(second, backend="onnxruntime", device="DIRECTML:1"),
+            ),
+        )
+        for gpu_plans in cases:
+            with self.subTest(devices=[plan.device for plan in gpu_plans]):
+                window = self.window()
+                window._hardware_selection_configured = False
+                window.settings.hardware_selection_configured = False
+                window._show_hardware_scan(
+                    profile,
+                    (*gpu_plans, cpu_plan),
+                    automatic=True,
+                )
+
+                self.assertIsNone(
+                    _unique_ready_gpu_plan(profile, (*gpu_plans, cpu_plan))
+                )
+                self.assertEqual(window.backend.currentText(), "openvino")
+                self.assertEqual(window.device.currentText(), "CPU")
+                self.assertFalse(window._hardware_selection_configured)
+                self.assertIn("explicitly", window._hardware_start_notice)
+
+    def test_provider_presence_without_one_scanned_physical_gpu_is_not_auto_selected(self) -> None:
+        reported_only = Accelerator(
+            AcceleratorKind.GPU,
+            Vendor.NVIDIA,
+            "Provider-only GPU claim",
+            "10de:ffff",
+            True,
+        )
+        profile = hardware_profile()
+        cuda = recommendation(
+            reported_only,
+            backend="onnxruntime",
+            device="CUDA",
+        )
+
+        self.assertIsNone(_unique_ready_gpu_plan(profile, (cuda,)))
+
+    def test_hybrid_intel_igpu_does_not_make_exact_rtx_directml_ambiguous(self) -> None:
+        intel = Accelerator(
+            AcceleratorKind.GPU,
+            Vendor.INTEL,
+            "Intel Graphics",
+            "8086:1234",
+            False,
+        )
+        rtx = Accelerator(
+            AcceleratorKind.GPU,
+            Vendor.NVIDIA,
+            "RTX 5060 Laptop GPU",
+            "10de:2d59",
+            # Exercise the WMI AdapterRAM-truncation path: exact DXGI dedicated
+            # memory still proves that this is the discrete accelerator.
+            None,
+        )
+        adapters = (
+            DirectMLAdapter(0, intel.name, "8086", "1234", 0),
+            DirectMLAdapter(1, rtx.name, "10de", "2d59", 8 << 30),
+        )
+        profile = hardware_profile(intel, rtx, adapters=adapters)
+        intel_plan = recommendation(
+            intel, backend="onnxruntime", device="DIRECTML:0"
+        )
+        rtx_plan = recommendation(
+            rtx, backend="onnxruntime", device="DIRECTML:1"
+        )
+
+        self.assertIs(
+            _unique_ready_gpu_plan(profile, (intel_plan, rtx_plan)),
+            rtx_plan,
+        )
+
+    def test_close_cancels_and_joins_first_scan_worker(self) -> None:
+        window = self.window()
+        worker = threading.Thread(
+            target=window._first_hardware_scan_cancel.wait,
+            daemon=True,
+        )
+        window._first_hardware_scan_thread = worker
+        worker.start()
+        event = mock.Mock()
+
+        window.closeEvent(event)
+
+        self.assertTrue(window._first_hardware_scan_cancel.is_set())
+        self.assertFalse(worker.is_alive())
+        event.accept.assert_called_once_with()
+
+    def test_late_first_scan_result_does_not_touch_closing_window(self) -> None:
+        gpu = Accelerator(
+            AcceleratorKind.GPU,
+            Vendor.NVIDIA,
+            "RTX 5060",
+            "10de:2d59",
+            True,
+        )
+        profile = hardware_profile(gpu)
+        plan = recommendation(gpu, backend="onnxruntime", device="CUDA")
+        window = self.window()
+        original_report = window.hardware_report.toPlainText()
+        window._closing = True
+
+        window._finish_first_hardware_scan(profile, (plan,))
+
+        self.assertEqual(window.hardware_report.toPlainText(), original_report)
+        self.assertEqual(window.backend.currentText(), "openvino")
+        self.assertEqual(window.device.currentText(), "CPU")
+
+    def test_inconclusive_first_run_requires_cpu_confirmation_before_start(self) -> None:
+        window = self.window()
+        window._hardware_selection_configured = False
+        window.settings.hardware_selection_configured = False
+        window._hardware_start_notice = "GPU adapter binding is ambiguous."
+
+        with mock.patch(
+            "launcher.qt_app.QMessageBox.question",
+            return_value=QMessageBox.StandardButton.No,
+        ) as question:
+            accepted = window._confirm_hardware_before_start()
+
+        self.assertFalse(accepted)
+        self.assertFalse(window._hardware_selection_configured)
+        self.assertEqual(window.stack.currentIndex(), 2)
+        self.assertIn("ambiguous", question.call_args.args[2])
+
+    def test_accuracy_workload_does_not_overwrite_saved_capture_rate(self) -> None:
+        window = self.window(
+            LauncherSettings(
+                model_tier="high",
+                screen_fps="60",
+                capture_fps="60",
+            )
+        )
+
+        self.assertEqual(window.screen_fps.text(), "60")
+        self.assertEqual(window.capture_fps.text(), "60")
+        self.assertEqual(window.model_preset.currentData(), "fort_player_balanced")
 
     def test_int8_cpu_hardware_selects_int8_but_onnx_hides_it(self) -> None:
         window = self.window()
