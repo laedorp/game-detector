@@ -1090,6 +1090,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("gains X/Y 0.125/0.12 px/count", output)
         self.assertIn("delay 8.00 ms", output)
         self.assertIn("head source pinned SunXDS 0.8.0 direct boxes on CPU", output)
+        self.assertIn("CPU (4 threads)", output)
         self.assertIn(
             "direct-head prediction gated by same-frame player motion",
             output,
@@ -1099,7 +1100,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)
 
-    def test_stable_head_job_starts_before_primary_inference(self) -> None:
+    def test_head_job_starts_only_after_current_primary_inference(self) -> None:
         events: list[str] = []
         original_infer = _FakeDetector.infer
 
@@ -1109,15 +1110,19 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
 
         head_runtime = mock.Mock()
         head_runtime.status = SimpleNamespace()
-        head_runtime.early_submission_authorized = True
         head_runtime.identity_generation = 7
+        head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.return_value = False
+        head_runtime.take_latest.return_value = None
         head_runtime.submit.side_effect = lambda *_args, **_kwargs: (
             events.append("head") or True
         )
         head_runtime.revoke_body.return_value = True
         head_runtime.visible_sample.return_value = None
         head_runtime.stop.return_value = True
-        _FakeDetector.detections = []
+        _FakeDetector.detections = [
+            Detection(0, "player", 0.9, (1200.0, 200.0, 1400.0, 700.0))
+        ]
 
         with (
             mock.patch(
@@ -1129,12 +1134,18 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
                 "infer",
                 new=ordered_primary_infer,
             ),
+            mock.patch.object(
+                _FakeMakcuController,
+                "activation_pressed",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ),
         ):
             result, _output = self._run(self.base_config)
 
         self.assertEqual(result, 0)
         self.assertGreaterEqual(len(events), 2)
-        self.assertEqual(events[:2], ["head", "primary"])
+        self.assertEqual(events[:2], ["primary", "head"])
 
     def test_two_live_primary_misses_do_not_submit_from_prediction(self) -> None:
         player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
@@ -1212,13 +1223,12 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             result = run(config)
 
         self.assertEqual(result, 0)
-        # Frame one seeds after its accepted primary. Frame two may start one
-        # overlapped job from frame one's physical evidence. Once frame two is
-        # a prediction, frame three cannot recursively submit its predicted box.
-        self.assertEqual(len(worker.submissions), 2)
+        # Only frame one has an exact accepted primary. Neither predicted frame
+        # is allowed to schedule a crop from prior or predicted geometry.
+        self.assertEqual(len(worker.submissions), 1)
         self.assertEqual(
             [item["source_timestamp_ns"] for item in worker.submissions],
-            [source.base_ns, source.base_ns + 10_000_000],
+            [source.base_ns],
         )
         controller = _FakeMakcuController.instances[0]
         self.assertEqual(controller.corroboration_revocations, 2)
@@ -1232,12 +1242,16 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             confidence=0.88,
             evidence="direct head box",
             bridging=False,
-            corroboration_point=(900.0, 450.0),
+            corroboration_point=None,
         )
         head_runtime = mock.Mock()
         head_runtime.status = SimpleNamespace()
         head_runtime.identity_generation = 1
         head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.side_effect = [
+            False,
+            True,
+        ]
         head_runtime.take_latest.return_value = sample
         head_runtime.visible_sample.return_value = sample
         head_runtime.stop.return_value = True
@@ -1271,6 +1285,10 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             sample.source_timestamp_ns,
         )
         self.assertNotIn("velocity_target", controller.normal_update_keywords[1])
+        self.assertIsNone(
+            controller.normal_update_keywords[1]["motion_corroboration_point"]
+        )
+        self.assertEqual(controller.corroboration_revocations, 1)
         head_runtime.submit.assert_called_once()
         submitted_player = head_runtime.submit.call_args.args[1]
         self.assertEqual(submitted_player, player)

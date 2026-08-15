@@ -17,9 +17,9 @@ AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT = 0.120
 AUTOMATIC_MAKCU_DELAY_SECONDS = 0.008
 AUTOMATIC_MAKCU_EMPTY_GRACE_FRAMES = 3
 AUTOMATIC_MAKCU_STALE_AFTER_SECONDS = 0.065
-AUTOMATIC_HEAD_LOCALIZATION_HZ = 120.0
+AUTOMATIC_HEAD_LOCALIZATION_HZ = 90.0
 AUTOMATIC_HEAD_STALE_AFTER_SECONDS = AUTOMATIC_MAKCU_STALE_AFTER_SECONDS
-AUTOMATIC_HEAD_CPU_THREADS = 6
+AUTOMATIC_HEAD_CPU_THREADS = 4
 
 
 def _identity_payload(payload):
@@ -116,7 +116,6 @@ class _AutomaticHeadRuntime:
         self._current_player_timestamp_ns: int | None = None
         self._visible_player_box: tuple[float, float, float, float] | None = None
         self._visible_player_timestamp_ns: int | None = None
-        self._submitted_player_timestamps: dict[int, int] = {}
         self._observed_body_centers: dict[int, tuple[float, float]] = {}
         self._current_body_observed = False
         self._motion_corroboration_revocation_pending = False
@@ -136,18 +135,11 @@ class _AutomaticHeadRuntime:
         self._current_player_timestamp_ns = None
         self._visible_player_box = None
         self._visible_player_timestamp_ns = None
-        self._submitted_player_timestamps.clear()
         self._observed_body_centers.clear()
         self._current_body_observed = False
         self._motion_corroboration_revocation_pending = False
         self._tracker_generation = None
         self.worker.advance_identity(self.identity_generation)
-
-    @property
-    def early_submission_authorized(self) -> bool:
-        """Whether the immediately prior body sample was physically observed."""
-
-        return bool(self.body_valid and self._current_body_observed)
 
     def consume_motion_corroboration_revocation(self) -> bool:
         """Consume one fail-closed loss of independent motion evidence."""
@@ -384,14 +376,8 @@ class _AutomaticHeadRuntime:
         self.advance_identity()
         return True
 
-    def submit(self, frame, selected_player=None, *, source_timestamp_ns: int) -> bool:
-        """Prepare one bounded crop on the caller thread at the rate gate.
-
-        ``selected_player=None`` intentionally uses the last verified primary
-        box.  The live loop uses that form before the GPU primary pass so the
-        CPU head pass overlaps it; the completed result still has to pass the
-        current frame's primary identity/anatomy gates before publication.
-        """
+    def submit(self, frame, selected_player, *, source_timestamp_ns: int) -> bool:
+        """Prepare one bounded crop from an exact same-frame primary box."""
 
         if not self.body_valid:
             return False
@@ -404,22 +390,7 @@ class _AutomaticHeadRuntime:
 
         from detection.head_detector import plan_head_crop, prepare_head_input
 
-        if selected_player is None:
-            # Early overlap is authorized only by a fresh, physical primary
-            # measurement from the immediately prior processed frame. A
-            # smoothed/predicted body may retain position safety briefly, but
-            # it can never recursively seed more detector work.
-            previous_timestamp_ns = self._current_player_timestamp_ns
-            if not self.early_submission_authorized or previous_timestamp_ns is None:
-                return False
-            authorization_age_ns = timestamp - previous_timestamp_ns
-            if authorization_age_ns < 0 or authorization_age_ns > self.stale_after_ns:
-                return False
-            selected_player_box = self._current_player_box
-        else:
-            selected_player_box = tuple(float(value) for value in selected_player.box)
-        if selected_player_box is None:
-            return False
+        selected_player_box = tuple(float(value) for value in selected_player.box)
         transform = plan_head_crop(frame.shape, selected_player_box)
         prepared = prepare_head_input(frame, transform)
         payload = _TimestampedPreparedHeadInput(prepared, timestamp)
@@ -430,25 +401,6 @@ class _AutomaticHeadRuntime:
             selected_player_box=selected_player_box,
         )
         if accepted:
-            selected_player_timestamp_ns = (
-                self._current_player_timestamp_ns
-                if selected_player is None
-                and self._current_player_timestamp_ns is not None
-                else timestamp
-            )
-            self._submitted_player_timestamps[timestamp] = (
-                selected_player_timestamp_ns
-            )
-            cutoff_ns = timestamp - self.stale_after_ns * 2
-            self._submitted_player_timestamps = {
-                source_ns: player_ns
-                for source_ns, player_ns in self._submitted_player_timestamps.items()
-                if source_ns >= cutoff_ns
-            }
-            while len(self._submitted_player_timestamps) > 32:
-                del self._submitted_player_timestamps[
-                    min(self._submitted_player_timestamps)
-                ]
             if deadline is None:
                 self.next_submission_ns = timestamp + self.submission_interval_ns
             else:
@@ -473,10 +425,6 @@ class _AutomaticHeadRuntime:
             return None
         current_box = self._current_player_box
         current_body_timestamp_ns = self._current_player_timestamp_ns
-        submitted_player_timestamp_ns = self._submitted_player_timestamps.pop(
-            result.source_timestamp_ns,
-            result.source_timestamp_ns,
-        )
         association_timestamp_ns = (
             current_ns
             if current_body_timestamp_ns is None
@@ -486,7 +434,7 @@ class _AutomaticHeadRuntime:
             result.selected_player_box,
             current_box,
             elapsed_ns=(
-                association_timestamp_ns - submitted_player_timestamp_ns
+                association_timestamp_ns - result.source_timestamp_ns
             ),
         ):
             # A late result from a replaced primary target invalidates the
@@ -535,31 +483,20 @@ class _AutomaticHeadRuntime:
         )
         if corroboration_point is None:
             self._motion_corroboration_revocation_pending = True
-            # The direct box may be real, but without an accepted primary
-            # measurement from this exact source frame it cannot renew either
-            # controller state or the visible lease. Keep only the previously
-            # verified position until its ordinary freshness deadline.
-            leased = self._visible_sample
-            if leased is not None:
-                self._visible_sample = _AutomaticHeadSample(
-                    point=leased.point,
-                    source_timestamp_ns=leased.source_timestamp_ns,
-                    confidence=leased.confidence,
-                    evidence=leased.evidence,
-                    bridging=True,
-                    corroboration_point=None,
-                )
-            return None
+            # A direct head remains valid position evidence. Missing primary
+            # motion evidence only withdraws predictive feed-forward; it must
+            # not discard or delay the independently observed head coordinate.
         sample = _AutomaticHeadSample(
             point=observation.point,
             source_timestamp_ns=result.source_timestamp_ns,
             confidence=observation.confidence,
             evidence=observation.evidence,
+            bridging=not self._current_body_observed,
             corroboration_point=corroboration_point,
         )
         self._visible_sample = sample
         self._visible_player_box = result.selected_player_box
-        self._visible_player_timestamp_ns = submitted_player_timestamp_ns
+        self._visible_player_timestamp_ns = result.source_timestamp_ns
         return sample
 
     def visible_sample(self, *, now_ns: int) -> _AutomaticHeadSample | None:
@@ -2593,24 +2530,6 @@ def run(config: AppConfig) -> int:
             # when both bounds are supplied.
 
             processing_started_ns = perf_counter_ns()
-            # Start the independent CPU head pass from the last verified body
-            # before the GPU primary pass.  The current primary result remains
-            # the identity/safety authority, but the two inference costs now
-            # overlap instead of forcing every head result into the next
-            # processed frame.  Exact ``is True`` keeps internal test doubles
-            # from accidentally claiming a previous body they do not model.
-            automatic_head_early_generation: int | None = None
-            if (
-                automatic_head_runtime is not None
-                and automatic_head_runtime.early_submission_authorized is True
-                and automatic_head_runtime.submit(
-                    packet.image,
-                    source_timestamp_ns=packet.read_started_ns,
-                )
-            ):
-                automatic_head_early_generation = (
-                    automatic_head_runtime.identity_generation
-                )
             preprocessing_started_ns = perf_counter_ns()
             prepared = preprocess_frame(
                 packet.image,
@@ -3017,10 +2936,7 @@ def run(config: AppConfig) -> int:
                                     track_generation=target_tracker.track_generation,
                                     source_timestamp_ns=packet.read_started_ns,
                                 )
-                            if (
-                                new_head_sample is not None
-                                and new_head_sample.corroboration_point is not None
-                            ):
+                            if new_head_sample is not None:
                                 # The point and timestamp belong to the same
                                 # source frame.  The current primary player is
                                 # passed only as the live safety identity.
@@ -3072,15 +2988,12 @@ def run(config: AppConfig) -> int:
                                     track_generation=target_tracker.track_generation,
                                     source_timestamp_ns=packet.read_started_ns,
                                 )
-                            if (
-                                accepted_player is not None
-                                and automatic_head_early_generation
-                                != automatic_head_runtime.identity_generation
-                            ):
-                                # Seed the first/new identity after current
-                                # safety is known. Stable identities were
-                                # already submitted before primary inference so
-                                # CPU/GPU work overlaps rather than serializes.
+                            if accepted_player is not None:
+                                # The head crop and association must use this
+                                # exact source frame's accepted primary box.
+                                # A prior-frame box is stale geometry during
+                                # commanded camera motion and can manufacture
+                                # clustered no-head results.
                                 automatic_head_runtime.submit(
                                     packet.image,
                                     accepted_player,

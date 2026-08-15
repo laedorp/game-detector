@@ -627,7 +627,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             "direct-head prediction gated by same-frame player motion",
             startup,
         )
-        self.assertIn("latest-only 120 Hz", startup)
+        self.assertIn("latest-only 90 Hz", startup)
 
     def test_capture_starvation_surfaces_automatic_head_worker_failure(self) -> None:
         report_path = self.root / "head-worker-starvation.json"
