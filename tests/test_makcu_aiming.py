@@ -31,10 +31,16 @@ from aiming.makcu import (
     MakcuAimingController,
     MakcuCalibrationSnapshot,
     MakcuTelemetrySnapshot,
+    _ButtonStreamParser,
     detect_makcu_port,
     makcu_target_delta,
 )
 from aiming.makcu_calibration import MIN_EXCURSION_PIXELS, MIN_PULSES_PER_POLARITY
+from aiming.makcu_calibration_session import (
+    CalibrationObservation,
+    CalibrationSessionState,
+    MakcuCalibrationSession,
+)
 from aiming.makcu_calibrated_control import (
     CalibratedControlConfig,
     CalibratedControlOutput,
@@ -230,6 +236,41 @@ class MakcuAimingTests(unittest.TestCase):
     def _queue_calibration_repress(self, connection: FakeSerial) -> None:
         self._queue_button_event(connection, 0)
         self._queue_button_event(connection, 0b00010)
+
+    def _establish_calibration_hold(
+        self,
+        controller: MakcuAimingController,
+        connection: FakeSerial,
+        *,
+        press_ns: int,
+    ) -> None:
+        """Deliver the fresh release and press as two real parser reads."""
+
+        entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
+        initial_press_ns = max(press_ns - 2_000_000, entered_ns + 1)
+        release_event_ns = max(press_ns - 1_000_000, initial_press_ns + 1)
+        press_event_ns = max(press_ns, release_event_ns + 1)
+        self._queue_button_event(connection, 0b00010)
+        controller.poll_button_mask(now_ns=initial_press_ns)
+        self._queue_button_event(connection, 0)
+        controller.poll_button_mask(now_ns=release_event_ns)
+        self._queue_button_event(connection, 0b00010)
+        controller.poll_button_mask(now_ns=press_event_ns)
+
+    @staticmethod
+    def _calibration_observation(measurement_ns: int) -> CalibrationObservation:
+        return CalibrationObservation(
+            measurement_ns=measurement_ns,
+            error_x=20.0,
+            error_y=-16.0,
+            confidence=0.95,
+            exact_label=True,
+            unique_candidates=1,
+            self_safe=True,
+            is_prediction=False,
+            target_identity="stationary-target-1",
+            normalized_bbox=(0.40, 0.20, 0.60, 0.86),
+        )
 
     def _ready_calibrated_adapter(
         self,
@@ -1083,6 +1124,15 @@ class MakcuAimingTests(unittest.TestCase):
         active.responses.extend(bytes((0,)))
         self.assertEqual(controller.poll_button_mask(now_ns=now_ns + 10_000_000), 0)
 
+    def test_button_parser_reports_framed_provenance(self) -> None:
+        parser = _ButtonStreamParser()
+        self.assertEqual(parser.feed(bytes((0b00010,))), ((0b00010, False),))
+        parser.reset()
+        self.assertEqual(
+            parser.feed(b"km.buttons" + bytes((0b00010,)) + b"\r\n"),
+            ((0b00010, True),),
+        )
+
     def test_framed_button_masks_survive_split_reads_and_ignore_prompt_noise(self) -> None:
         controller = self.controller()
         controller.start()
@@ -1501,15 +1551,16 @@ class MakcuAimingTests(unittest.TestCase):
         controller._output_thread = live_worker
         token = controller.enter_calibration_mode()
         try:
-            controller.publish_calibration_lease(True, base_ns, token)
-            controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
             self.assertFalse(
                 controller._activation_pressed_at(base_ns + 1_000_000)
             )
             self.assertEqual(self._movement_writes(active), ())
 
-            self._queue_calibration_repress(active)
-            controller._output_tick(0.001, now_ns=base_ns + 2_000_000)
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns + 2_000_000,
+            )
             controller.publish_calibration_lease(
                 True,
                 base_ns + 2_000_000,
@@ -1527,6 +1578,258 @@ class MakcuAimingTests(unittest.TestCase):
             controller.exit_calibration_mode(token)
             controller._output_thread = None
             controller.stop()
+
+    def test_calibration_session_consumes_release_dwell_between_updates(self) -> None:
+        from tests.test_makcu_calibration_session import _binding
+
+        controller = self.controller(MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        started_ns = time.perf_counter_ns()
+        session = MakcuCalibrationSession(
+            controller,
+            _binding(),
+            started_ns=started_ns,
+        )
+        decision_ns = started_ns
+        try:
+            status = session.update_from_controller(
+                started_ns,
+                observation=self._calibration_observation(started_ns),
+            )
+            self.assertEqual(status.state, CalibrationSessionState.WAIT_RELEASE)
+            entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
+
+            release_ns = entered_ns + 1_000_000
+            press_ns = entered_ns + 101_000_000
+            self._queue_button_event(active, 0b00010)
+            controller._output_tick(0.0, now_ns=entered_ns + 500_000)
+            self._queue_button_event(active, 0)
+            controller._output_tick(0.0, now_ns=release_ns)
+            self._queue_button_event(active, 0b00010)
+            controller._output_tick(0.0, now_ns=press_ns)
+
+            decision_ns = press_ns + 1_000_000
+            status = session.update_from_controller(
+                decision_ns,
+                observation=self._calibration_observation(decision_ns),
+            )
+            raw = controller.raw_activation_snapshot
+            self.assertEqual(status.state, CalibrationSessionState.BASELINE_SETTLE)
+            self.assertTrue(raw.pressed)
+            self.assertEqual(raw.completed_release_started_ns, release_ns)
+            self.assertEqual(raw.completed_press_ns, press_ns)
+            self.assertEqual(controller.calibration_snapshot().emitted_events, ())
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            if not session.terminal:
+                session.abort("test cleanup", now_ns=decision_ns + 1_000_000)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_session_rejects_too_brief_dwell_between_updates(self) -> None:
+        from tests.test_makcu_calibration_session import _binding
+
+        controller = self.controller(MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        started_ns = time.perf_counter_ns()
+        session = MakcuCalibrationSession(
+            controller,
+            _binding(),
+            started_ns=started_ns,
+        )
+        decision_ns = started_ns
+        try:
+            session.update_from_controller(
+                started_ns,
+                observation=self._calibration_observation(started_ns),
+            )
+            entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
+
+            release_ns = entered_ns + 1_000_000
+            press_ns = release_ns + 40_000_000
+            self._queue_button_event(active, 0b00010)
+            controller._output_tick(0.0, now_ns=entered_ns + 500_000)
+            self._queue_button_event(active, 0)
+            controller._output_tick(0.0, now_ns=release_ns)
+            self._queue_button_event(active, 0b00010)
+            controller._output_tick(0.0, now_ns=press_ns)
+
+            decision_ns = press_ns + 1_000_000
+            status = session.update_from_controller(
+                decision_ns,
+                observation=self._calibration_observation(decision_ns),
+            )
+            self.assertEqual(status.state, CalibrationSessionState.WAIT_RELEASE)
+            self.assertIn("too brief", status.message.lower())
+            self.assertEqual(controller.calibration_snapshot().emitted_events, ())
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            if not session.terminal:
+                session.abort("test cleanup", now_ns=decision_ns + 1_000_000)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_silent_released_entry_requires_press_release_hold(self) -> None:
+        from tests.test_makcu_calibration_session import _binding
+
+        controller = self.controller(MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        preentry_ns = time.perf_counter_ns()
+        self._queue_button_event(active, 0)
+        controller.poll_button_mask(now_ns=preentry_ns)
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        started_ns = time.perf_counter_ns()
+        session = MakcuCalibrationSession(
+            controller,
+            _binding(),
+            started_ns=started_ns,
+        )
+        decision_ns = started_ns
+        try:
+            session.update_from_controller(
+                started_ns,
+                observation=self._calibration_observation(started_ns),
+            )
+            entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
+
+            # An event-driven board is silent while an already-released button
+            # remains released. Cached pre-entry zero must not start the dwell.
+            decision_ns = entered_ns + 500_000_000
+            status = session.update_from_controller(
+                decision_ns,
+                observation=self._calibration_observation(decision_ns),
+            )
+            raw = controller.raw_activation_snapshot
+            self.assertEqual(status.state, CalibrationSessionState.WAIT_RELEASE)
+            self.assertIn("press activation once", status.message.lower())
+            self.assertFalse(raw.post_entry_press_seen)
+            self.assertIsNone(raw.release_started_ns)
+            self.assertEqual(self._movement_writes(active), ())
+
+            initial_press_ns = entered_ns + 501_000_000
+            release_ns = entered_ns + 502_000_000
+            self._queue_button_event(active, 0b00010)
+            controller._output_tick(0.0, now_ns=initial_press_ns)
+            self._queue_button_event(active, 0)
+            controller._output_tick(0.0, now_ns=release_ns)
+
+            decision_ns = release_ns + 81_000_000
+            with mock.patch(
+                "aiming.makcu.time.perf_counter_ns",
+                return_value=decision_ns,
+            ):
+                status = session.update_from_controller(
+                    decision_ns,
+                    observation=self._calibration_observation(decision_ns),
+                )
+            self.assertEqual(status.state, CalibrationSessionState.WAIT_HOLD)
+            self.assertIn("release confirmed", status.message.lower())
+            self.assertEqual(self._movement_writes(active), ())
+
+            final_press_ns = decision_ns + 1_000_000
+            self._queue_button_event(active, 0b00010)
+            controller._output_tick(0.0, now_ns=final_press_ns)
+            decision_ns = final_press_ns + 1_000_000
+            status = session.update_from_controller(
+                decision_ns,
+                observation=self._calibration_observation(decision_ns),
+            )
+            self.assertEqual(status.state, CalibrationSessionState.BASELINE_SETTLE)
+            self.assertEqual(controller.calibration_snapshot().emitted_events, ())
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            if not session.terminal:
+                session.abort("test cleanup", now_ns=decision_ns + 1_000_000)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_rejects_standalone_control_bytes_as_proof(self) -> None:
+        from tests.test_makcu_calibration_session import _binding
+
+        controls = (
+            ("nul", b"\x00"),
+            ("ack", b"\x06"),
+            ("lf", b"\x0a"),
+            ("cr", b"\x0d"),
+            ("esc", b"\x1b"),
+            ("unit-separator", b"\x1f"),
+        )
+        for name, control in controls:
+            with self.subTest(control=name):
+                controller = self.controller(MakcuAimConfig(output_hz=1000))
+                controller.start(output_loop=False)
+                active = self.factory.connections[-1]
+                live_worker = mock.Mock()
+                live_worker.is_alive.return_value = True
+                controller._output_thread = live_worker
+                started_ns = time.perf_counter_ns()
+                session = MakcuCalibrationSession(
+                    controller,
+                    _binding(),
+                    started_ns=started_ns,
+                )
+                decision_ns = started_ns
+                try:
+                    session.update_from_controller(
+                        started_ns,
+                        observation=self._calibration_observation(started_ns),
+                    )
+                    entered_ns = (
+                        controller.raw_activation_snapshot.calibration_entered_ns
+                    )
+
+                    for offset_ms, payload in (
+                        (1, control),
+                        (2, b"\x02"),
+                        (3, b"\x00"),
+                        (103, b"\x02"),
+                    ):
+                        active.responses.extend(payload)
+                        controller._output_tick(
+                            0.0,
+                            now_ns=entered_ns + offset_ms * 1_000_000,
+                        )
+
+                    decision_ns = entered_ns + 104_000_000
+                    status = session.update_from_controller(
+                        decision_ns,
+                        observation=self._calibration_observation(decision_ns),
+                    )
+                    raw = controller.raw_activation_snapshot
+                    self.assertEqual(
+                        status.state,
+                        CalibrationSessionState.WAIT_RELEASE,
+                    )
+                    self.assertIn("press activation once", status.message.lower())
+                    self.assertFalse(raw.post_entry_press_seen)
+                    self.assertEqual(
+                        raw.framed_report_sequence,
+                        raw.calibration_entry_framed_report_sequence,
+                    )
+                    self.assertFalse(raw.last_report_framed)
+                    self.assertIsNone(raw.release_started_ns)
+                    self.assertIsNone(raw.completed_press_ns)
+                    self.assertEqual(controller.calibration_snapshot().emitted_events, ())
+                    self.assertEqual(self._movement_writes(active), ())
+                finally:
+                    if not session.terminal:
+                        session.abort(
+                            "test cleanup",
+                            now_ns=decision_ns + 1_000_000,
+                        )
+                    controller._output_thread = None
+                    controller.stop()
 
     def test_calibration_excludes_normal_output_and_rejects_token_misuse(self) -> None:
         controller = self.controller(
@@ -1577,9 +1880,14 @@ class MakcuAimingTests(unittest.TestCase):
             controller.stop()
 
     def test_calibration_rejects_pulse_bounds_and_parallel_axes(self) -> None:
-        controller, _active, token = self._start_test_calibration()
+        controller, active, token = self._start_test_calibration()
         base_ns = 20_000_000_000
         try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns,
+            )
             controller.publish_calibration_lease(True, base_ns, token)
             with self.assertRaisesRegex(ValueError, "axis"):
                 controller.request_calibration_pulse("z", 1, 1000.0, token)
@@ -1620,7 +1928,6 @@ class MakcuAimingTests(unittest.TestCase):
 
     def test_calibration_session_budget_uses_actual_absolute_counts(self) -> None:
         controller, active, token = self._start_test_calibration()
-        self._queue_calibration_repress(active)
         base_ns = 30_000_000_000
         now_ns = base_ns
         # At the validated low-end response of 0.10 px/count, a 120-count
@@ -1665,6 +1972,11 @@ class MakcuAimingTests(unittest.TestCase):
             CALIBRATION_MAX_SESSION_ABS_COUNTS,
         )
         try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns,
+            )
             for axis, counts in excursions:
                 controller.publish_calibration_lease(True, now_ns, token)
                 controller.request_calibration_pulse(
@@ -1706,9 +2018,13 @@ class MakcuAimingTests(unittest.TestCase):
 
     def test_calibration_snapshot_records_exact_successful_emission_order(self) -> None:
         controller, active, token = self._start_test_calibration()
-        self._queue_calibration_repress(active)
         base_ns = 40_000_000_000
         try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns,
+            )
             controller.publish_calibration_lease(True, base_ns, token)
             controller.request_calibration_pulse("x", 5, 2400.0, token)
             for offset_ms in (1, 2, 3):
@@ -1766,8 +2082,12 @@ class MakcuAimingTests(unittest.TestCase):
     def test_calibration_release_aborts_partial_pulse_without_return_motion(self) -> None:
         controller, active, token = self._start_test_calibration()
         base_ns = 50_000_000_000
-        self._queue_calibration_repress(active)
         try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns,
+            )
             controller.publish_calibration_lease(True, base_ns, token)
             controller.request_calibration_pulse("x", 10, 1000.0, token)
             controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
@@ -1804,11 +2124,133 @@ class MakcuAimingTests(unittest.TestCase):
             controller._output_thread = None
             controller.stop()
 
+    def test_calibration_coalesced_release_repress_aborts_before_write(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
+        press_ns = entered_ns + 2_000_000
+        try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=press_ns,
+            )
+            held_transition = (
+                controller.raw_activation_snapshot.completed_press_transition_sequence
+            )
+            assert held_transition is not None
+            controller.publish_calibration_lease(
+                True,
+                press_ns,
+                token,
+                activation_transition_sequence=held_transition,
+            )
+            controller.request_calibration_pulse("x", 10, 1000.0, token)
+            before = controller.raw_activation_snapshot
+
+            # Both reports are consumed in one serial read. The final level is
+            # pressed, but the intervening release must still revoke the lease.
+            self._queue_calibration_repress(active)
+            controller._output_tick(0.001, now_ns=press_ns + 1_000_000)
+
+            raw = controller.raw_activation_snapshot
+            snapshot = controller.calibration_snapshot()
+            self.assertTrue(raw.pressed)
+            self.assertEqual(raw.report_sequence, before.report_sequence + 2)
+            self.assertEqual(
+                raw.transition_sequence,
+                before.transition_sequence + 2,
+            )
+            self.assertEqual(snapshot.pending_counts, 0)
+            self.assertEqual(snapshot.emitted_events, ())
+            self.assertIn(
+                "physical activation was released",
+                snapshot.abort_reason or "",
+            )
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_lease_rejects_changed_hold_transition(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
+        press_ns = entered_ns + 2_000_000
+        try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=press_ns,
+            )
+            expected = (
+                controller.raw_activation_snapshot.completed_press_transition_sequence
+            )
+            assert expected is not None
+
+            self._queue_calibration_repress(active)
+            controller.poll_button_mask(now_ns=press_ns + 1_000_000)
+            with self.assertRaisesRegex(MakcuError, "hold transition changed"):
+                controller.publish_calibration_lease(
+                    True,
+                    press_ns + 1_000_000,
+                    token,
+                    activation_transition_sequence=expected,
+                )
+
+            snapshot = controller.calibration_snapshot()
+            self.assertEqual(snapshot.emitted_events, ())
+            self.assertEqual(snapshot.pending_counts, 0)
+            self.assertIn("hold transition changed", snapshot.abort_reason or "")
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_lease_rejects_legacy_naked_button_proof(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
+        try:
+            for offset_ms, payload in (
+                (1, b"\x02"),
+                (2, b"\x00"),
+                (102, b"\x02"),
+            ):
+                active.responses.extend(payload)
+                controller._output_tick(
+                    0.0,
+                    now_ns=entered_ns + offset_ms * 1_000_000,
+                )
+
+            raw = controller.raw_activation_snapshot
+            self.assertTrue(raw.pressed)
+            self.assertFalse(raw.post_entry_press_seen)
+            self.assertEqual(
+                raw.framed_report_sequence,
+                raw.calibration_entry_framed_report_sequence,
+            )
+            with self.assertRaisesRegex(MakcuError, "fresh release/hold transition"):
+                controller.publish_calibration_lease(
+                    True,
+                    entered_ns + 102_000_000,
+                    token,
+                )
+            self.assertEqual(controller.calibration_snapshot().emitted_events, ())
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
     def test_calibration_stale_lease_aborts_before_any_motion(self) -> None:
         controller, active, token = self._start_test_calibration()
         base_ns = 60_000_000_000
-        self._queue_calibration_repress(active)
         try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns,
+            )
             controller.publish_calibration_lease(True, base_ns, token)
             controller.request_calibration_pulse("x", 10, 1000.0, token)
             stale_ns = base_ns + round(
@@ -1830,6 +2272,11 @@ class MakcuAimingTests(unittest.TestCase):
         controller, active, token = self._start_test_calibration()
         base_ns = 70_000_000_000
         try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns,
+            )
             controller.publish_calibration_lease(True, base_ns, token)
             controller.request_calibration_pulse("y", -10, 1000.0, token)
             controller.publish_calibration_lease(False, base_ns + 1, token)
@@ -1849,8 +2296,12 @@ class MakcuAimingTests(unittest.TestCase):
     def test_calibration_write_failure_is_excluded_from_evidence_and_aborts(self) -> None:
         controller, active, token = self._start_test_calibration()
         base_ns = 80_000_000_000
-        self._queue_calibration_repress(active)
         try:
+            self._establish_calibration_hold(
+                controller,
+                active,
+                press_ns=base_ns,
+            )
             controller.publish_calibration_lease(True, base_ns, token)
             controller.request_calibration_pulse("x", 10, 1000.0, token)
             with (
@@ -1881,7 +2332,11 @@ class MakcuAimingTests(unittest.TestCase):
     def test_calibration_stop_invalidates_token_and_restart_erases_evidence(self) -> None:
         controller, active, old_token = self._start_test_calibration()
         base_ns = 90_000_000_000
-        self._queue_calibration_repress(active)
+        self._establish_calibration_hold(
+            controller,
+            active,
+            press_ns=base_ns,
+        )
         controller.publish_calibration_lease(True, base_ns, old_token)
         controller.request_calibration_pulse("x", 10, 1000.0, old_token)
         controller._output_tick(0.001, now_ns=base_ns + 1_000_000)

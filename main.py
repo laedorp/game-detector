@@ -612,6 +612,7 @@ def _apply_hard_aim_guard(
     self_zone,
     aim_label: str,
     configured_confidence: float | None = None,
+    confirmed_self_detection=None,
 ) -> HardAimGuardResult:
     """Apply the existing conservative aim guard and attribute exact labels.
 
@@ -620,7 +621,7 @@ def _apply_hard_aim_guard(
     grace for a genuinely empty target-label sample.
     """
 
-    from utils.self_filter import is_player_like
+    from utils.self_filter import boxes_are_safely_distinct, is_player_like
 
     source = tuple(detections)
     if self_zone is None or not source:
@@ -638,9 +639,25 @@ def _apply_hard_aim_guard(
     guarded: list[object] = []
     removed_exact_label_boxes = 0
     for detection in source:
-        drop_for_aim = (
+        zone_candidate = (
             is_player_like(detection)
             and self_zone.candidate_score(detection.box, frame_shape) is not None
+        )
+        # Once the temporal filter has positively removed one confirmed self
+        # box, broad zone membership alone is no longer enough to call every
+        # remaining player "self".  Keep a distinct opponent, while still
+        # suppressing overlapping/associated duplicate detections of the
+        # confirmed avatar.  Invalid geometry remains guarded fail-closed.
+        drop_for_aim = bool(
+            zone_candidate
+            and (
+                confirmed_self_detection is None
+                or not boxes_are_safely_distinct(
+                    confirmed_self_detection.box,
+                    detection.box,
+                    frame_shape,
+                )
+            )
         )
         if drop_for_aim:
             if detection.class_name.strip().lower() == normalized_aim_label:
@@ -910,7 +927,8 @@ def _makcu_telemetry_summary(previous, current, elapsed_seconds: float) -> str:
         else 0.0
     )
     return (
-        f"MAKCU loop {ticks / elapsed:.0f} Hz | button {duty('button_pressed_ticks'):.0f}% | "
+        f"MAKCU loop {ticks / elapsed:.0f} Hz | "
+        f"button gate {duty('button_pressed_ticks'):.0f}% | "
         f"target {duty('target_present_ticks'):.0f}% | "
         f"fresh {duty('fresh_target_ticks'):.0f}% | "
         f"authorized {duty('authorized_ticks'):.0f}% | "
@@ -1834,6 +1852,13 @@ def run(config: AppConfig) -> int:
                     self_zone=self_zone,
                     aim_label=config.aim_label,
                     configured_confidence=aim_configured_confidence,
+                    confirmed_self_detection=(
+                        exclusion.ignored_detection
+                        if exclusion.aim_safe
+                        and exclusion.ignored_count == 1
+                        and exclusion.ignored_detection is not None
+                        else None
+                    ),
                 )
                 aim_detections, aim_continuation_detections = (
                     _partition_detections_by_confidence(
@@ -2085,8 +2110,14 @@ def run(config: AppConfig) -> int:
                     makcu_report_snapshot = current_telemetry
                     makcu_report_ns = telemetry_snapshot_ns
                 if calibration_status is not None:
+                    assert isinstance(aim_controller, MakcuAimingController)
+                    raw_known, raw_pressed = aim_controller.raw_activation_state
+                    raw_button_state = (
+                        "pressed" if raw_pressed else "released"
+                    ) if raw_known else "unknown"
                     summary += (
                         f" | CAL {calibration_status.state.value} | "
+                        f"raw button {raw_button_state} | "
                         f"counts {calibration_status.emitted_abs_counts}/2400 | "
                         "qualifying X +/- "
                         f"{calibration_status.qualifying_x_positive}/"

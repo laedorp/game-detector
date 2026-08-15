@@ -17,6 +17,7 @@ from utils.render import console_summary
 from utils.self_filter import (
     NormalizedBottomZone,
     SelfAvatarFilter,
+    boxes_are_safely_distinct,
     exclude_self_avatar,
     is_player_like,
 )
@@ -169,6 +170,45 @@ class NormalizedBottomZoneTests(unittest.TestCase):
     def test_invalid_frame_shapes_are_rejected(self) -> None:
         with self.assertRaises(ValueError):
             self.zone.pixel_bounds((0, 1920, 3))
+
+    def test_distinct_box_check_rejects_duplicates_but_allows_separate_player(
+        self,
+    ) -> None:
+        confirmed = (430, 560, 850, 1080)
+        overlapping_duplicate = (440, 570, 860, 1080)
+        nested_duplicate = (560, 700, 760, 1050)
+        separate_opponent = (850, 600, 1050, 1080)
+
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                confirmed,
+                overlapping_duplicate,
+                (1080, 1920, 3),
+            )
+        )
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                confirmed,
+                nested_duplicate,
+                (1080, 1920, 3),
+            )
+        )
+        self.assertTrue(
+            boxes_are_safely_distinct(
+                confirmed,
+                separate_opponent,
+                (1080, 1920, 3),
+            )
+        )
+
+    def test_malformed_box_is_never_declared_safely_distinct(self) -> None:
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                (430, 560, 850, 1080),
+                (math.nan, 600, 1050, 1080),
+                (1080, 1920, 3),
+            )
+        )
 
 
 class StatefulSelfAvatarFilterTests(unittest.TestCase):

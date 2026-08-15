@@ -126,7 +126,7 @@ class _ButtonStreamParser:
                 return length
         return 0
 
-    def feed(self, data: bytes) -> tuple[int, ...]:
+    def feed(self, data: bytes) -> tuple[tuple[int, bool], ...]:
         bare_mask = (
             not self._framed_mode
             and not self._pending
@@ -135,7 +135,7 @@ class _ButtonStreamParser:
         )
         if data:
             self._pending.extend(data)
-        masks: list[int] = []
+        reports: list[tuple[int, bool]] = []
         while self._pending:
             index = self._pending.find(_BUTTON_FRAME_PREFIX)
             if index < 0:
@@ -144,7 +144,7 @@ class _ButtonStreamParser:
                 # Once a framed stream is observed, split CR/LF/prompt bytes
                 # must never be reclassified as physical mouse state.
                 if bare_mask and len(self._pending) == 1:
-                    masks.append(self._pending[0])
+                    reports.append((self._pending[0], False))
                     self._pending.clear()
                     break
                 tail_length = self._prefix_tail_length(self._pending)
@@ -180,7 +180,7 @@ class _ButtonStreamParser:
                 break
             value = self._pending[value_index]
             if value <= 0x1F:
-                masks.append(value)
+                reports.append((value, True))
                 del self._pending[: value_index + 1]
                 continue
 
@@ -192,7 +192,7 @@ class _ButtonStreamParser:
         if len(self._pending) > 256:
             # A malformed/noisy device must not grow this buffer forever.
             del self._pending[:-32]
-        return tuple(masks)
+        return tuple(reports)
 
 
 def _canonical_port(path: str) -> str:
@@ -425,6 +425,188 @@ class MakcuCalibrationSnapshot:
     abort_reason: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class MakcuRawActivationSnapshot:
+    """Immutable raw button evidence for one exclusive calibration epoch.
+
+    The serial worker can observe a complete release/repress cycle between two
+    detector callbacks. Keeping its transition timestamps lets calibration
+    prove the released dwell instead of sampling only the final button level.
+    """
+
+    captured_ns: int
+    calibration_epoch: int
+    calibration_entered_ns: int
+    calibration_entry_report_sequence: int
+    calibration_entry_framed_report_sequence: int
+    calibration_entry_transition_sequence: int
+    active: bool
+    known: bool
+    pressed: bool
+    report_sequence: int
+    framed_report_sequence: int
+    transition_sequence: int
+    last_report_framed: bool | None = None
+    post_entry_press_seen: bool = False
+    continuous_state_since_ns: int | None = None
+    release_started_ns: int | None = None
+    release_started_report_sequence: int | None = None
+    completed_release_started_ns: int | None = None
+    completed_release_report_sequence: int | None = None
+    completed_press_ns: int | None = None
+    completed_press_report_sequence: int | None = None
+    completed_press_transition_sequence: int | None = None
+
+    def __post_init__(self) -> None:
+        for name in (
+            "captured_ns",
+            "calibration_epoch",
+            "calibration_entered_ns",
+            "calibration_entry_report_sequence",
+            "calibration_entry_framed_report_sequence",
+            "calibration_entry_transition_sequence",
+            "report_sequence",
+            "framed_report_sequence",
+            "transition_sequence",
+        ):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be a non-negative integer")
+        for name in ("active", "known", "pressed"):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be bool")
+        if self.pressed and not self.known:
+            raise ValueError("an unknown raw activation state cannot be pressed")
+        if self.active and self.calibration_entered_ns <= 0:
+            raise ValueError("active calibration requires its entry timestamp")
+        if self.calibration_entered_ns > self.captured_ns:
+            raise ValueError("calibration entry cannot be later than captured_ns")
+        if self.calibration_entry_report_sequence > self.report_sequence:
+            raise ValueError("calibration entry report sequence exceeds current reports")
+        if (
+            self.calibration_entry_framed_report_sequence
+            > self.framed_report_sequence
+        ):
+            raise ValueError(
+                "calibration entry framed-report sequence exceeds framed reports"
+            )
+        if self.framed_report_sequence > self.report_sequence:
+            raise ValueError("framed report sequence exceeds all reports")
+        if self.calibration_entry_transition_sequence > self.transition_sequence:
+            raise ValueError(
+                "calibration entry transition sequence exceeds current transitions"
+            )
+        if self.transition_sequence > self.report_sequence:
+            raise ValueError("activation transition sequence exceeds reports")
+        if self.last_report_framed is not None and not isinstance(
+            self.last_report_framed, bool
+        ):
+            raise TypeError("last_report_framed must be bool or None")
+        if (self.report_sequence == 0) != (self.last_report_framed is None):
+            raise ValueError("last-report provenance must match report availability")
+        if not isinstance(self.post_entry_press_seen, bool):
+            raise TypeError("post_entry_press_seen must be bool")
+        if self.post_entry_press_seen and (
+            not self.active
+            or self.framed_report_sequence
+            <= self.calibration_entry_framed_report_sequence
+        ):
+            raise ValueError("post-entry press requires a fresh framed report")
+        for name in (
+            "continuous_state_since_ns",
+            "release_started_ns",
+            "completed_release_started_ns",
+            "completed_press_ns",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer or None")
+            if value is not None and value > self.captured_ns:
+                raise ValueError(f"{name} cannot be later than captured_ns")
+            if (
+                self.active
+                and value is not None
+                and value < self.calibration_entered_ns
+                and name != "continuous_state_since_ns"
+            ):
+                raise ValueError(f"{name} cannot predate calibration entry")
+        for name in (
+            "release_started_report_sequence",
+            "completed_release_report_sequence",
+            "completed_press_report_sequence",
+            "completed_press_transition_sequence",
+        ):
+            value = getattr(self, name)
+            if value is not None and (
+                isinstance(value, bool) or not isinstance(value, int) or value < 0
+            ):
+                raise ValueError(f"{name} must be a non-negative integer or None")
+        if (self.release_started_ns is None) != (
+            self.release_started_report_sequence is None
+        ):
+            raise ValueError("live release timestamp/report sequence must be paired")
+        completed = (
+            self.completed_release_started_ns,
+            self.completed_release_report_sequence,
+            self.completed_press_ns,
+            self.completed_press_report_sequence,
+            self.completed_press_transition_sequence,
+        )
+        if any(value is None for value in completed) != all(
+            value is None for value in completed
+        ):
+            raise ValueError("completed release/press evidence must be complete")
+        if (
+            completed[0] is not None
+            and completed[2] is not None
+            and completed[2] < completed[0]
+        ):
+            raise ValueError("completed press cannot precede its release")
+        if self.release_started_report_sequence is not None and not (
+            self.calibration_entry_framed_report_sequence
+            < self.release_started_report_sequence
+            <= self.framed_report_sequence
+        ):
+            raise ValueError(
+                "live release framed report is outside the calibration epoch"
+            )
+        if completed[1] is not None and completed[3] is not None:
+            if not (
+                self.calibration_entry_framed_report_sequence
+                < completed[1]
+                <= completed[3]
+                <= self.framed_report_sequence
+            ):
+                raise ValueError(
+                    "completed release/press framed reports are outside the "
+                    "calibration epoch"
+                )
+        if completed[4] is not None and not (
+            self.calibration_entry_transition_sequence
+            < completed[4]
+            <= self.transition_sequence
+        ):
+            raise ValueError(
+                "completed press transition is outside the calibration epoch"
+            )
+        if self.pressed and completed[4] is not None and (
+            completed[4] != self.transition_sequence
+        ):
+            raise ValueError("pressed state does not match the completed hold transition")
+        if not self.active and any(value is not None for value in completed):
+            raise ValueError("inactive calibration cannot retain a completed cycle")
+        if not self.active and self.release_started_ns is not None:
+            raise ValueError("inactive calibration cannot retain a live release")
+        if self.release_started_ns is not None and (
+            not self.active or not self.known or self.pressed
+        ):
+            raise ValueError("a live release requires known released calibration state")
+        if self.known and self.continuous_state_since_ns is None:
+            raise ValueError("known raw activation requires a state timestamp")
+
+
 def makcu_target_delta(
     target: Detection | None,
     frame_shape: tuple[int, ...],
@@ -552,6 +734,25 @@ class MakcuAimingController:
         self._button_state_known = False
         self._activation_started_ns = 0
         self._activation_requires_release = False
+        self._activation_report_sequence = 0
+        self._activation_framed_report_sequence = 0
+        self._activation_transition_sequence = 0
+        self._activation_last_report_ns = 0
+        self._activation_last_report_framed: bool | None = None
+        self._activation_continuous_state_since_ns: int | None = None
+        self._calibration_activation_epoch = 0
+        self._calibration_activation_entered_ns = 0
+        self._calibration_entry_report_sequence = 0
+        self._calibration_entry_framed_report_sequence = 0
+        self._calibration_entry_transition_sequence = 0
+        self._calibration_post_entry_press_seen = False
+        self._calibration_release_started_ns: int | None = None
+        self._calibration_release_started_report_sequence: int | None = None
+        self._calibration_completed_release_started_ns: int | None = None
+        self._calibration_completed_release_report_sequence: int | None = None
+        self._calibration_completed_press_ns: int | None = None
+        self._calibration_completed_press_report_sequence: int | None = None
+        self._calibration_completed_press_transition_sequence: int | None = None
         self._button_parser = _ButtonStreamParser()
         self._serial_lock = threading.Lock()
         self._connection_close_lock = threading.Lock()
@@ -595,6 +796,7 @@ class MakcuAimingController:
         self._calibration_lease_token: object | None = None
         self._calibration_lease_valid = False
         self._calibration_lease_measurement_ns = 0
+        self._calibration_hold_transition_sequence: int | None = None
         self._calibration_pending_token: object | None = None
         self._calibration_pending_axis: str | None = None
         self._calibration_pending_counts = 0
@@ -765,9 +967,22 @@ class MakcuAimingController:
         """Invalidate every prior token and erase its evidence before a restart."""
 
         self._calibration_token = None
+        self._calibration_activation_entered_ns = 0
+        self._calibration_entry_report_sequence = 0
+        self._calibration_entry_framed_report_sequence = 0
+        self._calibration_entry_transition_sequence = 0
+        self._calibration_post_entry_press_seen = False
+        self._calibration_release_started_ns = None
+        self._calibration_release_started_report_sequence = None
+        self._calibration_completed_release_started_ns = None
+        self._calibration_completed_release_report_sequence = None
+        self._calibration_completed_press_ns = None
+        self._calibration_completed_press_report_sequence = None
+        self._calibration_completed_press_transition_sequence = None
         self._calibration_lease_token = None
         self._calibration_lease_valid = False
         self._calibration_lease_measurement_ns = 0
+        self._calibration_hold_transition_sequence = None
         self._clear_calibration_pending_locked()
         self._calibration_emitted_x = 0
         self._calibration_emitted_y = 0
@@ -793,6 +1008,7 @@ class MakcuAimingController:
         self._calibration_lease_token = None
         self._calibration_lease_valid = False
         self._calibration_lease_measurement_ns = 0
+        self._calibration_hold_transition_sequence = None
         self._clear_calibration_pending_locked()
         self._clear_normal_motion_locked()
         if deactivate:
@@ -830,6 +1046,26 @@ class MakcuAimingController:
             token = object()
             self._reset_calibration_session_locked()
             self._calibration_token = token
+            self._calibration_activation_epoch += 1
+            entered_ns = time.perf_counter_ns()
+            self._calibration_activation_entered_ns = entered_ns
+            self._calibration_entry_report_sequence = self._activation_report_sequence
+            self._calibration_entry_framed_report_sequence = (
+                self._activation_framed_report_sequence
+            )
+            self._calibration_entry_transition_sequence = (
+                self._activation_transition_sequence
+            )
+            self._calibration_post_entry_press_seen = False
+            # Only a report received after exclusive entry can begin the
+            # release proof. A cached pre-entry zero is not fresh evidence.
+            self._calibration_release_started_ns = None
+            self._calibration_release_started_report_sequence = None
+            self._calibration_completed_release_started_ns = None
+            self._calibration_completed_release_report_sequence = None
+            self._calibration_completed_press_ns = None
+            self._calibration_completed_press_report_sequence = None
+            self._calibration_completed_press_transition_sequence = None
             # Calibration requires an unambiguous physical action after the
             # exclusive mode begins. A button which was already held cannot
             # authorize a pulse until its release and a new press are observed.
@@ -853,6 +1089,8 @@ class MakcuAimingController:
         valid: bool,
         measurement_ns: int,
         token: object,
+        *,
+        activation_transition_sequence: int | None = None,
     ) -> None:
         """Publish one detector-timestamped quality lease for the pulse worker."""
 
@@ -862,6 +1100,14 @@ class MakcuAimingController:
             raise TypeError("calibration lease timestamp must be an integer")
         if measurement_ns < 0:
             raise ValueError("calibration lease timestamp cannot be negative")
+        if activation_transition_sequence is not None and (
+            isinstance(activation_transition_sequence, bool)
+            or not isinstance(activation_transition_sequence, int)
+            or activation_transition_sequence < 0
+        ):
+            raise ValueError(
+                "activation_transition_sequence must be a non-negative integer or None"
+            )
         with self._state_lock:
             self._require_calibration_token_locked(token)
             if self._worker_error is not None:
@@ -881,6 +1127,68 @@ class MakcuAimingController:
                 and measurement_ns < self._calibration_lease_measurement_ns
             ):
                 raise ValueError("calibration lease timestamps must not move backwards")
+            if valid:
+                raw_pressed = bool(
+                    self._button_state_known
+                    and self._button_mask
+                    & (1 << self.config.activation_button)
+                )
+                if not raw_pressed or self._activation_requires_release:
+                    self._abort_calibration_locked(
+                        "calibration lease requires a fresh physical hold"
+                    )
+                    raise MakcuError(
+                        "MAKCU calibration lease requires a fresh physical hold"
+                    )
+                if (
+                    not self._calibration_post_entry_press_seen
+                    or self._calibration_completed_release_started_ns is None
+                    or self._calibration_completed_release_report_sequence is None
+                    or self._calibration_completed_press_ns is None
+                    or self._calibration_completed_press_report_sequence is None
+                    or self._calibration_completed_press_transition_sequence is None
+                    or self._calibration_completed_release_started_ns
+                    < self._calibration_activation_entered_ns
+                    or self._calibration_completed_release_report_sequence
+                    <= self._calibration_entry_framed_report_sequence
+                    or self._calibration_completed_press_report_sequence
+                    < self._calibration_completed_release_report_sequence
+                    or self._calibration_completed_press_transition_sequence
+                    != self._activation_transition_sequence
+                    or self._activation_framed_report_sequence
+                    <= self._calibration_entry_framed_report_sequence
+                ):
+                    self._abort_calibration_locked(
+                        "calibration lease lacks a fresh release/hold transition"
+                    )
+                    raise MakcuError(
+                        "MAKCU calibration lease lacks a fresh release/hold transition"
+                    )
+                if (
+                    activation_transition_sequence is not None
+                    and activation_transition_sequence
+                    != self._calibration_completed_press_transition_sequence
+                ):
+                    self._abort_calibration_locked(
+                        "calibration hold transition changed before lease commit"
+                    )
+                    raise MakcuError(
+                        "MAKCU calibration hold transition changed before lease commit"
+                    )
+                if self._calibration_hold_transition_sequence is None:
+                    self._calibration_hold_transition_sequence = (
+                        self._calibration_completed_press_transition_sequence
+                    )
+                elif (
+                    self._activation_transition_sequence
+                    != self._calibration_hold_transition_sequence
+                ):
+                    self._abort_calibration_locked(
+                        "physical activation changed after calibration hold"
+                    )
+                    raise MakcuError(
+                        "MAKCU calibration activation changed after its hold"
+                    )
             self._calibration_lease_token = token
             self._calibration_lease_valid = valid
             self._calibration_lease_measurement_ns = measurement_ns
@@ -939,6 +1247,17 @@ class MakcuAimingController:
                 or self._calibration_lease_token is not token
             ):
                 raise MakcuError("a valid calibration lease is required before a pulse")
+            if (
+                self._calibration_hold_transition_sequence is None
+                or self._activation_transition_sequence
+                != self._calibration_hold_transition_sequence
+            ):
+                self._abort_calibration_locked(
+                    "physical activation changed before calibration pulse"
+                )
+                raise MakcuError(
+                    "physical activation changed before calibration pulse"
+                )
             if (
                 self._calibration_emitted_abs_counts + abs(signed_counts)
                 > CALIBRATION_MAX_SESSION_ABS_COUNTS
@@ -1171,6 +1490,25 @@ class MakcuAimingController:
         self._button_state_known = False
         self._activation_started_ns = 0
         self._activation_requires_release = False
+        self._activation_report_sequence = 0
+        self._activation_framed_report_sequence = 0
+        self._activation_transition_sequence = 0
+        self._activation_last_report_ns = 0
+        self._activation_last_report_framed = None
+        self._activation_continuous_state_since_ns = None
+        self._calibration_activation_entered_ns = 0
+        self._calibration_entry_report_sequence = 0
+        self._calibration_entry_framed_report_sequence = 0
+        self._calibration_entry_transition_sequence = 0
+        self._calibration_post_entry_press_seen = False
+        self._calibration_release_started_ns = None
+        self._calibration_release_started_report_sequence = None
+        self._calibration_completed_release_started_ns = None
+        self._calibration_completed_release_report_sequence = None
+        self._calibration_completed_press_ns = None
+        self._calibration_completed_press_report_sequence = None
+        self._calibration_completed_press_transition_sequence = None
+        self._calibration_hold_transition_sequence = None
         self._button_parser.reset()
         self._worker_error = None
         self._latest_target = None
@@ -1221,22 +1559,90 @@ class MakcuAimingController:
                 data = self._serial.read(available) if available else b""
         except (OSError, ValueError) as exc:
             raise MakcuError(f"MAKCU button read failed: {exc}") from exc
-        for value in self._button_parser.feed(data):
-            with self._state_lock:
+        reports = self._button_parser.feed(data)
+        if not reports:
+            return
+        # Apply one serial read atomically to controller state. In particular,
+        # a coalesced release/repress pair must latch the release before its
+        # final pressed level can be considered by the pulse worker.
+        with self._state_lock:
+            for value, is_framed in reports:
+                event_ns = max(
+                    current_ns,
+                    self._activation_last_report_ns,
+                    self._calibration_activation_entered_ns,
+                )
+                self._activation_last_report_ns = event_ns
+                was_known = self._button_state_known
                 was_pressed = bool(
-                    self._button_state_known
+                    was_known
                     and self._button_mask & (1 << self.config.activation_button)
                 )
+                self._activation_report_sequence += 1
+                if is_framed:
+                    self._activation_framed_report_sequence += 1
+                self._activation_last_report_framed = is_framed
                 self._button_mask = value & 0x1F
                 self._button_state_known = True
                 is_pressed = bool(
                     self._button_mask & (1 << self.config.activation_button)
                 )
+                if not was_known or is_pressed != was_pressed:
+                    self._activation_transition_sequence += 1
+                    self._activation_continuous_state_since_ns = event_ns
+                if (
+                    self._calibration_token is not None
+                    and not is_pressed
+                    and (
+                        self._calibration_lease_valid
+                        or self._calibration_pending_counts
+                        or self._calibration_hold_transition_sequence is not None
+                    )
+                ):
+                    # Release safety applies to every accepted report, including
+                    # legacy naked masks. Framing is required only for arming
+                    # new calibration movement, never for revoking it.
+                    self._abort_calibration_locked(
+                        "physical activation was released"
+                    )
+                calibration_report_is_fresh_and_framed = bool(
+                    self._calibration_token is not None
+                    and is_framed
+                    and current_ns >= self._calibration_activation_entered_ns
+                )
+                if calibration_report_is_fresh_and_framed:
+                    if is_pressed:
+                        self._calibration_post_entry_press_seen = True
+                    if not is_pressed:
+                        if (
+                            self._calibration_post_entry_press_seen
+                            and self._calibration_release_started_ns is None
+                        ):
+                            self._calibration_release_started_ns = event_ns
+                            self._calibration_release_started_report_sequence = (
+                                self._activation_framed_report_sequence
+                            )
+                    elif self._calibration_release_started_ns is not None:
+                        self._calibration_completed_release_started_ns = (
+                            self._calibration_release_started_ns
+                        )
+                        self._calibration_completed_release_report_sequence = (
+                            self._calibration_release_started_report_sequence
+                        )
+                        self._calibration_completed_press_ns = event_ns
+                        self._calibration_completed_press_report_sequence = (
+                            self._activation_framed_report_sequence
+                        )
+                        self._calibration_completed_press_transition_sequence = (
+                            self._activation_transition_sequence
+                        )
+                        self._calibration_release_started_ns = None
+                        self._calibration_release_started_report_sequence = None
                 if not is_pressed:
                     self._activation_started_ns = 0
                     self._activation_requires_release = False
                 elif not was_pressed and not self._activation_requires_release:
-                    self._activation_started_ns = current_ns
+                    self._activation_started_ns = event_ns
                 # Even a release/repress pair which ends in the same mask must
                 # invalidate a normal decision computed before those physical
                 # events.
@@ -1289,6 +1695,88 @@ class MakcuAimingController:
                 and self._button_mask & (1 << self.config.activation_button)
             )
             return known, pressed
+
+    @property
+    def raw_activation_snapshot(self) -> MakcuRawActivationSnapshot:
+        """Return lossless raw transition evidence for active calibration."""
+
+        with self._state_lock:
+            captured_ns = max(
+                time.perf_counter_ns(),
+                self._calibration_activation_entered_ns,
+                self._activation_last_report_ns,
+                self._activation_continuous_state_since_ns or 0,
+                self._calibration_release_started_ns or 0,
+                self._calibration_completed_press_ns or 0,
+            )
+            active = self._calibration_token is not None
+            known = self._button_state_known
+            pressed = bool(
+                known
+                and self._button_mask & (1 << self.config.activation_button)
+            )
+            return MakcuRawActivationSnapshot(
+                captured_ns=captured_ns,
+                calibration_epoch=self._calibration_activation_epoch,
+                calibration_entered_ns=(
+                    self._calibration_activation_entered_ns if active else 0
+                ),
+                calibration_entry_report_sequence=(
+                    self._calibration_entry_report_sequence if active else 0
+                ),
+                calibration_entry_framed_report_sequence=(
+                    self._calibration_entry_framed_report_sequence
+                    if active
+                    else 0
+                ),
+                calibration_entry_transition_sequence=(
+                    self._calibration_entry_transition_sequence if active else 0
+                ),
+                active=active,
+                known=known,
+                pressed=pressed,
+                report_sequence=self._activation_report_sequence,
+                framed_report_sequence=self._activation_framed_report_sequence,
+                transition_sequence=self._activation_transition_sequence,
+                last_report_framed=self._activation_last_report_framed,
+                post_entry_press_seen=(
+                    self._calibration_post_entry_press_seen if active else False
+                ),
+                continuous_state_since_ns=(
+                    self._activation_continuous_state_since_ns if known else None
+                ),
+                release_started_ns=(
+                    self._calibration_release_started_ns if active else None
+                ),
+                release_started_report_sequence=(
+                    self._calibration_release_started_report_sequence
+                    if active
+                    else None
+                ),
+                completed_release_started_ns=(
+                    self._calibration_completed_release_started_ns
+                    if active
+                    else None
+                ),
+                completed_release_report_sequence=(
+                    self._calibration_completed_release_report_sequence
+                    if active
+                    else None
+                ),
+                completed_press_ns=(
+                    self._calibration_completed_press_ns if active else None
+                ),
+                completed_press_report_sequence=(
+                    self._calibration_completed_press_report_sequence
+                    if active
+                    else None
+                ),
+                completed_press_transition_sequence=(
+                    self._calibration_completed_press_transition_sequence
+                    if active
+                    else None
+                ),
+            )
 
     def poll_button_mask(self, *, now_ns: int | None = None) -> int:
         """Read pending physical button reports and return the latest 5-bit mask."""
@@ -1466,6 +1954,15 @@ class MakcuAimingController:
                 return
             if not self._calibration_lease_valid:
                 self._abort_calibration_locked("calibration lease is invalid")
+                return
+            if (
+                self._calibration_hold_transition_sequence is None
+                or self._activation_transition_sequence
+                != self._calibration_hold_transition_sequence
+            ):
+                self._abort_calibration_locked(
+                    "physical activation changed during calibration pulse"
+                )
                 return
             lease_age_ns = current_ns - self._calibration_lease_measurement_ns
             maximum_lease_age_ns = round(

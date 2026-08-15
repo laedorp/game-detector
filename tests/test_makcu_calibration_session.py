@@ -120,8 +120,10 @@ class FakeCalibrationController:
         valid: bool,
         measurement_ns: int,
         token: object,
+        *,
+        activation_transition_sequence: int | None = None,
     ) -> None:
-        del measurement_ns, token
+        del measurement_ns, token, activation_transition_sequence
         if not self.active:
             raise RuntimeError("inactive")
         if not valid:

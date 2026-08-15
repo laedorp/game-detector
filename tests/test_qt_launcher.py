@@ -554,6 +554,10 @@ class QtLauncherTests(unittest.TestCase):
             QMessageBox.StandardButton.No,
         )
         self.assertIn("never activated automatically", question.call_args.args[2])
+        self.assertIn(
+            "press Right once, then fully release it",
+            question.call_args.args[2],
+        )
         private_path.assert_not_called()
         start.assert_not_called()
         self.assertIsNone(window.calibration_process)

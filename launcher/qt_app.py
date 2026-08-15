@@ -2416,8 +2416,10 @@ class LauncherWindow(QMainWindow):
             "and do not move the mouse.\n\n"
             f"Selected aim mode: {context_label}. Keep that exact mode active for "
             "the entire calibration.\n\n"
-            f"Fully release, then continuously hold {button_name} only when the "
-            "calibration asks. Releasing it, pressing Stop, or pressing Esc aborts.\n\n"
+            f"After calibration starts, press {button_name} once, then fully "
+            "release it and keep it released until the preview says Release "
+            "confirmed. Then press and continuously hold it when asked. "
+            "Releasing it after that, pressing Stop, or pressing Esc aborts.\n\n"
             "Passing evidence is staged for review and is never activated automatically. "
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2454,8 +2456,9 @@ class LauncherWindow(QMainWindow):
         self.log.clear()
         self._append_log("Started bounded MAKCU response calibration.")
         self.aim_makcu_calibration_status.setText(
-            "Calibration running. Follow the detector preview instructions; "
-            "release the activation button or press Stop/Esc to abort."
+            "Calibration running. First press and release the activation button, "
+            "wait for Release confirmed, then press and hold as instructed. "
+            "Press Stop/Esc to abort."
         )
         self._set_status("MAKCU calibration running.", "warn")
         self.start_button.setEnabled(False)

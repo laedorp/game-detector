@@ -37,7 +37,7 @@ from main import (
     _validate_aim_safety,
 )
 from utils.render import draw_aim_target
-from utils.self_filter import NormalizedBottomZone
+from utils.self_filter import NormalizedBottomZone, SelfAvatarFilter
 
 
 @dataclass(frozen=True)
@@ -155,7 +155,7 @@ class AimingControllerTests(unittest.TestCase):
         summary = _makcu_telemetry_summary(previous, current, 1.0)
 
         self.assertIn("MAKCU loop 1000 Hz", summary)
-        self.assertIn("button 80%", summary)
+        self.assertIn("button gate 80%", summary)
         self.assertIn("target 90%", summary)
         self.assertIn("fresh 85%", summary)
         self.assertIn("authorized 70%", summary)
@@ -237,6 +237,133 @@ class AimingControllerTests(unittest.TestCase):
         self.assertEqual(result.detections, (opponent,))
         self.assertEqual(result.removed_exact_label_boxes, 1)
         self.assertFalse(result.targetless_after_exact_removal)
+
+    def test_confirmed_self_removal_retains_distinct_in_zone_opponent(self) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        self_filter = SelfAvatarFilter(zone)
+        avatar = Detection(0, "person", 0.90, (430, 560, 850, 1080))
+        opponent = Detection(0, "player", 0.90, (850, 600, 1050, 1080))
+        for _ in range(3):
+            self_filter.apply((avatar,), frame_shape)
+
+        exclusion = self_filter.apply((avatar, opponent), frame_shape)
+        self.assertTrue(exclusion.aim_safe)
+        self.assertEqual(exclusion.ignored_count, 1)
+        self.assertIs(exclusion.ignored_detection, avatar)
+        self.assertEqual(exclusion.detections, (opponent,))
+
+        result = _apply_hard_aim_guard(
+            exclusion.detections,
+            frame_shape,
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.25,
+            confirmed_self_detection=exclusion.ignored_detection,
+        )
+
+        self.assertEqual(result.detections, (opponent,))
+        self.assertEqual(result.removed_exact_label_boxes, 0)
+        self.assertFalse(result.targetless_after_exact_removal)
+        selected = _update_aim_target(
+            TargetTracker(label="player"),
+            result.detections,
+            frame_shape,
+            self_exclusion_safe=exclusion.aim_safe,
+        )
+        self.assertIs(selected, opponent)
+
+    def test_confirmed_self_removal_still_guards_overlapping_duplicate(self) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        self_filter = SelfAvatarFilter(zone)
+        avatar = Detection(0, "person", 0.90, (430, 560, 850, 1080))
+        duplicate = Detection(0, "player", 0.90, (440, 570, 860, 1080))
+        for _ in range(3):
+            self_filter.apply((avatar,), frame_shape)
+
+        exclusion = self_filter.apply((avatar, duplicate), frame_shape)
+        self.assertTrue(exclusion.aim_safe)
+        self.assertIs(exclusion.ignored_detection, avatar)
+        self.assertEqual(exclusion.detections, (duplicate,))
+
+        result = _apply_hard_aim_guard(
+            exclusion.detections,
+            frame_shape,
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.25,
+            confirmed_self_detection=exclusion.ignored_detection,
+        )
+
+        self.assertEqual(result.detections, ())
+        self.assertEqual(result.removed_exact_label_boxes, 1)
+        self.assertTrue(result.targetless_after_exact_removal)
+
+    def test_ambiguous_same_class_self_boxes_remain_fail_closed(self) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        self_filter = SelfAvatarFilter(zone)
+        avatar = Detection(0, "player", 0.90, (430, 560, 850, 1080))
+        duplicate = Detection(0, "player", 0.90, (440, 570, 860, 1080))
+        for _ in range(3):
+            self_filter.apply((avatar,), frame_shape)
+
+        exclusion = self_filter.apply((avatar, duplicate), frame_shape)
+        self.assertFalse(exclusion.aim_safe)
+        self.assertEqual(exclusion.ignored_count, 0)
+        self.assertIsNone(exclusion.ignored_detection)
+        guarded = _apply_hard_aim_guard(
+            exclusion.detections,
+            frame_shape,
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.25,
+        )
+        self.assertIsNone(
+            _update_aim_target(
+                TargetTracker(label="player"),
+                guarded.detections,
+                frame_shape,
+                self_exclusion_safe=exclusion.aim_safe,
+            )
+        )
+
+    def test_confirmed_self_refinement_updates_guard_telemetry_exactly(self) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        confirmed = Detection(0, "person", 0.90, (430, 560, 850, 1080))
+        distinct = Detection(0, "player", 0.90, (850, 600, 1050, 1080))
+        duplicate = Detection(0, "player", 0.90, (440, 570, 860, 1080))
+        telemetry = AimInputTelemetry("player")
+
+        telemetry.record_hard_guard(
+            _apply_hard_aim_guard(
+                (distinct,),
+                frame_shape,
+                self_zone=zone,
+                aim_label="player",
+                configured_confidence=0.25,
+                confirmed_self_detection=confirmed,
+            )
+        )
+        after_distinct = telemetry.snapshot()
+        self.assertEqual(after_distinct.hard_guard_removed_exact_boxes, 0)
+        self.assertEqual(after_distinct.hard_guard_targetless_samples, 0)
+
+        telemetry.record_hard_guard(
+            _apply_hard_aim_guard(
+                (duplicate,),
+                frame_shape,
+                self_zone=zone,
+                aim_label="player",
+                configured_confidence=0.25,
+                confirmed_self_detection=confirmed,
+            )
+        )
+        after_duplicate = telemetry.snapshot()
+        self.assertEqual(after_duplicate.hard_guard_removed_exact_boxes, 1)
+        self.assertEqual(after_duplicate.hard_guard_targetless_samples, 1)
 
     def test_hard_guard_weak_survivor_cannot_preserve_removed_strong_target(
         self,

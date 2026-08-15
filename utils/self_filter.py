@@ -484,6 +484,42 @@ def _association_score(
     return iou, -(delta_x + delta_y)
 
 
+def boxes_are_safely_distinct(
+    confirmed_self_box: Sequence[float],
+    candidate_box: Sequence[float],
+    frame_shape: Sequence[int],
+) -> bool:
+    """Whether a candidate is provably separate from a confirmed self box.
+
+    This is intentionally asymmetric in its safety consequence: malformed or
+    degenerate geometry is *not* declared distinct.  Callers can therefore use
+    ``False`` as a reason to retain a conservative self guard.  In addition to
+    the temporal association envelope, any overlap catches duplicate or merged
+    detections whose areas differ too much for the normal tracker association
+    gate.  Only a genuinely non-overlapping candidate can be relaxed.
+    """
+
+    confirmed = _normalized_box(confirmed_self_box, frame_shape)
+    candidate = _normalized_box(candidate_box, frame_shape)
+    if confirmed is None or candidate is None:
+        return False
+    if _association_score(confirmed, candidate) is not None:
+        return False
+
+    intersection_width = max(
+        0.0,
+        min(confirmed[2], candidate[2]) - max(confirmed[0], candidate[0]),
+    )
+    intersection_height = max(
+        0.0,
+        min(confirmed[3], candidate[3]) - max(confirmed[1], candidate[1]),
+    )
+    intersection = intersection_width * intersection_height
+    if min(_box_area(confirmed), _box_area(candidate)) <= 0.0:
+        return False
+    return intersection == 0.0
+
+
 def _is_strong_continuation(
     previous: tuple[float, float, float, float],
     current: tuple[float, float, float, float],

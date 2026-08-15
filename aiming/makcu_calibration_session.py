@@ -30,6 +30,7 @@ from aiming.makcu import (
     CALIBRATION_MAX_SESSION_ABS_COUNTS,
     CALIBRATION_MAX_STEP_COUNTS,
     MakcuCalibrationSnapshot,
+    MakcuRawActivationSnapshot,
 )
 from aiming.makcu_calibration import (
     AxisCalibrationFit,
@@ -437,6 +438,9 @@ class CalibrationController(Protocol):
     @property
     def raw_activation_state(self) -> tuple[bool, bool]: ...
 
+    @property
+    def raw_activation_snapshot(self) -> MakcuRawActivationSnapshot: ...
+
     def enter_calibration_mode(self) -> object: ...
 
     def publish_calibration_lease(
@@ -444,6 +448,8 @@ class CalibrationController(Protocol):
         valid: bool,
         measurement_ns: int,
         token: object,
+        *,
+        activation_transition_sequence: int | None = None,
     ) -> None: ...
 
     def request_calibration_pulse(
@@ -572,6 +578,14 @@ class MakcuCalibrationSession:
         self._arm_deadline_ns = 0
         self._held_ns: int | None = None
         self._last_now_ns: int | None = None
+        self._activation_epoch: int | None = None
+        self._activation_entered_ns: int | None = None
+        self._activation_entry_report_sequence: int | None = None
+        self._activation_entry_framed_report_sequence: int | None = None
+        self._activation_entry_transition_sequence: int | None = None
+        self._last_activation_snapshot: MakcuRawActivationSnapshot | None = None
+        self._accepted_release_started_ns: int | None = None
+        self._accepted_hold_transition_sequence: int | None = None
         self._last_measurement_ns: int | None = None
         self._target_identity: str | None = None
         self._target_bbox: tuple[float, float, float, float] | None = None
@@ -632,6 +646,7 @@ class MakcuCalibrationSession:
         activation_known: bool,
         activation_pressed: bool,
         observation: CalibrationObservation | None,
+        activation_snapshot: MakcuRawActivationSnapshot | None = None,
     ) -> CalibrationSessionStatus:
         """Advance once; callers must invoke this for every detector decision."""
 
@@ -640,6 +655,19 @@ class MakcuCalibrationSession:
             activation_pressed, bool
         ):
             raise TypeError("activation state flags must be bool")
+        if activation_snapshot is not None:
+            if not isinstance(activation_snapshot, MakcuRawActivationSnapshot):
+                raise TypeError(
+                    "activation_snapshot must be MakcuRawActivationSnapshot or None"
+                )
+            if (
+                activation_snapshot.known != activation_known
+                or activation_snapshot.pressed != activation_pressed
+            ):
+                raise ValueError("activation snapshot disagrees with raw state flags")
+            # update_from_controller obtains the immutable snapshot immediately
+            # after its caller takes now_ns. Keep one monotonic session clock.
+            now = max(now, activation_snapshot.captured_ns)
         if self.terminal:
             return self.status()
         if self._last_now_ns is not None and now <= self._last_now_ns:
@@ -683,8 +711,9 @@ class MakcuCalibrationSession:
                         f"could not enter exclusive calibration: {exc}",
                     )
                 self.message = (
-                    "Exclusive mode armed. Fully release activation and keep "
-                    "it released briefly."
+                    "Exclusive mode armed. Press activation once, fully release "
+                    "it, keep it released until Release confirmed, then press "
+                    "and hold."
                 )
                 self._arm_deadline_ns = now + round(
                     self.config.arm_timeout_seconds * 1_000_000_000
@@ -694,8 +723,91 @@ class MakcuCalibrationSession:
                 # deliberate post-entry fresh-release latch.
                 self._release_started_ns = None
                 return self.status()
+        if activation_snapshot is not None:
+            activation_error = self._accept_activation_snapshot(
+                activation_snapshot,
+                now,
+            )
+            if activation_error is not None:
+                return self._abort(now, activation_error)
+
+        if self.state is CalibrationSessionState.WAIT_RELEASE:
             if now > self._arm_deadline_ns:
                 return self._abort(now, "fresh release/hold arming timed out")
+            if activation_snapshot is not None:
+                dwell_ns = round(
+                    self.config.release_dwell_seconds * 1_000_000_000
+                )
+                if not activation_snapshot.post_entry_press_seen:
+                    self.message = (
+                        "Press activation once, then fully release it and keep it "
+                        "released until Release confirmed."
+                    )
+                    return self.status()
+                if not activation_snapshot.known:
+                    self.message = (
+                        "Waiting for a fresh MAKCU activation report; movement is "
+                        "disarmed."
+                    )
+                    return self.status()
+                if (
+                    activation_snapshot.framed_report_sequence
+                    <= activation_snapshot.calibration_entry_framed_report_sequence
+                ):
+                    self.message = (
+                        "Waiting for a post-entry framed MAKCU button report; "
+                        "movement is disarmed."
+                    )
+                    return self.status()
+                if activation_snapshot.pressed:
+                    release_ns = activation_snapshot.completed_release_started_ns
+                    press_ns = activation_snapshot.completed_press_ns
+                    if release_ns is not None and press_ns is not None:
+                        if (
+                            press_ns - release_ns >= dwell_ns
+                            and activation_snapshot.completed_press_transition_sequence
+                            == activation_snapshot.transition_sequence
+                        ):
+                            self._accepted_release_started_ns = release_ns
+                            self._accepted_hold_transition_sequence = (
+                                activation_snapshot.completed_press_transition_sequence
+                            )
+                            self.state = CalibrationSessionState.WAIT_HOLD
+                            self.message = (
+                                "Release confirmed. Press and continuously hold "
+                                "activation."
+                            )
+                            self._hold_deadline_ns = now + 15_000_000_000
+                            return self._begin_held_calibration(now, observation)
+                        self.message = (
+                            "Release was too brief. Fully release activation and "
+                            "wait for Release confirmed before pressing again."
+                        )
+                    else:
+                        self.message = (
+                            "Post-entry press received. Now fully release activation "
+                            "and keep it released until Release confirmed."
+                        )
+                    return self.status()
+                release_ns = activation_snapshot.release_started_ns
+                if release_ns is None:
+                    self.message = (
+                        "Fully release activation; waiting for a fresh release "
+                        "report."
+                    )
+                    return self.status()
+                if activation_snapshot.captured_ns - release_ns >= dwell_ns:
+                    self._accepted_release_started_ns = release_ns
+                    self.state = CalibrationSessionState.WAIT_HOLD
+                    self.message = (
+                        "Release confirmed. Press and continuously hold activation."
+                    )
+                    self._hold_deadline_ns = now + 15_000_000_000
+                else:
+                    self.message = (
+                        "Keep activation fully released until Release confirmed."
+                    )
+                return self.status()
             if activation_known and not activation_pressed:
                 if self._release_started_ns is None:
                     self._release_started_ns = now
@@ -714,31 +826,36 @@ class MakcuCalibrationSession:
             if now > self._hold_deadline_ns:
                 return self._abort(now, "fresh post-entry activation timed out")
             if not activation_known:
+                if activation_snapshot is not None:
+                    return self._abort(
+                        now,
+                        "physical activation became unknown after release confirmation",
+                    )
                 return self.status()
             if not activation_pressed:
                 return self.status()
-            reason = self._observation_rejection(observation, now)
-            if reason is not None:
-                return self._abort(now, f"fresh activation lacked a safe target: {reason}")
-            assert observation is not None
-            try:
-                assert self._token is not None
-                self.controller.publish_calibration_lease(
-                    True, observation.measurement_ns, self._token
+            if activation_snapshot is not None:
+                release_ns = activation_snapshot.completed_release_started_ns
+                press_ns = activation_snapshot.completed_press_ns
+                dwell_ns = round(
+                    self.config.release_dwell_seconds * 1_000_000_000
                 )
-            except Exception as exc:
-                return self._abort(now, f"could not authorize calibration hold: {exc}")
-            self._held_ns = now
-            self._target_identity = observation.target_identity
-            self._target_bbox = observation.normalized_bbox
-            self.state = CalibrationSessionState.BASELINE_SETTLE
-            self.message = "Hold still while the stationary baseline settles."
-            self._settle_deadline_ns = now + round(
-                self.config.initial_settle_timeout_seconds * 1_000_000_000
-            )
-            self._record_fit_observation(observation)
-            self._stable.append(observation)
-            return self.status()
+                if (
+                    release_ns != self._accepted_release_started_ns
+                    or press_ns is None
+                    or release_ns is None
+                    or press_ns - release_ns < dwell_ns
+                    or activation_snapshot.completed_press_transition_sequence
+                    != activation_snapshot.transition_sequence
+                ):
+                    return self._abort(
+                        now,
+                        "fresh activation did not follow the confirmed release dwell",
+                    )
+                self._accepted_hold_transition_sequence = (
+                    activation_snapshot.completed_press_transition_sequence
+                )
+            return self._begin_held_calibration(now, observation)
 
         if not activation_known or not activation_pressed:
             return self._abort(now, "physical activation was released or became unknown")
@@ -766,8 +883,16 @@ class MakcuCalibrationSession:
         ):
             return self._abort(now, "detector timestamps stopped increasing")
         try:
+            lease_options = {}
+            if self._accepted_hold_transition_sequence is not None:
+                lease_options["activation_transition_sequence"] = (
+                    self._accepted_hold_transition_sequence
+                )
             self.controller.publish_calibration_lease(
-                True, observation.measurement_ns, self._token
+                True,
+                observation.measurement_ns,
+                self._token,
+                **lease_options,
             )
         except Exception as exc:
             return self._abort(now, f"calibration lease failed: {exc}")
@@ -810,15 +935,175 @@ class MakcuCalibrationSession:
         *,
         observation: CalibrationObservation | None,
     ) -> CalibrationSessionStatus:
-        """Advance using the controller's raw, latch-independent button state."""
+        """Advance using one immutable controller-owned raw activation snapshot."""
 
-        known, raw_pressed = self.controller.raw_activation_state
+        try:
+            activation = self.controller.raw_activation_snapshot
+        except Exception as exc:
+            return self._abort(
+                _timestamp(now_ns, "now_ns"),
+                f"could not read raw activation snapshot: {exc}",
+            )
         return self.update(
             now_ns,
-            activation_known=known,
-            activation_pressed=raw_pressed,
+            activation_known=activation.known,
+            activation_pressed=activation.pressed,
             observation=observation,
+            activation_snapshot=activation,
         )
+
+    def _accept_activation_snapshot(
+        self,
+        snapshot: MakcuRawActivationSnapshot,
+        now_ns: int,
+    ) -> str | None:
+        """Bind one monotonic raw-button evidence stream to this session."""
+
+        if not snapshot.active:
+            return "raw activation snapshot reports inactive calibration"
+        if snapshot.captured_ns > now_ns:
+            return "raw activation snapshot is in the future"
+        if snapshot.transition_sequence > snapshot.report_sequence:
+            return "raw activation transition sequence exceeds reports"
+        if snapshot.framed_report_sequence > snapshot.report_sequence:
+            return "raw activation framed reports exceed all reports"
+        if self._activation_epoch is None:
+            if snapshot.calibration_epoch <= 0:
+                return "raw activation snapshot has no calibration epoch"
+            self._activation_epoch = snapshot.calibration_epoch
+            self._activation_entered_ns = snapshot.calibration_entered_ns
+            self._activation_entry_report_sequence = (
+                snapshot.calibration_entry_report_sequence
+            )
+            self._activation_entry_framed_report_sequence = (
+                snapshot.calibration_entry_framed_report_sequence
+            )
+            self._activation_entry_transition_sequence = (
+                snapshot.calibration_entry_transition_sequence
+            )
+        elif snapshot.calibration_epoch != self._activation_epoch:
+            return "raw activation calibration epoch changed"
+        elif snapshot.calibration_entered_ns != self._activation_entered_ns:
+            return "raw activation calibration entry changed"
+        elif (
+            snapshot.calibration_entry_report_sequence
+            != self._activation_entry_report_sequence
+            or snapshot.calibration_entry_framed_report_sequence
+            != self._activation_entry_framed_report_sequence
+            or snapshot.calibration_entry_transition_sequence
+            != self._activation_entry_transition_sequence
+        ):
+            return "raw activation calibration entry baseline changed"
+
+        previous = self._last_activation_snapshot
+        if previous is not None:
+            if snapshot.captured_ns < previous.captured_ns:
+                return "raw activation snapshot clock moved backwards"
+            if snapshot.transition_sequence < previous.transition_sequence:
+                return "raw activation transition sequence moved backwards"
+            if snapshot.report_sequence < previous.report_sequence:
+                return "raw activation report sequence moved backwards"
+            if snapshot.framed_report_sequence < previous.framed_report_sequence:
+                return "raw activation framed-report sequence moved backwards"
+            report_delta = snapshot.report_sequence - previous.report_sequence
+            framed_report_delta = (
+                snapshot.framed_report_sequence - previous.framed_report_sequence
+            )
+            transition_delta = (
+                snapshot.transition_sequence - previous.transition_sequence
+            )
+            if transition_delta > report_delta:
+                return "raw activation transitions exceeded new reports"
+            if framed_report_delta > report_delta:
+                return "raw activation framed reports exceeded new reports"
+            if snapshot.report_sequence == previous.report_sequence and (
+                snapshot.known != previous.known
+                or snapshot.pressed != previous.pressed
+                or snapshot.last_report_framed != previous.last_report_framed
+                or snapshot.continuous_state_since_ns
+                != previous.continuous_state_since_ns
+                or snapshot.release_started_ns != previous.release_started_ns
+                or snapshot.release_started_report_sequence
+                != previous.release_started_report_sequence
+                or snapshot.completed_release_started_ns
+                != previous.completed_release_started_ns
+                or snapshot.completed_release_report_sequence
+                != previous.completed_release_report_sequence
+                or snapshot.completed_press_ns != previous.completed_press_ns
+                or snapshot.completed_press_report_sequence
+                != previous.completed_press_report_sequence
+                or snapshot.completed_press_transition_sequence
+                != previous.completed_press_transition_sequence
+            ):
+                return "raw activation state changed without a report"
+            if snapshot.framed_report_sequence == previous.framed_report_sequence and (
+                snapshot.post_entry_press_seen
+                != previous.post_entry_press_seen
+                or snapshot.release_started_ns != previous.release_started_ns
+                or snapshot.release_started_report_sequence
+                != previous.release_started_report_sequence
+                or snapshot.completed_release_started_ns
+                != previous.completed_release_started_ns
+                or snapshot.completed_release_report_sequence
+                != previous.completed_release_report_sequence
+                or snapshot.completed_press_ns != previous.completed_press_ns
+                or snapshot.completed_press_report_sequence
+                != previous.completed_press_report_sequence
+                or snapshot.completed_press_transition_sequence
+                != previous.completed_press_transition_sequence
+            ):
+                return "calibration proof changed without a framed report"
+            if (
+                snapshot.transition_sequence == previous.transition_sequence
+                and snapshot.pressed != previous.pressed
+            ):
+                return "raw activation level changed without a transition"
+        self._last_activation_snapshot = snapshot
+        return None
+
+    def _begin_held_calibration(
+        self,
+        now_ns: int,
+        observation: CalibrationObservation | None,
+    ) -> CalibrationSessionStatus:
+        """Authorize the first hold only after its release proof is complete."""
+
+        reason = self._observation_rejection(observation, now_ns)
+        if reason is not None:
+            return self._abort(
+                now_ns,
+                f"fresh activation lacked a safe target: {reason}",
+            )
+        assert observation is not None
+        try:
+            assert self._token is not None
+            lease_options = {}
+            if self._accepted_hold_transition_sequence is not None:
+                lease_options["activation_transition_sequence"] = (
+                    self._accepted_hold_transition_sequence
+                )
+            self.controller.publish_calibration_lease(
+                True,
+                observation.measurement_ns,
+                self._token,
+                **lease_options,
+            )
+        except Exception as exc:
+            return self._abort(
+                now_ns,
+                f"could not authorize calibration hold: {exc}",
+            )
+        self._held_ns = now_ns
+        self._target_identity = observation.target_identity
+        self._target_bbox = observation.normalized_bbox
+        self.state = CalibrationSessionState.BASELINE_SETTLE
+        self.message = "Hold still while the stationary baseline settles."
+        self._settle_deadline_ns = now_ns + round(
+            self.config.initial_settle_timeout_seconds * 1_000_000_000
+        )
+        self._record_fit_observation(observation)
+        self._stable.append(observation)
+        return self.status()
 
     def abort(self, reason: str, *, now_ns: int) -> CalibrationSessionStatus:
         """Idempotently stop an unfinished session without corrective movement."""
