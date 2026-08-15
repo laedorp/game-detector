@@ -255,6 +255,27 @@ class FortReleaseCandidateExporterTests(unittest.TestCase):
         self.assertEqual(result["status"], "validated")
         self.assertEqual(result["parity"]["seeded_tensor_count"], 4)
 
+    def test_training_argument_paths_compare_by_resolved_identity(self) -> None:
+        noncanonical_data = self.data.parent / ".." / self.data.parent.name / self.data.name
+        noncanonical_project = self.run_dir.parent / ".." / self.run_dir.parent.name
+        config = replace(
+            self.training_config,
+            data=noncanonical_data,
+            project=noncanonical_project,
+        )
+        dataset_manifest = json.loads(
+            (self.data.parent / "manifest.json").read_text(encoding="utf-8")
+        )
+        (self.run_dir / "initial_run_contract.json").write_text(
+            json.dumps(_initial_run_contract(config, dataset_manifest)),
+            encoding="utf-8",
+        )
+        _write_reproducibility_record(config, dataset_manifest, self.weights)
+
+        manifest = self._stage(self.root / "candidate-noncanonical-paths")
+
+        self.assertEqual(manifest["training_provenance"]["schema_version"], 1)
+
     def test_refuses_existing_output_symlink_checkpoint_and_dataset_tamper(self) -> None:
         output = self.root / "candidate"
         output.mkdir()

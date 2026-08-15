@@ -1645,7 +1645,6 @@ def _validate_packaged_training_provenance(
     ):
         raise CandidateExportError("packaged initial training policy is invalid")
     expected_argument_values = {
-        "data": str(dataset_yaml_path),
         "epochs": planned_epochs,
         "patience": training.get("patience"),
         "batch": training.get("batch"),
@@ -1660,15 +1659,27 @@ def _validate_packaged_training_provenance(
         "single_cls": False,
         "save": True,
         "save_period": 1,
-        "project": str(run_dir.parent),
         "name": run_dir.name,
         "exist_ok": True,
     }
-    differing_arguments = sorted(
+    differing_arguments = [
         key
         for key, expected in expected_argument_values.items()
         if initial_arguments.get(key) != expected
-    )
+    ]
+    for key, expected in (
+        ("data", dataset_yaml_path),
+        ("project", run_dir.parent),
+    ):
+        try:
+            matches = _recorded_path(
+                initial_arguments.get(key), f"packaged initial training argument {key}"
+            ) == expected.resolve()
+        except CandidateExportError:
+            matches = False
+        if not matches:
+            differing_arguments.append(key)
+    differing_arguments.sort()
     if differing_arguments:
         raise CandidateExportError(
             "packaged initial training arguments violate the release policy: "
