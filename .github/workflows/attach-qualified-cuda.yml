@@ -1,0 +1,369 @@
+name: Attach physically qualified Windows CUDA bundle
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing published v* release tag (for example v1.2.3)
+        required: true
+        type: string
+      source_build_run_id:
+        description: Successful manual Build Windows app run ID for this exact tag commit
+        required: true
+        type: string
+      evidence_run_id:
+        description: Successful Qualify Windows CUDA run ID for this exact tag commit
+        required: true
+        type: string
+      evidence_artifact_name:
+        description: Must remain ProAim-Windows-CUDA-Qualification-Evidence
+        required: true
+        default: ProAim-Windows-CUDA-Qualification-Evidence
+        type: string
+      cuda_zip_sha256:
+        description: SHA-256 of ProAim-Windows-x64-NVIDIA-CUDA.zip tested on the physical GPU
+        required: true
+        type: string
+      qualification_evidence_sha256:
+        description: SHA-256 of the immutable completed physical-qualification evidence archive
+        required: true
+        type: string
+      qualification_manifest_sha256:
+        description: SHA-256 of qualification-manifest.json inside that evidence archive
+        required: true
+        type: string
+      physical_attestation_sha256:
+        description: SHA-256 of PHYSICAL-GPU-ATTESTATION.json inside the evidence archive
+        required: true
+        type: string
+      qualified_gpu:
+        description: Exact physical NVIDIA GPU product name used for qualification
+        required: true
+        type: string
+      confirmation:
+        description: Type ATTACH QUALIFIED WINDOWS CUDA TO followed by one space and the exact tag
+        required: true
+        type: string
+      nvidia_redistribution_confirmation:
+        description: Type I APPROVE NVIDIA REDISTRIBUTION REVIEW FOR followed by one space and the exact tag
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: qualified-cuda-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  verify-candidate:
+    name: Verify source identity and frozen CUDA candidate
+    runs-on: windows-2022
+    timeout-minutes: 30
+    outputs:
+      tag_commit: ${{ steps.identity.outputs.tag_commit }}
+      verified_artifact_id: ${{ steps.verified-artifact.outputs.artifact-id }}
+      staged_content_manifest_sha256: ${{ steps.staged-content.outputs.staged_content_manifest_sha256 }}
+    env:
+      REPOSITORY_INPUT: ${{ github.repository }}
+      TAG_INPUT: ${{ inputs.tag }}
+      BUILD_RUN_INPUT: ${{ inputs.source_build_run_id }}
+      EVIDENCE_RUN_INPUT: ${{ inputs.evidence_run_id }}
+      EVIDENCE_ARTIFACT_INPUT: ${{ inputs.evidence_artifact_name }}
+      CUDA_ZIP_SHA_INPUT: ${{ inputs.cuda_zip_sha256 }}
+      EVIDENCE_SHA_INPUT: ${{ inputs.qualification_evidence_sha256 }}
+      QUALIFICATION_MANIFEST_SHA_INPUT: ${{ inputs.qualification_manifest_sha256 }}
+      PHYSICAL_ATTESTATION_SHA_INPUT: ${{ inputs.physical_attestation_sha256 }}
+      QUALIFIED_GPU_INPUT: ${{ inputs.qualified_gpu }}
+      CONFIRMATION_INPUT: ${{ inputs.confirmation }}
+      NVIDIA_REDISTRIBUTION_CONFIRMATION_INPUT: ${{ inputs.nvidia_redistribution_confirmation }}
+    steps:
+      - name: Require dispatch from protected main workflow source
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "This release-mutating workflow must be dispatched from refs/heads/main."
+          }
+
+      - name: Check out protected workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up verification Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Validate tag, release, source run, and artifact identity
+        id: identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Arguments = @(
+            "verify-metadata",
+            "--repository", $env:REPOSITORY_INPUT,
+            "--tag", $env:TAG_INPUT,
+            "--source-build-run-id", $env:BUILD_RUN_INPUT,
+            "--evidence-run-id", $env:EVIDENCE_RUN_INPUT,
+            "--evidence-artifact-name", $env:EVIDENCE_ARTIFACT_INPUT,
+            "--cuda-zip-sha256", $env:CUDA_ZIP_SHA_INPUT,
+            "--qualification-evidence-sha256", $env:EVIDENCE_SHA_INPUT,
+            "--qualification-manifest-sha256", $env:QUALIFICATION_MANIFEST_SHA_INPUT,
+            "--physical-attestation-sha256", $env:PHYSICAL_ATTESTATION_SHA_INPUT,
+            "--qualified-gpu", $env:QUALIFIED_GPU_INPUT,
+            "--confirmation", $env:CONFIRMATION_INPUT,
+            "--nvidia-redistribution-confirmation", $env:NVIDIA_REDISTRIBUTION_CONFIRMATION_INPUT,
+            "--output", "verified-remote-metadata.json"
+          )
+          python scripts/manage_cuda_release_attachment.py @Arguments
+          $Metadata = Get-Content -LiteralPath "verified-remote-metadata.json" -Raw | ConvertFrom-Json
+          if ([string]$Metadata.tag_commit -notmatch '^[0-9a-f]{40}$') {
+            throw "Verified tag commit output is invalid."
+          }
+          "tag_commit=$($Metadata.tag_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "build_artifact_id=$($Metadata.build_artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "evidence_artifact_id=$($Metadata.qualification_artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download the exact CUDA artifact by verified numeric artifact ID
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.build_artifact_id }}
+          path: downloaded-cuda-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download physical qualification by verified numeric artifact ID
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.evidence_artifact_id }}
+          path: downloaded-qualification-artifact
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.evidence_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate and safely extract the candidate ZIP
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Arguments = @(
+            "prepare",
+            "--repository", $env:REPOSITORY_INPUT,
+            "--tag", $env:TAG_INPUT,
+            "--source-build-run-id", $env:BUILD_RUN_INPUT,
+            "--evidence-run-id", $env:EVIDENCE_RUN_INPUT,
+            "--evidence-artifact-name", $env:EVIDENCE_ARTIFACT_INPUT,
+            "--cuda-zip-sha256", $env:CUDA_ZIP_SHA_INPUT,
+            "--qualification-evidence-sha256", $env:EVIDENCE_SHA_INPUT,
+            "--qualification-manifest-sha256", $env:QUALIFICATION_MANIFEST_SHA_INPUT,
+            "--physical-attestation-sha256", $env:PHYSICAL_ATTESTATION_SHA_INPUT,
+            "--qualified-gpu", $env:QUALIFIED_GPU_INPUT,
+            "--confirmation", $env:CONFIRMATION_INPUT,
+            "--nvidia-redistribution-confirmation", $env:NVIDIA_REDISTRIBUTION_CONFIRMATION_INPUT,
+            "--downloaded-directory", "downloaded-cuda-artifact",
+            "--evidence-downloaded-directory", "downloaded-qualification-artifact",
+            "--stage-directory", "verified-attachment",
+            "--extract-directory", "extracted-candidate",
+            "--evidence-extract-directory", "extracted-qualification-evidence",
+            "--github-run-id", $env:GITHUB_RUN_ID,
+            "--github-actor", $env:GITHUB_ACTOR
+          )
+          python scripts/manage_cuda_release_attachment.py @Arguments
+
+      - name: Smoke-test the extracted frozen CLI and release-default model on CPU
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Cli = (Resolve-Path -LiteralPath "extracted-candidate\ProAim\ProAimCLI.exe").Path
+          $BundleRoot = (Resolve-Path -LiteralPath "extracted-candidate\ProAim").Path
+          $BuildInfo = Get-Content -LiteralPath (Join-Path $BundleRoot "BUILD-INFO.json") -Raw | ConvertFrom-Json
+          $Default = $BuildInfo.release_default_model
+          if ($null -eq $Default -or @($Default.input_shape_hw).Count -ne 2) {
+            throw "BUILD-INFO omitted its release-default model contract."
+          }
+          $Model = Join-Path $BundleRoot ([string]$Default.model_path).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+          $Labels = Join-Path $BundleRoot ([string]$Default.labels_path).Replace('/', [System.IO.Path]::DirectorySeparatorChar)
+          $InferenceSize = if ([int]$Default.input_shape_hw[0] -eq [int]$Default.input_shape_hw[1]) {
+            [string][int]$Default.input_shape_hw[0]
+          } else {
+            "{0}x{1}" -f [int]$Default.input_shape_hw[0], [int]$Default.input_shape_hw[1]
+          }
+          & $Cli --cli --help
+          $RuntimeLines = @(& $Cli --runtime-info 2> "hosted-runtime-info.stderr.txt")
+          [System.IO.File]::WriteAllLines(
+            (Join-Path $PWD "hosted-runtime-info.json"),
+            [string[]]$RuntimeLines,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $BenchmarkLines = @(& $Cli --benchmark-models `
+            --backend onnxruntime `
+            --model $Model `
+            --labels $Labels `
+            --name release-default `
+            --precision FP32 `
+            --inference-size $InferenceSize `
+            --device CPU `
+            --synthetic `
+            --samples 1 `
+            --warmup 1 `
+            --iterations 1 `
+            --repeats 1 `
+            2> "hosted-cpu-model-smoke.stderr.txt")
+          [System.IO.File]::WriteAllLines(
+            (Join-Path $PWD "hosted-cpu-model-smoke.json"),
+            [string[]]$BenchmarkLines,
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          python scripts/manage_cuda_release_attachment.py validate-smoke `
+            --stage-directory "verified-attachment" `
+            --runtime-info "hosted-runtime-info.json" `
+            --benchmark "hosted-cpu-model-smoke.json"
+
+      - name: Create exact staged-content manifest before upload
+        id: staged-content
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_cuda_release_attachment.py write-content-manifest `
+            --root "verified-attachment" `
+            --output-name "STAGED-CONTENT-MANIFEST.json" `
+            --kind "proaim-cuda-verified-stage" `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --tag-commit "${{ steps.identity.outputs.tag_commit }}" `
+            --source-build-run-id $env:BUILD_RUN_INPUT `
+            --verification-run-id $env:GITHUB_RUN_ID `
+            --result "staged-content-result.json"
+          $Result = Get-Content -LiteralPath "staged-content-result.json" -Raw | ConvertFrom-Json
+          "staged_content_manifest_sha256=$($Result.manifest_sha256)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload immutable verified attachment staging artifact
+        id: verified-artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: verified-qualified-cuda-attachment
+          path: verified-attachment
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Record read-only verification summary
+        shell: pwsh
+        env:
+          STAGED_CONTENT_MANIFEST_SHA256: ${{ steps.staged-content.outputs.staged_content_manifest_sha256 }}
+          VERIFIED_TAG_COMMIT: ${{ steps.identity.outputs.tag_commit }}
+        run: |
+          @"
+          ## Qualified CUDA attachment verification
+
+          - Tag commit: ``$env:VERIFIED_TAG_COMMIT``
+          - Verified staged-content manifest SHA-256: ``$env:STAGED_CONTENT_MANIFEST_SHA256``
+          - Hosted smoke scope: frozen import and real release-default-model inference on CPU only
+          - Physical GPU evidence: exact Actions run/artifact bytes, inner manifest, typed attestation, and NVIDIA telemetry verified
+          - Legal scope: integrity evidence makes no legal-rights inference for NVIDIA redistribution
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append
+
+  publish-existing-release:
+    name: Protected CUDA release attachment
+    needs: verify-candidate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: cuda-release-publication
+    permissions:
+      actions: read
+      contents: write
+    env:
+      REPOSITORY_INPUT: ${{ github.repository }}
+      TAG_INPUT: ${{ inputs.tag }}
+      BUILD_RUN_INPUT: ${{ inputs.source_build_run_id }}
+      EVIDENCE_RUN_INPUT: ${{ inputs.evidence_run_id }}
+      EVIDENCE_ARTIFACT_INPUT: ${{ inputs.evidence_artifact_name }}
+      CUDA_ZIP_SHA_INPUT: ${{ inputs.cuda_zip_sha256 }}
+      EVIDENCE_SHA_INPUT: ${{ inputs.qualification_evidence_sha256 }}
+      QUALIFICATION_MANIFEST_SHA_INPUT: ${{ inputs.qualification_manifest_sha256 }}
+      PHYSICAL_ATTESTATION_SHA_INPUT: ${{ inputs.physical_attestation_sha256 }}
+      QUALIFIED_GPU_INPUT: ${{ inputs.qualified_gpu }}
+      CONFIRMATION_INPUT: ${{ inputs.confirmation }}
+      NVIDIA_REDISTRIBUTION_CONFIRMATION_INPUT: ${{ inputs.nvidia_redistribution_confirmation }}
+      STAGED_CONTENT_MANIFEST_SHA256: ${{ needs.verify-candidate.outputs.staged_content_manifest_sha256 }}
+      VERIFICATION_RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Require preconfigured protected environment guard
+        env:
+          ENVIRONMENT_GUARD: ${{ secrets.CUDA_RELEASE_ENVIRONMENT_GUARD }}
+          ENVIRONMENT_POLICY_VERSION: ${{ vars.CUDA_RELEASE_ENVIRONMENT_POLICY_VERSION }}
+        run: |
+          set -euo pipefail
+          test -n "$ENVIRONMENT_GUARD" || {
+            echo "cuda-release-publication must define the environment-only CUDA_RELEASE_ENVIRONMENT_GUARD secret." >&2
+            exit 2
+          }
+          test "$ENVIRONMENT_POLICY_VERSION" = "required-reviewers-v1" || {
+            echo "cuda-release-publication must define CUDA_RELEASE_ENVIRONMENT_POLICY_VERSION=required-reviewers-v1." >&2
+            exit 2
+          }
+
+      - name: Check out protected workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up publication Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Download read-only verified attachment staging artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.verify-candidate.outputs.verified_artifact_id }}
+          path: verified-attachment
+
+      - name: Reverify and attach to the existing release with rollback
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python scripts/manage_cuda_release_attachment.py publish \
+            --repository "$REPOSITORY_INPUT" \
+            --tag "$TAG_INPUT" \
+            --source-build-run-id "$BUILD_RUN_INPUT" \
+            --evidence-run-id "$EVIDENCE_RUN_INPUT" \
+            --evidence-artifact-name "$EVIDENCE_ARTIFACT_INPUT" \
+            --cuda-zip-sha256 "$CUDA_ZIP_SHA_INPUT" \
+            --qualification-evidence-sha256 "$EVIDENCE_SHA_INPUT" \
+            --qualification-manifest-sha256 "$QUALIFICATION_MANIFEST_SHA_INPUT" \
+            --physical-attestation-sha256 "$PHYSICAL_ATTESTATION_SHA_INPUT" \
+            --qualified-gpu "$QUALIFIED_GPU_INPUT" \
+            --confirmation "$CONFIRMATION_INPUT" \
+            --nvidia-redistribution-confirmation "$NVIDIA_REDISTRIBUTION_CONFIRMATION_INPUT" \
+            --staged-content-manifest-sha256 "$STAGED_CONTENT_MANIFEST_SHA256" \
+            --verification-run-id "$VERIFICATION_RUN_ID" \
+            --stage-directory "verified-attachment" \
+            --output "cuda-publication-result.json"
+
+      - name: Record publication result
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path("cuda-publication-result.json").read_text(encoding="utf-8"))
+          print("## Windows CUDA release asset attached")
+          print()
+          print(f"- Release: {result['release_html_url']}")
+          print(f"- Tag commit: `{result['tag_commit']}`")
+          print(f"- CUDA ZIP SHA-256: `{result['cuda_asset']['sha256']}`")
+          print(f"- Updated SHA256SUMS SHA-256: `{result['checksum_asset']['sha256']}`")
+          print(f"- Qualification evidence SHA-256: `{result['qualification_evidence_sha256']}`")
+          PY

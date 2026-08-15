@@ -1,0 +1,28 @@
+# ProAim release lock: Windows x86-64, CPython 3.13.14, CUDA 13/cuDNN 9.
+# The seven NVIDIA transitive distributions are explicit and artifact-hashed;
+# a new vendor wheel cannot silently enter a frozen CUDA candidate.
+altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+comtypes==1.4.16 --hash=sha256:e18d85179ff12955524c5a8c3bc09cb3c0d890f1da4d7123d14244c7b78f84c8
+dxcam==0.3.0 --hash=sha256:d3de4d64e6d85a4c3c5b869dd35eba82d4784e5b6c4b1703e0cb09da14be9575
+flatbuffers==25.12.19 --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
+mss==10.2.0 --hash=sha256:e79f428899280e7e64e38365b5bfed683851ebea807eeaeadaf06eb8e0d67197
+numpy==2.5.2 --hash=sha256:85aaccb24182c25df891ad0ec333585967e115269d5f1b17f2c9ae005bc96657
+nvidia-cublas==13.6.0.2 --hash=sha256:3b5bcd6bfb6f65010ebf195851bcb9b2aa34b9fe08479432002991c1fe84b67d
+nvidia-cuda-nvrtc==13.3.33 --hash=sha256:7d2af818851c0c224d5f92221e9226e51ee23c236df4b51f9194563979c888be
+nvidia-cuda-runtime==13.3.29 --hash=sha256:0667ec61c3d897388efa305ed4f7609ace88849a753ba9c6311d06dca55fff4f
+nvidia-cudnn-cu13==9.24.0.43 --hash=sha256:67a7273b5cf062f9446fd76cf464351a1c0f66501e6cd78f6675c0d604d8ac87
+nvidia-cufft==12.3.0.29 --hash=sha256:510036a2bbab5c83ae93dc5c907c3a49d3518e3066ac3a2052ff0f7f9b27dfc4
+nvidia-curand==10.4.3.29 --hash=sha256:34b18d5a2a8e5db4c3846475ae4eef0cacdf3ac5e9c501f3a4efb422f137a74e
+nvidia-nvjitlink==13.3.33 --hash=sha256:4297ee49639b4f2e07255a1d69b3acc7ab2d011bb892b403e91ac98368962e3b
+onnxruntime-gpu[cuda,cudnn]==1.28.0 --hash=sha256:4c89b8c192864582e04eb4b43574648f185bfd00fc754c3f085fd04d0cd81bc2
+opencv-python==4.14.0.94 --hash=sha256:ace53616cdffc9643e17e075397b493e607c427d388c7508798ef7ad2ed577cc
+openvino==2026.3.0 --hash=sha256:1c41f2d1072d600c260741b350aaf4a09d53f821a9a8fc8989bdc79a46b50a2c
+openvino-telemetry==2025.2.0 --hash=sha256:bcb667e83a44f202ecf4cfa49281715c6d7e21499daec04ff853b7f964833599
+pefile==2024.8.26 --hash=sha256:76f8b485dcd3b1bb8166f1128d395fa3d87af26360c2358fb75b80019b957c6f
+protobuf==7.35.1 --hash=sha256:230a75ddfc2de4806e56696ce9640c1cdfdb6543b7cfce98d42a4c0a0e7bdb87
+pyinstaller==6.22.0 --hash=sha256:6e5f3656de100954bf5db25536c43e097e46d482843a96d03a0852bf266e4853
+pyinstaller-hooks-contrib==2026.6 --hash=sha256:fd13b8ac126b35361175edacd41a0d97080b75dd5f4b594ecefefff969509dd3
+pyserial==3.5 --hash=sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0
+pyside6-essentials==6.11.1 --hash=sha256:63311bd48e32c584599ab04b9ef7c324082374cd2c9fa533f978fb893bb47e40
+pywin32-ctypes==0.2.3 --hash=sha256:8a1513379d709975552d202d942d9837758905c8d01eb82b8bcc30918929e7b8
+shiboken6==6.11.1 --hash=sha256:c2c6863aa80ec18c0f82cea3417837b279cdc60024ac17123461dc9042577df7

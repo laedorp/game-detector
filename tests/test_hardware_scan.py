@@ -8,6 +8,7 @@ import unittest
 from detection.hardware import (
     Accelerator,
     AcceleratorKind,
+    DirectMLAdapter,
     HardwareProfile,
     ProcessorInfo,
     Vendor,
@@ -182,6 +183,20 @@ class WindowsScanTests(unittest.TestCase):
         self.assertEqual(len(gpus), 1)
         self.assertEqual(gpus[0].vendor, Vendor.NVIDIA)
 
+    def test_windows_scan_records_injected_dxgi_adapter_order(self) -> None:
+        adapters = (
+            DirectMLAdapter(0, "Intel Graphics", "8086", "1234"),
+            DirectMLAdapter(1, "RTX 5060", "10de", "2d59", 8 << 30),
+        )
+        profile = scan_hardware(
+            system="Windows",
+            logical_cores=8,
+            powershell_runner=lambda _query: "",
+            directml_adapter_factory=lambda: adapters,
+        )
+
+        self.assertEqual(profile.directml_adapters, adapters)
+
 
 def build_profile(
     *,
@@ -189,6 +204,7 @@ def build_profile(
     accelerators: tuple[Accelerator, ...] = (),
     runtime_devices: tuple[str, ...] = ("CPU",),
     flags: frozenset[str] = frozenset({"avx2"}),
+    directml_adapters: tuple[DirectMLAdapter, ...] = (),
 ) -> HardwareProfile:
     processor = ProcessorInfo(name="Intel(R) Core(TM) i7", logical_cores=12, flags=flags)
     cpu = Accelerator(kind=AcceleratorKind.CPU, vendor=Vendor.INTEL, name=processor.name)
@@ -197,6 +213,7 @@ def build_profile(
         processor=processor,
         accelerators=(cpu, *accelerators),
         runtime_devices=runtime_devices,
+        directml_adapters=directml_adapters,
     )
 
 
@@ -264,7 +281,9 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(plans[0].accelerator, gpu)
         self.assertEqual(plans[0].backend, "onnxruntime")
         self.assertEqual(plans[0].device, "DIRECTML")
+        self.assertEqual(plans[0].precision, "fp32")
         self.assertTrue(plans[0].ready)
+        self.assertIn("Task Manager", plans[0].summary)
 
     def test_windows_intel_gpu_still_prefers_openvino_when_exposed(self) -> None:
         gpu = Accelerator(
@@ -297,7 +316,8 @@ class RecommendationTests(unittest.TestCase):
         self.assertEqual(amd.backend, "onnxruntime")
         self.assertNotEqual(amd.backend, "openvino")
         self.assertFalse(amd.ready)
-        self.assertIn("ROCm", amd.setup_hint)
+        self.assertIn("MIGraphX", amd.setup_hint)
+        self.assertIn("RX 6950 XT", amd.setup_hint)
 
     def test_amd_gpu_on_windows_points_at_directml(self) -> None:
         gpu = Accelerator(
@@ -323,6 +343,25 @@ class RecommendationTests(unittest.TestCase):
         self.assertTrue(plans[0].ready)
         self.assertEqual(plans[0].accelerator.vendor, Vendor.AMD)
         self.assertEqual(plans[0].setup_hint, "")
+
+    def test_amd_gpu_prefers_migraphx_on_a_modern_linux_stack(self) -> None:
+        gpu = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.AMD,
+            name="supported AMD GPU",
+            discrete=True,
+        )
+        plans = recommend(
+            build_profile(accelerators=(gpu,)),
+            provider_factory=lambda: (
+                "ROCMExecutionProvider",
+                "MIGraphXExecutionProvider",
+                "CPUExecutionProvider",
+            ),
+        )
+
+        self.assertTrue(plans[0].ready)
+        self.assertEqual(plans[0].device, "MIGRAPHX")
 
     def test_nvidia_prefers_cuda_when_tensorrt_is_also_exposed(self) -> None:
         gpu = Accelerator(
@@ -356,6 +395,86 @@ class RecommendationTests(unittest.TestCase):
         self.assertTrue(plans[0].ready)
         self.assertEqual(plans[0].backend, "onnxruntime")
         self.assertEqual(plans[0].device, "DIRECTML")
+        self.assertEqual(plans[0].precision, "fp32")
+        self.assertIn("Task Manager", plans[0].summary)
+
+    def test_windows_directml_binds_exact_dxgi_adapter_instead_of_wmi_order(self) -> None:
+        intel = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.INTEL,
+            name="Intel UHD Graphics",
+            identifier="8086:9bc4",
+            discrete=False,
+        )
+        nvidia = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.NVIDIA,
+            name="NVIDIA GeForce RTX 5060 Laptop GPU",
+            identifier="10de:2d59",
+            discrete=True,
+        )
+        # Deliberately put the RTX at DXGI index 1; WMI order is unrelated.
+        adapters = (
+            DirectMLAdapter(0, intel.name, "8086", "9bc4"),
+            DirectMLAdapter(1, nvidia.name, "10de", "2d59", 8 << 30),
+        )
+        plans = recommend(
+            build_profile(
+                system="windows",
+                accelerators=(nvidia, intel),
+                directml_adapters=adapters,
+            ),
+            provider_factory=lambda: (
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ),
+        )
+
+        by_accelerator = {plan.accelerator: plan for plan in plans}
+        self.assertEqual(by_accelerator[nvidia].device, "DIRECTML:1")
+        self.assertEqual(by_accelerator[intel].device, "DIRECTML:0")
+        self.assertIs(plans[0].accelerator, nvidia)
+
+    def test_hybrid_laptop_recommends_rtx_before_ready_intel_igpu(self) -> None:
+        intel = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.INTEL,
+            name="Intel UHD Graphics",
+            identifier="8086:9bc4",
+            discrete=False,
+        )
+        # WMI can report a truncated AdapterRAM value, so keep placement
+        # unknown and prove vendor-aware ranking still avoids the iGPU trap.
+        nvidia = Accelerator(
+            kind=AcceleratorKind.GPU,
+            vendor=Vendor.NVIDIA,
+            name="NVIDIA GeForce RTX 5060 Laptop GPU",
+            identifier="10de:2d59",
+            discrete=None,
+        )
+        adapters = (
+            DirectMLAdapter(0, intel.name, "8086", "9bc4"),
+            DirectMLAdapter(1, nvidia.name, "10de", "2d59", 8 << 30),
+        )
+
+        plans = recommend(
+            build_profile(
+                system="windows",
+                accelerators=(intel, nvidia),
+                runtime_devices=("CPU", "GPU"),
+                directml_adapters=adapters,
+            ),
+            provider_factory=lambda: (
+                "DmlExecutionProvider",
+                "CPUExecutionProvider",
+            ),
+        )
+
+        self.assertEqual(plans[0].accelerator, nvidia)
+        self.assertEqual(plans[0].device, "DIRECTML:1")
+        self.assertTrue(plans[0].ready)
+        self.assertEqual(plans[1].accelerator, intel)
+        self.assertEqual(plans[1].device, "GPU")
 
     def test_intel_npu_is_ranked_first_when_openvino_exposes_it(self) -> None:
         npu = Accelerator(kind=AcceleratorKind.NPU, vendor=Vendor.INTEL, name="AI Boost")

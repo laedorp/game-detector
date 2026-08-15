@@ -1,0 +1,167 @@
+{
+  "schema_version": 1,
+  "status": "dataset_independently_audited_fresh_n640_cpu_baseline_retired_after_epoch_17_for_gpu_handoff",
+  "generated_date": "2026-08-14",
+  "dataset": {
+    "source_archive_sha256": "eb0ea27ecbf7ac14e13485b6c8943a5bcacbb6adabc7d63d571ce3cb9af850b5",
+    "grouped_manifest_sha256": "f09ad355ead4a4dd4504f550f0b390786950faa6702fcd065c6849d765dbdffb",
+    "exact_content_sha256": "b2979f0ea75e5245944076aab51636ab7173a6e5ef1108d0cfb2e3f0549e0255",
+    "canonical_yaml_sha256": "b6868017e5c28f9e10a7c4e8450bc48eb2fcff2b354a9b3018460e3594ffaa62",
+    "attribution_sha256": "f0cfd95720ce6ba1a03fb9ff1902b6a80f5954a81bf295846bed075b9931e9f5",
+    "known_cross_split_source_groups": 0,
+    "known_cross_split_visual_edges": 0,
+    "reviewed_negative_images": 0,
+    "splits": {
+      "train": {"images": 2636, "boxes": 3877, "source_groups": 1090},
+      "valid": {"images": 468, "boxes": 660, "source_groups": 248},
+      "test": {"images": 269, "boxes": 449, "source_groups": 175}
+    },
+    "projected_height_buckets_at_1080p": {
+      "train": {"le_32": 14, "33_64": 149, "65_96": 297, "gt_96": 3417},
+      "valid": {"le_32": 1, "33_64": 41, "65_96": 44, "gt_96": 574},
+      "test": {"le_32": 4, "33_64": 26, "65_96": 14, "gt_96": 405}
+    },
+    "excluded_annotations": [
+      {
+        "source_split": "train",
+        "annotation_id": 228,
+        "category": "fortnite",
+        "native_width": 6.12,
+        "native_height": 1.25,
+        "reason": "manual visual review: malformed box on non-player pixels"
+      },
+      {
+        "source_split": "train",
+        "annotation_id": 3393,
+        "category": "player",
+        "native_width": 0.38,
+        "native_height": 0.48,
+        "reason": "manual visual review: malformed box on non-player pixels"
+      }
+    ],
+    "test_far_domain_warning": "All 30 test ground-truth boxes at <=64 projected pixels are from original_file groups; none are from capture, numbered, or video sequence groups.",
+    "test_selection_status": "development_consumed_not_final_holdout",
+    "test_selection_warning": "The v9 test split was examined during old-v1 application-path A/B and detail/filter development; final selection requires a new independent holdout."
+  },
+  "independent_audit": {
+    "status": "go_for_exploratory_fresh_n640_training",
+    "archive_to_base_manifest_reproduced": true,
+    "base_to_grouped_exact_content_reproduced": true,
+    "runtime_cache_members_absent": true,
+    "cache_free_real_validation_evidence_consistent": true,
+    "whole_bundle_byte_exact": false,
+    "whole_bundle_caveat": "Attribution wording and recorded OpenCV/NumPy environment versions are outside the exact training-data content fingerprint."
+  },
+  "baseline_checkpoint_screening": {
+    "scope": "Ultralytics PyTorch checkpoint screening at scalar imgsz 416; not exact static deployment-artifact evaluation",
+    "weights_sha256": "6f34a85bb1573126f0bb473c451f020cc3abc57ed183781d7d57a446f995a570",
+    "evaluator_script_sha256": "9b1342dfc96a95c8e0b7a353e300d60e601caa47dc0b63d6ff791dba17c9b915",
+    "configuration": {
+      "imgsz": 416,
+      "iou": 0.5,
+      "operating_confidences": [0.25, 0.45],
+      "minimum_pr_confidence": 0.001,
+      "bootstrap_samples": 500,
+      "bootstrap_seed": 0
+    },
+    "source_metrics_sha256": {
+      "valid": "1b3c5925de44f95285e3892afcb215302b2b9a87dffe99453ba103774936fc84",
+      "test": "1cd55b6f7937828a488b9286c31d496356d2a305f47b4ff040a9ffb03ff6f051"
+    },
+    "aggregate": {
+      "valid": {"precision": 0.7812285611, "recall": 0.6606060606, "map50": 0.7469299320, "map50_95": 0.3749632612},
+      "test": {"precision": 0.8160011069, "recall": 0.7817371938, "map50": 0.8534805150, "map50_95": 0.4608969356}
+    },
+    "confidence_0_25": {
+      "valid": {
+        "le_32": {"detected": 0, "total": 1, "missed": 1, "predictions": 0, "false_positives": 0},
+        "33_64": {"detected": 5, "total": 41, "missed": 36, "predictions": 15, "false_positives": 10},
+        "65_96": {"detected": 22, "total": 44, "missed": 22, "predictions": 38, "false_positives": 16},
+        "gt_96": {"detected": 430, "total": 574, "missed": 144, "predictions": 589, "false_positives": 159}
+      },
+      "test": {
+        "le_32": {"detected": 0, "total": 4, "missed": 4, "predictions": 0, "false_positives": 0},
+        "33_64": {"detected": 6, "total": 26, "missed": 20, "predictions": 7, "false_positives": 1},
+        "65_96": {"detected": 5, "total": 14, "missed": 9, "predictions": 9, "false_positives": 4},
+        "gt_96": {"detected": 340, "total": 405, "missed": 65, "predictions": 415, "false_positives": 75}
+      }
+    },
+    "confidence_0_45": {
+      "valid": {
+        "le_32": {"detected": 0, "total": 1, "missed": 1, "predictions": 0, "false_positives": 0},
+        "33_64": {"detected": 2, "total": 41, "missed": 39, "predictions": 2, "false_positives": 0},
+        "65_96": {"detected": 5, "total": 44, "missed": 39, "predictions": 6, "false_positives": 1},
+        "gt_96": {"detected": 292, "total": 574, "missed": 282, "predictions": 323, "false_positives": 31}
+      },
+      "test": {
+        "le_32": {"detected": 0, "total": 4, "missed": 4, "predictions": 0, "false_positives": 0},
+        "33_64": {"detected": 3, "total": 26, "missed": 23, "predictions": 3, "false_positives": 0},
+        "65_96": {"detected": 2, "total": 14, "missed": 12, "predictions": 3, "false_positives": 1},
+        "gt_96": {"detected": 285, "total": 405, "missed": 120, "predictions": 304, "false_positives": 19}
+      }
+    },
+    "ap50_by_size_with_image_bootstrap_ci95": {
+      "valid": {
+        "le_32": {"ap50": 0.0, "ci95": [0.0, 0.0]},
+        "33_64": {"ap50": 0.1815878988, "ci95": [0.0777122428, 0.3337996527]},
+        "65_96": {"ap50": 0.5613949407, "ci95": [0.4320270779, 0.7243459749]},
+        "gt_96": {"ap50": 0.7950515245, "ci95": [0.7648896306, 0.8278170706]}
+      },
+      "test": {
+        "le_32": {"ap50": 0.0, "ci95": [0.0, 0.0]},
+        "33_64": {"ap50": 0.3998254178, "ci95": [0.2101896774, 0.6371172379]},
+        "65_96": {"ap50": 0.5057520547, "ci95": [0.2784900820, 0.7535807035]},
+        "gt_96": {"ap50": 0.8990218004, "ci95": [0.8710114583, 0.9213620666]}
+      }
+    }
+  },
+  "next_candidate": {
+    "initial_weights": "yolo26n.pt",
+    "initial_weights_sha256": "9b09cc8bf347f0fc8a5f7657480587f25db09b34bf33b0652110fb03a8ad4fef",
+    "run_name": "yolo26n_640_player_grouped_v9_fresh",
+    "imgsz": 640,
+    "epochs": 60,
+    "patience": 15,
+    "batch": 8,
+    "seed": 0,
+    "rect": false,
+    "cache": "none",
+    "save_period": 1,
+    "launch_gate": "independent v9 audit GO",
+    "training_state": {
+      "status": "retired_at_clean_epoch_boundary_for_rtx5060_gpu_handoff",
+      "completed_epochs": 17,
+      "best_epoch": 15,
+      "epoch_15_validation": {
+        "precision": 0.63576,
+        "recall": 0.63736,
+        "map50": 0.65386,
+        "map50_95": 0.26638
+      },
+      "epoch_17_validation": {
+        "precision": 0.68543,
+        "recall": 0.54394,
+        "map50": 0.60365,
+        "map50_95": 0.24509
+      },
+      "last_checkpoint_sha256": "6a570543cd7c2a75e2212e4be7f2c78cdb8295fa7034217621ae0d0aad46e048",
+      "best_checkpoint_sha256": "7e63cde0f65bce03c04e6473e1644de93ffb8b88dedcaf460cb5720ed7733446",
+      "results_csv_sha256": "2d57e4c129deeb2a39f5a39884a8c5b7d9b43c2a9d48c7d7a467e2e130591305",
+      "initial_run_contract_sha256": "4637ad0ca150135df40ccb61819ff2af3fa5a69a0239f190993059e85cc7a6fa",
+      "resume_mode": "stateful_optimizer_scheduler_ema_resume",
+      "resume_gate": "do_not_resume; forensic record only; final n/s training uses the audited RTX 5060 CUDA handoff",
+      "release_candidate_status": "incomplete_exploratory_cpu_baseline_not_exportable_or_adoptable",
+      "launch_training_script_sha256": null,
+      "launch_training_script_hash_status": "unavailable_pre_contract_run"
+    }
+  },
+  "known_limits": [
+    "No reviewed negative/background scenes are included.",
+    "Filename and perceptual grouping cannot prove source independence.",
+    "The test far subset has no held-out gameplay-sequence coverage.",
+    "The v9 test split has been consumed during development and is not a final-selection holdout.",
+    "Ultra-far validation/test sample counts are too small for standalone ranking.",
+    "One player-appearance class cannot establish enemy versus ally identity.",
+    "Final candidates require exact static runtime-artifact evaluation and target-hardware p95 latency."
+  ]
+}

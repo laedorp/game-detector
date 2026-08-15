@@ -1,0 +1,441 @@
+name: Publish dual-GPU-qualified DirectML release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Staged v* tag to publish
+        required: true
+        type: string
+      source_build_run_id:
+        description: Exact tagged staging workflow run ID
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        description: Exact staged RELEASE-CANDIDATE-MANIFEST.json SHA-256
+        required: true
+        type: string
+      directml_zip_sha256:
+        description: Exact staged Windows DirectML ZIP SHA-256
+        required: true
+        type: string
+      amd_evidence_run_id:
+        description: Successful RX 6950 XT DirectML qualification run ID
+        required: true
+        type: string
+      amd_adapter_index:
+        description: Exact RX 6950 XT DXGI adapter index
+        required: true
+        type: number
+      amd_evidence_archive_sha256:
+        description: Sealed RX 6950 XT evidence ZIP SHA-256
+        required: true
+        type: string
+      amd_qualification_manifest_sha256:
+        description: RX 6950 XT inner qualification-manifest SHA-256
+        required: true
+        type: string
+      amd_physical_attestation_sha256:
+        description: RX 6950 XT physical-attestation SHA-256
+        required: true
+        type: string
+      amd_public_receipt_sha256:
+        description: RX 6950 XT redacted receipt SHA-256
+        required: true
+        type: string
+      nvidia_evidence_run_id:
+        description: Successful RTX 5060 Laptop DirectML qualification run ID
+        required: true
+        type: string
+      nvidia_adapter_index:
+        description: Exact RTX 5060 Laptop DXGI adapter index
+        required: true
+        type: number
+      nvidia_evidence_archive_sha256:
+        description: Sealed RTX 5060 Laptop evidence ZIP SHA-256
+        required: true
+        type: string
+      nvidia_qualification_manifest_sha256:
+        description: RTX 5060 Laptop inner qualification-manifest SHA-256
+        required: true
+        type: string
+      nvidia_physical_attestation_sha256:
+        description: RTX 5060 Laptop physical-attestation SHA-256
+        required: true
+        type: string
+      nvidia_public_receipt_sha256:
+        description: RTX 5060 Laptop redacted receipt SHA-256
+        required: true
+        type: string
+      holdout_run_id:
+        description: Successful protected independent-holdout workflow run ID
+        required: true
+        type: string
+      holdout_prerequisite_artifact_id:
+        description: Exact verified-prerequisite Actions artifact ID
+        required: true
+        type: string
+      holdout_prerequisite_artifact_digest:
+        description: Exact verified-prerequisite Actions artifact digest
+        required: true
+        type: string
+      holdout_plan_artifact_id:
+        description: Exact pre-access frozen-plan Actions artifact ID
+        required: true
+        type: string
+      holdout_plan_artifact_digest:
+        description: Exact pre-access frozen-plan Actions artifact digest
+        required: true
+        type: string
+      holdout_evidence_artifact_id:
+        description: Exact independent-holdout evidence Actions artifact ID
+        required: true
+        type: string
+      holdout_evidence_artifact_digest:
+        description: Exact independent-holdout evidence Actions artifact digest
+        required: true
+        type: string
+      holdout_attestation_artifact_id:
+        description: Exact protected independent-attestation Actions artifact ID
+        required: true
+        type: string
+      holdout_attestation_artifact_digest:
+        description: Exact protected independent-attestation Actions artifact digest
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: qualified-directml-release-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  REPOSITORY_INPUT: ${{ github.repository }}
+  TAG_INPUT: ${{ inputs.tag }}
+  SOURCE_RUN_INPUT: ${{ inputs.source_build_run_id }}
+  CANDIDATE_MANIFEST_SHA_INPUT: ${{ inputs.candidate_manifest_sha256 }}
+  DIRECTML_ZIP_SHA_INPUT: ${{ inputs.directml_zip_sha256 }}
+  AMD_EVIDENCE_RUN_INPUT: ${{ inputs.amd_evidence_run_id }}
+  AMD_ADAPTER_INDEX_INPUT: ${{ inputs.amd_adapter_index }}
+  AMD_EVIDENCE_ARCHIVE_SHA_INPUT: ${{ inputs.amd_evidence_archive_sha256 }}
+  AMD_QUALIFICATION_MANIFEST_SHA_INPUT: ${{ inputs.amd_qualification_manifest_sha256 }}
+  AMD_PHYSICAL_ATTESTATION_SHA_INPUT: ${{ inputs.amd_physical_attestation_sha256 }}
+  AMD_PUBLIC_RECEIPT_SHA_INPUT: ${{ inputs.amd_public_receipt_sha256 }}
+  NVIDIA_EVIDENCE_RUN_INPUT: ${{ inputs.nvidia_evidence_run_id }}
+  NVIDIA_ADAPTER_INDEX_INPUT: ${{ inputs.nvidia_adapter_index }}
+  NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT: ${{ inputs.nvidia_evidence_archive_sha256 }}
+  NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT: ${{ inputs.nvidia_qualification_manifest_sha256 }}
+  NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT: ${{ inputs.nvidia_physical_attestation_sha256 }}
+  NVIDIA_PUBLIC_RECEIPT_SHA_INPUT: ${{ inputs.nvidia_public_receipt_sha256 }}
+  CONFIRMATION_INPUT: PUBLISH DUAL-GPU QUALIFIED DIRECTML RELEASE ${{ inputs.tag }}
+  HOLDOUT_RUN_INPUT: ${{ inputs.holdout_run_id }}
+  HOLDOUT_PREREQUISITE_ID_INPUT: ${{ inputs.holdout_prerequisite_artifact_id }}
+  HOLDOUT_PREREQUISITE_DIGEST_INPUT: ${{ inputs.holdout_prerequisite_artifact_digest }}
+  HOLDOUT_PLAN_ID_INPUT: ${{ inputs.holdout_plan_artifact_id }}
+  HOLDOUT_PLAN_DIGEST_INPUT: ${{ inputs.holdout_plan_artifact_digest }}
+  HOLDOUT_EVIDENCE_ID_INPUT: ${{ inputs.holdout_evidence_artifact_id }}
+  HOLDOUT_EVIDENCE_DIGEST_INPUT: ${{ inputs.holdout_evidence_artifact_digest }}
+  HOLDOUT_ATTESTATION_ID_INPUT: ${{ inputs.holdout_attestation_artifact_id }}
+  HOLDOUT_ATTESTATION_DIGEST_INPUT: ${{ inputs.holdout_attestation_artifact_digest }}
+
+jobs:
+  verify-and-stage:
+    name: Revalidate source, both physical evidence bundles, and public bytes
+    runs-on: windows-2022
+    timeout-minutes: 30
+    outputs:
+      candidate_artifact_id: ${{ steps.identity.outputs.candidate_artifact_id }}
+      amd_evidence_artifact_id: ${{ steps.identity.outputs.amd_evidence_artifact_id }}
+      nvidia_evidence_artifact_id: ${{ steps.identity.outputs.nvidia_evidence_artifact_id }}
+      holdout_evidence_artifact_id: ${{ steps.identity.outputs.holdout_evidence_artifact_id }}
+      holdout_attestation_artifact_id: ${{ steps.identity.outputs.holdout_attestation_artifact_id }}
+      verified_stage_artifact_id: ${{ steps.verified-stage.outputs.artifact-id }}
+      staged_content_manifest_sha256: ${{ steps.stage.outputs.staged_content_manifest_sha256 }}
+      tag_commit: ${{ steps.identity.outputs.tag_commit }}
+    steps:
+      - name: Require dispatch from protected main workflow source
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_RUN_ATTEMPT -cne "1") {
+            throw "Qualified publication requires Actions run attempt 1."
+          }
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "DirectML publication must be dispatched from refs/heads/main."
+          }
+
+      - name: Check out exact verification workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up verification Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Resolve exact remote run and artifact identities
+        id: identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Arguments = @(
+            "verify-publication-metadata",
+            "--repository", $env:REPOSITORY_INPUT,
+            "--tag", $env:TAG_INPUT,
+            "--source-build-run-id", $env:SOURCE_RUN_INPUT,
+            "--candidate-manifest-sha256", $env:CANDIDATE_MANIFEST_SHA_INPUT,
+            "--directml-zip-sha256", $env:DIRECTML_ZIP_SHA_INPUT,
+            "--confirmation", $env:CONFIRMATION_INPUT,
+            "--amd-evidence-run-id", $env:AMD_EVIDENCE_RUN_INPUT,
+            "--amd-adapter-index", $env:AMD_ADAPTER_INDEX_INPUT,
+            "--amd-evidence-archive-sha256", $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT,
+            "--amd-qualification-manifest-sha256", $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT,
+            "--amd-physical-attestation-sha256", $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT,
+            "--amd-public-receipt-sha256", $env:AMD_PUBLIC_RECEIPT_SHA_INPUT,
+            "--nvidia-evidence-run-id", $env:NVIDIA_EVIDENCE_RUN_INPUT,
+            "--nvidia-adapter-index", $env:NVIDIA_ADAPTER_INDEX_INPUT,
+            "--nvidia-evidence-archive-sha256", $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT,
+            "--nvidia-qualification-manifest-sha256", $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT,
+            "--nvidia-physical-attestation-sha256", $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT,
+            "--nvidia-public-receipt-sha256", $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT,
+            "--holdout-run-id", $env:HOLDOUT_RUN_INPUT,
+            "--holdout-prerequisite-artifact-id", $env:HOLDOUT_PREREQUISITE_ID_INPUT,
+            "--holdout-prerequisite-artifact-digest", $env:HOLDOUT_PREREQUISITE_DIGEST_INPUT,
+            "--holdout-plan-artifact-id", $env:HOLDOUT_PLAN_ID_INPUT,
+            "--holdout-plan-artifact-digest", $env:HOLDOUT_PLAN_DIGEST_INPUT,
+            "--holdout-evidence-artifact-id", $env:HOLDOUT_EVIDENCE_ID_INPUT,
+            "--holdout-evidence-artifact-digest", $env:HOLDOUT_EVIDENCE_DIGEST_INPUT,
+            "--holdout-attestation-artifact-id", $env:HOLDOUT_ATTESTATION_ID_INPUT,
+            "--holdout-attestation-artifact-digest", $env:HOLDOUT_ATTESTATION_DIGEST_INPUT,
+            "--output", "verified-remote-metadata.json"
+          )
+          python scripts/manage_directml_release.py @Arguments
+          $Metadata = Get-Content -LiteralPath verified-remote-metadata.json -Raw | ConvertFrom-Json
+          if ([string]$Metadata.source.tag_commit -ne $env:GITHUB_SHA) {
+            throw "The staged tag commit must equal this protected workflow source SHA."
+          }
+          "tag_commit=$($Metadata.source.tag_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "candidate_artifact_id=$($Metadata.source.candidate_artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "amd_evidence_artifact_id=$($Metadata.evidence.amd_rx_6950_xt.artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "nvidia_evidence_artifact_id=$($Metadata.evidence.nvidia_rtx_5060_laptop.artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "holdout_evidence_artifact_id=$($Metadata.independent_holdout.evidence_artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "holdout_attestation_artifact_id=$($Metadata.independent_holdout.attestation_artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download exact staged candidate artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.candidate_artifact_id }}
+          path: downloaded-release-candidate
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact RX 6950 XT evidence artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.amd_evidence_artifact_id }}
+          path: downloaded-amd-evidence
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.amd_evidence_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact RTX 5060 Laptop evidence artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.nvidia_evidence_artifact_id }}
+          path: downloaded-nvidia-evidence
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.nvidia_evidence_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact authenticated independent-holdout evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.holdout_evidence_artifact_id }}
+          path: downloaded-holdout-bundle
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.holdout_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact protected independent-holdout attestation
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.holdout_attestation_artifact_id }}
+          path: downloaded-holdout-attestation
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.holdout_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate all bytes and create immutable publication stage
+        id: stage
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Arguments = @(
+            "prepare-publication-stage",
+            "--repository", $env:REPOSITORY_INPUT,
+            "--tag", $env:TAG_INPUT,
+            "--source-build-run-id", $env:SOURCE_RUN_INPUT,
+            "--candidate-manifest-sha256", $env:CANDIDATE_MANIFEST_SHA_INPUT,
+            "--directml-zip-sha256", $env:DIRECTML_ZIP_SHA_INPUT,
+            "--confirmation", $env:CONFIRMATION_INPUT,
+            "--amd-evidence-run-id", $env:AMD_EVIDENCE_RUN_INPUT,
+            "--amd-adapter-index", $env:AMD_ADAPTER_INDEX_INPUT,
+            "--amd-evidence-archive-sha256", $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT,
+            "--amd-qualification-manifest-sha256", $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT,
+            "--amd-physical-attestation-sha256", $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT,
+            "--amd-public-receipt-sha256", $env:AMD_PUBLIC_RECEIPT_SHA_INPUT,
+            "--nvidia-evidence-run-id", $env:NVIDIA_EVIDENCE_RUN_INPUT,
+            "--nvidia-adapter-index", $env:NVIDIA_ADAPTER_INDEX_INPUT,
+            "--nvidia-evidence-archive-sha256", $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT,
+            "--nvidia-qualification-manifest-sha256", $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT,
+            "--nvidia-physical-attestation-sha256", $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT,
+            "--nvidia-public-receipt-sha256", $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT,
+            "--holdout-run-id", $env:HOLDOUT_RUN_INPUT,
+            "--holdout-prerequisite-artifact-id", $env:HOLDOUT_PREREQUISITE_ID_INPUT,
+            "--holdout-prerequisite-artifact-digest", $env:HOLDOUT_PREREQUISITE_DIGEST_INPUT,
+            "--holdout-plan-artifact-id", $env:HOLDOUT_PLAN_ID_INPUT,
+            "--holdout-plan-artifact-digest", $env:HOLDOUT_PLAN_DIGEST_INPUT,
+            "--holdout-evidence-artifact-id", $env:HOLDOUT_EVIDENCE_ID_INPUT,
+            "--holdout-evidence-artifact-digest", $env:HOLDOUT_EVIDENCE_DIGEST_INPUT,
+            "--holdout-attestation-artifact-id", $env:HOLDOUT_ATTESTATION_ID_INPUT,
+            "--holdout-attestation-artifact-digest", $env:HOLDOUT_ATTESTATION_DIGEST_INPUT,
+            "--candidate-directory", "downloaded-release-candidate",
+            "--amd-evidence-directory", "downloaded-amd-evidence",
+            "--nvidia-evidence-directory", "downloaded-nvidia-evidence",
+            "--holdout-bundle-directory", "downloaded-holdout-bundle",
+            "--holdout-attestation-directory", "downloaded-holdout-attestation",
+            "--stage-directory", "verified-release-stage",
+            "--verification-run-id", $env:GITHUB_RUN_ID,
+            "--result", "verified-release-stage-result.json"
+          )
+          python scripts/manage_directml_release.py @Arguments
+          $Result = Get-Content -LiteralPath verified-release-stage-result.json -Raw | ConvertFrom-Json
+          "staged_content_manifest_sha256=$($Result.staged_content_manifest_sha256)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload immutable verified publication stage
+        id: verified-stage
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: verified-directml-release-stage-${{ github.run_id }}
+          path: verified-release-stage
+          if-no-files-found: error
+          retention-days: 7
+
+  publish-draft-transactionally:
+    name: Protected atomic draft creation and publication
+    needs: verify-and-stage
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment:
+      name: directml-release-publication
+    permissions:
+      actions: read
+      contents: write
+    env:
+      STAGED_CONTENT_MANIFEST_SHA256: ${{ needs.verify-and-stage.outputs.staged_content_manifest_sha256 }}
+      VERIFICATION_RUN_ID: ${{ github.run_id }}
+    steps:
+      - name: Require independent protected publication environment
+        env:
+          ENVIRONMENT_GUARD: ${{ secrets.DIRECTML_RELEASE_ENVIRONMENT_GUARD }}
+          ENVIRONMENT_POLICY_VERSION: ${{ vars.DIRECTML_RELEASE_ENVIRONMENT_POLICY_VERSION }}
+          REVIEWER_GROUP: ${{ vars.DIRECTML_RELEASE_REVIEWER_GROUP }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_RUN_ATTEMPT" = "1" || {
+            echo "Qualified publication requires Actions run attempt 1." >&2
+            exit 2
+          }
+          test -n "$ENVIRONMENT_GUARD" || {
+            echo "directml-release-publication must define its environment-only guard secret." >&2
+            exit 2
+          }
+          test "$ENVIRONMENT_POLICY_VERSION" = "required-reviewers-v1" || {
+            echo "directml-release-publication must enforce required-reviewers-v1." >&2
+            exit 2
+          }
+          test "$REVIEWER_GROUP" = "directml-publication-independent-reviewers-v1" || {
+            echo "directml-release-publication has the wrong independent reviewer group marker." >&2
+            exit 2
+          }
+
+      - name: Check out exact publication workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up publication Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Download exact read-only verified publication stage
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.verify-and-stage.outputs.verified_stage_artifact_id }}
+          path: verified-release-stage
+
+      - name: Reverify identities and publish draft transactionally
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          python scripts/manage_directml_release.py publish \
+            --repository "$REPOSITORY_INPUT" \
+            --tag "$TAG_INPUT" \
+            --source-build-run-id "$SOURCE_RUN_INPUT" \
+            --candidate-manifest-sha256 "$CANDIDATE_MANIFEST_SHA_INPUT" \
+            --directml-zip-sha256 "$DIRECTML_ZIP_SHA_INPUT" \
+            --confirmation "$CONFIRMATION_INPUT" \
+            --amd-evidence-run-id "$AMD_EVIDENCE_RUN_INPUT" \
+            --amd-adapter-index "$AMD_ADAPTER_INDEX_INPUT" \
+            --amd-evidence-archive-sha256 "$AMD_EVIDENCE_ARCHIVE_SHA_INPUT" \
+            --amd-qualification-manifest-sha256 "$AMD_QUALIFICATION_MANIFEST_SHA_INPUT" \
+            --amd-physical-attestation-sha256 "$AMD_PHYSICAL_ATTESTATION_SHA_INPUT" \
+            --amd-public-receipt-sha256 "$AMD_PUBLIC_RECEIPT_SHA_INPUT" \
+            --nvidia-evidence-run-id "$NVIDIA_EVIDENCE_RUN_INPUT" \
+            --nvidia-adapter-index "$NVIDIA_ADAPTER_INDEX_INPUT" \
+            --nvidia-evidence-archive-sha256 "$NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT" \
+            --nvidia-qualification-manifest-sha256 "$NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT" \
+            --nvidia-physical-attestation-sha256 "$NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT" \
+            --nvidia-public-receipt-sha256 "$NVIDIA_PUBLIC_RECEIPT_SHA_INPUT" \
+            --holdout-run-id "$HOLDOUT_RUN_INPUT" \
+            --holdout-prerequisite-artifact-id "$HOLDOUT_PREREQUISITE_ID_INPUT" \
+            --holdout-prerequisite-artifact-digest "$HOLDOUT_PREREQUISITE_DIGEST_INPUT" \
+            --holdout-plan-artifact-id "$HOLDOUT_PLAN_ID_INPUT" \
+            --holdout-plan-artifact-digest "$HOLDOUT_PLAN_DIGEST_INPUT" \
+            --holdout-evidence-artifact-id "$HOLDOUT_EVIDENCE_ID_INPUT" \
+            --holdout-evidence-artifact-digest "$HOLDOUT_EVIDENCE_DIGEST_INPUT" \
+            --holdout-attestation-artifact-id "$HOLDOUT_ATTESTATION_ID_INPUT" \
+            --holdout-attestation-artifact-digest "$HOLDOUT_ATTESTATION_DIGEST_INPUT" \
+            --stage-directory verified-release-stage \
+            --verification-run-id "$VERIFICATION_RUN_ID" \
+            --staged-content-manifest-sha256 "$STAGED_CONTENT_MANIFEST_SHA256" \
+            --output directml-publication-result.json
+
+      - name: Record verified public release
+        run: |
+          set -euo pipefail
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          result = json.loads(Path("directml-publication-result.json").read_text(encoding="utf-8"))
+          print("## Dual-GPU-qualified DirectML release published")
+          print()
+          print(f"- Tag commit: `{result['tag_commit']}`")
+          print(f"- Release: {result['release_html_url']}")
+          print("- Physical gates: AMD Radeon RX 6950 XT and NVIDIA GeForce RTX 5060 Laptop GPU")
+          print("- Independent holdout: authenticated protected run, pre-access plan, retired ledger, and redacted receipt")
+          print("- Publication: draft assembled and byte-verified before one final public transition")
+          PY

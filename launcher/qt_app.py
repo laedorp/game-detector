@@ -13,9 +13,15 @@ not.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import replace
+import json
+import math
 import os
 from pathlib import Path
+import re
+import secrets
 import subprocess
+import stat
 import sys
 import threading
 import time
@@ -27,6 +33,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QDoubleSpinBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -36,6 +43,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -45,12 +53,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from utils.inference_size import format_inference_size
+
 from aiming.makcu import (
     BUTTON_NAMES,
     MakcuAimConfig,
     MakcuAimingController,
     MakcuError,
     detect_makcu_port,
+)
+from aiming.makcu_calibration_activation import (
+    CalibrationActivationError,
+    activate_session_evidence_file,
+)
+from aiming.makcu_calibration_session import (
+    CalibrationEvidenceError,
+    CalibrationSessionEvidence,
+    load_session_evidence,
 )
 
 from . import qt_theme
@@ -100,6 +119,8 @@ from .settings import (
     SettingsError,
     launcher_command,
     load_settings,
+    makcu_calibration_command,
+    model_preset_detail_crop_text,
     resource_root,
     save_settings,
     settings_path,
@@ -107,7 +128,58 @@ from .settings import (
 
 
 UNIT = qt_theme.UNIT
-PROAIM_BUILD_TAG = "2026-08-10-makcu-monitor-v1"
+
+
+def _private_calibration_path(kind: str, prefix: str) -> Path:
+    """Return a randomized, nonexistent path inside a private config directory."""
+
+    if kind not in {"evidence", "active"} or not re.fullmatch(
+        r"[a-z][a-z0-9-]{0,31}", prefix
+    ):
+        raise ValueError("invalid private calibration path category")
+    directory = (
+        settings_path().expanduser().resolve().parent
+        / "calibration"
+        / kind
+    )
+    directory_preexisted = os.path.lexists(directory)
+    if not directory_preexisted:
+        directory.mkdir(parents=True, mode=0o700, exist_ok=False)
+        if os.name == "posix":
+            directory.chmod(0o700)
+    metadata = directory.lstat()
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise PermissionError("private calibration path is not a real directory")
+    if os.name == "posix" and stat.S_IMODE(metadata.st_mode) & 0o077:
+        raise PermissionError(
+            "private calibration directory must not be group/world accessible"
+        )
+    for _attempt in range(128):
+        destination = directory / f"{prefix}-{secrets.token_hex(16)}.json"
+        if not os.path.lexists(destination):
+            return destination
+    raise FileExistsError("could not allocate a unique private calibration path")
+
+
+def _build_tag() -> str:
+    """Return immutable frozen identity or a neutral source-checkout label."""
+
+    if not bool(getattr(sys, "frozen", False)):
+        return "source checkout"
+    build_info = Path(sys.executable).resolve().parent / "BUILD-INFO.json"
+    try:
+        record = json.loads(build_info.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return "frozen build (identity unavailable)"
+    if not isinstance(record, dict):
+        return "frozen build (identity unavailable)"
+    commit = str(record.get("commit", "unknown")).strip()
+    variant = str(record.get("runtime_variant", "unknown")).strip()
+    short_commit = commit[:12] if commit and commit != "unknown" else "unknown commit"
+    return f"{variant} · {short_commit}"
+
+
+PROAIM_BUILD_TAG = _build_tag()
 SOURCE_REPOSITORY = "https://github.com/laedorp/game-detector"
 MAKCU_BUTTON_LABELS = BUTTON_NAMES
 AIM_POINT_OPTIONS = (
@@ -129,9 +201,9 @@ MODEL_TIER_LOW = "low"
 MODEL_TIER_MID = "mid"
 MODEL_TIER_HIGH = "high"
 MODEL_TIER_OPTIONS = (
-    ("Low-end PC", MODEL_TIER_LOW),
-    ("Mid-tier PC", MODEL_TIER_MID),
-    ("High-end PC", MODEL_TIER_HIGH),
+    ("Responsive", MODEL_TIER_LOW),
+    ("Balanced (Recommended)", MODEL_TIER_MID),
+    ("Advanced / benchmark", MODEL_TIER_HIGH),
 )
 MODEL_TIER_PRESET_KEYS = {
     MODEL_TIER_LOW: (
@@ -146,8 +218,8 @@ MODEL_TIER_PRESET_KEYS = {
         MODEL_PRESET_COCO_BALANCED,
     ),
     MODEL_TIER_HIGH: (
-        MODEL_PRESET_COCO_HIGH,
         MODEL_PRESET_FORT_PLAYER_BALANCED,
+        MODEL_PRESET_COCO_HIGH,
         MODEL_PRESET_COCO_BALANCED,
         MODEL_PRESET_FORT_PLAYER,
         MODEL_PRESET_COCO,
@@ -161,9 +233,152 @@ MODEL_TIER_DEFAULT_PRESET = {
     # benchmark option within the high tier.
     MODEL_TIER_HIGH: MODEL_PRESET_FORT_PLAYER_BALANCED,
 }
-HIGH_END_CAPTURE_WIDTH = "1920"
-HIGH_END_CAPTURE_HEIGHT = "1080"
-HIGH_END_CAPTURE_FPS = "100"
+
+
+def _has_exact_directml_binding(profile: object, plan: object) -> bool:
+    """Return whether a DirectML plan names its exact matching DXGI adapter."""
+
+    device = str(getattr(plan, "device", "")).strip().upper()
+    if not device.startswith(("DIRECTML", "DML")):
+        return True
+    match = re.fullmatch(r"(?:DIRECTML|DML):(\d+)", device)
+    if match is None:
+        return False
+    index = int(match.group(1))
+    adapters = [
+        item
+        for item in getattr(profile, "directml_adapters", ())
+        if getattr(item, "index", None) == index
+    ]
+    if len(adapters) != 1:
+        return False
+    adapter = adapters[0]
+    accelerator = getattr(plan, "accelerator", None)
+    identifier_matches = bool(
+        str(getattr(accelerator, "identifier", "")).strip()
+        and str(getattr(adapter, "identifier", "")).casefold()
+        == str(getattr(accelerator, "identifier", "")).casefold()
+    )
+    name_matches = bool(
+        str(getattr(accelerator, "name", "")).strip()
+        and str(getattr(adapter, "name", "")).casefold().strip()
+        == str(getattr(accelerator, "name", "")).casefold().strip()
+    )
+    return identifier_matches or name_matches
+
+
+def _is_gpu_accelerator(accelerator: object) -> bool:
+    kind = getattr(accelerator, "kind", "")
+    return str(getattr(kind, "value", kind)).strip().lower() == "gpu"
+
+
+def _plan_has_one_physical_gpu(profile: object, plan: object) -> bool:
+    """Reject a provider-only claim that has no unique scanned GPU behind it."""
+
+    accelerator = getattr(plan, "accelerator", None)
+    matches = [
+        item
+        for item in getattr(profile, "accelerators", ())
+        if _is_gpu_accelerator(item) and item == accelerator
+    ]
+    return len(matches) == 1
+
+
+def _plan_names_gpu_device(plan: object) -> bool:
+    backend = str(getattr(plan, "backend", "")).strip().lower()
+    device = str(getattr(plan, "device", "")).strip().upper()
+    if backend == "openvino":
+        return device == "GPU" or bool(re.fullmatch(r"GPU\.\d+", device))
+    if backend != "onnxruntime":
+        return False
+    return device in {"CUDA", "TENSORRT", "ROCM", "MIGRAPHX"} or bool(
+        re.fullmatch(r"(?:DIRECTML|DML):\d+", device)
+    )
+
+
+def _accelerator_vendor(accelerator: object) -> str:
+    vendor = getattr(accelerator, "vendor", "")
+    return str(getattr(vendor, "value", vendor)).strip().lower()
+
+
+def _provider_device_is_unambiguous(profile: object, plan: object) -> bool:
+    """Reject generic provider device zero when multiple compatible GPUs exist."""
+
+    device = str(getattr(plan, "device", "")).strip().upper()
+    backend = str(getattr(plan, "backend", "")).strip().lower()
+    if device.startswith(("DIRECTML", "DML")):
+        return _has_exact_directml_binding(profile, plan)
+    if backend == "openvino":
+        vendor = "intel"
+    elif device in {"CUDA", "TENSORRT"}:
+        vendor = "nvidia"
+    elif device in {"ROCM", "MIGRAPHX"}:
+        vendor = "amd"
+    else:
+        return False
+    compatible = [
+        item
+        for item in getattr(profile, "accelerators", ())
+        if _is_gpu_accelerator(item) and _accelerator_vendor(item) == vendor
+    ]
+    return len(compatible) == 1
+
+
+def _qualifying_discrete_gpu(profile: object, plan: object) -> bool:
+    """Return whether a plan is backed by a confidently discrete GPU."""
+
+    accelerator = getattr(plan, "accelerator", None)
+    if not _plan_has_one_physical_gpu(profile, plan):
+        return False
+    placement = getattr(accelerator, "discrete", None)
+    if placement is True:
+        return True
+    if placement is False:
+        return False
+    # WMI's AdapterRAM is often truncated on GPUs above 2 GiB. For an exactly
+    # matched DirectML adapter, DXGI's dedicated-memory value is the stronger
+    # signal and also prevents a hybrid laptop's integrated GPU from turning a
+    # unique RTX/Radeon selection into a false ambiguity.
+    identifier = str(getattr(accelerator, "identifier", "")).casefold().strip()
+    name = str(getattr(accelerator, "name", "")).casefold().strip()
+    matching_adapters = [
+        item
+        for item in getattr(profile, "directml_adapters", ())
+        if (
+            identifier
+            and str(getattr(item, "identifier", "")).casefold().strip()
+            == identifier
+        )
+        or (
+            name
+            and str(getattr(item, "name", "")).casefold().strip() == name
+        )
+    ]
+    return bool(
+        len(matching_adapters) == 1
+        and int(getattr(matching_adapters[0], "dedicated_vram", 0))
+        > 1_500_000_000
+    )
+
+
+def _unique_ready_gpu_plan(profile: object, plans: Sequence[object]) -> object | None:
+    """Choose only one unambiguous, ready physical GPU recommendation.
+
+    Provider presence alone is insufficient for DirectML: its default adapter
+    may differ from the GPU WMI reported. An automatic selection therefore
+    requires a verified WMI-to-DXGI match encoded as ``DIRECTML:<index>``.
+    """
+
+    candidates = []
+    for plan in plans:
+        if (
+            bool(getattr(plan, "ready", False))
+            and _qualifying_discrete_gpu(profile, plan)
+            and _plan_names_gpu_device(plan)
+            and _provider_device_is_unambiguous(profile, plan)
+        ):
+            candidates.append(plan)
+    return candidates[0] if len(candidates) == 1 else None
 
 
 def _label(text: str, role: str = "") -> QLabel:
@@ -191,9 +406,11 @@ def _card(title: str, subtitle: str = "") -> tuple[QFrame, QVBoxLayout]:
     return frame, outer
 
 
-def _field_row(layout: QGridLayout, row: int, text: str, widget: QWidget) -> None:
-    layout.addWidget(_label(text, "fieldLabel"), row, 0, Qt.AlignmentFlag.AlignVCenter)
+def _field_row(layout: QGridLayout, row: int, text: str, widget: QWidget) -> QLabel:
+    label = _label(text, "fieldLabel")
+    layout.addWidget(label, row, 0, Qt.AlignmentFlag.AlignVCenter)
     layout.addWidget(widget, row, 1)
+    return label
 
 
 class Section(QWidget):
@@ -232,11 +449,14 @@ class LauncherWindow(QMainWindow):
     """Main window: sidebar, section stack, and a persistent run bar."""
 
     log_line = Signal(str)
+    calibration_output_line = Signal(str)
     makcu_verification_done = Signal(bool, str, str, str)
     makcu_verification_progress = Signal(str)
     makcu_monitor_done = Signal()
     precision_output_line = Signal(str)
     precision_reader_done = Signal(object)
+    first_hardware_scan_done = Signal(object, object)
+    first_hardware_scan_failed = Signal(str)
 
     def __init__(self, settings: LauncherSettings | None = None) -> None:
         super().__init__()
@@ -244,10 +464,40 @@ class LauncherWindow(QMainWindow):
         self.resize(1080, 760)
         self.setMinimumSize(880, 620)
 
-        self.settings = settings or load_settings(settings_path())
+        settings_were_supplied = settings is not None
+        # Let the loader adopt the pre-rename GameDetector profile when the
+        # current ProAim file does not exist. Passing the current path here
+        # would disable that intentional one-time fallback.
+        self.settings = settings if settings is not None else load_settings()
+        self._hardware_selection_configured = bool(
+            self.settings.hardware_selection_configured or settings_were_supplied
+        )
+        if settings_were_supplied:
+            # Passing a settings object is an explicit embedding/test choice,
+            # not a fresh profile loaded from disk.
+            self.settings.hardware_selection_configured = True
+        self._changing_hardware_selection = False
+        self._first_hardware_scan_active = False
+        self._first_hardware_scan_thread: threading.Thread | None = None
+        self._first_hardware_scan_cancel = threading.Event()
+        self._hardware_start_notice = ""
         self.process: subprocess.Popen[str] | None = None
         self._reader: Any | None = None
         self._stop_requested = False
+        self.calibration_process: subprocess.Popen[str] | None = None
+        self._calibration_reader: threading.Thread | None = None
+        self._calibration_stop_requested = False
+        self._calibration_evidence_path: Path | None = None
+        self._calibration_launch_arguments: tuple[str, ...] | None = None
+        self._calibration_context: str | None = None
+        self._calibration_last_runtime_failure = ""
+        self._calibration_guide_stage = "ready"
+        self._calibration_release_confirmed = False
+        self._calibration_target_ready = False
+        self._calibration_raw_button = "unknown"
+        self._calibration_settling_view = False
+        self._pending_calibration_evidence: CalibrationSessionEvidence | None = None
+        self._pending_calibration_path: Path | None = None
         self._makcu_verify_thread: threading.Thread | None = None
         self._makcu_verify_cancel = threading.Event()
         self._makcu_monitor_thread: threading.Thread | None = None
@@ -288,6 +538,10 @@ class LauncherWindow(QMainWindow):
 
         self._build_interface()
         self._load_from_settings()
+        # Connect after loading so restoring a saved value is not mistaken for
+        # a new user choice. Programmatic fallback changes are guarded below.
+        self.backend.currentTextChanged.connect(self._hardware_selection_edited)
+        self.device.currentTextChanged.connect(self._hardware_selection_edited)
         self._refresh_precision_devices(silent=True)
 
         self._start_key = QShortcut(QKeySequence(Qt.Key.Key_F5), self)
@@ -300,11 +554,20 @@ class LauncherWindow(QMainWindow):
         self._poll.start(400)
 
         self.log_line.connect(self._append_log)
+        self.calibration_output_line.connect(self._handle_calibration_output_line)
         self.makcu_verification_done.connect(self._apply_makcu_verification_result)
         self.makcu_verification_progress.connect(self._apply_makcu_verification_progress)
         self.makcu_monitor_done.connect(self._finish_makcu_monitor)
         self.precision_output_line.connect(self._handle_precision_output_line)
         self.precision_reader_done.connect(self._precision_reader_finished)
+        self.first_hardware_scan_done.connect(self._finish_first_hardware_scan)
+        self.first_hardware_scan_failed.connect(self._fail_first_hardware_scan)
+
+        if not settings_were_supplied and not self._hardware_selection_configured:
+            # Let the first window paint before discovery starts. The scan itself
+            # runs off the UI thread because Windows hardware enumeration can
+            # legitimately take several seconds on a hybrid laptop.
+            QTimer.singleShot(0, self._begin_first_hardware_scan)
 
     # -- construction ----------------------------------------------------
     def _build_interface(self) -> None:
@@ -401,7 +664,9 @@ class LauncherWindow(QMainWindow):
         section.add_card(card)
 
         screen_card, screen_layout = _card(
-            "Screen capture", "X11 only. Keep the preview off the captured area."
+            "Screen capture",
+            "Windows uses low-latency DXGI Desktop Duplication; Linux screen "
+            "capture requires X11. Keep the preview off the captured area.",
         )
         grid = QGridLayout()
         grid.setHorizontalSpacing(UNIT * 2)
@@ -461,11 +726,21 @@ class LauncherWindow(QMainWindow):
         self.capture_width = QLineEdit()
         self.capture_height = QLineEdit()
         self.capture_fps = QLineEdit()
+        self.capture_format = QComboBox()
+        self.capture_format.addItems(
+            ("Auto", "NV12", "BGR3", "YUYV", "P010", "MJPG")
+        )
+        self.capture_format.setEditable(True)
         _field_row(grid, 0, "Device index", self.camera_index)
         _field_row(grid, 1, "Width", self.capture_width)
         _field_row(grid, 2, "Height", self.capture_height)
         _field_row(grid, 3, "Frame rate (fps)", self.capture_fps)
+        _field_row(grid, 4, "Pixel format", self.capture_format)
         camera_layout.addLayout(grid)
+        self.capture_rotate_180 = QCheckBox(
+            "Rotate capture 180° (fix an upside-down feed)"
+        )
+        camera_layout.addWidget(self.capture_rotate_180)
         self.camera_card = camera_card
         section.add_card(camera_card)
 
@@ -503,7 +778,7 @@ class LauncherWindow(QMainWindow):
         for preset in MODEL_PRESETS:
             self.model_preset.addItem(preset.label, preset.key)
         self.model_preset.currentIndexChanged.connect(self._preset_changed)
-        _field_row(grid, 0, "Performance tier", self.model_tier)
+        _field_row(grid, 0, "Workload", self.model_tier)
         _field_row(grid, 1, "Detector", self.model_preset)
 
         self.custom_model_path = QLineEdit()
@@ -543,7 +818,8 @@ class LauncherWindow(QMainWindow):
         layout.addLayout(actions)
 
         tier_hint = _label(
-            "Pick Low, Mid, or High first, then choose a model tuned for that performance class.",
+            "Balanced uses the trained 416px player model. Responsive favors update rate; "
+            "Advanced exposes slower comparison models only when you explicitly choose them.",
             "subtitle",
         )
         tier_hint.setWordWrap(True)
@@ -570,6 +846,18 @@ class LauncherWindow(QMainWindow):
         self.iou_threshold = QLineEdit()
         self.crop_size = QLineEdit()
         self.crop_size.setPlaceholderText("Optional centered square crop")
+        self.detail_crop_size = QLineEdit()
+        self.detail_crop_size.setPlaceholderText(
+            "Off (experimental, max source width)"
+        )
+        self.detail_crop_size.setToolTip(
+            "Runs the same model a second time on a centered ROI whose aspect "
+            "matches the static model input; this value is its maximum source "
+            "width. "
+            "Only unmatched small/medium detail detections are added; large "
+            "players remain owned by the full-frame pass. Leave blank for the "
+            "ordinary single-pass pipeline."
+        )
         self.output_format = QComboBox()
         self.output_format.addItems(("auto", "end2end", "traditional"))
 
@@ -580,11 +868,17 @@ class LauncherWindow(QMainWindow):
         confidence_layout.addWidget(self.confidence, 1)
         confidence_layout.addWidget(self.confidence_value)
 
-        _field_row(grid, 0, "Inference size", self.inference_size)
+        _field_row(grid, 0, "Inference size (H×W)", self.inference_size)
         _field_row(grid, 1, "Confidence", confidence_row)
         _field_row(grid, 2, "IoU threshold", self.iou_threshold)
         _field_row(grid, 3, "Centered crop (px)", self.crop_size)
-        _field_row(grid, 4, "Model output format", self.output_format)
+        self.detail_crop_label = _field_row(
+            grid,
+            4,
+            "Detail ROI max width (experimental)",
+            self.detail_crop_size,
+        )
+        _field_row(grid, 5, "Model output format", self.output_format)
         layout.addLayout(grid)
         section.add_card(card)
 
@@ -595,8 +889,21 @@ class LauncherWindow(QMainWindow):
         )
         self.preview = QCheckBox("Show preview window")
         self.draw = QCheckBox("Draw boxes on the preview")
+        self.preview_fps = QComboBox()
+        self.preview_fps.addItems(("15", "30", "60"))
+        self.preview_fps.setEditable(True)
         layout.addWidget(self.preview)
         layout.addWidget(self.draw)
+        preview_grid = QGridLayout()
+        preview_grid.setColumnStretch(1, 1)
+        _field_row(preview_grid, 0, "Preview refresh (fps)", self.preview_fps)
+        layout.addLayout(preview_grid)
+        preview_hint = _label(
+            "Detection stays full speed; only the optional preview is rate-limited.",
+            "subtitle",
+        )
+        preview_hint.setWordWrap(True)
+        layout.addWidget(preview_hint)
         section.add_card(card)
 
         card, layout = _card(
@@ -640,6 +947,11 @@ class LauncherWindow(QMainWindow):
         self.aim_point = QComboBox()
         for label, value in AIM_POINT_OPTIONS:
             self.aim_point.addItem(label, value)
+        self.aim_point.setToolTip(
+            "Automatic mode ignores this saved body-box ratio because the pinned "
+            "direct head detector supplies the anatomical aim point. An active "
+            "measured response profile uses the ratio."
+        )
         self.aim_invert_x = QCheckBox("Invert X")
         self.aim_invert_y = QCheckBox("Invert Y")
         self.aim_makcu_port = QLineEdit()
@@ -656,17 +968,86 @@ class LauncherWindow(QMainWindow):
         self.verify_makcu_button.clicked.connect(self.verify_makcu_activation)
         self.monitor_makcu_button = QPushButton("Monitor Mouse Clicks…")
         self.monitor_makcu_button.clicked.connect(self.monitor_makcu_buttons)
+        self.calibrate_makcu_button = QPushButton(
+            "Optional advanced response calibration…"
+        )
+        self.calibrate_makcu_button.setToolTip(
+            "Normal Start works without calibration by using automatic direct-head "
+            "command-aware MAKCU control. Run this only to measure an optional "
+            "mode-specific profile."
+        )
+        self.calibrate_makcu_button.clicked.connect(self.start_makcu_calibration)
+        self.activate_makcu_calibration_button = QPushButton(
+            "Review and activate…"
+        )
+        self.activate_makcu_calibration_button.clicked.connect(
+            self.activate_staged_makcu_calibration
+        )
+        self.activate_makcu_calibration_button.setEnabled(False)
+        self.aim_makcu_context = QComboBox()
+        self.aim_makcu_context.setEditable(False)
+        self.aim_makcu_context.addItem("Hip fire", "hip")
+        self.aim_makcu_context.addItem("ADS (aiming down sights)", "ads")
+        self.aim_makcu_context.currentIndexChanged.connect(
+            self._calibration_context_changed
+        )
+        self.aim_makcu_context.setToolTip(
+            "Choose the exact in-game aim mode used during optional advanced "
+            "calibration. The active profile is bound to this choice."
+        )
         self.aim_makcu_strength = QSlider(Qt.Orientation.Horizontal)
         self.aim_makcu_strength.setRange(5, 250)
         self.aim_makcu_strength.setSingleStep(1)
+        self.aim_makcu_strength.setToolTip(
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control do not use this value."
+        )
         self.aim_makcu_strength_value = _label("0.50", "subtitle")
         self.aim_makcu_strength.valueChanged.connect(self._sync_strength_label)
         self.aim_makcu_smoothing = QSlider(Qt.Orientation.Horizontal)
         self.aim_makcu_smoothing.setRange(10, 100)
         self.aim_makcu_smoothing.setSingleStep(1)
+        self.aim_makcu_smoothing.setToolTip(
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control do not use this value."
+        )
         self.aim_makcu_smoothing_value = _label("0.78", "subtitle")
         self.aim_makcu_smoothing.valueChanged.connect(self._sync_smoothing_label)
         self.aim_makcu_max_step = QLineEdit()
+        self.aim_makcu_max_step.setToolTip(
+            "Sets the active MAKCU mouse-rate envelope. Automatic direct-head "
+            "command-aware control uses the same envelope for X and Y."
+        )
+        self.aim_makcu_prediction_lead_seconds = QDoubleSpinBox()
+        self.aim_makcu_prediction_lead_seconds.setRange(0.0, 0.25)
+        self.aim_makcu_prediction_lead_seconds.setDecimals(3)
+        self.aim_makcu_prediction_lead_seconds.setSingleStep(0.001)
+        self.aim_makcu_prediction_lead_seconds.setSuffix(" s")
+        self.aim_makcu_prediction_lead_seconds.setToolTip(
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control estimate target motion directly and do not "
+            "use this value."
+        )
+        self.aim_makcu_derivative_damping_seconds = QDoubleSpinBox()
+        self.aim_makcu_derivative_damping_seconds.setRange(0.0, 0.25)
+        self.aim_makcu_derivative_damping_seconds.setDecimals(3)
+        self.aim_makcu_derivative_damping_seconds.setSingleStep(0.001)
+        self.aim_makcu_derivative_damping_seconds.setSuffix(" s")
+        self.aim_makcu_derivative_damping_seconds.setToolTip(
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control estimate target motion directly and do not "
+            "use this value."
+        )
+        self.aim_makcu_vertical_rate_ratio = QDoubleSpinBox()
+        self.aim_makcu_vertical_rate_ratio.setRange(0.10, 1.00)
+        self.aim_makcu_vertical_rate_ratio.setDecimals(2)
+        self.aim_makcu_vertical_rate_ratio.setSingleStep(0.05)
+        self.aim_makcu_vertical_rate_ratio.setSuffix(" ×")
+        self.aim_makcu_vertical_rate_ratio.setToolTip(
+            "Caps vertical mouse rate only when an active measured response profile "
+            "is selected. Automatic direct-head command-aware control uses an equal "
+            "X/Y envelope."
+        )
         self.aim_makcu_verification_status = _label("", "subtitle")
         self.aim_makcu_verification_status.setWordWrap(True)
 
@@ -703,6 +1084,28 @@ class LauncherWindow(QMainWindow):
         tuning_layout.addWidget(self.aim_makcu_max_step)
         tuning_layout.addStretch(1)
 
+        motion_tuning_row = QWidget()
+        motion_tuning_layout = QHBoxLayout(motion_tuning_row)
+        motion_tuning_layout.setContentsMargins(0, 0, 0, 0)
+        motion_tuning_layout.setSpacing(UNIT)
+        motion_tuning_layout.addWidget(_label("Prediction lead", "fieldLabel"))
+        motion_tuning_layout.addWidget(self.aim_makcu_prediction_lead_seconds)
+        motion_tuning_layout.addSpacing(UNIT)
+        motion_tuning_layout.addWidget(_label("Damping", "fieldLabel"))
+        motion_tuning_layout.addWidget(self.aim_makcu_derivative_damping_seconds)
+        motion_tuning_layout.addSpacing(UNIT)
+        motion_tuning_layout.addWidget(_label("Vertical cap", "fieldLabel"))
+        motion_tuning_layout.addWidget(self.aim_makcu_vertical_rate_ratio)
+        motion_tuning_layout.addStretch(1)
+
+        calibration_row = QWidget()
+        calibration_layout = QHBoxLayout(calibration_row)
+        calibration_layout.setContentsMargins(0, 0, 0, 0)
+        calibration_layout.setSpacing(UNIT)
+        calibration_layout.addWidget(self.calibrate_makcu_button)
+        calibration_layout.addWidget(self.activate_makcu_calibration_button)
+        calibration_layout.addStretch(1)
+
         _field_row(grid, 0, "Target label", self.aim_label)
         _field_row(grid, 1, "Aim point", self.aim_point)
         grid.addWidget(self.aim_invert_x, 1, 2)
@@ -710,11 +1113,48 @@ class LauncherWindow(QMainWindow):
         _field_row(grid, 2, "MAKCU device", port_row)
         _field_row(grid, 3, "Hold to activate", button_row)
         _field_row(grid, 4, "Tuning", tuning_row)
+        _field_row(grid, 5, "Motion tuning", motion_tuning_row)
+        _field_row(grid, 6, "Optional calibration mode", self.aim_makcu_context)
+        _field_row(grid, 7, "Advanced response profile", calibration_row)
         layout.addLayout(grid)
+        self.aim_makcu_control_mode_note = _label("", "subtitle")
+        self.aim_makcu_control_mode_note.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_control_mode_note)
         self.aim_makcu_summary = _label("", "subtitle")
         self.aim_makcu_summary.setWordWrap(True)
         layout.addWidget(self.aim_makcu_summary)
         layout.addWidget(self.aim_makcu_verification_status)
+        self.aim_makcu_calibration_help = _label(
+            "Normal Start does not require a response calibration profile. When no "
+            "profile is active, ProAim uses automatic direct-head command-aware MAKCU "
+            "control. Advanced response calibration is optional and creates a profile "
+            "for one exact aim mode only after you review and activate it.",
+            "subtitle",
+        )
+        self.aim_makcu_calibration_help.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_calibration_help)
+        self.aim_makcu_calibration_status = _label(
+            "No optional advanced response profile is staged for activation.",
+            "subtitle",
+        )
+        self.aim_makcu_calibration_status.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_calibration_status)
+        self.aim_makcu_calibration_step = _label(
+            "Optional advanced response calibration — ready",
+            "title",
+        )
+        self.aim_makcu_calibration_step.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_calibration_step)
+        self.aim_makcu_calibration_progress = QProgressBar()
+        self.aim_makcu_calibration_progress.setRange(0, 4)
+        self.aim_makcu_calibration_progress.setValue(0)
+        self.aim_makcu_calibration_progress.setTextVisible(True)
+        self.aim_makcu_calibration_progress.setFormat("Not started")
+        layout.addWidget(self.aim_makcu_calibration_progress)
+        self.aim_makcu_calibration_instruction = _label("")
+        self.aim_makcu_calibration_instruction.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_calibration_instruction)
+        self._set_calibration_guide("ready")
         note = _label(
             "Verification is read-only. It watches for a press and release from the selected "
             "MAKCU mouse button and never moves or clicks during the check.",
@@ -722,7 +1162,7 @@ class LauncherWindow(QMainWindow):
         )
         note.setWordWrap(True)
         layout.addWidget(note)
-        build_note = _label(f"MAKCU verifier build: {PROAIM_BUILD_TAG}", "subtitle")
+        build_note = _label(f"ProAim build: {PROAIM_BUILD_TAG}", "subtitle")
         layout.addWidget(build_note)
         section.add_card(card)
 
@@ -739,8 +1179,10 @@ class LauncherWindow(QMainWindow):
         card, layout = _card(
             "Automatic selection",
             "Scanning reports every accelerator present and which runtime "
-            "provider is installed, then suggests the fastest path. GPU driver "
-            "initialization is verified when detection starts.",
+            "provider is installed, then suggests a compatible path. GPU driver "
+            "initialization is verified when detection starts. On hybrid Windows "
+            "laptops, DirectML may use the primary adapter even when a different "
+            "GPU row is selected; confirm the active GPU in Task Manager.",
         )
         row = QHBoxLayout()
         row.setSpacing(UNIT)
@@ -950,13 +1392,15 @@ class LauncherWindow(QMainWindow):
         self.screen_card.setVisible(mode == SOURCE_SCREEN)
         self.camera_card.setVisible(mode == SOURCE_CAMERA)
         self.video_card.setVisible(mode == SOURCE_VIDEO)
+        if hasattr(self, "calibrate_makcu_button"):
+            self._update_calibration_controls()
 
     def _update_region_state(self) -> None:
         enabled = self.use_screen_region.isChecked()
         for widget in self._region_widgets:
             widget.setEnabled(enabled)
 
-    def _preset_changed(self) -> None:
+    def _preset_changed(self, _index: int = -1, *, apply_workload: bool = True) -> None:
         key = self.model_preset.currentData()
         custom = key == MODEL_PRESET_CUSTOM
         self.custom_model_path.setEnabled(custom)
@@ -968,7 +1412,9 @@ class LauncherWindow(QMainWindow):
             if preset.key == key:
                 self.preset_note.setText(preset.description)
                 if preset.inference_size is not None:
-                    self.inference_size.setCurrentText(str(preset.inference_size))
+                    self.inference_size.setCurrentText(
+                        format_inference_size(preset.inference_size)
+                    )
                 if preset.bundled:
                     self.output_format.setCurrentText("auto")
                     if hasattr(self, "aim_label"):
@@ -983,17 +1429,50 @@ class LauncherWindow(QMainWindow):
                             else "person"
                         )
                 break
+        if apply_workload and hasattr(self, "detail_crop_size"):
+            # A direct combo-box choice applies the preset's complete workload.
+            # Programmatic refresh/load callers pass apply_workload=False and
+            # restore the persisted value after the model list is rebuilt.
+            self.detail_crop_size.setText(model_preset_detail_crop_text(str(key)))
+        if (
+            not custom
+            and str(self.model_tier.currentData() or MODEL_TIER_MID)
+            != MODEL_TIER_HIGH
+            and hasattr(self, "detail_crop_size")
+            and not self.detail_crop_size.text().strip()
+        ):
+            self.detail_crop_size.clear()
+        self._update_detail_pass_visibility()
 
     def _model_tier_changed(self) -> None:
         tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
+        if (
+            tier != MODEL_TIER_HIGH
+            and self.model_preset.currentData() != MODEL_PRESET_CUSTOM
+            and hasattr(self, "detail_crop_size")
+        ):
+            self.detail_crop_size.setText(
+                model_preset_detail_crop_text(str(self.model_preset.currentData()))
+            )
         self._refresh_model_preset_options(
             preferred_key=MODEL_TIER_DEFAULT_PRESET.get(tier)
         )
-        if tier == MODEL_TIER_HIGH:
-            self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
-            self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
-            self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
-            self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
+        if hasattr(self, "detail_crop_size"):
+            self.detail_crop_size.setText(
+                model_preset_detail_crop_text(str(self.model_preset.currentData()))
+            )
+        self._update_detail_pass_visibility()
+
+    def _update_detail_pass_visibility(self) -> None:
+        if not hasattr(self, "detail_crop_size"):
+            return
+        tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
+        custom = self.model_preset.currentData() == MODEL_PRESET_CUSTOM
+        visible = tier == MODEL_TIER_HIGH or custom or bool(
+            self.detail_crop_size.text().strip()
+        )
+        self.detail_crop_label.setVisible(visible)
+        self.detail_crop_size.setVisible(visible)
 
     def _backend_changed(self, _backend: str = "") -> None:
         if not hasattr(self, "model_preset"):
@@ -1014,12 +1493,12 @@ class LauncherWindow(QMainWindow):
         for preset in MODEL_PRESETS:
             if preset.key in allowed:
                 self.model_preset.addItem(preset.label, preset.key)
-        self.model_preset.blockSignals(False)
         index = self.model_preset.findData(current)
         if index < 0:
             index = 0
         self.model_preset.setCurrentIndex(index)
-        self._preset_changed()
+        self.model_preset.blockSignals(False)
+        self._preset_changed(apply_workload=False)
 
     def _tier_for_preset(self, preset_key: str) -> str:
         for tier, keys in MODEL_TIER_PRESET_KEYS.items():
@@ -1041,6 +1520,8 @@ class LauncherWindow(QMainWindow):
         self.capture_width.setText(s.capture_width)
         self.capture_height.setText(s.capture_height)
         self.capture_fps.setText(s.capture_fps)
+        self.capture_format.setCurrentText(s.capture_format or "Auto")
+        self.capture_rotate_180.setChecked(s.capture_rotate_180)
         self.video_path.setText(s.video_path)
         self._set_confidence_slider_value(s.confidence)
         self.iou_threshold.setText(s.iou_threshold)
@@ -1049,6 +1530,7 @@ class LauncherWindow(QMainWindow):
         self.output_format.setCurrentText(s.output_format)
         self.preview.setChecked(s.preview)
         self.draw.setChecked(s.draw)
+        self.preview_fps.setCurrentText(s.preview_fps)
         self.backend.setCurrentText(s.backend)
         self.device.setCurrentText(s.device)
         self.custom_model_path.setText(s.model_path)
@@ -1066,14 +1548,35 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_button.setCurrentIndex(makcu_button)
         self.aim_makcu_port.blockSignals(False)
         self.aim_makcu_button.blockSignals(False)
+        context_index = self.aim_makcu_context.findData(s.aim_makcu_context)
+        self.aim_makcu_context.setCurrentIndex(max(context_index, 0))
         self._set_strength_slider_value(s.aim_makcu_strength)
         self._set_smoothing_slider_value(s.aim_makcu_smoothing_alpha)
         self.aim_makcu_max_step.setText(s.aim_makcu_max_step)
+        self._set_seconds_control_value(
+            self.aim_makcu_prediction_lead_seconds,
+            s.aim_makcu_prediction_lead_seconds,
+            default=0.03,
+        )
+        self._set_seconds_control_value(
+            self.aim_makcu_derivative_damping_seconds,
+            s.aim_makcu_derivative_damping_seconds,
+            default=0.008,
+        )
+        self._set_seconds_control_value(
+            self.aim_makcu_vertical_rate_ratio,
+            s.aim_makcu_vertical_rate_ratio,
+            default=0.48,
+        )
         self.ignore_self.setChecked(s.ignore_self)
         position_index = self.self_position.findData(s.self_position)
         if position_index >= 0:
             self.self_position.setCurrentIndex(position_index)
         tier_value = s.model_tier if s.model_tier in MODEL_TIER_PRESET_KEYS else self._tier_for_preset(s.model_preset)
+        if s.detail_crop_size and s.model_preset != MODEL_PRESET_CUSTOM:
+            # An active persisted detail pass is advanced workload. Promote
+            # its presentation rather than hiding a setting that will run.
+            tier_value = MODEL_TIER_HIGH
         tier_index = self.model_tier.findData(tier_value)
         if tier_index >= 0:
             self.model_tier.setCurrentIndex(tier_index)
@@ -1084,23 +1587,25 @@ class LauncherWindow(QMainWindow):
         ):
             preferred_model = MODEL_TIER_DEFAULT_PRESET.get(tier_value, s.model_preset)
         self._refresh_model_preset_options(preferred_key=preferred_model)
-        self._preset_changed()
+        self._preset_changed(apply_workload=False)
+        self.detail_crop_size.setText(s.detail_crop_size)
+        self._update_detail_pass_visibility()
         if preferred_model == MODEL_PRESET_CUSTOM:
             # Tier initialization may temporarily select a bundled preset. Put
             # the custom decoder and size back after the final preset is active.
             self.inference_size.setCurrentText(s.inference_size)
             self.output_format.setCurrentText(s.output_format)
-        if tier_value == MODEL_TIER_HIGH:
-            self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
-            self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
-            self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
-            self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
         self._choose_source(s.source_mode)
         precision_index = self.precision_preset.findData(s.precision_preset)
         if precision_index < 0:
             precision_index = self.precision_preset.findData(DEFAULT_PRECISION_PRESET)
         self.precision_preset.setCurrentIndex(max(precision_index, 0))
         self._precision_preset_changed()
+        if s.aim_makcu_active_profile.strip():
+            self.aim_makcu_calibration_status.setText(
+                "Active calibration profile selected. Runtime identity and "
+                "profile integrity are revalidated at every launch."
+            )
         self._makcu_verification_selection_changed()
         self._update_aim_state()
 
@@ -1124,14 +1629,19 @@ class LauncherWindow(QMainWindow):
         s.capture_width = self.capture_width.text()
         s.capture_height = self.capture_height.text()
         s.capture_fps = self.capture_fps.text()
+        capture_format = self.capture_format.currentText().strip()
+        s.capture_format = "" if capture_format.lower() == "auto" else capture_format
+        s.capture_rotate_180 = self.capture_rotate_180.isChecked()
         s.video_path = self.video_path.text()
         s.confidence = f"{self._confidence_from_slider():.2f}"
         s.iou_threshold = self.iou_threshold.text()
         s.inference_size = self.inference_size.currentText()
         s.crop_size = self.crop_size.text().strip()
+        s.detail_crop_size = self.detail_crop_size.text().strip()
         s.output_format = self.output_format.currentText()
         s.preview = self.preview.isChecked()
         s.draw = self.draw.isChecked()
+        s.preview_fps = self.preview_fps.currentText().strip()
         s.backend = self.backend.currentText()
         s.device = self.device.currentText()
         s.model_tier = str(self.model_tier.currentData() or MODEL_TIER_MID)
@@ -1146,12 +1656,18 @@ class LauncherWindow(QMainWindow):
         s.aim_output = AIM_OUTPUT_MAKCU
         s.aim_makcu_port = self.aim_makcu_port.text().strip()
         s.aim_makcu_button = str(self._selected_makcu_button())
+        s.aim_makcu_context = str(self.aim_makcu_context.currentData() or "")
         s.aim_makcu_strength = f"{self._strength_from_slider():.2f}"
         s.aim_makcu_smoothing_alpha = f"{self._smoothing_from_slider():.2f}"
         s.aim_makcu_max_step = self.aim_makcu_max_step.text().strip()
-        s.aim_makcu_prediction_lead_seconds = self.settings.aim_makcu_prediction_lead_seconds
+        s.aim_makcu_prediction_lead_seconds = (
+            f"{self.aim_makcu_prediction_lead_seconds.value():g}"
+        )
         s.aim_makcu_derivative_damping_seconds = (
-            self.settings.aim_makcu_derivative_damping_seconds
+            f"{self.aim_makcu_derivative_damping_seconds.value():g}"
+        )
+        s.aim_makcu_vertical_rate_ratio = (
+            f"{self.aim_makcu_vertical_rate_ratio.value():g}"
         )
         s.aim_makcu_verified_port = (
             self._makcu_verified_port if self._makcu_verification_matches() else ""
@@ -1303,6 +1819,8 @@ class LauncherWindow(QMainWindow):
             return
         process = self.precision_process
         busy = process is not None and process.poll() is None
+        calibration_busy = self._calibration_running()
+        controls_busy = busy or calibration_busy
         candidate = self._selected_precision_candidate()
         verified = bool(
             candidate is not None
@@ -1310,13 +1828,15 @@ class LauncherWindow(QMainWindow):
             and self._precision_verified_identity
             and candidate_identity(candidate) == self._precision_verified_identity
         )
-        self.precision_device.setEnabled(bool(self._precision_candidates) and not busy)
-        self.precision_refresh_button.setEnabled(not busy)
-        self.precision_verify_button.setEnabled(
-            candidate is not None and candidate.readable and not busy
+        self.precision_device.setEnabled(
+            bool(self._precision_candidates) and not controls_busy
         )
-        self.precision_preset.setEnabled(not busy)
-        self.precision_start_button.setEnabled(verified and not busy)
+        self.precision_refresh_button.setEnabled(not controls_busy)
+        self.precision_verify_button.setEnabled(
+            candidate is not None and candidate.readable and not controls_busy
+        )
+        self.precision_preset.setEnabled(not controls_busy)
+        self.precision_start_button.setEnabled(verified and not controls_busy)
         self.precision_stop_button.setEnabled(busy and not self._precision_stop_requested)
         self.precision_moonlight_button.setEnabled(
             busy
@@ -1326,6 +1846,13 @@ class LauncherWindow(QMainWindow):
         )
 
     def verify_precision_mapping(self) -> None:
+        if self._calibration_running():
+            QMessageBox.information(
+                self,
+                "MAKCU calibration in progress",
+                "Stop MAKCU calibration before verifying controller precision.",
+            )
+            return
         if not self._precision_supported:
             QMessageBox.critical(
                 self, "Linux required", "Controller precision is available only on Linux."
@@ -1373,6 +1900,13 @@ class LauncherWindow(QMainWindow):
         )
 
     def start_precision(self) -> None:
+        if self._calibration_running():
+            QMessageBox.information(
+                self,
+                "MAKCU calibration in progress",
+                "Stop MAKCU calibration before starting controller precision.",
+            )
+            return
         if not self._precision_supported:
             return
         if self.precision_process is not None and self.precision_process.poll() is None:
@@ -1483,6 +2017,7 @@ class LauncherWindow(QMainWindow):
         )
         self._precision_reader.start()
         self._update_precision_controls()
+        self._update_calibration_controls()
         return True
 
     def _handle_precision_output_line(self, line: str) -> None:
@@ -1594,6 +2129,7 @@ class LauncherWindow(QMainWindow):
         except OSError:
             pass
         self._update_precision_controls()
+        self._update_calibration_controls()
 
     def stop_precision(self) -> None:
         process = self.precision_process
@@ -1665,6 +2201,13 @@ class LauncherWindow(QMainWindow):
             self.aim_makcu_port.setText(chosen)
 
     def _detect_makcu_port(self) -> None:
+        if self._calibration_running():
+            QMessageBox.information(
+                self,
+                "MAKCU calibration in progress",
+                "Stop calibration before scanning the MAKCU serial connection.",
+            )
+            return
         if self.process is not None and self.process.poll() is None:
             QMessageBox.information(
                 self,
@@ -1725,39 +2268,979 @@ class LauncherWindow(QMainWindow):
             self._makcu_verified_port = ""
             self._makcu_verified_button = ""
         self._refresh_makcu_verification_status()
+        if (
+            hasattr(self, "aim_makcu_calibration_instruction")
+            and not self._calibration_running()
+            and self._pending_calibration_evidence is None
+        ):
+            self._set_calibration_guide("ready")
+        self._update_calibration_controls()
 
     def _update_aim_state(self) -> None:
-        enabled = self.aim.isChecked()
-        if enabled:
+        aim_enabled = self.aim.isChecked()
+        calibration_busy = self._calibration_running()
+        enabled = aim_enabled and not calibration_busy
+        active_profile = bool(self.settings.aim_makcu_active_profile.strip())
+        if aim_enabled:
             # Detection output must never run without the third-person guard.
             # Keep the relationship visible in the UI instead of silently
             # adding a hidden command-line option.
             self.ignore_self.setChecked(True)
-        self.ignore_self.setEnabled(not enabled)
+        self.ignore_self.setEnabled(not aim_enabled and not calibration_busy)
         for widget in (
             self.aim_label,
-            self.aim_point,
             self.aim_invert_x,
             self.aim_invert_y,
             self.aim_makcu_port,
             self.detect_makcu_button,
             self.browse_makcu_button,
             self.aim_makcu_button,
-            self.aim_makcu_strength,
-            self.aim_makcu_smoothing,
+            self.aim_makcu_context,
             self.aim_makcu_max_step,
         ):
             widget.setEnabled(enabled)
+        # Automatic mode receives an anatomical point from the pinned direct
+        # head detector, so its saved body-box ratio is deliberately not a live
+        # control. Measured profiles retain the established body-box path.
+        self.aim_point.setEnabled(enabled and active_profile)
+        # These legacy shaping values remain loaded and collected for settings
+        # compatibility, but neither command-aware automatic nor measured-profile
+        # control consumes them. Do not present them as live tracking controls.
+        for widget in (
+            self.aim_makcu_strength,
+            self.aim_makcu_strength_value,
+            self.aim_makcu_smoothing,
+            self.aim_makcu_smoothing_value,
+            self.aim_makcu_prediction_lead_seconds,
+            self.aim_makcu_derivative_damping_seconds,
+        ):
+            widget.setEnabled(False)
+        self.aim_makcu_vertical_rate_ratio.setEnabled(enabled and active_profile)
+        if active_profile:
+            self.aim_makcu_control_mode_note.setText(
+                "Measured calibrated profile: Aim point uses the saved body-box "
+                "ratio; Max step and Vertical cap set the rate envelope. Strength, "
+                "Smoothing, Prediction lead, and Damping are stored compatibility "
+                "values and do not affect profile control."
+            )
+        else:
+            self.aim_makcu_control_mode_note.setText(
+                "Automatic direct-head command-aware control: the pinned direct head "
+                "detector supplies the anatomical aim point, so the saved body-box Aim "
+                "point ratio is ignored. Max step sets the equal X/Y rate envelope. "
+                "Strength, Smoothing, Prediction lead, Damping, and Vertical cap are "
+                "stored but do not affect normal tracking."
+            )
         verify_busy = (
             self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive()
         )
         monitor_busy = (
             self._makcu_monitor_thread is not None and self._makcu_monitor_thread.is_alive()
         )
-        self.verify_makcu_button.setEnabled(enabled and not verify_busy)
+        self.verify_makcu_button.setEnabled(
+            enabled and not verify_busy and not monitor_busy
+        )
         self.monitor_makcu_button.setEnabled(enabled and not verify_busy and not monitor_busy)
+        self._update_calibration_controls()
+
+    def _calibration_running(self) -> bool:
+        process = self.calibration_process
+        return process is not None and process.poll() is None
+
+    def _detector_running(self) -> bool:
+        process = self.process
+        return process is not None and process.poll() is None
+
+    def _precision_running(self) -> bool:
+        process = self.precision_process
+        return process is not None and process.poll() is None
+
+    @staticmethod
+    def _thread_running(thread: object | None) -> bool:
+        return bool(thread is not None and thread.is_alive())  # type: ignore[union-attr]
+
+    def _update_calibration_controls(self) -> None:
+        if not hasattr(self, "calibrate_makcu_button"):
+            return
+        verify_busy = self._thread_running(self._makcu_verify_thread)
+        monitor_busy = self._thread_running(self._makcu_monitor_thread)
+        process_busy = (
+            self._detector_running()
+            or self._calibration_running()
+            or self._precision_running()
+        )
+        source_is_live = any(
+            self._source_boxes[source].isChecked()
+            for source in (SOURCE_SCREEN, SOURCE_CAMERA)
+        )
+        can_calibrate = bool(
+            self.aim.isChecked()
+            and source_is_live
+            and self._selected_calibration_context() in {"hip", "ads"}
+            and self._makcu_verification_matches()
+            and not verify_busy
+            and not monitor_busy
+            and not process_busy
+        )
+        self.calibrate_makcu_button.setEnabled(can_calibrate)
+        self.activate_makcu_calibration_button.setEnabled(
+            self._pending_calibration_evidence is not None
+            and self._pending_calibration_path is not None
+            and not verify_busy
+            and not monitor_busy
+            and not process_busy
+        )
+
+    def _selected_calibration_context(self) -> str:
+        return str(self.aim_makcu_context.currentData() or "")
+
+    def _calibration_context_changed(self, _index: int = -1) -> None:
+        selected = self._selected_calibration_context()
+        if (
+            self._pending_calibration_evidence is not None
+            and self._calibration_context is not None
+            and selected != self._calibration_context
+        ):
+            self._clear_staged_calibration()
+            self.aim_makcu_calibration_status.setText(
+                "Aim mode changed after calibration. The old evidence is no longer "
+                "staged; calibrate this mode before activation."
+            )
+            self._set_status("Calibration context changed; run calibration again.", "warn")
+            self._set_calibration_guide("ready")
+            return
+        if not self._calibration_running() and self._pending_calibration_evidence is None:
+            self._set_calibration_guide("ready")
+        self._update_calibration_controls()
+
+    def _clear_staged_calibration(self) -> None:
+        self._pending_calibration_evidence = None
+        self._pending_calibration_path = None
+        self._calibration_launch_arguments = None
+        self._calibration_context = None
+        self._update_calibration_controls()
+
+    def _calibration_busy_message(self) -> str | None:
+        if self._detector_running():
+            return "Stop detection before starting MAKCU calibration."
+        if self._calibration_running():
+            return "A MAKCU calibration is already running."
+        if self._thread_running(self._makcu_verify_thread):
+            return "Finish MAKCU button verification before calibration."
+        if self._thread_running(self._makcu_monitor_thread):
+            return "Finish the MAKCU button monitor before calibration."
+        if self._precision_running():
+            return "Stop controller precision before MAKCU calibration."
+        return None
+
+    def _set_calibration_guide(self, stage: str, detail: str = "") -> None:
+        """Show the next physical action without making the log a requirement.
+
+        Calibration startup can spend tens of seconds compiling a GPU model.
+        A click made during that interval is deliberately not accepted by the
+        fresh-input safety latch, so the persistent panel must distinguish
+        loading from the moment the controller is actually ready.
+        """
+
+        if not hasattr(self, "aim_makcu_calibration_instruction"):
+            return
+        button = MAKCU_BUTTON_LABELS[self._selected_makcu_button()]
+        context = self.aim_makcu_context.currentText() or "selected aim mode"
+        context_mode = self._selected_calibration_context()
+        if context_mode == "ads":
+            context_setup = (
+                f"{context} is selected; the final {button} Mouse hold should enter "
+                "and maintain ADS."
+            )
+        else:
+            context_setup = f"Keep the game in {context} during the final hold."
+        descriptions = {
+            "ready": (
+                0,
+                "Optional advanced response calibration — ready",
+                "Optional — not started",
+                "Normal Start already works without calibration by using automatic "
+                "direct-head command-aware control. Only continue if you intentionally "
+                "want a mode-specific response profile. Before calibration, show at "
+                "least one fully visible stationary player in the game; "
+                "ProAim will use the player nearest the center. "
+                f"{context_setup} Keep {button} Mouse released, then click Optional "
+                "advanced response calibration.",
+            ),
+            "loading": (
+                1,
+                "Step 1 of 4 — Starting the GPU model",
+                "Step 1 / 4",
+                f"Keep {button} Mouse fully released and do not move the mouse. "
+                "GPU model startup can take 30–40 seconds. This guide will advance "
+                "automatically when MAKCU is armed.",
+            ),
+            "release_wait": (
+                2,
+                "Step 2 of 4 — MAKCU armed; keep the button released",
+                "Step 2 / 4",
+                f"Keep {button} Mouse fully released. Release confirmation is "
+                "automatic; wait until this panel advances. Do not press and hold yet.",
+            ),
+            "input_unknown": (
+                2,
+                "Step 2 of 4 — MAKCU needs a fresh button report",
+                "Step 2 / 4",
+                f"MAKCU still reports an unknown state. Tap {button} Mouse once, "
+                "release it immediately, then keep it released. Do not hold it yet.",
+            ),
+            "hold": (
+                3,
+                "Step 3 of 4 — READY TO HOLD",
+                "Step 3 / 4",
+                "A stable target is ready in the preview. Press and continuously "
+                f"hold {button} Mouse. Keep "
+                "holding it and do not move the mouse until calibration completes.",
+            ),
+            "target_before_hold": (
+                3,
+                "Step 3 of 4 — Waiting for a safe target",
+                "Step 3 / 4",
+                f"Keep {button} Mouse released. Put a fully visible stationary player "
+                "in the preview; ProAim will choose the one nearest the center and "
+                "change this guide to READY TO HOLD automatically.",
+            ),
+            "target_while_held": (
+                3,
+                "Step 3 of 4 — Hold detected; waiting for a safe target",
+                "Step 3 / 4",
+                f"Keep {button} Mouse held and put a fully visible stationary player "
+                "in the preview. No movement is authorized until a safe target is ready.",
+            ),
+            "settling_view": (
+                3,
+                "Step 3 of 4 — Hold detected; settling the aim view",
+                "Step 3 / 4",
+                f"Keep {button} Mouse held continuously and do not move the mouse. "
+                "ProAim is waiting 300 ms for the aim-mode/FOV transition to settle. "
+                "No movement is authorized during this wait.",
+            ),
+            "measuring": (
+                4,
+                "Step 4 of 4 — Measuring response",
+                "Step 4 / 4",
+                f"Keep {button} Mouse held continuously. Keep the same player still "
+                "and fully visible, and do not move the mouse. The bounded pointer "
+                "movements are automatic.",
+            ),
+            "complete": (
+                4,
+                "Calibration measured — review and activate",
+                "Measurement complete",
+                "The measurement passed strict checks but is not active yet. Click "
+                "Review and activate to use it for detection.",
+            ),
+            "active": (
+                4,
+                "Calibration active",
+                "Profile active",
+                "The measured response profile is selected. Start detection to use "
+                "the calibrated controller.",
+            ),
+            "failed": (
+                0,
+                "Calibration stopped safely — nothing was activated",
+                "Stopped — retry",
+                detail
+                or "Correct the condition shown below, then click Optional advanced "
+                "response calibration to try again.",
+            ),
+        }
+        if stage not in descriptions:
+            raise ValueError(f"unknown calibration guide stage: {stage}")
+        value, heading, progress, instruction = descriptions[stage]
+        self._calibration_guide_stage = stage
+        self.aim_makcu_calibration_step.setText(heading)
+        self.aim_makcu_calibration_progress.setValue(value)
+        self.aim_makcu_calibration_progress.setFormat(progress)
+        self.aim_makcu_calibration_instruction.setText(instruction)
+
+    @staticmethod
+    def _calibration_failure_help(message: str) -> str:
+        """Translate a fail-closed runtime reason into one actionable retry."""
+
+        lowered = message.casefold()
+        if "no exact target observation" in lowered or "safe target" in lowered:
+            return (
+                "No movement was sent because a safe target was not available at "
+                "the hold step. Retry with a fully visible stationary player box; "
+                "ProAim will choose the one nearest the center. Wait for READY TO "
+                "HOLD before pressing and holding the activation button."
+            )
+        if "timed out" in lowered:
+            return (
+                "The current step timed out without moving the pointer. Retry and "
+                "follow the large release / READY TO HOLD prompts as they appear."
+            )
+        if "released" in lowered or "unknown" in lowered:
+            return (
+                "MAKCU lost the continuous hold, so movement stopped safely. Retry "
+                "and keep the activation button held from READY TO HOLD until completion."
+            )
+        return f"Calibration stopped safely: {message} Retry after correcting this condition."
+
+    def _handle_calibration_output_line(self, text: str) -> None:
+        """Append one child line and advance the visible calibration guide."""
+
+        self._append_log(text)
+        # Strip terminal colors before interpreting the bounded status line.
+        plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).strip()
+        prefix = "MAKCU calibration:"
+        if plain.startswith(prefix):
+            message = plain[len(prefix) :].strip()
+        elif plain.startswith("MAKCU calibration target:"):
+            readiness = plain[len("MAKCU calibration target:") :].strip()
+            self._calibration_target_ready = readiness.casefold().startswith(
+                "target ready"
+            )
+            if self._calibration_release_confirmed and not self._calibration_settling_view:
+                if self._calibration_target_ready:
+                    if self._calibration_raw_button == "pressed":
+                        self._set_calibration_guide("target_while_held")
+                    else:
+                        self._set_calibration_guide("hold")
+                        self._set_status(
+                            "READY TO HOLD: target ready; press and hold activation.",
+                            "warn",
+                        )
+                else:
+                    self._set_calibration_guide(
+                        "target_while_held"
+                        if self._calibration_raw_button == "pressed"
+                        else "target_before_hold"
+                    )
+            return
+        elif plain.startswith("Error: MAKCU calibration aborted:"):
+            message = plain.split(":", 2)[-1].strip()
+        elif "| CAL " in plain:
+            state_match = re.search(
+                r"\| CAL ([a-z_]+) \| "
+                r"(?:(target (?:ready|wait)[^|]*) \| )?"
+                r"raw button (pressed|released|unknown)\b",
+                plain,
+            )
+            if state_match is None:
+                return
+            state, readiness, raw_button = state_match.groups()
+            self._calibration_raw_button = raw_button
+            if readiness is not None:
+                self._calibration_target_ready = readiness.casefold().startswith(
+                    "target ready"
+                )
+            if state == "wait_release":
+                self._calibration_release_confirmed = False
+                self._calibration_settling_view = False
+                self._set_calibration_guide(
+                    "input_unknown" if raw_button == "unknown" else "release_wait"
+                )
+            elif state == "wait_hold":
+                self._calibration_release_confirmed = True
+                if raw_button == "pressed" and self._calibration_settling_view:
+                    self._set_calibration_guide("settling_view")
+                elif raw_button == "pressed":
+                    self._set_calibration_guide("target_while_held")
+                elif not self._calibration_target_ready:
+                    self._set_calibration_guide(
+                        "target_before_hold"
+                    )
+                else:
+                    self._set_calibration_guide("hold")
+            elif state in {"baseline_settle", "pulse", "response_settle"}:
+                self._calibration_release_confirmed = True
+                self._calibration_settling_view = False
+                self._set_calibration_guide("measuring")
+            return
+        else:
+            return
+        lowered = message.casefold()
+        if (
+            "waiting for a fresh makcu activation report" in lowered
+            or "waiting for a post-entry framed makcu button report" in lowered
+        ):
+            self._calibration_settling_view = False
+            self._set_calibration_guide("input_unknown")
+            self._set_status(
+                "MAKCU input is unknown—tap the activation button once, then release.",
+                "warn",
+            )
+        elif lowered.startswith("release confirmed"):
+            self._calibration_release_confirmed = True
+            self._calibration_settling_view = False
+            self._calibration_target_ready = "target ready" in lowered
+            if self._calibration_target_ready:
+                self._set_calibration_guide("hold")
+                self._set_status(
+                    "READY TO HOLD: target ready; press and hold activation.",
+                    "warn",
+                )
+            else:
+                self._set_calibration_guide("target_before_hold")
+                self._set_status(
+                    "Release confirmed—waiting for a safe target before the hold.",
+                    "warn",
+                )
+        elif (
+            "exclusive mode armed" in lowered
+            or "keep the activation button released while calibration starts" in lowered
+            or "keep activation released" in lowered
+            or "keep activation fully released" in lowered
+            or "activation is pressed" in lowered
+        ):
+            self._set_calibration_guide("release_wait")
+            self._set_status(
+                "MAKCU armed—keep the activation button fully released.",
+                "warn",
+            )
+        elif (
+            "hold detected" in lowered
+            and "selected aim mode settles" in lowered
+        ):
+            self._calibration_release_confirmed = True
+            self._calibration_raw_button = "pressed"
+            self._calibration_settling_view = True
+            self._set_calibration_guide("settling_view")
+            self._set_status(
+                "Hold detected—settling the aim view safely; no movement yet.",
+                "warn",
+            )
+        elif "keep holding activation; waiting for one safe exact target" in lowered:
+            self._calibration_release_confirmed = True
+            self._calibration_target_ready = False
+            self._calibration_raw_button = "pressed"
+            self._calibration_settling_view = False
+            self._set_calibration_guide("target_while_held")
+            self._set_status(
+                "Hold detected—waiting safely for a visible target; no movement yet.",
+                "warn",
+            )
+        elif (
+            "hold still" in lowered
+            or "running bounded" in lowered
+            or "pulse response to settle" in lowered
+        ):
+            self._calibration_settling_view = False
+            self._set_calibration_guide("measuring")
+            self._set_status(
+                "Measuring—keep holding and do not move the mouse or target.",
+                "warn",
+            )
+        elif "calibration fit passed" in lowered:
+            self._set_calibration_guide("complete")
+        elif any(
+            marker in lowered
+            for marker in (
+                "timed out",
+                "lacked a safe target",
+                "no exact target",
+                "became unknown",
+                "was released",
+                "rejected the evidence",
+                "exceeded",
+                "could not",
+                "invalid calibration",
+                "changed discontinuously",
+            )
+        ):
+            self._calibration_last_runtime_failure = message
+            self._set_calibration_guide(
+                "failed",
+                self._calibration_failure_help(message),
+            )
+
+    def start_makcu_calibration(self) -> None:
+        busy_message = self._calibration_busy_message()
+        if busy_message is not None:
+            QMessageBox.information(self, "Calibration is busy", busy_message)
+            return
+        if not self.aim.isChecked():
+            QMessageBox.warning(
+                self,
+                "Enable MAKCU aim",
+                "Enable MAKCU aim before calibrating its measured response.",
+            )
+            return
+        if not self._makcu_verification_matches():
+            QMessageBox.warning(
+                self,
+                "Verify MAKCU activation first",
+                "Calibration requires the selected board and activation button "
+                "to pass a complete press-and-release verification.",
+            )
+            return
+        source_is_live = any(
+            self._source_boxes[source].isChecked()
+            for source in (SOURCE_SCREEN, SOURCE_CAMERA)
+        )
+        if not source_is_live:
+            QMessageBox.warning(
+                self,
+                "Choose a live source",
+                "MAKCU calibration requires live screen or camera/capture-card input.",
+            )
+            return
+        calibration_context = self._selected_calibration_context()
+        if calibration_context not in {"hip", "ads"}:
+            QMessageBox.warning(
+                self,
+                "Choose the calibration context",
+                "Choose Hip fire or ADS before calibration. The measured response "
+                "cannot be shared between different in-game sensitivity modes.",
+            )
+            return
+        if not self._confirm_hardware_before_start():
+            return
+
+        settings = self.collect()
+        calibration_settings = replace(settings, aim_makcu_active_profile="")
+        if calibration_settings.detail_crop_size.strip():
+            QMessageBox.warning(
+                self,
+                "Turn off the detail pass",
+                "MAKCU calibration requires one unambiguous inference timestamp. "
+                "Clear Detail crop size in the advanced model workload, then "
+                "calibrate again. The detail pass will not be silently changed.",
+            )
+            return
+        if (
+            calibration_settings.source_mode == SOURCE_SCREEN
+            and os.name == "posix"
+            and os.environ.get("XDG_SESSION_TYPE", "").strip().lower() == "wayland"
+        ):
+            QMessageBox.critical(
+                self,
+                "X11/Xorg session required",
+                "Moonlight calibration capture needs an X11/Xorg desktop session.",
+            )
+            return
+        try:
+            launch_arguments = tuple(calibration_settings.detector_arguments())
+        except SettingsError as exc:
+            QMessageBox.warning(self, "Check the calibration settings", str(exc))
+            self._set_status(str(exc), "warn")
+            return
+
+        button_name = MAKCU_BUTTON_LABELS[self._selected_makcu_button()]
+        context_label = self.aim_makcu_context.currentText()
+        context_hold_instruction = (
+            f"The final {button_name} Mouse hold must enter and maintain ADS."
+            if calibration_context == "ads"
+            else "Keep the game in hip-fire mode during the final hold."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Optional advanced calibration will move the pointer",
+            "Normal Start works without this calibration by using automatic "
+            "direct-head command-aware MAKCU control. Continue only if you "
+            "intentionally want an advanced mode-specific response profile.\n\n"
+            "Calibration sends only a short, bounded sequence of horizontal and "
+            "vertical mouse movements through MAKCU. Nothing is activated "
+            "automatically.\n\n"
+            "1. Show at least one stationary, fully visible player. ProAim uses "
+            "the player nearest the center. Do not move the mouse, target, or camera.\n"
+            f"2. Selected mode: {context_label}. {context_hold_instruction} After "
+            f"clicking Yes, KEEP {button_name} Mouse RELEASED while the GPU model "
+            "loads. This can take 30–40 seconds.\n"
+            "3. Release confirmation is automatic. If the guide specifically says "
+            f"MAKCU input is unknown, tap {button_name} once and release it; otherwise "
+            "do not click yet.\n"
+            "4. When the guide says READY TO HOLD, press and continuously hold "
+            f"{button_name} until complete. If a target is not ready, ProAim waits "
+            "without moving.\n\n"
+            "The guide advances automatically. Releasing during measurement, "
+            "pressing Stop, or pressing Esc aborts safely.\n\n"
+            "Passing evidence is staged for review and is never activated automatically. "
+            "Continue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._set_status("MAKCU calibration cancelled before movement.", "warn")
+            return
+
+        try:
+            evidence_path = _private_calibration_path("evidence", "session")
+            command = makcu_calibration_command(
+                calibration_settings,
+                evidence_path,
+                context=calibration_context,
+            )
+        except (OSError, SettingsError, ValueError) as exc:
+            QMessageBox.critical(self, "Cannot start MAKCU calibration", str(exc))
+            self._set_status(str(exc), "error")
+            return
+        try:
+            process = start_detector(command)
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not start MAKCU calibration", str(exc))
+            self._set_status(str(exc), "error")
+            return
+
+        self._clear_staged_calibration()
+        self.calibration_process = process
+        self._calibration_evidence_path = evidence_path
+        self._calibration_launch_arguments = launch_arguments
+        self._calibration_context = calibration_context
+        self._calibration_stop_requested = False
+        self._calibration_last_runtime_failure = ""
+        self._calibration_release_confirmed = False
+        self._calibration_target_ready = False
+        self._calibration_raw_button = "unknown"
+        self._calibration_settling_view = False
+        self.log.clear()
+        self._append_log("Started bounded MAKCU response calibration.")
+        self._set_calibration_guide("loading")
+        self.aim_makcu_calibration_status.setText(
+            "Calibration is starting. Follow the numbered guide below; it changes "
+            "automatically. Press Stop/Esc to abort."
+        )
+        self._set_status(
+            "Step 1/4: loading—keep the activation button released and wait.",
+            "warn",
+        )
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self._start_calibration_reader(process)
+        self._update_aim_state()
+        self._update_precision_controls()
+
+    def _start_calibration_reader(self, process: subprocess.Popen[str]) -> None:
+        if process.stdout is None:
+            return
+
+        def pump() -> None:
+            assert process.stdout is not None
+            for line in process.stdout:
+                self.calibration_output_line.emit(line)
+
+        self._calibration_reader = threading.Thread(
+            target=pump,
+            name="makcu-calibration-log-reader",
+            daemon=True,
+        )
+        self._calibration_reader.start()
+
+    def _poll_calibration_process(self) -> None:
+        process = self.calibration_process
+        if process is None:
+            return
+        return_code = process.poll()
+        if return_code is None:
+            return
+        self._finish_calibration_process(process, return_code)
+
+    def _finish_calibration_process(
+        self,
+        process: subprocess.Popen[str],
+        return_code: int,
+    ) -> None:
+        if self.calibration_process is not process:
+            return
+        stopped = self._calibration_stop_requested
+        evidence_path = self._calibration_evidence_path
+        calibration_context = self._calibration_context
+        self.calibration_process = None
+        self._calibration_reader = None
+        self._calibration_stop_requested = False
+        self._calibration_evidence_path = None
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+
+        failure: str | None = None
+        evidence: CalibrationSessionEvidence | None = None
+        if stopped:
+            failure = "MAKCU calibration was stopped; no profile was staged."
+        elif return_code != 0:
+            if self._calibration_last_runtime_failure:
+                failure = (
+                    "Calibration stopped safely: "
+                    f"{self._calibration_last_runtime_failure}. No profile was staged."
+                )
+            else:
+                failure = (
+                    f"MAKCU calibration exited with code {return_code}; "
+                    "no profile was staged."
+                )
+        elif evidence_path is None:
+            failure = "Calibration ended without a bound evidence destination."
+        else:
+            try:
+                evidence = load_session_evidence(evidence_path)
+            except (OSError, CalibrationEvidenceError, ValueError) as exc:
+                failure = f"Calibration evidence failed strict validation: {exc}"
+            if evidence is not None and (
+                evidence.outcome != "success"
+                or not evidence.evidence_complete
+                or evidence.cleanup_error is not None
+                or evidence.fit is None
+                or evidence.core_evidence_sha256 is None
+                or calibration_context not in {"hip", "ads"}
+                or evidence.binding.context_name != calibration_context
+                or evidence.binding.aim_mode != calibration_context
+            ):
+                reason = str(
+                    getattr(evidence, "reason", "strict validation did not pass")
+                )
+                failure = (
+                    f"Calibration stopped safely: {reason}. No profile was staged."
+                )
+                evidence = None
+
+        if failure is not None or evidence is None or evidence_path is None:
+            self._clear_staged_calibration()
+            message = failure or "Calibration produced no usable evidence."
+            self.aim_makcu_calibration_status.setText(message)
+            self._set_calibration_guide(
+                "failed",
+                self._calibration_failure_help(message),
+            )
+            self._set_status(message, "error" if not stopped else "warn")
+            if not stopped and not self._closing:
+                QMessageBox.warning(self, "MAKCU calibration not staged", message)
+        else:
+            self._pending_calibration_evidence = evidence
+            self._pending_calibration_path = evidence_path
+            fit = evidence.fit
+            assert fit is not None
+            self.aim_makcu_calibration_status.setText(
+                "Evidence passed strict validation and refit. Review is required "
+                "before activation; it is not active yet."
+            )
+            self._set_calibration_guide("complete")
+            self._set_status(
+                "MAKCU calibration passed and is staged for review only.",
+                "ok",
+            )
+            if not self._closing:
+                QMessageBox.information(
+                    self,
+                    "Calibration ready for review",
+                    "The evidence passed strict validation and a fresh numeric refit. "
+                    f"Aim mode: {calibration_context.upper()}. "
+                    f"Measured gain: X {fit.x.gain_pixels_per_count:.6g}, "
+                    f"Y {fit.y.gain_pixels_per_count:.6g} px/count; "
+                    f"delay {fit.delay_seconds * 1000.0:.2f} ms.\n\n"
+                    "Nothing was activated. Click Review and activate only after "
+                    "checking these results.",
+                )
+        self._update_aim_state()
+        self._update_precision_controls()
+
+    def stop_makcu_calibration(self) -> None:
+        process = self.calibration_process
+        if process is None or process.poll() is not None or self._calibration_stop_requested:
+            return
+        self._calibration_stop_requested = True
+        self._set_calibration_guide(
+            "failed",
+            "Stopping safely. No calibration profile will be activated; wait for "
+            "shutdown, then click Optional advanced response calibration to retry.",
+        )
+        self._set_status("Stopping MAKCU calibration…", "warn")
+        self.stop_button.setEnabled(False)
+        request_stop(process)
+        QTimer.singleShot(
+            3000,
+            lambda current=process: self._force_stop_calibration_if_current(current),
+        )
+        QTimer.singleShot(
+            6000,
+            lambda current=process: self._kill_calibration_if_current(current),
+        )
+
+    def _force_stop_calibration_if_current(
+        self,
+        process: subprocess.Popen[str],
+    ) -> None:
+        if self.calibration_process is process and process.poll() is None:
+            self._append_log("Calibration did not exit; terminating it.")
+            force_stop(process)
+
+    def _kill_calibration_if_current(
+        self,
+        process: subprocess.Popen[str],
+    ) -> None:
+        if self.calibration_process is process and process.poll() is None:
+            self._append_log("Calibration still did not exit; forcing shutdown.")
+            kill_process(process)
+
+    def activate_staged_makcu_calibration(self) -> None:
+        staged = self._pending_calibration_evidence
+        evidence_path = self._pending_calibration_path
+        launch_arguments = self._calibration_launch_arguments
+        calibration_context = self._calibration_context
+        if (
+            staged is None
+            or evidence_path is None
+            or launch_arguments is None
+            or calibration_context not in {"hip", "ads"}
+        ):
+            QMessageBox.information(
+                self,
+                "No calibration to activate",
+                "Run calibration and wait for strictly validated evidence first.",
+            )
+            return
+        if (
+            self._detector_running()
+            or self._calibration_running()
+            or self._precision_running()
+            or self._thread_running(self._makcu_verify_thread)
+            or self._thread_running(self._makcu_monitor_thread)
+        ):
+            QMessageBox.information(
+                self,
+                "Stop active work first",
+                "Stop detection, calibration, verification, monitoring, and controller "
+                "precision before activating a calibration profile.",
+            )
+            return
+        try:
+            current = load_session_evidence(evidence_path)
+        except (OSError, CalibrationEvidenceError, ValueError) as exc:
+            self._clear_staged_calibration()
+            QMessageBox.critical(
+                self,
+                "Calibration evidence changed",
+                f"The staged evidence no longer passes strict validation: {exc}",
+            )
+            return
+        if (
+            current.outcome != "success"
+            or not current.evidence_complete
+            or current.cleanup_error is not None
+            or current.fit is None
+            or current.artifact_sha256 != staged.artifact_sha256
+            or current.core_evidence_sha256 != staged.core_evidence_sha256
+            or current.binding != staged.binding
+            or current.fit != staged.fit
+            or current.binding.context_name != calibration_context
+            or current.binding.aim_mode != calibration_context
+        ):
+            self._clear_staged_calibration()
+            QMessageBox.critical(
+                self,
+                "Calibration evidence changed",
+                "The staged evidence is no longer the exact successful artifact that "
+                "was reviewed. Run calibration again.",
+            )
+            return
+        try:
+            current_settings = replace(
+                self.collect(),
+                aim_makcu_active_profile="",
+            )
+            current_arguments = tuple(current_settings.detector_arguments())
+        except SettingsError as exc:
+            QMessageBox.warning(self, "Current settings changed", str(exc))
+            return
+        if (
+            current_arguments != launch_arguments
+            or self._selected_calibration_context() != calibration_context
+        ):
+            QMessageBox.warning(
+                self,
+                "Current settings changed",
+                "Detector, capture, aim, or MAKCU settings changed after calibration. "
+                "Restore them or run calibration again before activation.",
+            )
+            return
+
+        fit = current.fit
+        binding = current.binding
+        answer = QMessageBox.question(
+            self,
+            "Activate measured MAKCU response?",
+            f"Provider/device: {binding.active_provider} / {binding.active_device}\n"
+            f"Aim mode: {calibration_context.upper()}\n"
+            f"Capture: {binding.capture_width}x{binding.capture_height} "
+            f"at {binding.capture_fps:g} FPS ({binding.pixel_format})\n"
+            f"Gain: X {fit.x.gain_pixels_per_count:.6g}, "
+            f"Y {fit.y.gain_pixels_per_count:.6g} px/count\n"
+            f"Delay: {fit.delay_seconds * 1000.0:.2f} ms\n"
+            f"Evidence: {current.artifact_sha256[:16]}…\n\n"
+            "Activation creates a private immutable profile. Runtime still requires "
+            "an exact hardware, model, capture, and aim binding match. Activate?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._set_status("Calibration remains staged and inactive.", "warn")
+            return
+
+        active_path: Path | None = None
+        profile_published = False
+        old_active_path = self.settings.aim_makcu_active_profile
+        try:
+            active_path = _private_calibration_path("active", "profile")
+            profile = activate_session_evidence_file(
+                evidence_path,
+                active_path,
+                expected_binding=current.binding,
+            )
+            profile_published = True
+            if (
+                profile.session_artifact_sha256 != current.artifact_sha256
+                or profile.core_evidence_sha256 != current.core_evidence_sha256
+                or profile.binding != current.binding
+                or profile.fit != current.fit
+            ):
+                raise CalibrationActivationError(
+                    "activated profile does not match the reviewed evidence"
+                )
+            self.settings.aim_makcu_active_profile = str(active_path.resolve())
+            try:
+                save_settings(self.collect(), settings_path())
+            except OSError:
+                self.settings.aim_makcu_active_profile = old_active_path
+                try:
+                    active_path.unlink()
+                except OSError:
+                    pass
+                raise
+        except (OSError, CalibrationActivationError, ValueError) as exc:
+            self.settings.aim_makcu_active_profile = old_active_path
+            if profile_published and active_path is not None:
+                try:
+                    active_path.unlink()
+                except OSError:
+                    pass
+            QMessageBox.critical(
+                self,
+                "Calibration activation failed",
+                f"No active profile was selected: {exc}",
+            )
+            self._set_status("Calibration activation failed.", "error")
+            return
+
+        self._clear_staged_calibration()
+        assert active_path is not None
+        self.aim_makcu_calibration_status.setText(
+            "Measured response profile activated. Runtime will revalidate its exact "
+            "binding before using it."
+        )
+        self._set_calibration_guide("active")
+        self._update_aim_state()
+        self._set_status("MAKCU calibration profile activated.", "ok")
+        QMessageBox.information(
+            self,
+            "MAKCU calibration activated",
+            "The reviewed profile was saved privately and selected for future runs. "
+            "Runtime will fail closed if its exact binding changes.",
+        )
 
     def monitor_makcu_buttons(self) -> None:
+        if self._calibration_running():
+            QMessageBox.information(
+                self,
+                "MAKCU calibration in progress",
+                "Stop calibration before monitoring MAKCU button reports.",
+            )
+            return
         if self.process is not None and self.process.poll() is None:
             QMessageBox.information(
                 self,
@@ -1795,11 +3278,14 @@ class LauncherWindow(QMainWindow):
         self._update_aim_state()
 
     def _monitor_makcu_buttons_worker(self, port: str) -> None:
-        controller = MakcuAimingController(MakcuAimConfig(port=port, activation_button=1))
+        controller: MakcuAimingController | None = None
         deadline = time.monotonic() + 10.0
         last_mask = -1
         saw_nonzero = False
         try:
+            controller = MakcuAimingController(
+                MakcuAimConfig(port=port, activation_button=1)
+            )
             controller.start(output_loop=False)
             while time.monotonic() < deadline and not self._makcu_monitor_cancel.is_set():
                 mask = controller.poll_button_mask()
@@ -1826,11 +3312,20 @@ class LauncherWindow(QMainWindow):
                     self.makcu_verification_progress.emit(
                         "Monitor finished with no click reports. Mouse clicks are not reaching MAKCU input."
                     )
-        except (MakcuError, OSError, ValueError) as exc:
+        except Exception as exc:
             self.makcu_verification_progress.emit(f"Monitor error: {exc}")
         finally:
-            controller.stop()
-            self.makcu_monitor_done.emit()
+            try:
+                if controller is not None:
+                    controller.stop()
+            except Exception as exc:
+                self.makcu_verification_progress.emit(
+                    f"Monitor shutdown failed: {exc}"
+                )
+            finally:
+                # Never strand the Qt controls in their busy state, including
+                # when bounded MAKCU shutdown reports a stuck driver/worker.
+                self.makcu_monitor_done.emit()
 
     def _finish_makcu_monitor(self) -> None:
         """Finish monitor UI work on Qt's main thread."""
@@ -1839,6 +3334,13 @@ class LauncherWindow(QMainWindow):
         self._update_aim_state()
 
     def verify_makcu_activation(self) -> None:
+        if self._calibration_running():
+            QMessageBox.information(
+                self,
+                "MAKCU calibration in progress",
+                "Stop calibration before verifying the MAKCU activation button.",
+            )
+            return
         if self.process is not None and self.process.poll() is None:
             QMessageBox.information(
                 self,
@@ -1847,6 +3349,8 @@ class LauncherWindow(QMainWindow):
             )
             return
         if self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive():
+            return
+        if self._makcu_monitor_thread is not None and self._makcu_monitor_thread.is_alive():
             return
 
         port = self.aim_makcu_port.text().strip()
@@ -1879,11 +3383,11 @@ class LauncherWindow(QMainWindow):
             daemon=True,
         )
         self._makcu_verify_thread.start()
+        self._update_aim_state()
 
     def _verify_makcu_activation_worker(self, port: str, button: int) -> None:
-        controller = MakcuAimingController(
-            MakcuAimConfig(port=port, activation_button=button)
-        )
+        controller: MakcuAimingController | None = None
+        result: tuple[bool, str, str, str] | None = None
         deadline = time.monotonic() + 10.0
         button_name = MAKCU_BUTTON_LABELS[button]
         next_progress = time.monotonic() + 1.0
@@ -1893,6 +3397,9 @@ class LauncherWindow(QMainWindow):
         pressed = False
         expected_mask = 1 << button
         try:
+            controller = MakcuAimingController(
+                MakcuAimConfig(port=port, activation_button=button)
+            )
             controller.start(output_loop=False)
             self.makcu_verification_progress.emit(
                 f"Listening for {button_name}… click the physical mouse connected through MAKCU."
@@ -1905,9 +3412,7 @@ class LauncherWindow(QMainWindow):
                             "Release every mouse button before verification, then try again. "
                             f"MAKCU initially reported mask 0x{mask:02X}."
                         )
-                        self.makcu_verification_done.emit(
-                            False, port, str(button), detail
-                        )
+                        result = (False, port, str(button), detail)
                         return
                     baseline_observed = True
                     self.makcu_verification_progress.emit(
@@ -1921,7 +3426,7 @@ class LauncherWindow(QMainWindow):
                             f"Expected only {button_name} (mask 0x{expected_mask:02X}), "
                             f"but MAKCU reported mask 0x{mask:02X}. No button was verified."
                         )
-                        self.makcu_verification_done.emit(False, port, str(button), detail)
+                        result = (False, port, str(button), detail)
                         return
                     self.makcu_verification_progress.emit(
                         f"Detected {button_name} (mask 0x{mask:02X}). Release it to finish verification…"
@@ -1932,7 +3437,7 @@ class LauncherWindow(QMainWindow):
                         f"Detected a complete {button_name} press and release "
                         f"(mask 0x{last_mask:02X})."
                     )
-                    self.makcu_verification_done.emit(
+                    result = (
                         True,
                         port,
                         str(button),
@@ -1945,7 +3450,7 @@ class LauncherWindow(QMainWindow):
                         f"mask 0x{expected_mask:02X} to 0x{mask:02X} before release. "
                         "No button was verified."
                     )
-                    self.makcu_verification_done.emit(
+                    result = (
                         False,
                         port,
                         str(button),
@@ -1974,11 +3479,30 @@ class LauncherWindow(QMainWindow):
                     )
                 )
             )
-            self.makcu_verification_done.emit(False, port, str(button), detail)
-        except (MakcuError, OSError, ValueError) as exc:
-            self.makcu_verification_done.emit(False, port, str(button), str(exc))
+            result = (False, port, str(button), detail)
+        except Exception as exc:
+            result = (False, port, str(button), str(exc))
         finally:
-            controller.stop()
+            try:
+                if controller is not None:
+                    controller.stop()
+            except Exception as exc:
+                # A successful button exchange is not safe to persist when the
+                # serial owner could not be shut down deterministically.
+                result = (
+                    False,
+                    port,
+                    str(button),
+                    f"MAKCU shutdown failed after verification: {exc}",
+                )
+            if result is None:
+                result = (
+                    False,
+                    port,
+                    str(button),
+                    "MAKCU verification ended without a result.",
+                )
+            self.makcu_verification_done.emit(*result)
 
     def _apply_makcu_verification_progress(self, message: str) -> None:
         self.aim_makcu_verification_status.setText(message)
@@ -2036,6 +3560,8 @@ class LauncherWindow(QMainWindow):
             value = float(str(text).strip())
         except (TypeError, ValueError):
             value = 0.5
+        if not math.isfinite(value):
+            value = 0.5
         scaled = int(round(max(0.05, min(2.5, value)) * STRENGTH_SLIDER_SCALE))
         self.aim_makcu_strength.setValue(scaled)
         self._sync_strength_label(scaled)
@@ -2045,14 +3571,33 @@ class LauncherWindow(QMainWindow):
             value = float(str(text).strip())
         except (TypeError, ValueError):
             value = 0.78
+        if not math.isfinite(value):
+            value = 0.78
         scaled = int(round(max(0.10, min(1.0, value)) * SMOOTHING_SLIDER_SCALE))
         self.aim_makcu_smoothing.setValue(scaled)
         self._sync_smoothing_label(scaled)
+
+    def _set_seconds_control_value(
+        self,
+        control: QDoubleSpinBox,
+        text: str,
+        *,
+        default: float,
+    ) -> None:
+        try:
+            value = float(str(text).strip())
+        except (TypeError, ValueError):
+            value = default
+        if not math.isfinite(value):
+            value = default
+        control.setValue(max(control.minimum(), min(control.maximum(), value)))
 
     def _set_confidence_slider_value(self, text: str) -> None:
         try:
             value = float(str(text).strip())
         except (TypeError, ValueError):
+            value = 0.25
+        if not math.isfinite(value):
             value = 0.25
         scaled = int(round(max(0.05, min(0.95, value)) * CONFIDENCE_SLIDER_SCALE))
         self.confidence.setValue(scaled)
@@ -2116,8 +3661,10 @@ class LauncherWindow(QMainWindow):
             return
         current_preset = str(self.model_preset.currentData() or "")
         precision = str(selected.get("precision", "")).strip().lower()
-        self.backend.setCurrentText(str(selected.get("backend", "openvino")))
-        self.device.setCurrentText(str(selected.get("device", "CPU")))
+        self._set_runtime_selection(
+            str(selected.get("backend", "openvino")),
+            str(selected.get("device", "CPU")),
+        )
         suggested_tier = str(selected.get("tier", MODEL_TIER_MID))
         tier_index = self.model_tier.findData(suggested_tier)
         if tier_index >= 0:
@@ -2145,12 +3692,27 @@ class LauncherWindow(QMainWindow):
             self._refresh_model_preset_options(
                 preferred_key=preferred_preset
             )
-            if suggested_tier == MODEL_TIER_HIGH:
-                self.capture_width.setText(HIGH_END_CAPTURE_WIDTH)
-                self.capture_height.setText(HIGH_END_CAPTURE_HEIGHT)
-                self.capture_fps.setText(HIGH_END_CAPTURE_FPS)
-                self.screen_fps.setText(HIGH_END_CAPTURE_FPS)
+        self._mark_hardware_selection_configured()
         self._set_status("Applied detected accelerator selection.", "ok")
+
+    def _set_runtime_selection(self, backend: str, device: str) -> None:
+        """Update runtime widgets without treating an internal fallback as consent."""
+
+        self._changing_hardware_selection = True
+        try:
+            self.backend.setCurrentText(backend)
+            self.device.setCurrentText(device)
+        finally:
+            self._changing_hardware_selection = False
+
+    def _hardware_selection_edited(self, _text: str = "") -> None:
+        if not self._changing_hardware_selection:
+            self._mark_hardware_selection_configured()
+
+    def _mark_hardware_selection_configured(self) -> None:
+        self._hardware_selection_configured = True
+        self.settings.hardware_selection_configured = True
+        self._hardware_start_notice = ""
 
     def _compatible_preset_for_tier(self, current: str, tier: str) -> str:
         allowed = set(
@@ -2174,7 +3736,7 @@ class LauncherWindow(QMainWindow):
         return MODEL_TIER_DEFAULT_PRESET.get(tier, DEFAULT_MODEL_PRESET)
 
     def _scan_hardware(self) -> None:
-        from detection.hardware import describe, scan_and_recommend
+        from detection.hardware import scan_and_recommend
 
         try:
             profile, plans = scan_and_recommend()
@@ -2182,8 +3744,95 @@ class LauncherWindow(QMainWindow):
             QMessageBox.critical(self, "Hardware scan failed", str(exc))
             return
 
+        self._show_hardware_scan(profile, plans, automatic=False)
+
+    def _begin_first_hardware_scan(self) -> None:
+        """Discover a fresh profile's GPU without blocking the Qt event loop."""
+
+        if (
+            self._closing
+            or self._hardware_selection_configured
+            or self._first_hardware_scan_active
+        ):
+            return
+        self._first_hardware_scan_active = True
+        self._first_hardware_scan_cancel.clear()
+        self.hardware_report.setPlainText("Scanning hardware and installed runtimes…")
+        self._set_status("Scanning for a safely bound GPU accelerator…", "warn")
+
+        def scan() -> None:
+            from detection.hardware import scan_and_recommend
+
+            try:
+                profile, plans = scan_and_recommend()
+            except Exception as exc:
+                if self._first_hardware_scan_cancel.is_set() or self._closing:
+                    return
+                try:
+                    self.first_hardware_scan_failed.emit(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                except RuntimeError:
+                    # Qt may already have destroyed the native window while a
+                    # platform scan was winding down.
+                    pass
+                return
+            if self._first_hardware_scan_cancel.is_set() or self._closing:
+                return
+            try:
+                self.first_hardware_scan_done.emit(profile, plans)
+            except RuntimeError:
+                pass
+
+        self._first_hardware_scan_thread = threading.Thread(
+            target=scan,
+            name="proaim-first-hardware-scan",
+            daemon=True,
+        )
+        self._first_hardware_scan_thread.start()
+
+    def _finish_first_hardware_scan(self, profile: object, plans: object) -> None:
+        self._first_hardware_scan_active = False
+        if self._closing or self._first_hardware_scan_cancel.is_set():
+            return
+        # A manual edit made while discovery was running always wins.
+        automatic = not self._hardware_selection_configured
+        self._show_hardware_scan(profile, tuple(plans), automatic=automatic)
+
+    def _fail_first_hardware_scan(self, detail: str) -> None:
+        self._first_hardware_scan_active = False
+        if (
+            self._closing
+            or self._first_hardware_scan_cancel.is_set()
+            or self._hardware_selection_configured
+        ):
+            return
+        self._set_runtime_selection("openvino", "CPU")
+        self._hardware_start_notice = (
+            "Automatic GPU discovery failed. CPU/OpenVINO remains selected. "
+            "Review Hardware settings before starting detection."
+        )
+        self.hardware_report.setPlainText(
+            f"Automatic hardware scan failed:\n{detail}\n\n"
+            f"{self._hardware_start_notice}"
+        )
+        self._set_status(self._hardware_start_notice, "warn")
+
+    def _show_hardware_scan(
+        self,
+        profile: object,
+        plans: Sequence[object],
+        *,
+        automatic: bool,
+    ) -> None:
+        from detection.hardware import describe
+
         report = describe(profile, plans)
-        pending = [plan for plan in plans if not plan.ready and plan.setup_hint]
+        pending = [
+            plan
+            for plan in plans
+            if not getattr(plan, "ready", False) and getattr(plan, "setup_hint", "")
+        ]
         if pending:
             report += "\n\nNot yet usable on this machine:\n" + "\n".join(
                 f"  - {plan.accelerator.label}: {plan.setup_hint}" for plan in pending
@@ -2195,18 +3844,44 @@ class LauncherWindow(QMainWindow):
         self.detected_accelerator.clear()
         for plan in plans:
             if plan.ready and plan.backend == "onnxruntime":
-                state = "provider found; verify at start"
+                if str(plan.device).upper().startswith(("DIRECTML", "DML")):
+                    if _has_exact_directml_binding(profile, plan):
+                        state = (
+                            "provider starts with exact DXGI index; confirm the "
+                            "physical GPU in Task Manager"
+                        )
+                    else:
+                        state = "default DXGI adapter; manual confirmation required"
+                else:
+                    state = "provider found; verify at start"
             else:
                 state = "ready" if plan.ready else "needs setup"
             text = f"{plan.accelerator.label} -> {plan.backend}/{plan.device} ({state})"
+            if (
+                plan.backend == "onnxruntime"
+                and str(plan.device).upper().startswith(("DIRECTML", "DML"))
+            ):
+                adapter = str(plan.device).partition(":")[2]
+                adapter_text = f"DXGI adapter {adapter}" if adapter else "default DXGI adapter"
+                text = (
+                    f"DirectML ({adapter_text}; {plan.accelerator.label}) "
+                    f"-> {plan.backend}/{plan.device} ({state})"
+                )
             backend = str(plan.backend).lower()
             device = str(plan.device).upper()
             if backend == "openvino" and device == "CPU":
                 tier = MODEL_TIER_LOW
             elif backend == "onnxruntime" and (
-                "TENSORRT" in device or "CUDA" in device or "ROCM" in device or "DML" in device
+                "TENSORRT" in device
+                or "CUDA" in device
+                or "ROCM" in device
+                or "DIRECTML" in device
+                or device == "DML"
             ):
-                tier = MODEL_TIER_HIGH
+                # A faster accelerator changes the runtime, not the intended
+                # detector workload. Keep the responsive player model as the
+                # one-click choice; the 640px COCO benchmark remains explicit.
+                tier = MODEL_TIER_MID
             else:
                 tier = MODEL_TIER_MID
             self.detected_accelerator.addItem(
@@ -2219,12 +3894,17 @@ class LauncherWindow(QMainWindow):
                     "ready": plan.ready,
                     "setup_hint": plan.setup_hint,
                     "tier": tier,
+                    "_plan": plan,
                 },
             )
 
         ready = [plan for plan in plans if plan.ready]
         if not ready:
-            self._set_status("No inference runtime was found. See scan report for setup hints.", "error")
+            message = "No inference runtime was found. See scan report for setup hints."
+            if automatic:
+                self._set_runtime_selection("openvino", "CPU")
+                self._hardware_start_notice = message
+            self._set_status(message, "error")
             return
         best = ready[0]
         for index in range(self.detected_accelerator.count()):
@@ -2236,7 +3916,51 @@ class LauncherWindow(QMainWindow):
             ):
                 self.detected_accelerator.setCurrentIndex(index)
                 break
-        self._set_status("Hardware scan complete. Choose a detected accelerator and click Use selection.", "ok")
+
+        if not automatic:
+            self._set_status(
+                "Hardware scan complete. Choose a detected accelerator and click Use selection.",
+                "ok",
+            )
+            return
+
+        selected_plan = _unique_ready_gpu_plan(profile, plans)
+        if selected_plan is not None:
+            for index in range(self.detected_accelerator.count()):
+                data = self.detected_accelerator.itemData(index)
+                if isinstance(data, dict) and data.get("_plan") is selected_plan:
+                    self.detected_accelerator.setCurrentIndex(index)
+                    break
+            self._apply_detected_accelerator()
+            self._set_status(
+                "Applied the only safely identified ready GPU. Provider use is "
+                "verified when detection starts.",
+                "ok",
+            )
+            return
+
+        self._set_runtime_selection("openvino", "CPU")
+        ready_gpu_count = sum(
+            1
+            for plan in plans
+            if bool(getattr(plan, "ready", False))
+            and _qualifying_discrete_gpu(profile, plan)
+        )
+        if ready_gpu_count:
+            reason = (
+                "The scan did not find exactly one ready GPU with an unambiguous "
+                "device binding."
+            )
+        else:
+            reason = "No ready GPU runtime was found."
+        self._hardware_start_notice = (
+            f"{reason} CPU/OpenVINO remains selected. Choose a Hardware entry "
+            "explicitly before detection, or confirm the CPU fallback when prompted."
+        )
+        self.hardware_report.appendPlainText(
+            f"\nAutomatic GPU selection:\n  {self._hardware_start_notice}"
+        )
+        self._set_status(self._hardware_start_notice, "warn")
 
     def _offer_runtime_download(self, profile, plans) -> None:
         """Offer setup guidance when a detected GPU needs another runtime."""
@@ -2304,7 +4028,50 @@ class LauncherWindow(QMainWindow):
     def _append_log(self, text: str) -> None:
         self.log.appendPlainText(text.rstrip())
 
+    def _confirm_hardware_before_start(self) -> bool:
+        """Require explicit consent when first-run GPU selection was inconclusive."""
+
+        if self._hardware_selection_configured:
+            return True
+        if self._first_hardware_scan_active:
+            QMessageBox.information(
+                self,
+                "Hardware scan in progress",
+                "Wait for the first-run GPU scan to finish before starting detection.",
+            )
+            self._set_status("Hardware scan is still running.", "warn")
+            return False
+
+        detail = self._hardware_start_notice or (
+            "Hardware has not been configured yet. CPU/OpenVINO is the safe fallback."
+        )
+        answer = QMessageBox.question(
+            self,
+            "Confirm CPU fallback",
+            f"{detail}\n\nContinue detection with CPU/OpenVINO?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            self._select_section(2)
+            self._set_status(
+                "Choose a detected accelerator in Hardware before starting.",
+                "warn",
+            )
+            return False
+        self._set_runtime_selection("openvino", "CPU")
+        self._mark_hardware_selection_configured()
+        self._set_status("CPU/OpenVINO fallback explicitly accepted.", "warn")
+        return True
+
     def _start(self) -> None:
+        if self._calibration_running():
+            QMessageBox.information(
+                self,
+                "MAKCU calibration in progress",
+                "Stop MAKCU calibration before starting normal detection.",
+            )
+            return
         if self.process is not None and self.process.poll() is None:
             return
         if self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive():
@@ -2313,6 +4080,19 @@ class LauncherWindow(QMainWindow):
                 "MAKCU verification in progress",
                 "Finish the MAKCU button check before starting detection.",
             )
+            return
+        if self._makcu_monitor_thread is not None and self._makcu_monitor_thread.is_alive():
+            QMessageBox.information(
+                self,
+                "MAKCU monitor in progress",
+                "Finish the MAKCU button monitor before starting detection so only "
+                "one process owns its serial port.",
+            )
+            return
+        # Controller precision owns a separate PXN device and is intentionally
+        # allowed to coexist with ordinary detection. MAKCU calibration remains
+        # exclusive with both children because it measures physical response.
+        if not self._confirm_hardware_before_start():
             return
         settings = self.collect()
         if (
@@ -2372,6 +4152,7 @@ class LauncherWindow(QMainWindow):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self._start_reader()
+        self._update_calibration_controls()
 
     def _start_reader(self) -> None:
         import threading
@@ -2389,6 +4170,9 @@ class LauncherWindow(QMainWindow):
         self._reader.start()
 
     def _stop(self) -> None:
+        if self._calibration_running():
+            self.stop_makcu_calibration()
+            return
         if self.process is None or self.process.poll() is not None or self._stop_requested:
             return
         process = self.process
@@ -2411,6 +4195,7 @@ class LauncherWindow(QMainWindow):
 
     def _poll_process(self) -> None:
         self._poll_precision_process()
+        self._poll_calibration_process()
         if self.process is None:
             return
         if self.process.poll() is None:
@@ -2426,14 +4211,23 @@ class LauncherWindow(QMainWindow):
         else:
             self._set_status(f"Detection exited with code {code}.", "error")
         self._stop_requested = False
+        self._update_calibration_controls()
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt naming
         self._closing = True
+        if self._calibration_running():
+            self._calibration_stop_requested = True
+        self._clear_staged_calibration()
+        self._first_hardware_scan_cancel.set()
         self._makcu_verify_cancel.set()
         self._makcu_monitor_cancel.set()
         running = [
             process
-            for process in (self.process, self.precision_process)
+            for process in (
+                self.process,
+                self.calibration_process,
+                self.precision_process,
+            )
             if process is not None and process.poll() is None
         ]
         for process in running:
@@ -2456,7 +4250,9 @@ class LauncherWindow(QMainWindow):
             self._makcu_verify_thread,
             self._makcu_monitor_thread,
             self._reader,
+            self._calibration_reader,
             self._precision_reader,
+            self._first_hardware_scan_thread,
         ):
             if (
                 isinstance(thread, threading.Thread)

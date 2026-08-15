@@ -1,20 +1,2055 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+import math
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from time import perf_counter_ns
 
+from aiming.direct_head_anchor import (
+    DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS,
+    DirectHeadAnchor,
+    DirectHeadAnchorSample,
+    DirectHeadProvenance,
+)
 from config import AppConfig, parse_args
+from utils.inference_size import compact_inference_size
 
 
 WINDOW_NAME = "ProAim"
+AIM_CONTINUATION_CONFIDENCE_FLOOR = 0.15
+AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT = 0.125
+AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT = 0.120
+AUTOMATIC_MAKCU_DELAY_SECONDS = 0.008
+AUTOMATIC_MAKCU_EMPTY_GRACE_FRAMES = 3
+AUTOMATIC_MAKCU_STALE_AFTER_SECONDS = 0.065
+AUTOMATIC_HEAD_LOCALIZATION_HZ = 90.0
+AUTOMATIC_HEAD_STALE_AFTER_SECONDS = AUTOMATIC_MAKCU_STALE_AFTER_SECONDS
+AUTOMATIC_HEAD_PROVIDER = "MIGraphXExecutionProvider"
+AUTOMATIC_HEAD_MAPPED_FILTER_TIME_CONSTANT_SECONDS = 0.012
+AUTOMATIC_DETAIL_RESCUE_CROP_SIZE = 768
+AUTOMATIC_DETAIL_REFERENCE_HEIGHT = 1080.0
+AUTOMATIC_DETAIL_MAX_REFERENCE_HEIGHT = 96.0
+AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS = 4.0
+
+
+@dataclass(slots=True)
+class _AutomaticDetailRescueTelemetry:
+    """Count conditional detail decisions without retaining frame contents."""
+
+    frames_evaluated: int = 0
+    frames_activation_released: int = 0
+    frames_triggered_no_exact_target: int = 0
+    frames_triggered_small_central_target: int = 0
+    frames_skipped_not_needed: int = 0
+
+    def record(self, reason: str) -> None:
+        self.frames_evaluated += 1
+        if reason == "activation_released":
+            self.frames_activation_released += 1
+        elif reason == "no_exact_target":
+            self.frames_triggered_no_exact_target += 1
+        elif reason == "small_central_target":
+            self.frames_triggered_small_central_target += 1
+        elif reason == "not_needed":
+            self.frames_skipped_not_needed += 1
+        else:
+            raise ValueError(f"unknown automatic detail decision: {reason}")
+
+    def snapshot(self) -> dict[str, int]:
+        triggered = (
+            self.frames_triggered_no_exact_target
+            + self.frames_triggered_small_central_target
+        )
+        return {
+            "automatic_frames_evaluated": self.frames_evaluated,
+            "automatic_frames_triggered": triggered,
+            "automatic_frames_activation_released": (
+                self.frames_activation_released
+            ),
+            "automatic_frames_triggered_no_exact_target": (
+                self.frames_triggered_no_exact_target
+            ),
+            "automatic_frames_triggered_small_central_target": (
+                self.frames_triggered_small_central_target
+            ),
+            "automatic_frames_skipped_not_needed": self.frames_skipped_not_needed,
+        }
+
+
+def _automatic_detail_rescue_reason(
+    detections,
+    frame_shape,
+    detail_plan,
+    *,
+    aim_label: str,
+    configured_confidence: float,
+) -> str:
+    """Return the bounded reason for a conditional centered detail inference.
+
+    The caller supplies full-pass detections.  Only configured-confidence,
+    exact-label evidence can suppress the no-target rescue.  When exact
+    targets exist, the branch follows the same center preference as initial
+    aim selection and runs only for a target whose source-space height is at
+    most 96 pixels at a 1080p reference height.
+    """
+
+    if len(frame_shape) < 2:
+        raise ValueError("frame_shape must contain height and width")
+    source_height = int(frame_shape[0])
+    source_width = int(frame_shape[1])
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError("frame dimensions must be positive")
+    label = str(aim_label).strip().casefold()
+    threshold = float(configured_confidence)
+    if not label:
+        raise ValueError("automatic detail rescue requires an aim label")
+    if not math.isfinite(threshold) or threshold < 0.0 or threshold > 1.0:
+        raise ValueError("configured confidence must be finite and in [0,1]")
+
+    exact = tuple(
+        detection
+        for detection in detections
+        if (
+            str(
+                getattr(
+                    detection,
+                    "class_name",
+                    getattr(detection, "label", ""),
+                )
+            ).strip().casefold()
+            == label
+            and float(detection.confidence) >= threshold
+        )
+    )
+    if not exact:
+        return "no_exact_target"
+
+    roi_left = float(detail_plan.crop_x)
+    roi_top = float(detail_plan.crop_y)
+    roi_right = roi_left + float(detail_plan.applied_crop_width)
+    roi_bottom = roi_top + float(detail_plan.applied_crop_height)
+    source_center_x = source_width * 0.5
+    source_center_y = source_height * 0.5
+    in_roi = []
+    for detection in exact:
+        center_x = (float(detection.x1) + float(detection.x2)) * 0.5
+        center_y = (float(detection.y1) + float(detection.y2)) * 0.5
+        if roi_left <= center_x <= roi_right and roi_top <= center_y <= roi_bottom:
+            distance_squared = (
+                (center_x - source_center_x) ** 2
+                + (center_y - source_center_y) ** 2
+            )
+            in_roi.append((distance_squared, detection))
+    if not in_roi:
+        return "not_needed"
+
+    _distance, center_nearest = min(in_roi, key=lambda item: item[0])
+    reference_height = (
+        max(0.0, float(center_nearest.y2) - float(center_nearest.y1))
+        / float(source_height)
+        * AUTOMATIC_DETAIL_REFERENCE_HEIGHT
+    )
+    if reference_height <= AUTOMATIC_DETAIL_MAX_REFERENCE_HEIGHT:
+        return "small_central_target"
+    return "not_needed"
+
+
+def _automatic_detail_telemetry_summary(previous, current, elapsed_seconds: float) -> str:
+    elapsed = max(float(elapsed_seconds), 1e-9)
+
+    def delta(key: str) -> int:
+        return int(current[key]) - int(previous[key])
+
+    triggered = delta("automatic_frames_triggered")
+    return (
+        f"DETAIL rescue {triggered / elapsed:.0f}/s | "
+        f"no-target {delta('automatic_frames_triggered_no_exact_target')} | "
+        f"small-central {delta('automatic_frames_triggered_small_central_target')} | "
+        f"close/off-center skip {delta('automatic_frames_skipped_not_needed')} | "
+        f"released skip {delta('automatic_frames_activation_released')}"
+    )
+
+
+def _identity_payload(payload):
+    """Transfer an already-owned prepared tensor into the latest-only worker."""
+
+    return payload
+
+
+@dataclass(frozen=True, slots=True)
+class _TimestampedPreparedHeadInput:
+    prepared: object
+    source_timestamp_ns: int
+
+
+class _PreparedDirectHeadLocalizer:
+    """Adapt the pinned direct-head decoder to ``LatestHeadWorker``."""
+
+    def __init__(self, session) -> None:
+        self._session = session
+
+    def __call__(self, payload, selected_player_box):
+        from detection.head_detector import (
+            PreparedHeadInput,
+            associate_head_to_player_outcome,
+            decode_head_output,
+        )
+        from detection.head_worker import HeadLocalizationOutcome, HeadObservation
+
+        if not isinstance(payload, _TimestampedPreparedHeadInput):
+            raise TypeError("head worker payload must be timestamped prepared input")
+        prepared = payload.prepared
+        if not isinstance(prepared, PreparedHeadInput):
+            raise TypeError("timestamped head payload must own PreparedHeadInput")
+        output = self._session.infer(prepared.tensor)
+        candidates = decode_head_output(output, prepared.transform)
+        association = associate_head_to_player_outcome(
+            candidates,
+            selected_player_box,
+            source_timestamp_ns=payload.source_timestamp_ns,
+        )
+        localization = association.localization
+        if localization is None:
+            return HeadLocalizationOutcome(association.reason, None)
+        if localization.source_timestamp_ns != payload.source_timestamp_ns:
+            raise RuntimeError("direct-head localization changed its source timestamp")
+        return HeadLocalizationOutcome(
+            association.reason,
+            HeadObservation(
+                point=localization.point,
+                confidence=localization.confidence,
+                evidence="SunXDS 0.8.0 direct head box",
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _AutomaticHeadSample:
+    point: tuple[float, float]
+    source_timestamp_ns: int
+    direct_source_timestamp_ns: int
+    identity_deadline_ns: int
+    track_generation: int
+    provenance: DirectHeadProvenance
+    confidence: float
+    evidence: str
+    bridging: bool = False
+    body_derived_motion_permitted: bool = False
+    body_derived_motion_deadline_ns: int | None = None
+    # Optional independent motion evidence from the exact same captured frame.
+    # This is never used to move ``point``; the controller may only use its
+    # temporal motion as permission for bounded direct-head feed-forward.
+    corroboration_point: tuple[float, float] | None = None
+
+
+class _AutomaticHeadRuntime:
+    """Own direct-head scheduling, identity epochs, and anchored propagation.
+
+    The exact direct-head result is the only evidence which may establish the
+    normalized location of a head.  Current primary geometry may carry that
+    identity-bound location for a short, explicit interval, while the raw
+    primary measurement remains the safety/identity authority.
+    """
+
+    def __init__(
+        self,
+        worker,
+        *,
+        submission_hz: float = AUTOMATIC_HEAD_LOCALIZATION_HZ,
+        stale_after_seconds: float = AUTOMATIC_HEAD_STALE_AFTER_SECONDS,
+        provider: str | None = None,
+    ) -> None:
+        rate = float(submission_hz)
+        stale = float(stale_after_seconds)
+        if not math.isfinite(rate) or rate <= 0.0:
+            raise ValueError("head submission_hz must be finite and positive")
+        if not math.isfinite(stale) or stale <= 0.0:
+            raise ValueError("head stale_after_seconds must be finite and positive")
+        self.worker = worker
+        provider_name = None if provider is None else str(provider).strip()
+        if provider is not None and not provider_name:
+            raise ValueError("head provider must not be empty")
+        self.provider = provider_name
+        self.submission_interval_ns = max(1, round(1_000_000_000 / rate))
+        self.stale_after_ns = max(1, round(stale * 1_000_000_000))
+        self.identity_generation = 0
+        self.body_valid = False
+        self.next_submission_ns: int | None = None
+        self.anchor = DirectHeadAnchor()
+        self._visible_sample: _AutomaticHeadSample | None = None
+        self._current_player_box: tuple[float, float, float, float] | None = None
+        self._current_aim_box: tuple[float, float, float, float] | None = None
+        self._current_player_timestamp_ns: int | None = None
+        self._visible_player_box: tuple[float, float, float, float] | None = None
+        self._visible_player_timestamp_ns: int | None = None
+        self._observed_primary_sources: dict[
+            int,
+            tuple[tuple[float, float, float, float], int],
+        ] = {}
+        self._current_body_observed = False
+        self._motion_corroboration_revocation_pending = False
+        self._tracker_generation: int | None = None
+        self._last_physical_source_timestamp_ns: int | None = None
+        self._anchor_evidence = "filtered direct-head anchor"
+        self._mapped_filter_point: tuple[float, float] | None = None
+        self._mapped_filter_timestamp_ns: int | None = None
+
+    def start(self) -> None:
+        self.worker.start()
+
+    def advance_identity(self) -> None:
+        """Invalidate every pending/result point and begin a fresh safety epoch."""
+
+        self.identity_generation += 1
+        self.body_valid = False
+        self.next_submission_ns = None
+        self.anchor.reset()
+        self._visible_sample = None
+        self._current_player_box = None
+        self._current_aim_box = None
+        self._current_player_timestamp_ns = None
+        self._visible_player_box = None
+        self._visible_player_timestamp_ns = None
+        self._observed_primary_sources.clear()
+        self._current_body_observed = False
+        self._motion_corroboration_revocation_pending = False
+        self._tracker_generation = None
+        self._last_physical_source_timestamp_ns = None
+        self._anchor_evidence = "filtered direct-head anchor"
+        self._reset_mapped_filter()
+        self.worker.advance_identity(self.identity_generation)
+
+    def _reset_mapped_filter(self) -> None:
+        self._mapped_filter_point = None
+        self._mapped_filter_timestamp_ns = None
+
+    def consume_motion_corroboration_revocation(self) -> bool:
+        """Consume one fail-closed loss of independent motion evidence."""
+
+        pending = self._motion_corroboration_revocation_pending
+        self._motion_corroboration_revocation_pending = False
+        return pending
+
+    @staticmethod
+    def _player_boxes_associate(first, second) -> bool:
+        """Conservatively recognize one primary body without moving its point."""
+
+        try:
+            a = tuple(float(value) for value in first)
+            b = tuple(float(value) for value in second)
+        except (TypeError, ValueError):
+            return False
+        if len(a) != 4 or len(b) != 4 or not all(
+            math.isfinite(value) for value in (*a, *b)
+        ):
+            return False
+        aw, ah = a[2] - a[0], a[3] - a[1]
+        bw, bh = b[2] - b[0], b[3] - b[1]
+        if min(aw, ah, bw, bh) <= 0.0:
+            return False
+        area_a, area_b = aw * ah, bw * bh
+        area_ratio = min(area_a, area_b) / max(area_a, area_b)
+        intersection = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+            0.0,
+            min(a[3], b[3]) - max(a[1], b[1]),
+        )
+        overlap_of_smaller = intersection / min(area_a, area_b)
+        center_dx = abs((a[0] + a[2]) - (b[0] + b[2])) * 0.5
+        center_dy = abs((a[1] + a[3]) - (b[1] + b[3])) * 0.5
+        return bool(
+            area_ratio >= 0.25
+            and overlap_of_smaller > 0.20
+            and center_dx < max(aw, bw) * 0.80
+            and center_dy < max(ah, bh) * 0.80
+        )
+
+    @staticmethod
+    def _head_point_belongs_to_player(point, player_box) -> bool:
+        """Require a direct point to remain in the current body's head region."""
+
+        try:
+            x, y = (float(value) for value in point)
+            x1, y1, x2, y2 = (float(value) for value in player_box)
+        except (TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) for value in (x, y, x1, y1, x2, y2)):
+            return False
+        width = x2 - x1
+        height = y2 - y1
+        if width <= 0.0 or height <= 0.0:
+            return False
+        side_margin = width * 0.12
+        top_margin = height * 0.12
+        return bool(
+            x1 - side_margin <= x <= x2 + side_margin
+            and y1 - top_margin <= y <= y1 + height * 0.48
+        )
+
+    @classmethod
+    def _player_boxes_associate_over_interval(
+        cls,
+        submitted_box,
+        current_box,
+        *,
+        elapsed_ns: int,
+    ) -> bool:
+        """Reject implausibly fast box transitions inside one tracker epoch.
+
+        A loose overlap test is intentionally retained for commanded-camera
+        motion.  Source-time displacement adds the missing crossing boundary:
+        a different overlapping player cannot inherit a just-submitted head
+        merely because both boxes share an anatomically plausible point.
+        """
+
+        if not cls._player_boxes_associate(submitted_box, current_box):
+            return False
+        elapsed = int(elapsed_ns)
+        if elapsed < 0:
+            return False
+        first = tuple(float(value) for value in submitted_box)
+        second = tuple(float(value) for value in current_box)
+        first_width = first[2] - first[0]
+        first_height = first[3] - first[1]
+        second_width = second[2] - second[0]
+        second_height = second[3] - second[1]
+        reference_extent = min(
+            max(first_width, second_width),
+            max(first_height, second_height),
+        )
+        center_dx = abs((first[0] + first[2]) - (second[0] + second[2])) * 0.5
+        center_dy = abs((first[1] + first[3]) - (second[1] + second[3])) * 0.5
+        elapsed_seconds = elapsed / 1_000_000_000
+        # Four pixels covers detector quantization on small boxes.  The 12%
+        # extent allowance covers ordinary localization jitter, while the
+        # time term explicitly retains verified 2400 px/s camera motion.
+        maximum_speed = max(2400.0, reference_extent * 12.0)
+        allowed_displacement = (
+            4.0 + reference_extent * 0.12 + maximum_speed * elapsed_seconds
+        )
+        return math.hypot(center_dx, center_dy) <= allowed_displacement
+
+    def accept_body(
+        self,
+        player_box=None,
+        *,
+        aim_box=None,
+        corroboration_box=None,
+        track_generation: int | None = None,
+        source_timestamp_ns: int | None = None,
+    ) -> bool:
+        """Accept live primary evidence; return true on identity replacement."""
+
+        replacement = False
+        body_timestamp_ns = (
+            None if source_timestamp_ns is None else int(source_timestamp_ns)
+        )
+        if body_timestamp_ns is not None and body_timestamp_ns < 0:
+            raise ValueError("body source timestamp cannot be negative")
+        mapped_geometry: tuple[float, float, float, float] | None = None
+        if aim_box is not None:
+            mapped_geometry = tuple(float(value) for value in aim_box)
+            if len(mapped_geometry) != 4 or not all(
+                math.isfinite(value) for value in mapped_geometry
+            ):
+                raise ValueError("aim_box must contain four finite coordinates")
+            if (
+                mapped_geometry[2] <= mapped_geometry[0]
+                or mapped_geometry[3] <= mapped_geometry[1]
+            ):
+                raise ValueError("aim_box must have positive width and height")
+            if player_box is None:
+                raise ValueError("aim_box requires an accepted player_box")
+        corroboration: tuple[float, float, float, float] | None = None
+        if corroboration_box is not None:
+            corroboration = tuple(float(value) for value in corroboration_box)
+            if len(corroboration) != 4 or not all(
+                math.isfinite(value) for value in corroboration
+            ):
+                raise ValueError(
+                    "corroboration_box must contain four finite coordinates"
+                )
+            if (
+                corroboration[2] <= corroboration[0]
+                or corroboration[3] <= corroboration[1]
+            ):
+                raise ValueError(
+                    "corroboration_box must have positive width and height"
+                )
+            if body_timestamp_ns is None:
+                raise ValueError("corroboration_box requires a source timestamp")
+            if player_box is None:
+                raise ValueError("corroboration_box requires an accepted player_box")
+        if track_generation is not None:
+            if (
+                isinstance(track_generation, bool)
+                or not isinstance(track_generation, int)
+                or track_generation < 0
+            ):
+                raise ValueError("track_generation must be a non-negative integer")
+            if (
+                self.body_valid
+                and self._tracker_generation is not None
+                and track_generation != self._tracker_generation
+            ):
+                self.advance_identity()
+                replacement = True
+        if player_box is not None:
+            candidate = tuple(float(value) for value in player_box)
+            if len(candidate) != 4 or not all(
+                math.isfinite(value) for value in candidate
+            ):
+                raise ValueError("player_box must contain four finite coordinates")
+            if candidate[2] <= candidate[0] or candidate[3] <= candidate[1]:
+                raise ValueError("player_box must have positive width and height")
+            if corroboration is not None and corroboration != candidate:
+                raise ValueError(
+                    "corroboration_box must equal the accepted player_box"
+                )
+            if (
+                self.body_valid
+                and self._current_player_box is not None
+                and (
+                    not self._player_boxes_associate(
+                        self._current_player_box,
+                        candidate,
+                    )
+                    or (
+                        body_timestamp_ns is not None
+                        and self._current_player_timestamp_ns is not None
+                        and not self._player_boxes_associate_over_interval(
+                            self._current_player_box,
+                            candidate,
+                            elapsed_ns=(
+                                body_timestamp_ns
+                                - self._current_player_timestamp_ns
+                            ),
+                        )
+                    )
+                )
+            ):
+                self.advance_identity()
+                replacement = True
+            self._current_player_box = candidate
+            self._current_aim_box = (
+                candidate if mapped_geometry is None else mapped_geometry
+            )
+            self._current_player_timestamp_ns = body_timestamp_ns
+            self._current_body_observed = corroboration is not None
+            if corroboration is None:
+                # Predicted primary geometry may be rendered as a truthful
+                # bridge, but it can neither publish a physical measurement nor
+                # authorize predictive feed-forward or a new direct-head crop.
+                self._motion_corroboration_revocation_pending = True
+            if corroboration is not None:
+                assert body_timestamp_ns is not None
+                effective_generation = (
+                    track_generation
+                    if track_generation is not None
+                    else self._tracker_generation
+                    if self._tracker_generation is not None
+                    else self.identity_generation
+                )
+                self._observed_primary_sources[body_timestamp_ns] = (
+                    candidate,
+                    effective_generation,
+                )
+                cutoff_ns = body_timestamp_ns - self.stale_after_ns * 2
+                self._observed_primary_sources = {
+                    timestamp: binding
+                    for timestamp, binding in self._observed_primary_sources.items()
+                    if timestamp >= cutoff_ns
+                }
+                while len(self._observed_primary_sources) > 32:
+                    del self._observed_primary_sources[
+                        min(self._observed_primary_sources)
+                    ]
+        if track_generation is not None:
+            self._tracker_generation = track_generation
+        elif self._tracker_generation is None:
+            # Tests and non-tracker callers still receive an explicit logical
+            # generation; the live path always supplies TargetTracker's value.
+            self._tracker_generation = self.identity_generation
+        self.body_valid = True
+        return replacement
+
+    def revoke_body(self) -> bool:
+        """Revoke on the first missing/unsafe body sample; return if state changed."""
+
+        if not self.body_valid:
+            return False
+        self.advance_identity()
+        return True
+
+    def submit(self, frame, selected_player, *, source_timestamp_ns: int) -> bool:
+        """Prepare one bounded crop from an exact same-frame primary box."""
+
+        if not self.body_valid or not self._current_body_observed:
+            return False
+        timestamp = int(source_timestamp_ns)
+        if timestamp < 0:
+            raise ValueError("head source timestamp cannot be negative")
+        binding = self._observed_primary_sources.get(timestamp)
+        if binding is None:
+            return False
+        bound_box, _bound_generation = binding
+        selected_player_box = tuple(float(value) for value in selected_player.box)
+        if (
+            self._current_player_timestamp_ns != timestamp
+            or self._current_player_box != bound_box
+            or selected_player_box != bound_box
+        ):
+            return False
+        deadline = self.next_submission_ns
+        if deadline is not None and timestamp < deadline:
+            return False
+
+        from detection.head_detector import plan_head_crop, prepare_head_input
+
+        transform = plan_head_crop(frame.shape, selected_player_box)
+        prepared = prepare_head_input(frame, transform)
+        payload = _TimestampedPreparedHeadInput(prepared, timestamp)
+        accepted = self.worker.submit(
+            payload,
+            source_timestamp_ns=timestamp,
+            identity_generation=self.identity_generation,
+            selected_player_box=selected_player_box,
+        )
+        if accepted:
+            if deadline is None:
+                self.next_submission_ns = timestamp + self.submission_interval_ns
+            else:
+                elapsed_intervals = (
+                    max(0, timestamp - deadline) // self.submission_interval_ns
+                ) + 1
+                self.next_submission_ns = (
+                    deadline + elapsed_intervals * self.submission_interval_ns
+                )
+        return bool(accepted)
+
+    def take_latest(self, *, now_ns: int) -> _AutomaticHeadSample | None:
+        """Ingest direct evidence, then publish only current measured geometry.
+
+        A completed worker result may be older than a body-derived position
+        already sent to the controller.  It therefore only updates the
+        normalized anchor.  The returned sample, when any, is always mapped
+        through this frame's current accepted primary geometry and carries its
+        current source timestamp.
+        """
+
+        current_ns = int(now_ns)
+        if current_ns < 0:
+            raise ValueError("head poll timestamp cannot be negative")
+        if not self.body_valid:
+            return None
+        result = self.worker.take_latest(self.identity_generation)
+        if result is not None:
+            result_age_ns = current_ns - result.source_timestamp_ns
+            if result_age_ns < 0 or result_age_ns > self.stale_after_ns:
+                # Worker freshness and anchor identity are separate. A late
+                # result is ignored; it must not revoke a newer live anchor
+                # merely because its exact-source binding has aged out.
+                result = None
+        if result is not None:
+            current_box = self._current_player_box
+            current_body_timestamp_ns = self._current_player_timestamp_ns
+            source_binding = self._observed_primary_sources.get(
+                result.source_timestamp_ns
+            )
+            result_box = tuple(float(value) for value in result.selected_player_box)
+            if source_binding is None or source_binding[0] != result_box:
+                # A direct observation without its exact accepted primary
+                # source binding has no trustworthy identity generation.
+                self.advance_identity()
+                return None
+            _source_box, source_track_generation = source_binding
+            association_timestamp_ns = (
+                current_ns
+                if current_body_timestamp_ns is None
+                else current_body_timestamp_ns
+            )
+            if (
+                current_box is None
+                or self._tracker_generation is None
+                or source_track_generation != self._tracker_generation
+                or not self._player_boxes_associate_over_interval(
+                    result_box,
+                    current_box,
+                    elapsed_ns=(
+                        association_timestamp_ns - result.source_timestamp_ns
+                    ),
+                )
+            ):
+                # A late result from a replaced primary target invalidates the
+                # whole epoch. It is never normalized against the new player.
+                self.advance_identity()
+                return None
+            observation = result.observation
+            if observation is None:
+                # A clustered direct miss does not erase a still-bounded
+                # anchor, but immediately withdraws any prior FF authority.
+                self._motion_corroboration_revocation_pending = True
+            elif not self._head_point_belongs_to_player(
+                observation.point,
+                result_box,
+            ):
+                self.advance_identity()
+                return None
+            else:
+                previous_direct_ns = self.anchor.last_direct_source_timestamp_ns
+                observed = self.anchor.observe_direct(
+                    observation.point,
+                    result_box,
+                    track_generation=source_track_generation,
+                    source_timestamp_ns=result.source_timestamp_ns,
+                    confidence=observation.confidence,
+                )
+                if observed is not None:
+                    if (
+                        previous_direct_ns is None
+                        or result.source_timestamp_ns - previous_direct_ns
+                        >= self.anchor.max_direct_age_ns
+                    ):
+                        self._reset_mapped_filter()
+                    self._anchor_evidence = observation.evidence
+
+        return self._map_current_anchor(now_ns=current_ns)
+
+    def _map_current_anchor(self, *, now_ns: int) -> _AutomaticHeadSample | None:
+        current_box = self._current_player_box
+        aim_box = self._current_aim_box
+        source_timestamp_ns = self._current_player_timestamp_ns
+        track_generation = self._tracker_generation
+        if (
+            current_box is None
+            or aim_box is None
+            or source_timestamp_ns is None
+            or track_generation is None
+        ):
+            self._visible_sample = None
+            self._reset_mapped_filter()
+            return None
+
+        deadline_ns = self.anchor.identity_deadline_ns
+        if deadline_ns is not None and max(now_ns, source_timestamp_ns) >= deadline_ns:
+            # Expiry is a hard safety epoch so the live loop publishes an
+            # immediate controller loss instead of extending the last mapped
+            # position by the controller's separate 65 ms input lease.
+            self.advance_identity()
+            return None
+        anchored = self.anchor.map_primary(
+            aim_box,
+            track_generation=track_generation,
+            source_timestamp_ns=source_timestamp_ns,
+            primary_observed=self._current_body_observed,
+        )
+        if anchored is None:
+            self._visible_sample = None
+            self._reset_mapped_filter()
+            return None
+        if not self._head_point_belongs_to_player(anchored.point, current_box):
+            self.advance_identity()
+            return None
+        if self._current_body_observed:
+            filtered_point = self._filter_mapped_point(anchored)
+            if not self._head_point_belongs_to_player(filtered_point, current_box):
+                # A discontinuous body move must not let filter lag manufacture
+                # an anatomically invalid point. Reseed from the current safe
+                # mapping instead of carrying the older screen coordinate.
+                self._reset_mapped_filter()
+                filtered_point = self._filter_mapped_point(anchored)
+        else:
+            # Prediction is display-only and is a physical observation gap.
+            # Do not advance or preserve the causal controller-input filter.
+            self._reset_mapped_filter()
+            filtered_point = anchored.point
+        sample = self._runtime_sample(
+            anchored,
+            point=filtered_point,
+            now_ns=now_ns,
+        )
+        self._visible_sample = sample
+        self._visible_player_box = current_box
+        self._visible_player_timestamp_ns = source_timestamp_ns
+
+        if not self._current_body_observed:
+            # Predicted primary geometry is display-only. It must revoke every
+            # predictive-motion grant immediately, while a measured
+            # BODY_DERIVED sample below carries its own explicit, short-lived
+            # provenance bit into the controller. Broadly revoking here on
+            # every measured frame would reset the derived direction history
+            # before it could ever earn coherent source-age projection.
+            self._motion_corroboration_revocation_pending = True
+            return None
+        previous_timestamp_ns = self._last_physical_source_timestamp_ns
+        if (
+            previous_timestamp_ns is not None
+            and source_timestamp_ns <= previous_timestamp_ns
+        ):
+            return None
+        self._last_physical_source_timestamp_ns = source_timestamp_ns
+        return sample
+
+    def _filter_mapped_point(
+        self,
+        sample: DirectHeadAnchorSample,
+    ) -> tuple[float, float]:
+        """Apply the qualified causal 12 ms LP to measured mapped geometry."""
+
+        if sample.provenance is not DirectHeadProvenance.MEASURED_PRIMARY:
+            self._reset_mapped_filter()
+            return sample.point
+        timestamp_ns = sample.source_timestamp_ns
+        previous_point = self._mapped_filter_point
+        previous_timestamp_ns = self._mapped_filter_timestamp_ns
+        if previous_point is None or previous_timestamp_ns is None:
+            filtered = sample.point
+        else:
+            elapsed_ns = timestamp_ns - previous_timestamp_ns
+            if elapsed_ns <= 0:
+                return previous_point
+            if elapsed_ns > self.stale_after_ns:
+                # A long primary-measurement gap is a discontinuity, not a
+                # reason to drag an old screen coordinate into reacquisition.
+                filtered = sample.point
+            else:
+                elapsed_seconds = elapsed_ns / 1_000_000_000
+                alpha = 1.0 - math.exp(
+                    -elapsed_seconds
+                    / AUTOMATIC_HEAD_MAPPED_FILTER_TIME_CONSTANT_SECONDS
+                )
+                filtered = (
+                    previous_point[0]
+                    + alpha * (sample.point[0] - previous_point[0]),
+                    previous_point[1]
+                    + alpha * (sample.point[1] - previous_point[1]),
+                )
+        self._mapped_filter_point = filtered
+        self._mapped_filter_timestamp_ns = timestamp_ns
+        return filtered
+
+    def _runtime_sample(
+        self,
+        sample: DirectHeadAnchorSample,
+        *,
+        point: tuple[float, float] | None = None,
+        now_ns: int | None = None,
+    ) -> _AutomaticHeadSample:
+        bridging = sample.provenance is DirectHeadProvenance.PREDICTED_PRIMARY
+        permission_timestamp_ns = (
+            sample.source_timestamp_ns
+            if now_ns is None
+            else max(int(now_ns), sample.source_timestamp_ns)
+        )
+        direct_age_ns = (
+            permission_timestamp_ns - sample.direct_source_timestamp_ns
+        )
+        body_derived_motion_permitted = bool(
+            sample.provenance is DirectHeadProvenance.MEASURED_PRIMARY
+            and 0 <= direct_age_ns < self.stale_after_ns
+        )
+        body_derived_motion_deadline_ns = (
+            sample.direct_source_timestamp_ns + self.stale_after_ns
+        )
+        return _AutomaticHeadSample(
+            point=sample.point if point is None else point,
+            source_timestamp_ns=sample.source_timestamp_ns,
+            direct_source_timestamp_ns=sample.direct_source_timestamp_ns,
+            identity_deadline_ns=sample.identity_deadline_ns,
+            track_generation=sample.track_generation,
+            provenance=sample.provenance,
+            confidence=sample.confidence,
+            evidence=self._anchor_evidence,
+            bridging=bridging,
+            body_derived_motion_permitted=body_derived_motion_permitted,
+            body_derived_motion_deadline_ns=(
+                body_derived_motion_deadline_ns
+                if body_derived_motion_permitted
+                else None
+            ),
+            corroboration_point=None,
+        )
+
+    def visible_sample(self, *, now_ns: int) -> _AutomaticHeadSample | None:
+        current_ns = int(now_ns)
+        if current_ns < 0:
+            raise ValueError("head display timestamp cannot be negative")
+        sample = self._visible_sample
+        if sample is None or not self.body_valid:
+            return None
+        if current_ns >= sample.identity_deadline_ns:
+            self.advance_identity()
+            return None
+        if (
+            self._current_player_box is None
+            or self._visible_player_box is None
+            or self._visible_player_timestamp_ns is None
+            or not self._player_boxes_associate_over_interval(
+                self._visible_player_box,
+                self._current_player_box,
+                elapsed_ns=(
+                    (
+                        current_ns
+                        if self._current_player_timestamp_ns is None
+                        else self._current_player_timestamp_ns
+                    )
+                    - self._visible_player_timestamp_ns
+                ),
+            )
+        ):
+            self.advance_identity()
+            return None
+        if not self._head_point_belongs_to_player(
+            sample.point,
+            self._current_player_box,
+        ):
+            self.advance_identity()
+            return None
+        return sample
+
+    def raise_if_failed(self) -> None:
+        self.worker.raise_if_failed()
+
+    @property
+    def status(self):
+        return self.worker.status
+
+    def stop(self) -> bool:
+        return bool(self.worker.stop())
+
+
+def _strict_primary_migraphx_provider(runtime_summary) -> str:
+    """Prove the primary model cannot execute or retry on CPU."""
+
+    if not isinstance(runtime_summary, Mapping):
+        raise RuntimeError("Primary detector runtime summary is unavailable")
+    active_values = runtime_summary.get("active_providers")
+    if (
+        not isinstance(active_values, (list, tuple))
+        or isinstance(active_values, (str, bytes))
+    ):
+        raise RuntimeError("Primary detector active provider chain is unavailable")
+    active = tuple(str(value).strip() for value in active_values)
+    allowed_active = (
+        (AUTOMATIC_HEAD_PROVIDER,),
+        (AUTOMATIC_HEAD_PROVIDER, "CPUExecutionProvider"),
+    )
+    if active not in allowed_active:
+        raise RuntimeError(
+            "Automatic direct-head tracking requires the primary detector on "
+            f"{AUTOMATIC_HEAD_PROVIDER}; active provider chain is "
+            + (", ".join(active) or "unavailable")
+        )
+    if runtime_summary.get("require_full_provider") is not True:
+        raise RuntimeError(
+            "Automatic direct-head tracking requires strict primary-provider "
+            "qualification"
+        )
+    configured = runtime_summary.get("configured_session_options")
+    if (
+        not isinstance(configured, Mapping)
+        or configured.get("disable_cpu_ep_fallback") is not True
+    ):
+        raise RuntimeError(
+            "Automatic direct-head tracking requires CPU graph fallback to be "
+            "disabled for the primary detector"
+        )
+    if runtime_summary.get("runtime_ep_fail_fallback_disabled") is not True:
+        raise RuntimeError(
+            "Automatic direct-head tracking requires primary execution-provider "
+            "failure fallback to be disabled"
+        )
+    return AUTOMATIC_HEAD_PROVIDER
+
+
+def _build_automatic_head_runtime(primary_runtime_summary) -> _AutomaticHeadRuntime:
+    """Build the pinned direct-head model on MIGraphX with no CPU fallback."""
+
+    import numpy as np
+
+    from detection.head_detector import (
+        HEAD_INPUT_HEIGHT,
+        HEAD_INPUT_WIDTH,
+        HEAD_OUTPUT_ATTRIBUTES,
+        HEAD_OUTPUT_CANDIDATES,
+        verify_pinned_head_model,
+    )
+    from detection.head_worker import (
+        LatestHeadWorker,
+        MIGRAPHX_PROVIDER,
+        OnnxModelContract,
+        OnnxTensorContract,
+        StrictProviderOnnxSession,
+    )
+
+    if AUTOMATIC_HEAD_PROVIDER != MIGRAPHX_PROVIDER:
+        raise RuntimeError("automatic head provider constant does not match MIGraphX")
+    active_primary_provider = _strict_primary_migraphx_provider(
+        primary_runtime_summary
+    )
+
+    model_path = verify_pinned_head_model()
+    contract = OnnxModelContract(
+        input=OnnxTensorContract(
+            "images",
+            (1, 3, HEAD_INPUT_HEIGHT, HEAD_INPUT_WIDTH),
+        ),
+        output=OnnxTensorContract(
+            "output0",
+            (1, HEAD_OUTPUT_ATTRIBUTES, HEAD_OUTPUT_CANDIDATES),
+        ),
+    )
+    session = StrictProviderOnnxSession(
+        model_path,
+        contract,
+        provider=active_primary_provider,
+    )
+    # Pay graph/allocation setup once before any physical activation can arm.
+    session.infer(np.zeros(contract.input.shape, dtype=np.float32))
+    worker = LatestHeadWorker(
+        _PreparedDirectHeadLocalizer(session),
+        payload_copier=_identity_payload,
+    )
+    return _AutomaticHeadRuntime(worker, provider=session.info.provider)
+
+
+def _publish_automatic_head_loss_once(
+    controller,
+    frame_shape,
+    *,
+    source_timestamp_ns: int,
+    already_published: bool,
+) -> bool:
+    """Publish at most one immediate target-loss decision in one source frame."""
+
+    if already_published:
+        return True
+    controller.update(
+        None,
+        frame_shape,
+        active=True,
+        measurement_ns=source_timestamp_ns,
+    )
+    return True
+
+
+def _calibration_requested(config: AppConfig) -> bool:
+    return config.aim_calibration_evidence is not None
+
+
+def _active_profile_requested(config: AppConfig) -> bool:
+    return config.aim_makcu_active_profile is not None
+
+
+def _calibrated_controller_from_active_profile(
+    profile,
+    *,
+    max_step: int,
+    vertical_rate_ratio: float,
+):
+    """Build the bounded numeric controller represented by one strict profile."""
+
+    from aiming.makcu_calibrated_control import (
+        CalibratedControlConfig,
+        CalibratedPlant,
+        MakcuCalibratedController,
+    )
+    from aiming.makcu_calibration_activation import ActiveMakcuCalibrationProfile
+
+    if not isinstance(profile, ActiveMakcuCalibrationProfile):
+        raise TypeError("profile must be an ActiveMakcuCalibrationProfile")
+    if isinstance(max_step, bool) or not isinstance(max_step, int) or max_step <= 0:
+        raise ValueError("calibrated maximum step must be a positive integer")
+    ratio = float(vertical_rate_ratio)
+    if not math.isfinite(ratio) or not 0.0 < ratio <= 1.0:
+        raise ValueError("calibrated vertical rate ratio must be in (0,1]")
+    maximum_rate_x = float(max_step) * 60.0
+    maximum_rate_y = maximum_rate_x * ratio
+    return MakcuCalibratedController(
+        CalibratedPlant(
+            profile.fit.x.gain_pixels_per_count,
+            profile.fit.y.gain_pixels_per_count,
+            profile.fit.delay_seconds,
+        ),
+        CalibratedControlConfig(
+            maximum_rate_x_counts_per_second=maximum_rate_x,
+            maximum_rate_y_counts_per_second=maximum_rate_y,
+        ),
+    )
+
+
+def _automatic_plant_aware_controller(*, max_step: int):
+    """Build bounded normal control from conservative host response seeds."""
+
+    from aiming.makcu_calibrated_control import (
+        CalibratedControlConfig,
+        CalibratedPlant,
+        MakcuCalibratedController,
+    )
+
+    if isinstance(max_step, bool) or not isinstance(max_step, int) or max_step <= 0:
+        raise ValueError("automatic maximum step must be a positive integer")
+    maximum_rate = float(max_step) * 60.0
+    return MakcuCalibratedController(
+        CalibratedPlant(
+            AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT,
+            AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT,
+            AUTOMATIC_MAKCU_DELAY_SECONDS,
+        ),
+        CalibratedControlConfig(
+            # Direct-head observations have a bounded 4 px feedback deadzone
+            # after the separate causal mapped-point filter. This rejects the
+            # measured 1-3 px circular residual without sacrificing the 5 px
+            # centering correction. Explicit profiles keep their own defaults.
+            # A 12 ms position response removes the measured moving-target lag
+            # left by the former 22 ms response without weakening any velocity
+            # or physical-output gate. Explicit profiles keep their defaults.
+            velocity_filter_time_constant_seconds=0.018,
+            position_time_constant_seconds=0.012,
+            maximum_target_acceleration_pixels_per_second_squared=20_000.0,
+            maximum_rate_x_counts_per_second=maximum_rate,
+            maximum_rate_y_counts_per_second=maximum_rate,
+            # The primary tracker can bridge three historical reference frames
+            # across short detector-empty intervals for 50 ms. Keep the numeric
+            # lease slightly wider so a normal ~12 ms processing age does not
+            # expire a valid
+            # prediction before the tracker does.  A longer observation gap
+            # still reseeds velocity rather than estimating motion through it.
+            stale_after_seconds=AUTOMATIC_MAKCU_STALE_AFTER_SECONDS,
+            maximum_observation_interval_seconds=0.040,
+            velocity_median_window=5,
+            feedback_deadzone_pixels=4.0,
+            # The body-mapped channel is not independent corroboration. Its
+            # explicit provenance is routed separately by the live adapter;
+            # omitting that permission remains an exact-zero predictive path.
+            maximum_velocity_feedforward_fraction=0.95,
+            require_motion_corroboration_for_feedforward=True,
+            maximum_body_derived_projection_fraction=1.0,
+            maximum_body_derived_feedforward_fraction=0.25,
+        ),
+    )
+
+
+def _calibration_model_sha256(snapshot: object) -> str:
+    """Return the exact selected-model identity, including OpenVINO weights."""
+
+    from hashlib import sha256
+    from typing import Mapping
+
+    if not isinstance(snapshot, Mapping):
+        raise ValueError("Model artifact snapshot is malformed")
+    digest = snapshot.get("sha256")
+    companions = snapshot.get("companions")
+    if (
+        not isinstance(digest, str)
+        or len(digest) != 64
+        or any(character not in "0123456789abcdef" for character in digest)
+        or not isinstance(companions, list)
+    ):
+        raise ValueError("Model artifact snapshot has no verified SHA-256")
+    if not companions:
+        # ONNX and other single-file models retain their ordinary file hash.
+        return digest
+
+    records: list[tuple[str, str]] = []
+    for record in [snapshot, *companions]:
+        if not isinstance(record, Mapping):
+            raise ValueError("Model companion snapshot is malformed")
+        name = record.get("name")
+        record_digest = record.get("sha256")
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(record_digest, str)
+            or len(record_digest) != 64
+            or any(
+                character not in "0123456789abcdef"
+                for character in record_digest
+            )
+        ):
+            raise ValueError("Model companion snapshot has no verified identity")
+        records.append((name, record_digest))
+    if len({name for name, _digest in records}) != len(records):
+        raise ValueError("Model artifact snapshot contains duplicate filenames")
+
+    composite = sha256(b"proaim-model-artifact-set-v1\0")
+    for name, record_digest in sorted(records):
+        encoded_name = name.encode("utf-8")
+        composite.update(len(encoded_name).to_bytes(4, "big"))
+        composite.update(encoded_name)
+        composite.update(bytes.fromhex(record_digest))
+    return composite.hexdigest()
+
+
+def _calibration_source_identity(
+    project_root: Path | None = None,
+) -> tuple[str, str]:
+    """Bind calibration to one exact frozen build or development source tree."""
+
+    from hashlib import sha256
+    import json
+    import os
+    import re
+    import stat
+    import subprocess
+
+    root = (project_root or Path(__file__).resolve().parent).resolve()
+    if bool(getattr(sys, "frozen", False)):
+        build_info = Path(sys.executable).resolve().parent / "BUILD-INFO.json"
+        try:
+            payload = build_info.read_bytes()
+            document = json.loads(payload.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                "Calibration requires a valid adjacent BUILD-INFO.json"
+            ) from exc
+        commit = document.get("commit") if isinstance(document, dict) else None
+        if not isinstance(commit, str) or re.fullmatch(r"[0-9a-f]{7,64}", commit) is None:
+            raise RuntimeError("Calibration build metadata has no exact source commit")
+        executable = Path(sys.executable).resolve()
+        identity = sha256(b"proaim-frozen-build-v1\0")
+        identity.update(payload)
+        try:
+            with executable.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    identity.update(chunk)
+        except OSError as exc:
+            raise RuntimeError("Could not hash the calibration executable") from exc
+        return commit, f"frozen-executable-sha256:{identity.hexdigest()}"
+
+    def git(*arguments: str) -> bytes:
+        try:
+            completed = subprocess.run(
+                ["git", "-C", str(root), *arguments],
+                check=False,
+                capture_output=True,
+                timeout=15,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise RuntimeError(
+                "Calibration requires readable source-control identity"
+            ) from exc
+        if completed.returncode != 0:
+            raise RuntimeError(
+                "Calibration requires readable source-control identity"
+            )
+        return completed.stdout
+
+    commit = git("rev-parse", "--verify", "HEAD").decode("ascii", "strict").strip()
+    if re.fullmatch(r"[0-9a-f]{7,64}", commit) is None:
+        raise RuntimeError("Calibration source commit is invalid")
+    diff = git("diff", "--binary", "--no-ext-diff", "HEAD", "--")
+    untracked = tuple(
+        value.decode("utf-8", "surrogateescape")
+        for value in git("ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
+        if value
+    )
+    if not diff and not untracked:
+        return commit, f"source-clean:{commit}"
+
+    identity = sha256(b"proaim-development-tree-v1\0")
+    identity.update(commit.encode("ascii"))
+    identity.update(b"\0tracked-diff\0")
+    identity.update(diff)
+    for relative_text in sorted(untracked):
+        relative = Path(relative_text)
+        if relative.is_absolute() or ".." in relative.parts:
+            raise RuntimeError("Git reported an unsafe untracked source path")
+        candidate = root / relative
+        try:
+            metadata = os.lstat(candidate)
+        except OSError as exc:
+            raise RuntimeError(
+                "Calibration source changed while its identity was captured"
+            ) from exc
+        identity.update(b"\0untracked\0")
+        identity.update(relative_text.encode("utf-8", "surrogateescape"))
+        identity.update(b"\0")
+        identity.update(str(stat.S_IMODE(metadata.st_mode)).encode("ascii"))
+        identity.update(b"\0")
+        if stat.S_ISLNK(metadata.st_mode):
+            identity.update(os.readlink(candidate).encode("utf-8", "surrogateescape"))
+        elif stat.S_ISREG(metadata.st_mode):
+            try:
+                with candidate.open("rb") as stream:
+                    while chunk := stream.read(1024 * 1024):
+                        identity.update(chunk)
+            except OSError as exc:
+                raise RuntimeError(
+                    "Calibration source changed while its identity was captured"
+                ) from exc
+        else:
+            raise RuntimeError("Calibration source contains an unsupported untracked entry")
+    return commit, f"source-tree-sha256:{identity.hexdigest()}"
+
+
+def _positive_integral_runtime_value(value: object, name: str) -> int:
+    if isinstance(value, bool):
+        raise ValueError(f"Calibration {name} is not a positive integer")
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Calibration {name} is unavailable") from exc
+    if not math.isfinite(numeric) or numeric <= 0.0 or not numeric.is_integer():
+        raise ValueError(f"Calibration {name} is not a positive integer")
+    return int(numeric)
+
+
+def _calibration_capture_identity(
+    config: AppConfig,
+    settings: object,
+) -> tuple[str, str, int, str, int, int, float, str, int]:
+    """Extract only negotiated live-capture identity from the running source."""
+
+    import json
+    from typing import Mapping
+
+    if not isinstance(settings, Mapping):
+        raise ValueError("Calibration capture settings are unavailable")
+    if config.source.kind not in {"screen", "device"}:
+        raise ValueError("Calibration requires a live screen or capture-card source")
+    width = _positive_integral_runtime_value(settings.get("width"), "capture width")
+    height = _positive_integral_runtime_value(settings.get("height"), "capture height")
+    try:
+        fps = float(settings.get("fps"))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Calibration capture frame rate is unavailable") from exc
+    if not math.isfinite(fps) or fps <= 0.0:
+        raise ValueError("Calibration capture frame rate must be positive")
+    try:
+        rotation = int(settings.get("rotation_degrees", 180 if config.capture_rotate_180 else 0))
+    except (TypeError, ValueError) as exc:
+        raise ValueError("Calibration capture rotation is unavailable") from exc
+    if rotation not in (0, 90, 180, 270):
+        raise ValueError("Calibration capture rotation is invalid")
+
+    if config.source.kind == "device":
+        backend_value = settings.get("backend")
+        if not isinstance(backend_value, str) or not backend_value.strip():
+            raise ValueError("Calibration capture-card backend is unavailable")
+        capture_backend = backend_value.strip()
+        capture_buffer_size = _positive_integral_runtime_value(
+            settings.get("buffer_size"), "capture buffer size"
+        )
+        actual_source = settings.get("source", config.source.value)
+        if actual_source is None:
+            raise ValueError("Calibration capture-card index is unavailable")
+        capture_index = str(actual_source)
+        pixel_format_value = settings.get("pixel_format")
+        if not isinstance(pixel_format_value, str) or not pixel_format_value.strip():
+            raise ValueError("Calibration capture-card pixel format is unavailable")
+        pixel_format = pixel_format_value.strip().upper()
+        capture_kind = "camera"
+    else:
+        # Screen backends expose different adapter/output fields.  Canonical
+        # JSON retains their actual selection without pretending they share an
+        # integer index namespace.
+        index_record = {
+            key: settings[key]
+            for key in (
+                "backend",
+                "device_index",
+                "left",
+                "monitor",
+                "output_index",
+                "top",
+            )
+            if key in settings and settings[key] is not None
+        }
+        capture_index = json.dumps(
+            index_record,
+            ensure_ascii=True,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        pixel_format = str(settings.get("pixel_format") or "BGR8").strip().upper()
+        capture_backend = str(settings.get("backend") or "").strip()
+        if not capture_backend:
+            raise ValueError("Calibration screen-capture backend is unavailable")
+        capture_buffer_size = 0
+        capture_kind = "screen"
+    if not capture_index or len(capture_index) > 256:
+        raise ValueError("Calibration capture identity is unavailable")
+    return (
+        capture_kind,
+        capture_backend,
+        capture_buffer_size,
+        capture_index,
+        width,
+        height,
+        fps,
+        pixel_format,
+        rotation,
+    )
+
+
+def _build_calibration_runtime_binding(
+    config: AppConfig,
+    *,
+    detector_summary: object,
+    capture_settings: object,
+    makcu_identity_token: object,
+    model_artifact_snapshot: object,
+    labels_artifact_snapshot: object,
+    source_identity: tuple[str, str] | None = None,
+    context_name: str | None = None,
+    aim_mode: str | None = None,
+):
+    """Create the exact immutable identity used by evidence and activation."""
+
+    from typing import Mapping
+
+    from aiming.makcu_calibration_session import (
+        CalibrationRuntimeBinding,
+        normalize_calibration_context,
+    )
+    from hashlib import sha256
+    import json
+    import os
+    import re
+
+    if not isinstance(detector_summary, Mapping):
+        raise ValueError("Calibration detector runtime summary is unavailable")
+    if not isinstance(labels_artifact_snapshot, Mapping):
+        raise ValueError("Labels artifact snapshot is malformed")
+    labels_sha256 = labels_artifact_snapshot.get("sha256")
+    if (
+        not isinstance(labels_sha256, str)
+        or len(labels_sha256) != 64
+        or any(character not in "0123456789abcdef" for character in labels_sha256)
+    ):
+        raise ValueError("Labels artifact snapshot has no verified SHA-256")
+    if not isinstance(makcu_identity_token, str) or len(makcu_identity_token) != 64:
+        raise RuntimeError("Verified MAKCU identity is unavailable for calibration")
+
+    shape = detector_summary.get("input_shape")
+    if not isinstance(shape, (list, tuple)) or len(shape) != 4:
+        raise ValueError("Calibration detector input shape is unavailable")
+    inference_height = _positive_integral_runtime_value(shape[-2], "inference height")
+    inference_width = _positive_integral_runtime_value(shape[-1], "inference width")
+    active_values = detector_summary.get("active_providers")
+    active_provider = ""
+    if isinstance(active_values, (list, tuple)) and active_values:
+        active_provider = str(active_values[0]).strip()
+    if not active_provider:
+        active_provider = str(detector_summary.get("device") or "").strip()
+    requested_provider = str(
+        detector_summary.get("requested_provider")
+        or detector_summary.get("requested_device")
+        or config.device
+    ).strip()
+    active_device = str(detector_summary.get("device") or active_provider).strip()
+    if not requested_provider or not active_provider or not active_device:
+        raise ValueError("Calibration detector provider/device identity is incomplete")
+
+    runtime_version = str(
+        detector_summary.get("onnxruntime_version")
+        or detector_summary.get("openvino_version")
+        or ""
+    ).strip()
+    if runtime_version.casefold() in {"", "unknown", "unavailable", "n/a", "none"}:
+        raise ValueError("Calibration runtime version identity is unavailable")
+    provider_identity_record = {
+        key: detector_summary.get(key)
+        for key in (
+            "active_providers",
+            "configured_session_options",
+            "execution_devices",
+            "num_streams",
+            "num_streams_requested",
+            "output_format",
+            "performance_hint",
+            "provider_chain",
+            "provider_option_overrides",
+            "provider_options",
+            "require_full_provider",
+            "runtime_ep_fail_fallback_disabled",
+        )
+        if key in detector_summary
+    }
+    if config.backend == "onnxruntime":
+        if detector_summary.get("provider_options_status") != "ok":
+            raise ValueError(
+                "Calibration requires a successful ONNX provider-options query"
+            )
+        if (
+            detector_summary.get("require_full_provider") is not True
+            or detector_summary.get("runtime_ep_fail_fallback_disabled") is not True
+        ):
+            raise ValueError(
+                "Calibration requires strict ONNX GPU provider fallback controls"
+            )
+        if os.environ.get("HSA_OVERRIDE_GFX_VERSION") is not None:
+            raise ValueError("Calibration refuses HSA_OVERRIDE_GFX_VERSION")
+        provider_identity_record["runtime_environment"] = {
+            key: value
+            for key, value in sorted(os.environ.items())
+            if key.startswith(("MIGRAPHX_", "ROCR_", "HIP_", "HSA_"))
+            or key in {"CUDA_VISIBLE_DEVICES", "GPU_DEVICE_ORDINAL"}
+        }
+    try:
+        provider_identity_bytes = json.dumps(
+            provider_identity_record,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Calibration provider options are not canonically serializable"
+        ) from exc
+    provider_options_sha256 = sha256(provider_identity_bytes).hexdigest()
+
+    physical_identity = str(
+        detector_summary.get("physical_device_identity") or ""
+    ).strip()
+    if not physical_identity and any(
+        token in active_provider.casefold() for token in ("migraphx", "rocm")
+    ):
+        rocr_selector = os.environ.get("ROCR_VISIBLE_DEVICES", "").strip()
+        if re.fullmatch(r"GPU-[0-9A-Fa-f]{16,64}", rocr_selector):
+            physical_identity = f"rocr:{rocr_selector}"
+    if (
+        not physical_identity
+        or len(physical_identity) > 256
+        or any(ord(character) < 0x20 for character in physical_identity)
+    ):
+        raise ValueError(
+            "Calibration requires an unambiguous physical accelerator identity"
+        )
+    physical_device_token = sha256(physical_identity.encode("utf-8")).hexdigest()
+
+    (
+        capture_kind,
+        capture_backend,
+        capture_buffer_size,
+        capture_index,
+        capture_width,
+        capture_height,
+        capture_fps,
+        pixel_format,
+        rotation_degrees,
+    ) = _calibration_capture_identity(config, capture_settings)
+    source_commit, build_identity = source_identity or _calibration_source_identity()
+    selected_context = context_name or config.aim_calibration_context
+    normalized_mode = normalize_calibration_context(selected_context)
+    selected_mode = aim_mode or normalized_mode
+    if selected_mode != normalized_mode:
+        raise ValueError("Calibration context and aim mode do not match")
+    return CalibrationRuntimeBinding(
+        model_sha256=_calibration_model_sha256(model_artifact_snapshot),
+        labels_sha256=labels_sha256,
+        source_commit=source_commit,
+        build_identity=build_identity,
+        backend=config.backend,
+        runtime_version=runtime_version,
+        requested_provider=requested_provider,
+        active_provider=active_provider,
+        active_device=active_device,
+        provider_options_sha256=provider_options_sha256,
+        physical_device_token=physical_device_token,
+        inference_width=inference_width,
+        inference_height=inference_height,
+        detail_pass_enabled=False,
+        capture_kind=capture_kind,
+        capture_backend=capture_backend,
+        capture_buffer_size=capture_buffer_size,
+        capture_index=capture_index,
+        capture_width=capture_width,
+        capture_height=capture_height,
+        capture_fps=capture_fps,
+        pixel_format=pixel_format,
+        rotation_degrees=rotation_degrees,
+        makcu_identity_token=makcu_identity_token,
+        activation_button=config.aim_makcu_button,
+        aim_label=config.aim_label or "",
+        head_ratio=config.aim_head_ratio,
+        invert_x=config.aim_invert_x,
+        invert_y=config.aim_invert_y,
+        context_name=selected_context,
+        aim_mode=selected_mode,
+    )
+
+
+def _calibration_observation_target_and_readiness(
+    detections,
+    frame_shape: tuple[int, ...],
+    *,
+    aim_label: str,
+    head_ratio: float,
+    configured_confidence: float,
+    invert_x: bool,
+    invert_y: bool,
+    self_exclusion_safe: bool,
+    measurement_ns: int,
+    safe_roi_margin_ratio: float | None = None,
+    maximum_reference_error: float | None = None,
+):
+    """Select one raw exact-label target and explain its readiness."""
+
+    from aiming import head_target_point
+    from aiming.makcu_calibration_session import (
+        CalibrationObservation,
+        target_within_safe_roi,
+    )
+
+    if not self_exclusion_safe:
+        return None, None, "target wait: self-avatar safety is not ready"
+    if len(frame_shape) < 2:
+        return None, None, "target wait: capture dimensions are unavailable"
+    height, width = frame_shape[:2]
+    if width <= 0 or height <= 0:
+        return None, None, "target wait: capture dimensions are invalid"
+    threshold = float(configured_confidence)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Calibration confidence must be finite and in [0,1]")
+    normalized_label = aim_label.strip().casefold()
+    exact_label_count = 0
+    eligible: list[
+        tuple[object, float, float, float, float, float, float, float]
+    ] = []
+    for detection in detections:
+        if detection.class_name.strip().casefold() != normalized_label:
+            continue
+        exact_label_count += 1
+        try:
+            confidence = float(detection.confidence)
+            left, top, right, bottom = (float(value) for value in detection.box)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(confidence) or confidence < threshold:
+            continue
+        if not all(math.isfinite(value) for value in (left, top, right, bottom)):
+            continue
+        if not (0.0 <= left < right <= width and 0.0 <= top < bottom <= height):
+            continue
+        target_x, target_y = head_target_point(detection, head_ratio)
+        if not math.isfinite(target_x) or not math.isfinite(target_y):
+            continue
+        eligible.append(
+            (
+                detection,
+                confidence,
+                left,
+                top,
+                right,
+                bottom,
+                target_x,
+                target_y,
+            )
+        )
+    if not eligible:
+        if exact_label_count:
+            readiness = (
+                "target wait: no valid exact "
+                f"{aim_label} detection at confidence >= {threshold:g}"
+            )
+        else:
+            readiness = f"target wait: no exact {aim_label} detection"
+        return None, None, readiness
+
+    center_x = width / 2.0
+    center_y = height / 2.0
+
+    def target_key(candidate):
+        (
+            detection,
+            confidence,
+            left,
+            top,
+            right,
+            bottom,
+            target_x,
+            target_y,
+        ) = candidate
+        reference_x = (target_x - center_x) * (1920.0 / width)
+        reference_y = (target_y - center_y) * (1080.0 / height)
+        # Distance is the intent signal. The remaining fields make equal-distance
+        # selection stable even if the detector returns boxes in another order.
+        return (
+            reference_x * reference_x + reference_y * reference_y,
+            -confidence,
+            left,
+            top,
+            right,
+            bottom,
+            int(detection.class_id),
+        )
+
+    (
+        target,
+        confidence,
+        left,
+        top,
+        right,
+        bottom,
+        target_x,
+        target_y,
+    ) = min(eligible, key=target_key)
+    reference_x = (target_x - width / 2.0) * (1920.0 / width)
+    reference_y = (target_y - height / 2.0) * (1080.0 / height)
+    if invert_x:
+        reference_x = -reference_x
+    if invert_y:
+        reference_y = -reference_y
+    observation = CalibrationObservation(
+        measurement_ns=measurement_ns,
+        error_x=reference_x,
+        error_y=reference_y,
+        confidence=confidence,
+        exact_label=True,
+        # Deterministic arbitration turns all safe, eligible full-pass boxes
+        # into one authorized candidate. The session still independently
+        # enforces central ROI and frame-to-frame box continuity.
+        unique_candidates=1,
+        self_safe=True,
+        is_prediction=False,
+        target_identity="selected-exact-target",
+        normalized_bbox=(
+            left / width,
+            top / height,
+            right / width,
+            bottom / height,
+        ),
+    )
+    if safe_roi_margin_ratio is not None and not target_within_safe_roi(
+        observation.normalized_bbox,
+        safe_roi_margin_ratio,
+    ):
+        readiness = "target wait: keep the complete target inside the central guide"
+    elif maximum_reference_error is not None and max(
+        abs(observation.error_x),
+        abs(observation.error_y),
+    ) > float(maximum_reference_error):
+        readiness = "target wait: move the target aim point closer to the crosshair"
+    else:
+        readiness = (
+            "target ready"
+            if len(eligible) == 1
+            else f"target ready: center-nearest of {len(eligible)} exact detections"
+        )
+    return observation, target, readiness
+
+
+def _calibration_observation_and_target(
+    detections,
+    frame_shape: tuple[int, ...],
+    *,
+    aim_label: str,
+    head_ratio: float,
+    configured_confidence: float,
+    invert_x: bool,
+    invert_y: bool,
+    self_exclusion_safe: bool,
+    measurement_ns: int,
+    safe_roi_margin_ratio: float | None = None,
+    maximum_reference_error: float | None = None,
+):
+    """Return the deterministically authorized raw calibration target."""
+
+    observation, target, _readiness = _calibration_observation_target_and_readiness(
+        detections,
+        frame_shape,
+        aim_label=aim_label,
+        head_ratio=head_ratio,
+        configured_confidence=configured_confidence,
+        invert_x=invert_x,
+        invert_y=invert_y,
+        self_exclusion_safe=self_exclusion_safe,
+        measurement_ns=measurement_ns,
+        safe_roi_margin_ratio=safe_roi_margin_ratio,
+        maximum_reference_error=maximum_reference_error,
+    )
+    return observation, target
+
+
+def _partition_detections_by_confidence(
+    detections,
+    configured_confidence: float | None,
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    """Separate normal detections from aim-only continuation evidence."""
+
+    source = tuple(detections)
+    if configured_confidence is None:
+        return source, ()
+    normal: list[object] = []
+    continuation: list[object] = []
+    for detection in source:
+        destination = (
+            normal
+            if float(detection.confidence) >= configured_confidence
+            else continuation
+        )
+        destination.append(detection)
+    return tuple(normal), tuple(continuation)
+
+
+@dataclass(frozen=True, slots=True)
+class HardAimGuardResult:
+    """Aim-only detections and exact-label attribution for the hard self guard."""
+
+    detections: tuple[object, ...]
+    removed_exact_label_boxes: int = 0
+    targetless_after_exact_removal: bool = False
+    removed_detections: tuple[object, ...] = ()
+
+
+def _apply_hard_aim_guard(
+    detections,
+    frame_shape: tuple[int, ...],
+    *,
+    self_zone,
+    aim_label: str,
+    configured_confidence: float | None = None,
+    confirmed_self_detection=None,
+) -> HardAimGuardResult:
+    """Apply the existing conservative aim guard and attribute exact labels.
+
+    The guard remains player-like rather than label-specific.  Attribution is
+    exact-label-specific so an unrelated guarded box cannot revoke prediction
+    grace for a genuinely empty target-label sample.
+    """
+
+    from utils.self_filter import boxes_are_safely_distinct, is_player_like
+
+    source = tuple(detections)
+    if self_zone is None or not source:
+        return HardAimGuardResult(source)
+
+    normalized_aim_label = aim_label.strip().lower()
+    if configured_confidence is not None:
+        configured_confidence = float(configured_confidence)
+        if not math.isfinite(configured_confidence) or not (
+            0.0 <= configured_confidence <= 1.0
+        ):
+            raise ValueError(
+                "configured_confidence must be finite and between 0 and 1"
+            )
+    guarded: list[object] = []
+    removed: list[object] = []
+    removed_exact_label_boxes = 0
+    for detection in source:
+        zone_candidate = (
+            is_player_like(detection)
+            and self_zone.candidate_score(detection.box, frame_shape) is not None
+        )
+        # Once the temporal filter has positively removed one confirmed self
+        # box, broad zone membership alone is no longer enough to call every
+        # remaining player "self".  Keep a distinct opponent, while still
+        # suppressing overlapping/associated duplicate detections of the
+        # confirmed avatar.  Invalid geometry remains guarded fail-closed.
+        confirmed_self_related = bool(
+            confirmed_self_detection is not None
+            and is_player_like(detection)
+            and not boxes_are_safely_distinct(
+                confirmed_self_detection.box,
+                detection.box,
+                frame_shape,
+            )
+        )
+        drop_for_aim = bool(
+            confirmed_self_related
+            or (zone_candidate and confirmed_self_detection is None)
+        )
+        if drop_for_aim:
+            removed.append(detection)
+            if detection.class_name.strip().lower() == normalized_aim_label:
+                removed_exact_label_boxes += 1
+            continue
+        guarded.append(detection)
+
+    targetless_after_exact_removal = (
+        removed_exact_label_boxes > 0
+        and not any(
+            detection.class_name.strip().lower() == normalized_aim_label
+            and (
+                configured_confidence is None
+                or float(detection.confidence) >= configured_confidence
+            )
+            for detection in guarded
+        )
+    )
+    return HardAimGuardResult(
+        tuple(guarded),
+        removed_exact_label_boxes=removed_exact_label_boxes,
+        targetless_after_exact_removal=targetless_after_exact_removal,
+        removed_detections=tuple(removed),
+    )
+
+
+def _exclude_automatic_detail_self_relatives(
+    detections,
+    frame_shape: tuple[int, ...],
+    *,
+    self_references,
+) -> tuple[object, ...]:
+    """Remove detail-pass player fragments tied to guarded self geometry.
+
+    A centered detail crop can truncate the bottom-anchored avatar and return
+    only a small upper-body fragment.  That fragment is too small for the
+    ordinary self-candidate geometry, so compare every player-like detail
+    result with the full-pass boxes already guarded as self (and the preceding
+    confirmed self box).  Only a box proven spatially distinct may enter the
+    cross-pass merge.  This helper is stateless: ``SelfAvatarFilter.apply``
+    remains the sole temporal transition for each source frame.
+    """
+
+    from utils.self_filter import boxes_are_safely_distinct, is_player_like
+
+    references = tuple(self_references)
+    if not references:
+        return tuple(detections)
+    retained: list[object] = []
+    for detection in detections:
+        if is_player_like(detection) and any(
+            not boxes_are_safely_distinct(
+                reference.box,
+                detection.box,
+                frame_shape,
+            )
+            for reference in references
+        ):
+            continue
+        retained.append(detection)
+    return tuple(retained)
+
+
+def _exclude_automatic_detail_lower_edge_self_fragments(
+    detections,
+    primary_detections,
+    frame_shape: tuple[int, ...],
+    *,
+    detail_plan,
+    self_zone,
+) -> tuple[object, ...]:
+    """Reject unmatched player fragments clipped by the detail ROI's bottom.
+
+    The centered 768 ROI ends above the configured bottom self zone at 1080p.
+    If the full pass misses the avatar entirely, its cropped upper body can
+    therefore look like a small, otherwise safe player.  Bound this cold-start
+    case to player-like detail-only boxes whose bottom lies within four model
+    pixels of the lower ROI edge and whose center lies in either configured
+    shoulder band.  A same-class overlapping full-pass box proves the result
+    is a refinement rather than detail-only evidence and keeps it eligible.
+    """
+
+    from utils.self_filter import boxes_are_safely_distinct, is_player_like
+
+    source_height = int(frame_shape[0])
+    source_width = int(frame_shape[1])
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError("frame dimensions must be positive")
+    crop_bottom = float(detail_plan.crop_y + detail_plan.applied_crop_height)
+    source_pixels_per_model_pixel = (
+        float(detail_plan.applied_crop_height) / float(detail_plan.model_height)
+    )
+    lower_edge_threshold = crop_bottom - (
+        AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS
+        * source_pixels_per_model_pixel
+    )
+    configured_left = float(self_zone.left) * source_width
+    configured_right = float(self_zone.left + self_zone.width) * source_width
+    mirrored_left = float(1.0 - self_zone.left - self_zone.width) * source_width
+    mirrored_right = float(1.0 - self_zone.left) * source_width
+    primary = tuple(primary_detections)
+
+    retained: list[object] = []
+    for detection in detections:
+        if not is_player_like(detection):
+            retained.append(detection)
+            continue
+        try:
+            x1, y1, x2, y2 = (float(value) for value in detection.box)
+        except (TypeError, ValueError):
+            # Malformed player geometry cannot safely establish aim authority.
+            continue
+        if not all(math.isfinite(value) for value in (x1, y1, x2, y2)):
+            continue
+        if x2 <= x1 or y2 <= y1:
+            continue
+        center_x = (x1 + x2) * 0.5
+        in_self_shoulder_band = bool(
+            configured_left <= center_x <= configured_right
+            or mirrored_left <= center_x <= mirrored_right
+        )
+        touches_lower_detail_edge = bool(
+            y1 < crop_bottom and y2 >= lower_edge_threshold
+        )
+        has_full_pass_parent = any(
+            is_player_like(candidate)
+            and candidate.class_id == detection.class_id
+            and not boxes_are_safely_distinct(
+                candidate.box,
+                detection.box,
+                frame_shape,
+            )
+            for candidate in primary
+        )
+        if (
+            in_self_shoulder_band
+            and touches_lower_detail_edge
+            and not has_full_pass_parent
+        ):
+            continue
+        retained.append(detection)
+    return tuple(retained)
+
+
+@dataclass(frozen=True, slots=True)
+class AimInputTelemetrySnapshot:
+    samples: int = 0
+    exact_label_samples: int = 0
+    self_filter_unsafe_samples: int = 0
+    hard_guard_removed_exact_boxes: int = 0
+    hard_guard_targetless_samples: int = 0
+
+
+class AimInputTelemetry:
+    """Cumulative non-spatial counters explaining missing aim inputs."""
+
+    def __init__(self, aim_label: str) -> None:
+        self._normalized_aim_label = aim_label.strip().lower()
+        self._samples = 0
+        self._exact_label_samples = 0
+        self._self_filter_unsafe_samples = 0
+        self._hard_guard_removed_exact_boxes = 0
+        self._hard_guard_targetless_samples = 0
+
+    def record_sample(self, detections) -> None:
+        self._samples += 1
+        if any(
+            detection.class_name.strip().lower() == self._normalized_aim_label
+            for detection in detections
+        ):
+            self._exact_label_samples += 1
+
+    def record_self_filter(self, *, aim_safe: bool) -> None:
+        if not aim_safe:
+            self._self_filter_unsafe_samples += 1
+
+    def record_hard_guard(self, result: HardAimGuardResult) -> None:
+        self._hard_guard_removed_exact_boxes += result.removed_exact_label_boxes
+        if result.targetless_after_exact_removal:
+            self._hard_guard_targetless_samples += 1
+
+    def snapshot(self) -> AimInputTelemetrySnapshot:
+        return AimInputTelemetrySnapshot(
+            samples=self._samples,
+            exact_label_samples=self._exact_label_samples,
+            self_filter_unsafe_samples=self._self_filter_unsafe_samples,
+            hard_guard_removed_exact_boxes=self._hard_guard_removed_exact_boxes,
+            hard_guard_targetless_samples=self._hard_guard_targetless_samples,
+        )
 
 
 def _build_capture(config: AppConfig):
-    from capture import OpenCVCaptureSource, ScreenCaptureSource
+    from capture import DesktopCaptureSource, OpenCVCaptureSource
 
     if config.source.kind == "screen":
-        return ScreenCaptureSource(
+        return DesktopCaptureSource(
             monitor=config.screen_monitor,
             region=config.screen_region,
             fps=config.screen_fps,
@@ -29,14 +2064,22 @@ def _build_capture(config: AppConfig):
             width=width,
             height=height,
             fps=config.capture_fps,
-            buffer_size=1,
+            # High-rate UVC devices require at least double buffering to keep
+            # one transfer in flight while the previous frame is consumed.
+            # The source still publishes into a one-frame latest-only mailbox,
+            # so this does not create an application-side stale-frame queue.
+            buffer_size=2,
             pixel_format=config.capture_format,
+            rotate_180=config.capture_rotate_180,
         )
 
     assert isinstance(config.source.value, Path)
     if not config.source.value.is_file():
         raise FileNotFoundError(f"Video file not found: {config.source.value}")
-    return OpenCVCaptureSource(config.source.value)
+    return OpenCVCaptureSource(
+        config.source.value,
+        rotate_180=config.capture_rotate_180,
+    )
 
 
 def _print_startup(detector, source) -> None:
@@ -106,23 +2149,177 @@ def _format_settings(settings) -> str:
     return ", ".join(f"{key}={value}" for key, value in settings.items() if value is not None)
 
 
-def _show_frame(cv2, frame) -> bool:
-    try:
-        cv2.imshow(WINDOW_NAME, frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key in (27, ord("q")):
-            return False
-        try:
-            if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
-                return False
-        except cv2.error:
-            # Some Linux GUI backends do not implement WND_PROP_VISIBLE.
-            pass
-        return True
-    except cv2.error as exc:
-        raise RuntimeError(
-            f"OpenCV preview failed: {exc}. Use --no-preview on a headless session."
-        ) from exc
+def _target_tracker_telemetry_summary(previous, current, elapsed_seconds: float) -> str:
+    """Format aggregate raw-measurement versus tracker-output diagnostics."""
+
+    elapsed = max(float(elapsed_seconds), 1e-9)
+
+    def count_delta(name: str) -> int:
+        return max(0, int(getattr(current, name)) - int(getattr(previous, name)))
+
+    def total_delta(name: str) -> float:
+        return float(getattr(current, name)) - float(getattr(previous, name))
+
+    updates = count_delta("updates")
+    candidates = count_delta("candidate_samples")
+    measurements = count_delta("measurement_samples")
+    continuation_measurements = count_delta("continuation_measurement_samples")
+    outputs = count_delta("output_samples")
+    compared = count_delta("compared_samples")
+
+    def mean(name: str, *, absolute: bool = False) -> float:
+        value = total_delta(name)
+        if absolute:
+            value = max(0.0, value)
+        return value / compared if compared else 0.0
+
+    rejected = max(0, candidates - measurements)
+    return (
+        f"TRACK samples {updates / elapsed:.0f}/s | "
+        f"raw/out {measurements / elapsed:.0f}/{outputs / elapsed:.0f}/s | "
+        f"continued-low {continuation_measurements / elapsed:.0f}/s | "
+        f"rejected {rejected / elapsed:.0f}/s | "
+        f"raw-track abs X/Y "
+        f"{mean('residual_abs_x', absolute=True):.1f}/"
+        f"{mean('residual_abs_y', absolute=True):.1f}px | "
+        f"signed {mean('residual_x'):+.1f}/{mean('residual_y'):+.1f}px | "
+        f"losses {count_delta('target_loss_transitions')}"
+    )
+
+
+def _aim_input_telemetry_summary(previous, current, elapsed_seconds: float) -> str:
+    """Format per-report deltas for non-spatial aim input causes."""
+
+    elapsed = max(float(elapsed_seconds), 1e-9)
+
+    def delta(name: str) -> int:
+        return max(0, int(getattr(current, name)) - int(getattr(previous, name)))
+
+    return (
+        f"AIM INPUT {delta('samples') / elapsed:.0f}/s | "
+        f"exact {delta('exact_label_samples') / elapsed:.0f}/s | "
+        f"self-unsafe {delta('self_filter_unsafe_samples')} | "
+        f"guard exact boxes {delta('hard_guard_removed_exact_boxes')} | "
+        f"guard targetless {delta('hard_guard_targetless_samples')}"
+    )
+
+
+def _head_runtime_telemetry_summary(
+    previous,
+    current,
+    elapsed_seconds: float,
+    *,
+    now_ns: int,
+    visible_sample: _AutomaticHeadSample | None,
+) -> str:
+    """Format non-spatial direct-head worker deltas and point freshness."""
+
+    elapsed = max(float(elapsed_seconds), 1e-9)
+
+    def delta(name: str) -> int:
+        return max(
+            0,
+            int(getattr(current, name, 0)) - int(getattr(previous, name, 0)),
+        )
+
+    overwrites = delta("pending_overwrites") + delta("result_overwrites")
+    stale = (
+        delta("stale_submissions")
+        + delta("stale_pending_dropped")
+        + delta("stale_results_dropped")
+    )
+    freshness = "none"
+    if visible_sample is not None:
+        direct_timestamp_ns = int(
+            getattr(
+                visible_sample,
+                "direct_source_timestamp_ns",
+                visible_sample.source_timestamp_ns,
+            )
+        )
+        age_ms = max(0.0, (int(now_ns) - direct_timestamp_ns) / 1e6)
+        provenance = getattr(visible_sample, "provenance", None)
+        state = (
+            "bridge"
+            if visible_sample.bridging
+            else "anchored"
+            if provenance is DirectHeadProvenance.MEASURED_PRIMARY
+            else "direct"
+        )
+        freshness = f"{age_ms:.0f}ms {state}"
+    return (
+        f"HEAD completed {delta('jobs_completed') / elapsed:.0f}/s | "
+        f"localized {delta('localized_heads') / elapsed:.0f}/s | "
+        f"no-head {delta('no_head_results') / elapsed:.0f}/s | "
+        "why no-decoded/no-plausible/multi-head "
+        f"{delta('no_decoded_head_candidates') / elapsed:.0f}/"
+        f"{delta('no_plausible_heads') / elapsed:.0f}/"
+        f"{delta('multiple_plausible_heads') / elapsed:.0f}/s | "
+        "secondary none/multi/unsupported "
+        f"{delta('no_matching_secondary_players') / elapsed:.0f}/"
+        f"{delta('multiple_matching_secondary_players') / elapsed:.0f}/"
+        f"{delta('head_unsupported_by_matched_player') / elapsed:.0f}/s | "
+        f"other {delta('unspecified_no_head_results') / elapsed:.0f}/s | "
+        f"overwrites {overwrites} | stale {stale} | point age {freshness}"
+    )
+
+
+def _makcu_telemetry_summary(previous, current, elapsed_seconds: float) -> str:
+    """Format passive output-loop counters collected since the prior report."""
+
+    elapsed = max(float(elapsed_seconds), 1e-9)
+
+    def delta(name: str) -> int:
+        return max(0, int(getattr(current, name)) - int(getattr(previous, name)))
+
+    ticks = delta("output_ticks")
+
+    def duty(name: str) -> float:
+        return 100.0 * delta(name) / ticks if ticks else 0.0
+
+    commands = delta("movement_commands")
+    abs_x = delta("emitted_abs_x")
+    abs_y = delta("emitted_abs_y")
+    net_x = int(getattr(current, "emitted_x")) - int(getattr(previous, "emitted_x"))
+    net_y = int(getattr(current, "emitted_y")) - int(getattr(previous, "emitted_y"))
+    control_samples = delta("control_samples")
+
+    def control_mean(name: str) -> float:
+        total = max(
+            0.0,
+            float(getattr(current, name)) - float(getattr(previous, name)),
+        )
+        return total / control_samples if control_samples else 0.0
+
+    saturation_x = (
+        100.0 * delta("saturated_x_samples") / control_samples
+        if control_samples
+        else 0.0
+    )
+    saturation_y = (
+        100.0 * delta("saturated_y_samples") / control_samples
+        if control_samples
+        else 0.0
+    )
+    return (
+        f"MAKCU loop {ticks / elapsed:.0f} Hz | "
+        f"button gate {duty('button_pressed_ticks'):.0f}% | "
+        f"target {duty('target_present_ticks'):.0f}% | "
+        f"fresh {duty('fresh_target_ticks'):.0f}% | "
+        f"authorized {duty('authorized_ticks'):.0f}% | "
+        f"moves {commands / elapsed:.0f}/s | "
+        f"abs counts X/Y {abs_x / elapsed:.0f}/{abs_y / elapsed:.0f}/s | "
+        f"net X/Y {net_x / elapsed:+.0f}/{net_y / elapsed:+.0f}/s | "
+        f"CTRL samples {control_samples / elapsed:.0f}/s | "
+        f"error abs X/Y {control_mean('control_error_abs_x'):.1f}/"
+        f"{control_mean('control_error_abs_y'):.1f}px | "
+        f"pursuit X/Y {control_mean('pursuit_abs_x') * 60.0:.0f}/"
+        f"{control_mean('pursuit_abs_y') * 60.0:.0f} cps | "
+        "motion corroboration "
+        f"{control_mean('motion_corroboration_confidence') * 100.0:.0f}% | "
+        f"saturation X/Y {saturation_x:.0f}/{saturation_y:.0f}% | "
+        f"pursuit resets {delta('pursuit_resets')}"
+    )
 
 
 def _start_optional_aiming(aim_controller, aim_sensor):
@@ -169,8 +2366,87 @@ def _validate_aim_safety(config: AppConfig) -> None:
             "Remote aim is unavailable because no authenticated, physically gated "
             "receiver is included"
         )
-    if config.aim_output == "local" and not (config.aim_activate_path or "").strip():
-        raise ValueError("Local aim requires an explicit physical activation device")
+    if config.aim_output not in {"local", "makcu"}:
+        raise ValueError(
+            f"Unsupported safe aim output: {config.aim_output!r}; "
+            "expected 'local' or 'makcu'"
+        )
+    if config.aim_output == "local":
+        if not (config.aim_activate_path or "").strip():
+            raise ValueError("Local aim requires an explicit physical activation device")
+        if isinstance(config.aim_activate_threshold, bool):
+            raise ValueError(
+                "Local aim activation threshold must be finite, greater than 0, "
+                "and at most 1"
+            )
+        try:
+            activation_threshold = float(config.aim_activate_threshold)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "Local aim activation threshold must be a finite number in (0,1]"
+            ) from exc
+        if not math.isfinite(activation_threshold) or not 0.0 < activation_threshold <= 1.0:
+            raise ValueError(
+                "Local aim activation threshold must be finite, greater than 0, "
+                "and at most 1"
+            )
+
+
+def _validate_calibration_safety(config: AppConfig) -> None:
+    """Repeat the CLI's calibration gates for direct ``run(AppConfig)`` callers."""
+
+    if not _calibration_requested(config):
+        return
+    import os
+
+    from aiming.makcu_calibration_session import normalize_calibration_context
+
+    if not config.aim or config.aim_output != "makcu":
+        raise ValueError("MAKCU calibration requires live MAKCU aiming")
+    if config.source.kind not in {"screen", "device"}:
+        raise ValueError("MAKCU calibration requires a live capture source")
+    if not (config.aim_makcu_port or "").strip():
+        raise ValueError("MAKCU calibration requires an explicit verified port")
+    if not config.ignore_self:
+        raise ValueError("MAKCU calibration requires self-avatar exclusion")
+    if config.detail_crop_size is not None:
+        raise ValueError("MAKCU calibration cannot use the detail pass")
+    if config.aim_makcu_active_profile is not None:
+        raise ValueError("MAKCU calibration cannot load an active aim profile")
+    if config.metrics_json is not None:
+        raise ValueError("MAKCU calibration cannot write a live metrics report")
+    if config.max_frames is not None or config.max_seconds is not None:
+        raise ValueError("MAKCU calibration cannot use frame or time bounds")
+    assert config.aim_calibration_evidence is not None
+    if os.path.lexists(config.aim_calibration_evidence):
+        raise ValueError(
+            "MAKCU calibration evidence already exists; refusing to overwrite"
+        )
+    if not bool(getattr(sys, "frozen", False)):
+        source_root = Path(__file__).resolve().parent
+        evidence_path = config.aim_calibration_evidence.resolve(strict=False)
+        if evidence_path == source_root or source_root in evidence_path.parents:
+            raise ValueError(
+                "MAKCU calibration evidence must be kept outside the source tree"
+            )
+    normalize_calibration_context(config.aim_calibration_context)
+
+
+def _validate_active_profile_safety(config: AppConfig) -> None:
+    """Reject explicit calibrated mode unless its full live boundary exists."""
+
+    if not _active_profile_requested(config):
+        return
+    if not config.aim or config.aim_output != "makcu":
+        raise ValueError("An active MAKCU profile requires live MAKCU aiming")
+    if config.aim_calibration_evidence is not None:
+        raise ValueError(
+            "An active MAKCU profile cannot be combined with calibration"
+        )
+    if config.source.kind not in {"screen", "device"}:
+        raise ValueError("An active MAKCU profile requires a live capture source")
+    if config.detail_crop_size is not None:
+        raise ValueError("An active MAKCU profile cannot use the detail pass")
 
 
 def _update_aim_target(
@@ -178,10 +2454,14 @@ def _update_aim_target(
     detections,
     frame_shape: tuple[int, ...],
     *,
+    continuation_detections=(),
+    continuation_allowed: bool = True,
     self_exclusion_safe: bool,
     aim_runtime_enabled: bool = True,
+    prediction_grace_safe: bool = True,
+    measurement_ns: int | None = None,
 ):
-    """Select a target, dropping all tracker history when self filtering is unsafe."""
+    """Select a target, dropping history whenever the physical sample is unsafe."""
 
     if tracker is None:
         return None
@@ -191,7 +2471,16 @@ def _update_aim_target(
     if not self_exclusion_safe:
         tracker.reset()
         return None
-    return tracker.update(detections, frame_shape)
+    if not prediction_grace_safe:
+        tracker.reset()
+        return None
+    return tracker.update(
+        detections,
+        frame_shape,
+        measurement_ns=measurement_ns,
+        continuation_detections=continuation_detections,
+        continuation_allowed=continuation_allowed,
+    )
 
 
 def _aim_status(
@@ -229,6 +2518,93 @@ def _aim_status(
 
 def run(config: AppConfig) -> int:
     _validate_aim_safety(config)
+    _validate_calibration_safety(config)
+    _validate_active_profile_safety(config)
+    calibration_requested = _calibration_requested(config)
+    active_profile_requested = _active_profile_requested(config)
+    active_profile = None
+    calibrated_numeric_controller = None
+    automatic_numeric_controller = None
+    if active_profile_requested:
+        from aiming.makcu_calibration_activation import load_active_profile
+
+        assert config.aim_makcu_active_profile is not None
+        # Explicit profile selection is not a cache lookup. Any malformed,
+        # insecure, missing, or tampered file is a terminal startup error.
+        active_profile = load_active_profile(config.aim_makcu_active_profile)
+        calibrated_numeric_controller = _calibrated_controller_from_active_profile(
+            active_profile,
+            max_step=config.aim_makcu_max_step,
+            vertical_rate_ratio=config.aim_makcu_vertical_rate_ratio,
+        )
+    automatic_makcu_requested = bool(
+        config.aim
+        and config.aim_output == "makcu"
+        and active_profile is None
+        and not calibration_requested
+    )
+    if automatic_makcu_requested:
+        # Automatic direct-head mode is an explicitly qualified MIGraphX path.
+        # Reject an arbitrary/manual CPU or OpenVINO invocation before either
+        # neural model is constructed or warmed up; the later runtime-summary
+        # checks still prove what the successfully created session activated.
+        if config.backend != "onnxruntime":
+            raise RuntimeError(
+                "Automatic direct-head MAKCU control requires the ONNX Runtime "
+                "MIGraphX GPU backend; CPU/OpenVINO inference is not permitted"
+            )
+        if config.require_full_provider is not True:
+            raise RuntimeError(
+                "Automatic direct-head MAKCU control requires --require-full-provider "
+                "so CPU graph and execution-provider failure fallback stay disabled"
+            )
+    if config.crop_size is not None and config.detail_crop_size is not None:
+        raise ValueError(
+            "The detail pass requires a full-frame primary inference; "
+            "crop_size and detail_crop_size cannot both be enabled"
+        )
+    # The release-default automatic MAKCU path gets one bounded, conditional
+    # small-target rescue without changing explicit crop/detail requests.
+    # Calibration, profile-bound control, local aim, and detector-only runs
+    # therefore cannot inherit this extra inference branch.
+    automatic_detail_rescue_enabled = bool(
+        automatic_makcu_requested
+        and config.crop_size is None
+        and config.detail_crop_size is None
+    )
+    effective_detail_crop_size = (
+        AUTOMATIC_DETAIL_RESCUE_CROP_SIZE
+        if automatic_detail_rescue_enabled
+        else config.detail_crop_size
+    )
+    detail_pass_mode = (
+        "automatic_activation_need_gated"
+        if automatic_detail_rescue_enabled
+        else "explicit_always"
+        if config.detail_crop_size is not None
+        else "disabled"
+    )
+    report_destination = None
+    model_artifact_snapshot = None
+    labels_artifact_snapshot = None
+    if config.metrics_json is not None:
+        # Reject a reused qualification filename before model startup or live
+        # capture can consume minutes of the tester's time. Publication repeats
+        # the check atomically to close the race between startup and shutdown.
+        from utils.live_report import prepare_report_destination, snapshot_artifact
+
+        report_destination = prepare_report_destination(config.metrics_json)
+        # Bind the report to the bytes that are about to be loaded, rather than
+        # hashing a mutable path only after the run has finished.
+        model_artifact_snapshot = snapshot_artifact(config.model_path)
+        labels_artifact_snapshot = snapshot_artifact(config.labels_path)
+    elif calibration_requested or active_profile_requested:
+        # Hash before detector construction so evidence is bound to the exact
+        # bytes that this session is about to load.
+        from utils.live_report import snapshot_artifact
+
+        model_artifact_snapshot = snapshot_artifact(config.model_path)
+        labels_artifact_snapshot = snapshot_artifact(config.labels_path)
     try:
         import cv2
     except ImportError as exc:
@@ -236,7 +2612,13 @@ def run(config: AppConfig) -> int:
             "OpenCV is not installed. Create a virtual environment and install requirements.txt."
         ) from exc
 
-    from detection import OpenVINOYoloDetector
+    from detection import (
+        DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT,
+        DetailPassStats,
+        OpenVINOYoloDetector,
+        merge_cross_pass_detections,
+        plan_detail_pass,
+    )
     from aiming import (
         AimActivationSensor,
         AimConfig,
@@ -250,6 +2632,7 @@ def run(config: AppConfig) -> int:
     )
     from aiming.makcu import BUTTON_NAMES
     from utils.metrics import FrameTimings, RollingMetrics
+    from utils.preview import PreviewPacer, create_preview_window
     from utils.preprocess import preprocess_frame
     from utils.render import (
         console_summary,
@@ -258,7 +2641,7 @@ def run(config: AppConfig) -> int:
         draw_ignore_zone,
         draw_metrics,
     )
-    from utils.self_filter import NormalizedBottomZone, SelfAvatarFilter, is_player_like
+    from utils.self_filter import NormalizedBottomZone, SelfAvatarFilter
 
     if config.backend == "onnxruntime":
         # AMD and NVIDIA GPUs have no OpenVINO plugin, so they run the same
@@ -270,21 +2653,72 @@ def run(config: AppConfig) -> int:
     else:
         detector_type = OpenVINOYoloDetector
 
-    detector = detector_type(
+    detector_arguments = dict(
         model_path=config.model_path,
         labels_path=config.labels_path,
-        device=config.device,
-        inference_size=config.inference_size,
+        # The automatic direct-head implementation is qualified for this AMD
+        # host on MIGraphX only.  Resolve that exact provider before session
+        # construction rather than allowing generic GPU/AUTO selection to
+        # initialize a different accelerator and reject it after warmup.
+        device=(AUTOMATIC_HEAD_PROVIDER if automatic_makcu_requested else config.device),
+        # Keep square detector-constructor integrations source-compatible;
+        # rectangular shapes remain an explicit (height, width) pair.
+        inference_size=compact_inference_size(config.inference_size),
         confidence=config.confidence,
         iou=config.iou_threshold,
         output_format=config.output_format,
     )
+    if config.backend == "onnxruntime":
+        detector_arguments["require_full_provider"] = config.require_full_provider
+    detector = detector_type(**detector_arguments)
     detector.warmup()
+    aim_configured_confidence = config.confidence if config.aim else None
+    postprocess_options = (
+        {
+            "confidence": min(
+                config.confidence,
+                AIM_CONTINUATION_CONFIDENCE_FLOOR,
+            )
+        }
+        if config.aim and not calibration_requested
+        else {}
+    )
+    if report_destination is not None or calibration_requested or active_profile_requested:
+        from utils.live_report import verify_artifact_unchanged
+
+        assert model_artifact_snapshot is not None
+        assert labels_artifact_snapshot is not None
+        verify_artifact_unchanged(
+            config.model_path,
+            model_artifact_snapshot,
+            description="Model artifact",
+        )
+        verify_artifact_unchanged(
+            config.labels_path,
+            labels_artifact_snapshot,
+            description="Labels artifact",
+        )
 
     source = _build_capture(config)
     metrics = RollingMetrics(config.stats_window)
+    display_snapshot = metrics.snapshot()
+    preview_pacer = PreviewPacer(config.preview_fps) if config.preview else None
+    preview_window = create_preview_window(cv2, WINDOW_NAME) if config.preview else None
     crop_warning_printed = False
+    detail_geometry_printed = False
+    detail_clamp_warning_printed = False
+    detail_redundant_warning_printed = False
+    detail_pass_stats = DetailPassStats(effective_detail_crop_size)
+    automatic_detail_telemetry = _AutomaticDetailRescueTelemetry()
+    automatic_detail_report_snapshot = automatic_detail_telemetry.snapshot()
     last_report_ns = perf_counter_ns()
+    pipeline_started_ns: int | None = None
+    pipeline_completed_ns: int | None = None
+    pipeline_started_utc: str | None = None
+    termination_reason = "source_ended"
+    processed_frames = 0
+    last_source_settings: dict[str, object] = {}
+    cleanup_failures: list[str] = []
     self_zone = (
         NormalizedBottomZone(
             left=config.self_zone_left,
@@ -297,22 +2731,47 @@ def run(config: AppConfig) -> int:
     self_filter = SelfAvatarFilter(self_zone) if self_zone is not None else None
     last_ignored_count: int | None = 0 if self_zone is not None else None
     last_ignored_detection = None
+    automatic_detail_confirmed_self_detection = None
     aim_controller: AimingController | MakcuAimingController | None = None
+    makcu_report_snapshot = None
+    makcu_report_ns: int | None = None
+    tracker_report_snapshot = None
+    tracker_report_ns: int | None = None
+    aim_input_telemetry: AimInputTelemetry | None = None
+    aim_input_report_snapshot: AimInputTelemetrySnapshot | None = None
+    aim_input_report_ns: int | None = None
+    head_report_snapshot = None
+    head_report_ns: int | None = None
     aim_sensor: AimActivationSensor | None = None
     target_tracker: TargetTracker | None = None
+    calibration_session = None
+    calibration_status = None
+    calibration_evidence_written = False
+    calibration_last_log: tuple[object, str] | None = None
+    calibration_target_readiness = "target wait: awaiting detector frame"
+    calibration_last_target_readiness: str | None = None
+    active_profile_bound = False
     aim_runtime_enabled = False
+    aim_activation_was_active = False
     aim_activation_name = "physical control"
     aim_control_description = "gated output"
+    automatic_head_runtime: _AutomaticHeadRuntime | None = None
     if config.aim:
-        target_tracker = TargetTracker(
-            label=config.aim_label,
-            head_ratio=config.aim_head_ratio,
-            # Output must fail closed on the first missed measurement.  The
-            # general tracker supports prediction grace for visualization,
-            # but carrying a predicted target into a physical output path can
-            # keep stale movement alive when inference drops a frame.
-            lost_grace_frames=0,
-        )
+        aim_input_telemetry = AimInputTelemetry(config.aim_label)
+        if not calibration_requested:
+            target_tracker = TargetTracker(
+                label=config.aim_label,
+                head_ratio=config.aim_head_ratio,
+                # Only automatic no-profile MAKCU receives the measured 50 ms
+                # genuine-empty bridge. Local aim and explicit profiles retain
+                # the original single-frame window; every unsafe/non-empty
+                # revocation path still resets the tracker immediately.
+                lost_grace_frames=(
+                    AUTOMATIC_MAKCU_EMPTY_GRACE_FRAMES
+                    if automatic_makcu_requested
+                    else 1
+                ),
+            )
         aim_config = AimConfig(
             invert_x=config.aim_invert_x,
             invert_y=config.aim_invert_y,
@@ -320,21 +2779,57 @@ def run(config: AppConfig) -> int:
         )
         if config.aim_output == "makcu":
             aim_activation_name = BUTTON_NAMES[config.aim_makcu_button]
-            aim_controller = MakcuAimingController(
-                MakcuAimConfig(
-                    port=config.aim_makcu_port or "",
-                    activation_button=config.aim_makcu_button,
-                    strength=config.aim_makcu_strength,
-                    max_step=config.aim_makcu_max_step,
-                    smoothing_alpha=config.aim_makcu_smoothing_alpha,
-                    prediction_lead_seconds=config.aim_makcu_prediction_lead_seconds,
-                    derivative_damping_seconds=config.aim_makcu_derivative_damping_seconds,
-                    invert_x=config.aim_invert_x,
-                    invert_y=config.aim_invert_y,
-                    head_ratio=config.aim_head_ratio,
-                )
+            makcu_config = MakcuAimConfig(
+                port=config.aim_makcu_port or "",
+                activation_button=config.aim_makcu_button,
+                strength=config.aim_makcu_strength,
+                max_step=config.aim_makcu_max_step,
+                smoothing_alpha=config.aim_makcu_smoothing_alpha,
+                prediction_lead_seconds=config.aim_makcu_prediction_lead_seconds,
+                derivative_damping_seconds=config.aim_makcu_derivative_damping_seconds,
+                vertical_rate_ratio=(
+                    1.0 if automatic_makcu_requested
+                    else config.aim_makcu_vertical_rate_ratio
+                ),
+                invert_x=config.aim_invert_x,
+                invert_y=config.aim_invert_y,
+                head_ratio=config.aim_head_ratio,
             )
-            aim_control_description = f"{aim_controller.config.output_hz} Hz control"
+            if active_profile is None and calibration_requested:
+                aim_controller = MakcuAimingController(makcu_config)
+            elif active_profile is None:
+                assert automatic_makcu_requested
+                automatic_numeric_controller = _automatic_plant_aware_controller(
+                    max_step=config.aim_makcu_max_step,
+                )
+                aim_controller = MakcuAimingController(
+                    makcu_config,
+                    calibrated_controller=automatic_numeric_controller,
+                )
+            else:
+                assert calibrated_numeric_controller is not None
+                aim_controller = MakcuAimingController(
+                    makcu_config,
+                    calibrated_controller=calibrated_numeric_controller,
+                    expected_identity_token=(
+                        active_profile.binding.makcu_identity_token
+                    ),
+                )
+            if automatic_numeric_controller is not None:
+                aim_control_description = (
+                    "automatic command-aware observer with direct-head input at "
+                    f"{aim_controller.config.output_hz} Hz"
+                )
+            elif active_profile is None:
+                aim_control_description = (
+                    f"{aim_controller.config.output_hz} Hz control"
+                )
+            else:
+                aim_control_description = (
+                    "calibrated profile "
+                    f"{active_profile.profile_sha256[:12]} at "
+                    f"{aim_controller.config.output_hz} Hz"
+                )
         else:
             aim_controller = AimingController(aim_config)
         if config.aim_output == "local":
@@ -347,6 +2842,31 @@ def run(config: AppConfig) -> int:
             )
 
     _print_startup(detector, source)
+    if automatic_detail_rescue_enabled:
+        print(
+            "Automatic MAKCU detail rescue: enabled | activation/need gated | "
+            "same model/input | centered model-aspect ROI up to "
+            f"{AUTOMATIC_DETAIL_RESCUE_CROP_SIZE} source px wide | runs on the "
+            "first held frame when the full pass has no configured-confidence "
+            "exact target, or its center-nearest target in the ROI is <= "
+            f"{AUTOMATIC_DETAIL_MAX_REFERENCE_HEIGHT:.0f}px at 1080p reference | "
+            "close/off-center targets and released preview skip the second "
+            "inference | self-guarded full-pass need decision | self-related "
+            "and lower-ROI-edge detail-only self fragments within "
+            f"{AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS:g} model px "
+            "excluded before aim merge | class-aware one-to-one merge | "
+            "unmatched additions <= "
+            f"{DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT:.0f}px at 1080p reference"
+        )
+    elif config.detail_crop_size is not None:
+        print(
+            "Detail pass: explicit always-on | same model/input | centered "
+            "model-aspect "
+            f"ROI up to {config.detail_crop_size} source px wide | "
+            "class-aware one-to-one "
+            "cross-pass deduplication | unmatched detail additions <= "
+            f"{DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT:.0f}px at 1080p reference"
+        )
     if self_zone is not None:
         print(
             "Self-avatar filter: enabled heuristic | player-like labels | "
@@ -357,25 +2877,120 @@ def run(config: AppConfig) -> int:
         )
     try:
         source.start()
-        aim_controller, aim_sensor = _start_optional_aiming(
-            aim_controller,
-            aim_sensor,
-        )
+        if active_profile is None:
+            aim_controller, aim_sensor = _start_optional_aiming(
+                aim_controller,
+                aim_sensor,
+            )
+        else:
+            # An explicitly selected profile is a strict operating mode, not
+            # an optional acceleration hint.  In particular, an identity
+            # rejection must stop startup instead of printing the legacy
+            # fail-soft message that capture will continue.
+            assert isinstance(aim_controller, MakcuAimingController)
+            assert aim_sensor is None
+            try:
+                aim_controller.start()
+            except (RuntimeError, OSError, ValueError) as exc:
+                try:
+                    aim_controller.stop()
+                except (RuntimeError, OSError, ValueError):
+                    pass
+                raise RuntimeError(
+                    "Calibrated MAKCU profile-bound controller failed strict "
+                    f"startup: {exc}"
+                ) from exc
         aim_runtime_enabled = aim_controller is not None
+        if aim_runtime_enabled and automatic_makcu_requested:
+            # This path is mandatory for automatic no-profile MAKCU.  A missing,
+            # changed, or unloadable head model is a startup failure; it never
+            # falls back to a body-box ratio.
+            print(
+                "Loading direct-head model on MIGraphXExecutionProvider GPU-only; "
+                "first compile may take about 40 seconds; CPU inference fallback "
+                "disabled."
+            )
+            automatic_head_runtime = _build_automatic_head_runtime(
+                detector.runtime_summary
+            )
+            automatic_head_runtime.start()
+        if calibration_requested and not isinstance(
+            aim_controller, MakcuAimingController
+        ):
+            raise RuntimeError(
+                "MAKCU calibration cannot continue because the verified live "
+                "controller did not start"
+            )
+        if active_profile is not None and not isinstance(
+            aim_controller, MakcuAimingController
+        ):
+            raise RuntimeError(
+                "Calibrated MAKCU aiming cannot continue because the exact "
+                "profile-bound controller did not start"
+            )
         if not aim_runtime_enabled:
             # A configured but unavailable output must fail closed. In
             # particular, do not retain a tracker that could still drive the
             # "aim ready" overlay or draw a selected aim point.
             target_tracker = None
+            aim_input_telemetry = None
+        elif config.aim_output == "makcu" and calibration_requested:
+            assert isinstance(aim_controller, MakcuAimingController)
+            print(
+                f"MAKCU calibration: enabled | target {config.aim_label} | "
+                f"activation {aim_activation_name} | exact full-pass detections "
+                f">= configured confidence {config.confidence:g} | "
+                "bounded exclusive pulses | no automatic profile activation"
+            )
+        elif config.aim_output == "makcu" and active_profile is not None:
+            # Announce calibrated operation only after capture/runtime binding
+            # is verified below. The output worker has no target yet and
+            # therefore cannot move during this startup boundary.
+            pass
         elif config.aim_output == "makcu":
+            from detection.head_detector import DEFAULT_HEAD_CONFIDENCE
+
+            assert automatic_numeric_controller is not None
+            assert automatic_head_runtime is not None
+            head_provider = automatic_head_runtime.provider
+            if head_provider != AUTOMATIC_HEAD_PROVIDER:
+                raise RuntimeError(
+                    "Automatic head runtime provider identity is not strict MIGraphX"
+                )
             activation = (
                 f"MAKCU mouse button {config.aim_makcu_button} | "
                 f"control loop {aim_controller.config.output_hz} Hz"
             )
             output = f"MAKCU {config.aim_makcu_port or 'auto-detect'}"
+            automatic_control = automatic_numeric_controller.config
             print(
                 f"Detection-driven aim: enabled | target {config.aim_label} | "
-                f"output {output} | activation {activation}"
+                f"output {output} | activation {activation} | "
+                "control automatic command-aware observer | gains X/Y "
+                f"{AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT:g}/"
+                f"{AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT:g} px/count | "
+                f"delay {AUTOMATIC_MAKCU_DELAY_SECONDS * 1000.0:.2f} ms | "
+                "head source pinned SunXDS 0.8.0 direct boxes on "
+                f"{head_provider} GPU-only "
+                "(CPU fallback disabled) | direct-head confidence "
+                f">= {DEFAULT_HEAD_CONFIDENCE:g} | "
+                f"latest-only {AUTOMATIC_HEAD_LOCALIZATION_HZ:g} Hz | "
+                f"direct results accepted within {AUTOMATIC_HEAD_STALE_AFTER_SECONDS * 1000.0:.0f} ms | "
+                "normalized direct-head anchor carried by current measured "
+                "primary boxes for at most "
+                f"{DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS * 1000.0:.0f} ms | "
+                "raw primary box remains identity/safety authority | "
+                "body-carried full projection permitted only within the "
+                f"{AUTOMATIC_HEAD_STALE_AFTER_SECONDS * 1000.0:.0f} ms direct lease; "
+                "explicit feed-forward capped at 25% | "
+                "mapped-point LP "
+                f"{AUTOMATIC_HEAD_MAPPED_FILTER_TIME_CONSTANT_SECONDS * 1000.0:.0f} ms | "
+                "position tau/deadzone "
+                f"{automatic_control.position_time_constant_seconds * 1000.0:.0f} ms/"
+                f"{automatic_control.feedback_deadzone_pixels:.0f} px | "
+                "caps X/Y "
+                f"{automatic_control.maximum_rate_x_counts_per_second:.0f}/"
+                f"{automatic_control.maximum_rate_y_counts_per_second:.0f} counts/s"
             )
         else:
             activation = (
@@ -389,25 +3004,192 @@ def run(config: AppConfig) -> int:
             )
         print(f"Capture settings: {_format_settings(source.actual_settings)}")
         _warn_on_capture_mismatch(config, source.actual_settings)
-        if config.preview:
-            try:
-                cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
-            except cv2.error as exc:
-                raise RuntimeError(
-                    f"Could not create the preview window: {exc}. Use --no-preview."
-                ) from exc
+        last_source_settings = dict(source.actual_settings)
+        if active_profile is not None:
+            from aiming.makcu_calibration_activation import (
+                CalibrationActivationBindingError,
+            )
+            from utils.live_report import verify_artifact_unchanged
 
+            assert isinstance(aim_controller, MakcuAimingController)
+            assert calibrated_numeric_controller is not None
+            assert model_artifact_snapshot is not None
+            assert labels_artifact_snapshot is not None
+            # Close the detector-construction/startup interval before allowing
+            # the first normal target publication into the output worker.
+            verify_artifact_unchanged(
+                config.model_path,
+                model_artifact_snapshot,
+                description="Model artifact",
+            )
+            verify_artifact_unchanged(
+                config.labels_path,
+                labels_artifact_snapshot,
+                description="Labels artifact",
+            )
+            runtime_binding = _build_calibration_runtime_binding(
+                config,
+                detector_summary=detector.runtime_summary,
+                capture_settings=last_source_settings,
+                makcu_identity_token=aim_controller.identity_token,
+                model_artifact_snapshot=model_artifact_snapshot,
+                labels_artifact_snapshot=labels_artifact_snapshot,
+            )
+            if active_profile.binding != runtime_binding:
+                raise CalibrationActivationBindingError(
+                    "Active calibration profile does not exactly match the "
+                    "current runtime binding"
+                )
+            active_profile_bound = True
+            profile_control = calibrated_numeric_controller.config
+            print(
+                f"Detection-driven aim: enabled | target {config.aim_label} | "
+                f"output MAKCU | activation {aim_activation_name} | "
+                f"control calibrated | profile {active_profile.profile_sha256[:12]} | "
+                f"context {active_profile.binding.context_name} | gains X/Y "
+                f"{active_profile.fit.x.gain_pixels_per_count:.6g}/"
+                f"{active_profile.fit.y.gain_pixels_per_count:.6g} px/count | "
+                f"delay {active_profile.fit.delay_seconds * 1000.0:.2f} ms | "
+                "caps X/Y "
+                f"{profile_control.maximum_rate_x_counts_per_second:.0f}/"
+                f"{profile_control.maximum_rate_y_counts_per_second:.0f} counts/s"
+            )
+        if config.preview:
+            assert preview_window is not None
+            preview_behavior = (
+                "latest-only Windows worker"
+                if preview_window.mode == "threaded"
+                else "main-thread HighGUI compatibility mode"
+            )
+            print(
+                f"Preview: capped at {config.preview_fps:g} fps; detection and "
+                f"control continue between refreshes | {preview_behavior} | "
+                "service cost measured separately"
+            )
+            preview_window.start()
+
+        if calibration_requested:
+            from aiming.makcu_calibration_session import (
+                CalibrationSessionConfig,
+                MakcuCalibrationSession,
+            )
+
+            assert isinstance(aim_controller, MakcuAimingController)
+            assert aim_configured_confidence is not None
+            assert model_artifact_snapshot is not None
+            assert labels_artifact_snapshot is not None
+            binding = _build_calibration_runtime_binding(
+                config,
+                detector_summary=detector.runtime_summary,
+                capture_settings=last_source_settings,
+                makcu_identity_token=aim_controller.identity_token,
+                model_artifact_snapshot=model_artifact_snapshot,
+                labels_artifact_snapshot=labels_artifact_snapshot,
+            )
+            calibration_started_ns = perf_counter_ns()
+            calibration_session = MakcuCalibrationSession(
+                aim_controller,
+                binding,
+                config=CalibrationSessionConfig(
+                    minimum_confidence=aim_configured_confidence,
+                ),
+                started_ns=calibration_started_ns,
+            )
+            calibration_status = calibration_session.status()
+            calibration_last_log = (
+                calibration_status.state,
+                calibration_status.message,
+            )
+            print(f"MAKCU calibration: {calibration_status.message}")
+
+        pipeline_started_ns = perf_counter_ns()
+        if isinstance(aim_controller, MakcuAimingController):
+            makcu_report_snapshot = aim_controller.telemetry_snapshot()
+            makcu_report_ns = pipeline_started_ns
+        if target_tracker is not None:
+            tracker_telemetry_snapshot = getattr(
+                target_tracker,
+                "telemetry_snapshot",
+                None,
+            )
+            if callable(tracker_telemetry_snapshot):
+                tracker_report_snapshot = tracker_telemetry_snapshot()
+                tracker_report_ns = pipeline_started_ns
+        if aim_input_telemetry is not None:
+            aim_input_report_snapshot = aim_input_telemetry.snapshot()
+            aim_input_report_ns = pipeline_started_ns
+        if automatic_head_runtime is not None:
+            head_report_snapshot = automatic_head_runtime.status
+            head_report_ns = pipeline_started_ns
+        if report_destination is not None:
+            from utils.live_report import utc_now
+
+            pipeline_started_utc = utc_now()
+        deadline_ns = (
+            pipeline_started_ns + round(config.max_seconds * 1_000_000_000)
+            if config.max_seconds is not None
+            else None
+        )
         while True:
-            packet = source.read(timeout=0.25)
+            loop_started_ns = perf_counter_ns()
+            if deadline_ns is not None and loop_started_ns >= deadline_ns:
+                termination_reason = "max_seconds"
+                break
+            read_timeout = 0.25
+            if deadline_ns is not None:
+                # Keep the existing bounded read and shorten its final wait so
+                # an unchanged DXGI desktop still obeys --max-seconds.
+                read_timeout = min(
+                    read_timeout,
+                    max(0.0, (deadline_ns - loop_started_ns) / 1_000_000_000),
+                )
+            preview_service_ms = 0.0
+            packet = source.read(timeout=read_timeout)
+            read_returned_ns = perf_counter_ns()
+            # A static DXGI source still returns from this bounded read every
+            # 250 ms, so inline HighGUI can service Escape/window close even
+            # when there is no paced preview frame to submit.
             if packet is None:
+                if automatic_head_runtime is not None:
+                    automatic_head_runtime.raise_if_failed()
                 if source.error:
                     raise RuntimeError(source.error)
-                if source.ended:
+                if deadline_ns is not None and read_returned_ns >= deadline_ns:
+                    termination_reason = "max_seconds"
                     break
+                if source.ended:
+                    termination_reason = "source_ended"
+                    break
+                if preview_window is not None:
+                    preview_service_started_ns = perf_counter_ns()
+                    continue_running = preview_window.poll()
+                    preview_service_ms += (
+                        perf_counter_ns() - preview_service_started_ns
+                    ) / 1e6
+                    if not continue_running:
+                        termination_reason = "preview_closed"
+                        break
                 continue
 
+            # A source may return its final packet as the deadline is reached.
+            # A packet already delivered by a source is still a
+            # legitimate sample; max-seconds is checked again immediately
+            # after it finishes, and this preserves exact max-frames behavior
+            # when both bounds are supplied.
+
             processing_started_ns = perf_counter_ns()
-            preprocessing_started_ns = processing_started_ns
+            # Sample the physical automatic-aim gate once for this captured
+            # frame.  The same value controls both rescue inference and later
+            # target publication, so a released preview never pays for the
+            # second pass and the first observed held frame can use it.
+            automatic_frame_activation_active: bool | None = None
+            if automatic_detail_rescue_enabled:
+                automatic_frame_activation_active = bool(
+                    isinstance(aim_controller, MakcuAimingController)
+                    and aim_runtime_enabled
+                    and aim_controller.activation_pressed
+                )
+            preprocessing_started_ns = perf_counter_ns()
             prepared = preprocess_frame(
                 packet.image,
                 inference_size=config.inference_size,
@@ -422,83 +3204,656 @@ def run(config: AppConfig) -> int:
                 raw,
                 transform=prepared.transform,
                 frame_shape=packet.image.shape,
+                **postprocess_options,
+            )
+            all_detections = tuple(detections)
+            detections, continuation_detections = (
+                _partition_detections_by_confidence(
+                    all_detections,
+                    aim_configured_confidence,
+                )
             )
             postprocess_completed_ns = perf_counter_ns()
+            detail_preprocess_ms = 0.0
+            detail_inference_ms = 0.0
+            detail_postprocess_ms = 0.0
+            detections_ready_ns = postprocess_completed_ns
+            automatic_detail_full_guard: HardAimGuardResult | None = None
+            if effective_detail_crop_size is not None:
+                detail_plan = plan_detail_pass(
+                    packet.image.shape,
+                    effective_detail_crop_size,
+                    config.inference_size,
+                )
+                detail_should_run = True
+                if automatic_detail_rescue_enabled:
+                    if not automatic_frame_activation_active:
+                        detail_reason = "activation_released"
+                    else:
+                        assert config.aim_label is not None
+                        assert self_zone is not None
+                        # Decide rescue need from stateless, aim-safe full-pass
+                        # evidence. The real SelfAvatarFilter is still applied
+                        # exactly once below, after both passes are merged.
+                        # Otherwise the large on-screen avatar itself can hide
+                        # the fact that no opponent survived the full pass.
+                        automatic_detail_full_guard = _apply_hard_aim_guard(
+                            all_detections,
+                            packet.image.shape,
+                            self_zone=self_zone,
+                            aim_label=config.aim_label,
+                            configured_confidence=config.confidence,
+                            confirmed_self_detection=(
+                                automatic_detail_confirmed_self_detection
+                            ),
+                        )
+                        detail_reason = _automatic_detail_rescue_reason(
+                            automatic_detail_full_guard.detections,
+                            packet.image.shape,
+                            detail_plan,
+                            aim_label=config.aim_label,
+                            configured_confidence=config.confidence,
+                        )
+                    automatic_detail_telemetry.record(detail_reason)
+                    detail_should_run = detail_reason in {
+                        "no_exact_target",
+                        "small_central_target",
+                    }
+                if detail_should_run:
+                    detail_pass_stats.record(detail_plan)
+                if detail_should_run and not detail_geometry_printed:
+                    print(
+                        "Detail pass coverage: centered "
+                        f"{detail_plan.applied_crop_width}x"
+                        f"{detail_plan.applied_crop_height} of "
+                        f"{detail_plan.source_width}x{detail_plan.source_height} "
+                        f"({detail_plan.coverage_fraction * 100.0:.1f}% of frame area; "
+                        f"{detail_plan.effective_linear_magnification:.2f}x "
+                        "derived linear detail versus the full pass)"
+                    )
+                    detail_geometry_printed = True
+                if (
+                    detail_should_run
+                    and detail_plan.clamped
+                    and not detail_clamp_warning_printed
+                ):
+                    print(
+                        "Warning: --detail-crop-size was reduced to the largest "
+                        "exact model-aspect ROI that fits this source: "
+                        f"{detail_plan.applied_crop_width}x"
+                        f"{detail_plan.applied_crop_height}px.",
+                        file=sys.stderr,
+                    )
+                    detail_clamp_warning_printed = True
+                if detail_should_run and detail_plan.redundant:
+                    if not detail_redundant_warning_printed:
+                        print(
+                            "Warning: detail pass is identical to this square source; "
+                            "the redundant second inference is disabled.",
+                            file=sys.stderr,
+                        )
+                        detail_redundant_warning_printed = True
+                elif detail_should_run:
+                    detail_preprocessing_started_ns = perf_counter_ns()
+                    detail_prepared = preprocess_frame(
+                        packet.image,
+                        inference_size=config.inference_size,
+                        crop_size=(
+                            detail_plan.applied_crop_height,
+                            detail_plan.applied_crop_width,
+                        ),
+                    )
+                    detail_preprocessing_completed_ns = perf_counter_ns()
+
+                    detail_inference_started_ns = detail_preprocessing_completed_ns
+                    detail_raw = detector.infer(detail_prepared.tensor)
+                    detail_inference_completed_ns = perf_counter_ns()
+                    detail_detections = detector.postprocess(
+                        detail_raw,
+                        transform=detail_prepared.transform,
+                        frame_shape=packet.image.shape,
+                        **postprocess_options,
+                    )
+                    if automatic_detail_rescue_enabled:
+                        assert automatic_detail_full_guard is not None
+                        assert self_zone is not None
+                        detail_detections = (
+                            _exclude_automatic_detail_lower_edge_self_fragments(
+                                detail_detections,
+                                all_detections,
+                                packet.image.shape,
+                                detail_plan=detail_plan,
+                                self_zone=self_zone,
+                            )
+                        )
+                        self_references = list(
+                            automatic_detail_full_guard.removed_detections
+                        )
+                        if automatic_detail_confirmed_self_detection is not None:
+                            self_references.append(
+                                automatic_detail_confirmed_self_detection
+                            )
+                        detail_detections = (
+                            _exclude_automatic_detail_self_relatives(
+                                detail_detections,
+                                packet.image.shape,
+                                self_references=self_references,
+                            )
+                        )
+                    if config.aim:
+                        detail_normal, _detail_continuation = (
+                            _partition_detections_by_confidence(
+                                detail_detections,
+                                aim_configured_confidence,
+                            )
+                        )
+                        all_detections = tuple(
+                            merge_cross_pass_detections(
+                                all_detections,
+                                detail_detections,
+                                source_height=packet.image.shape[0],
+                                unmatched_detail_max_reference_height=(
+                                    DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT
+                                ),
+                            )
+                        )
+                        detections = tuple(
+                            merge_cross_pass_detections(
+                                detections,
+                                detail_normal,
+                                source_height=packet.image.shape[0],
+                                unmatched_detail_max_reference_height=(
+                                    DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT
+                                ),
+                                stats=detail_pass_stats,
+                            )
+                        )
+                        _all_normal, continuation_detections = (
+                            _partition_detections_by_confidence(
+                                all_detections,
+                                aim_configured_confidence,
+                            )
+                        )
+                        all_detections = tuple(detections) + tuple(
+                            continuation_detections
+                        )
+                    else:
+                        detections = tuple(
+                            merge_cross_pass_detections(
+                                detections,
+                                detail_detections,
+                                source_height=packet.image.shape[0],
+                                unmatched_detail_max_reference_height=(
+                                    DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT
+                                ),
+                                stats=detail_pass_stats,
+                            )
+                        )
+                        all_detections = tuple(detections)
+                    detections_ready_ns = perf_counter_ns()
+                    detail_preprocess_ms = (
+                        detail_preprocessing_completed_ns
+                        - detail_preprocessing_started_ns
+                    ) / 1e6
+                    detail_inference_ms = (
+                        detail_inference_completed_ns - detail_inference_started_ns
+                    ) / 1e6
+                    # Includes source-space cross-pass consolidation, the final
+                    # deterministic postprocessing operation of this pass.
+                    detail_postprocess_ms = (
+                        detections_ready_ns - detail_inference_completed_ns
+                    ) / 1e6
+            if aim_input_telemetry is not None:
+                aim_input_telemetry.record_sample(detections)
+
             self_exclusion_ready = self_filter is None
             if self_filter is not None:
                 exclusion = self_filter.apply(
-                    detections,
+                    all_detections,
                     packet.image.shape,
                 )
-                detections = exclusion.detections
-                last_ignored_count = exclusion.ignored_count
-                last_ignored_detection = exclusion.ignored_detection
+                if exclusion.ignored_detection is not None:
+                    automatic_detail_confirmed_self_detection = (
+                        exclusion.ignored_detection
+                    )
+                elif not bool(getattr(self_filter, "acquired", False)):
+                    # Preserve the last positive self geometry only for the
+                    # temporal filter's own bounded lock/lost-grace interval.
+                    # This lets the next frame reject a cropped child even if
+                    # the full-pass parent is temporarily absent, without
+                    # permanently suppressing a later distinct opponent.
+                    automatic_detail_confirmed_self_detection = None
+                all_detections = tuple(exclusion.detections)
+                detections, continuation_detections = (
+                    _partition_detections_by_confidence(
+                        all_detections,
+                        aim_configured_confidence,
+                    )
+                )
+                ignored_detection = exclusion.ignored_detection
+                ignored_is_display_detection = bool(
+                    ignored_detection is not None
+                    and (
+                        aim_configured_confidence is None
+                        or float(ignored_detection.confidence)
+                        >= aim_configured_confidence
+                    )
+                )
+                last_ignored_count = (
+                    exclusion.ignored_count if ignored_is_display_detection else 0
+                )
+                last_ignored_detection = (
+                    ignored_detection if ignored_is_display_detection else None
+                )
                 self_exclusion_ready = exclusion.aim_safe
+            if aim_input_telemetry is not None:
+                aim_input_telemetry.record_self_filter(
+                    aim_safe=self_exclusion_ready,
+                )
 
             # Hard self guard for aim selection: never select a likely self-avatar
             # candidate from the configured bottom zone, even if temporal lock is
             # not currently confident enough to hide it from the preview list.
+            # Opposite-shoulder ambiguity is handled temporally by SelfAvatarFilter;
+            # do not guess that an arbitrary large bottom opponent is self.
             aim_detections = detections
-            if self_zone is not None and detections:
-                guarded: list = []
-                frame_h, frame_w = packet.image.shape[:2]
-                fallback_candidates: list[tuple[float, object]] = []
-                for detection in detections:
-                    drop_for_aim = (
-                        is_player_like(detection)
-                        and self_zone.candidate_score(detection.box, packet.image.shape)
-                        is not None
-                    )
-                    if not drop_for_aim and is_player_like(detection) and frame_h > 0 and frame_w > 0:
-                        x1, y1, x2, y2 = detection.box
-                        width_ratio = max(0.0, (x2 - x1) / frame_w)
-                        height_ratio = max(0.0, (y2 - y1) / frame_h)
-                        bottom_ratio = y2 / frame_h
-                        if (
-                            bottom_ratio >= 0.92
-                            and height_ratio >= 0.40
-                            and width_ratio >= 0.10
-                        ):
-                            # Fallback self candidate when the user-picked zone
-                            # is imperfect for current framing.
-                            fallback_candidates.append((bottom_ratio + height_ratio, detection))
-                    if drop_for_aim:
-                        continue
-                    guarded.append(detection)
-                if fallback_candidates and guarded:
-                    fallback_target = max(fallback_candidates, key=lambda item: item[0])[1]
-                    guarded = [item for item in guarded if item is not fallback_target]
-                aim_detections = tuple(guarded)
-            selected_aim_target = _update_aim_target(
-                target_tracker,
-                aim_detections,
-                packet.image.shape,
-                self_exclusion_safe=self_exclusion_ready,
-                aim_runtime_enabled=aim_runtime_enabled,
-            )
-            aim_engaged = False
-            if aim_controller is not None:
-                active = True
-                if aim_sensor is not None:
-                    active = aim_sensor.read()
-                aim_controller.update(
-                    selected_aim_target,
+            aim_continuation_detections = continuation_detections
+            hard_guard_revoked_prediction_grace = False
+            if self_zone is not None and all_detections:
+                hard_guard_result = _apply_hard_aim_guard(
+                    all_detections,
                     packet.image.shape,
-                    active=active,
+                    self_zone=self_zone,
+                    aim_label=config.aim_label,
+                    configured_confidence=aim_configured_confidence,
+                    confirmed_self_detection=(
+                        exclusion.ignored_detection
+                        if exclusion.aim_safe
+                        and exclusion.ignored_count == 1
+                        and exclusion.ignored_detection is not None
+                        else None
+                    ),
                 )
-                aim_engaged = (
-                    aim_controller.activation_pressed
-                    if isinstance(aim_controller, MakcuAimingController)
-                    else active
+                aim_detections, aim_continuation_detections = (
+                    _partition_detections_by_confidence(
+                        hard_guard_result.detections,
+                        aim_configured_confidence,
+                    )
                 )
-            aim_status = _aim_status(
-                runtime_enabled=aim_runtime_enabled,
-                self_exclusion_ready=self_exclusion_ready,
-                selected_target=selected_aim_target,
-                engaged=aim_engaged,
-                activation_name=aim_activation_name,
-                control_description=aim_control_description,
-            )
+                # This was not a genuine detector-empty sample. Never bridge
+                # an old physical target when an exact aim-label candidate was
+                # consumed and no exact aim-label target survived.
+                hard_guard_revoked_prediction_grace = (
+                    hard_guard_result.targetless_after_exact_removal
+                )
+                if aim_input_telemetry is not None:
+                    aim_input_telemetry.record_hard_guard(hard_guard_result)
+            direct_head_sample: _AutomaticHeadSample | None = None
+            if calibration_session is not None:
+                # Calibration consumes only this frame's configured-confidence,
+                # exact-label, full-pass result.  It deliberately bypasses the
+                # target tracker, prediction grace, continuation detections, and
+                # the normal aim controller update path.
+                assert isinstance(aim_controller, MakcuAimingController)
+                assert aim_configured_confidence is not None
+                assert config.aim_label is not None
+                (
+                    calibration_observation,
+                    selected_aim_target,
+                    calibration_target_readiness,
+                ) = _calibration_observation_target_and_readiness(
+                    aim_detections,
+                    packet.image.shape,
+                    aim_label=config.aim_label,
+                    head_ratio=config.aim_head_ratio,
+                    configured_confidence=aim_configured_confidence,
+                    invert_x=config.aim_invert_x,
+                    invert_y=config.aim_invert_y,
+                    self_exclusion_safe=self_exclusion_ready,
+                    measurement_ns=packet.read_started_ns,
+                    safe_roi_margin_ratio=(
+                        calibration_session.config.safe_roi_margin_ratio
+                    ),
+                    maximum_reference_error=(
+                        calibration_session.config.maximum_reference_error
+                    ),
+                )
+                if calibration_target_readiness != calibration_last_target_readiness:
+                    print(f"MAKCU calibration target: {calibration_target_readiness}")
+                    calibration_last_target_readiness = calibration_target_readiness
+                calibration_status = calibration_session.update_from_controller(
+                    perf_counter_ns(),
+                    observation=calibration_observation,
+                )
+                raw_known, raw_pressed = aim_controller.raw_activation_state
+                aim_engaged = raw_known and raw_pressed
+                current_calibration_log = (
+                    calibration_status.state,
+                    calibration_status.message,
+                )
+                if current_calibration_log != calibration_last_log:
+                    print(f"MAKCU calibration: {calibration_status.message}")
+                    calibration_last_log = current_calibration_log
+                aim_status = (
+                    f"calibration {calibration_status.state.value}: "
+                    f"{calibration_status.message} | {calibration_target_readiness}"
+                )
+            else:
+                if active_profile is not None and not active_profile_bound:
+                    raise RuntimeError(
+                        "Calibrated MAKCU profile was not bound before target update"
+                    )
+                tracking_activation_active = aim_runtime_enabled
+                if aim_sensor is not None:
+                    tracking_activation_active = aim_sensor.read()
+                elif isinstance(aim_controller, MakcuAimingController):
+                    tracking_activation_active = (
+                        automatic_frame_activation_active
+                        if automatic_frame_activation_active is not None
+                        else aim_controller.activation_pressed
+                    )
+                activation_transition = (
+                    tracking_activation_active != aim_activation_was_active
+                )
+                automatic_revoked_this_frame = False
+                if activation_transition and target_tracker is not None:
+                    # A new physical hold must establish configured-confidence
+                    # provenance in this hold; never inherit a weak-only track
+                    # maintained while output was inactive.
+                    target_tracker.reset()
+                if activation_transition and automatic_head_runtime is not None:
+                    # Both edges are safety epochs.  In-flight results from the
+                    # old hold can never arm the new one, even if inference
+                    # finishes after the button transition.
+                    automatic_head_runtime.advance_identity()
+                    assert isinstance(aim_controller, MakcuAimingController)
+                    automatic_revoked_this_frame = _publish_automatic_head_loss_once(
+                        aim_controller,
+                        packet.image.shape,
+                        source_timestamp_ns=packet.read_started_ns,
+                        already_published=automatic_revoked_this_frame,
+                    )
+                aim_activation_was_active = tracking_activation_active
+
+                selected_aim_target = _update_aim_target(
+                    target_tracker,
+                    aim_detections,
+                    packet.image.shape,
+                    continuation_detections=aim_continuation_detections,
+                    continuation_allowed=(
+                        aim_runtime_enabled and tracking_activation_active
+                    ),
+                    self_exclusion_safe=self_exclusion_ready,
+                    aim_runtime_enabled=aim_runtime_enabled,
+                    prediction_grace_safe=not hard_guard_revoked_prediction_grace,
+                    measurement_ns=packet.read_started_ns,
+                )
+                aim_engaged = False
+                if aim_controller is not None:
+                    active = (
+                        tracking_activation_active if aim_sensor is not None else True
+                    )
+                    if automatic_head_runtime is not None:
+                        assert isinstance(aim_controller, MakcuAimingController)
+                        assert target_tracker is not None
+                        accepted_player = target_tracker.accepted_measurement
+                        direct_body_safe = bool(
+                            tracking_activation_active
+                            and selected_aim_target is not None
+                        )
+                        if direct_body_safe:
+                            assert selected_aim_target is not None
+                            association_player = (
+                                accepted_player
+                                if accepted_player is not None
+                                else selected_aim_target
+                            )
+                            replacement = automatic_head_runtime.accept_body(
+                                association_player.box,
+                                aim_box=selected_aim_target.box,
+                                corroboration_box=(
+                                    accepted_player.box
+                                    if accepted_player is not None
+                                    else None
+                                ),
+                                track_generation=target_tracker.track_generation,
+                                source_timestamp_ns=packet.read_started_ns,
+                            )
+                            if (
+                                automatic_head_runtime.consume_motion_corroboration_revocation()
+                                is True
+                            ):
+                                aim_controller.revoke_motion_corroboration()
+                            if replacement and not automatic_revoked_this_frame:
+                                automatic_revoked_this_frame = (
+                                    _publish_automatic_head_loss_once(
+                                        aim_controller,
+                                        packet.image.shape,
+                                        source_timestamp_ns=packet.read_started_ns,
+                                        already_published=(
+                                            automatic_revoked_this_frame
+                                        ),
+                                    )
+                                )
+                            automatic_head_runtime.raise_if_failed()
+                            generation_before_poll = (
+                                automatic_head_runtime.identity_generation
+                            )
+                            new_head_sample = automatic_head_runtime.take_latest(
+                                now_ns=perf_counter_ns(),
+                            )
+                            if (
+                                automatic_head_runtime.consume_motion_corroboration_revocation()
+                                is True
+                            ):
+                                aim_controller.revoke_motion_corroboration()
+                            if (
+                                automatic_head_runtime.identity_generation
+                                != generation_before_poll
+                            ):
+                                # The completed result belonged geometrically to
+                                # an old player. Revoke its controller lease,
+                                # then seed only the current player's new epoch.
+                                if not automatic_revoked_this_frame:
+                                    automatic_revoked_this_frame = (
+                                        _publish_automatic_head_loss_once(
+                                            aim_controller,
+                                            packet.image.shape,
+                                            source_timestamp_ns=(
+                                                packet.read_started_ns
+                                            ),
+                                            already_published=(
+                                                automatic_revoked_this_frame
+                                            ),
+                                        )
+                                    )
+                                automatic_head_runtime.accept_body(
+                                    association_player.box,
+                                    aim_box=selected_aim_target.box,
+                                    corroboration_box=(
+                                        accepted_player.box
+                                        if accepted_player is not None
+                                        else None
+                                    ),
+                                    track_generation=target_tracker.track_generation,
+                                    source_timestamp_ns=packet.read_started_ns,
+                                )
+                            if new_head_sample is not None:
+                                # Async direct evidence has already been folded
+                                # into the identity-bound anchor. The point and
+                                # timestamp here both belong to this current
+                                # accepted primary frame, never the older worker
+                                # result. Body-derived motion is intentionally
+                                # not independent corroboration.
+                                aim_controller.update(
+                                    selected_aim_target,
+                                    packet.image.shape,
+                                    active=True,
+                                    measurement_ns=(
+                                        new_head_sample.source_timestamp_ns
+                                    ),
+                                    measurement_observed=True,
+                                    aim_point=new_head_sample.point,
+                                    velocity_point=new_head_sample.point,
+                                    body_derived_motion_permitted=(
+                                        new_head_sample.body_derived_motion_permitted
+                                    ),
+                                    body_derived_motion_deadline_ns=(
+                                        new_head_sample.body_derived_motion_deadline_ns
+                                    ),
+                                    identity_deadline_ns=(
+                                        new_head_sample.identity_deadline_ns
+                                    ),
+                                    motion_corroboration_point=(
+                                        new_head_sample.corroboration_point
+                                    ),
+                                )
+                            generation_before_display = (
+                                automatic_head_runtime.identity_generation
+                            )
+                            direct_head_sample = (
+                                automatic_head_runtime.visible_sample(
+                                    now_ns=perf_counter_ns(),
+                                )
+                            )
+                            if (
+                                automatic_head_runtime.identity_generation
+                                != generation_before_display
+                            ):
+                                if not automatic_revoked_this_frame:
+                                    automatic_revoked_this_frame = (
+                                        _publish_automatic_head_loss_once(
+                                            aim_controller,
+                                            packet.image.shape,
+                                            source_timestamp_ns=(
+                                                packet.read_started_ns
+                                            ),
+                                            already_published=(
+                                                automatic_revoked_this_frame
+                                            ),
+                                        )
+                                    )
+                                automatic_head_runtime.accept_body(
+                                    association_player.box,
+                                    aim_box=selected_aim_target.box,
+                                    corroboration_box=(
+                                        accepted_player.box
+                                        if accepted_player is not None
+                                        else None
+                                    ),
+                                    track_generation=target_tracker.track_generation,
+                                    source_timestamp_ns=packet.read_started_ns,
+                                )
+                            if accepted_player is not None:
+                                # The head crop and association must use this
+                                # exact source frame's accepted primary box.
+                                # A prior-frame box is stale geometry during
+                                # commanded camera motion and can manufacture
+                                # clustered no-head results.
+                                automatic_head_runtime.submit(
+                                    packet.image,
+                                    accepted_player,
+                                    source_timestamp_ns=packet.read_started_ns,
+                                )
+                        else:
+                            # Unsafe/guarded/expired body selection and inactive
+                            # output revoke immediately. A tracker prediction
+                            # remains bounded by its pre-existing empty-only
+                            # grace and can never create a new head observation.
+                            if (
+                                automatic_head_runtime.revoke_body()
+                                and not automatic_revoked_this_frame
+                            ):
+                                automatic_revoked_this_frame = (
+                                    _publish_automatic_head_loss_once(
+                                        aim_controller,
+                                        packet.image.shape,
+                                        source_timestamp_ns=packet.read_started_ns,
+                                        already_published=(
+                                            automatic_revoked_this_frame
+                                        ),
+                                    )
+                                )
+                            automatic_head_runtime.raise_if_failed()
+                    else:
+                        aim_controller.update(
+                            selected_aim_target,
+                            packet.image.shape,
+                            active=active,
+                            **(
+                                {
+                                    "measurement_ns": packet.read_started_ns,
+                                    "measurement_observed": not (
+                                        target_tracker is not None
+                                        and target_tracker.output_is_prediction
+                                    ),
+                                }
+                                if isinstance(aim_controller, MakcuAimingController)
+                                else {}
+                            ),
+                        )
+                    aim_engaged = (
+                        (
+                            automatic_frame_activation_active
+                            if automatic_frame_activation_active is not None
+                            else aim_controller.activation_pressed
+                        )
+                        if isinstance(aim_controller, MakcuAimingController)
+                        else active
+                    )
+                status_target = selected_aim_target
+                if automatic_head_runtime is not None and direct_head_sample is None:
+                    status_target = None
+                aim_status = _aim_status(
+                    runtime_enabled=aim_runtime_enabled,
+                    self_exclusion_ready=self_exclusion_ready,
+                    selected_target=status_target,
+                    engaged=aim_engaged,
+                    activation_name=aim_activation_name,
+                    control_description=aim_control_description,
+                )
+                if automatic_head_runtime is not None:
+                    if not tracking_activation_active:
+                        aim_status = (
+                            f"aim ready: hold {aim_activation_name} to run "
+                            "direct-head tracking"
+                        )
+                    elif (
+                        selected_aim_target is not None
+                        and direct_head_sample is None
+                    ):
+                        aim_status = (
+                            "aim blocked: selected player has no live direct-head anchor"
+                        )
+                    elif direct_head_sample is not None:
+                        remaining_ms = max(
+                            0.0,
+                            (
+                                getattr(
+                                    direct_head_sample,
+                                    "identity_deadline_ns",
+                                    direct_head_sample.source_timestamp_ns
+                                    + round(
+                                        DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS
+                                        * 1_000_000_000
+                                    ),
+                                )
+                                - perf_counter_ns()
+                            )
+                            / 1e6,
+                        )
+                        if direct_head_sample.bridging:
+                            aim_status = (
+                                "aim bridge visible: primary is predicted; physical "
+                                "aim is not renewed | direct anchor expires in "
+                                f"{remaining_ms:.0f} ms"
+                            )
+                        else:
+                            aim_status = (
+                                "aim anchored: direct head carried by current measured "
+                                f"player | expires in {remaining_ms:.0f} ms without "
+                                "another direct head"
+                            )
             result_ready_ns = perf_counter_ns()
 
             if prepared.crop_was_clamped and not crop_warning_printed:
@@ -510,8 +3865,12 @@ def run(config: AppConfig) -> int:
                 crop_warning_printed = True
 
             skipped_frames = source.stats.frames_overwritten
+            render_preview = bool(
+                preview_pacer is not None
+                and preview_pacer.should_render(result_ready_ns)
+            )
             draw_started_ns = result_ready_ns
-            if config.draw:
+            if config.draw and render_preview:
                 # The overlay intentionally shows the completed prior sample so
                 # its own drawing cost can be measured in the current sample.
                 if self_zone is not None:
@@ -523,15 +3882,30 @@ def run(config: AppConfig) -> int:
                         last_ignored_detection,
                     )
                 draw_detections(packet.image, detections)
-                if aim_runtime_enabled and selected_aim_target is not None:
+                if automatic_head_runtime is not None:
+                    if direct_head_sample is not None:
+                        draw_aim_target(
+                            packet.image,
+                            direct_head_sample.point,
+                            active=aim_engaged,
+                            activation_name=aim_activation_name,
+                            source_label=(
+                                "direct anchor bridge"
+                                if direct_head_sample.bridging
+                                else "direct head anchored"
+                            ),
+                        )
+                elif aim_runtime_enabled and selected_aim_target is not None:
                     draw_aim_target(
                         packet.image,
                         head_target_point(selected_aim_target, config.aim_head_ratio),
                         active=aim_engaged,
+                        activation_name=aim_activation_name,
+                        source_label="body-box head proxy",
                     )
                 draw_metrics(
                     packet.image,
-                    metrics.snapshot(),
+                    display_snapshot,
                     skipped_frames,
                     ignored_count=last_ignored_count,
                     aim_status=aim_status,
@@ -539,9 +3913,18 @@ def run(config: AppConfig) -> int:
             draw_completed_ns = perf_counter_ns()
 
             continue_running = True
-            if config.preview:
-                continue_running = _show_frame(cv2, packet.image)
-            display_completed_ns = perf_counter_ns()
+            if render_preview:
+                assert preview_window is not None
+                preview_service_started_ns = perf_counter_ns()
+                continue_running = preview_window.submit(packet.image)
+                preview_service_ms = (
+                    perf_counter_ns() - preview_service_started_ns
+                ) / 1e6
+            elif preview_window is not None:
+                # Inline HighGUI is serviced by submit at preview_fps; polling
+                # it on every faster inference frame costs milliseconds on Qt.
+                # The threaded Windows implementation polls independently.
+                continue_running = preview_window.should_continue()
 
             timings = FrameTimings(
                 capture_ms=(packet.read_completed_ns - packet.read_started_ns) / 1e6,
@@ -549,37 +3932,248 @@ def run(config: AppConfig) -> int:
                 preprocess_ms=(preprocessing_completed_ns - preprocessing_started_ns) / 1e6,
                 inference_ms=(inference_completed_ns - inference_started_ns) / 1e6,
                 postprocess_ms=(postprocess_completed_ns - inference_completed_ns) / 1e6,
-                control_ms=(result_ready_ns - postprocess_completed_ns) / 1e6,
+                detail_preprocess_ms=detail_preprocess_ms,
+                detail_inference_ms=detail_inference_ms,
+                detail_postprocess_ms=detail_postprocess_ms,
+                control_ms=(result_ready_ns - detections_ready_ns) / 1e6,
                 processing_ms=(result_ready_ns - processing_started_ns) / 1e6,
                 freshness_latency_ms=max(0, result_ready_ns - packet.read_completed_ns) / 1e6,
                 observed_pipeline_ms=max(0, result_ready_ns - packet.read_started_ns) / 1e6,
                 draw_ms=(draw_completed_ns - draw_started_ns) / 1e6,
-                display_ms=(display_completed_ns - draw_completed_ns) / 1e6,
+                # Threaded Windows mode measures owned copy/mailbox submission;
+                # inline compatibility mode measures HighGUI submission/event
+                # service. Neither is a measurement of display scanout.
+                preview_service_ms=preview_service_ms,
             )
-            snapshot = metrics.record(timings, result_ready_ns)
+            metrics.record(timings, result_ready_ns)
+            processed_frames += 1
 
             if result_ready_ns - last_report_ns >= 1_000_000_000:
-                print(
-                    console_summary(
-                        snapshot,
-                        skipped_frames,
-                        ignored_count=last_ignored_count,
-                    )
+                display_snapshot = metrics.snapshot()
+                summary = console_summary(
+                    display_snapshot,
+                    skipped_frames,
+                    ignored_count=last_ignored_count,
                 )
+                if (
+                    target_tracker is not None
+                    and tracker_report_snapshot is not None
+                    and tracker_report_ns is not None
+                ):
+                    current_tracker_telemetry = target_tracker.telemetry_snapshot()
+                    summary += " | " + _target_tracker_telemetry_summary(
+                        tracker_report_snapshot,
+                        current_tracker_telemetry,
+                        (result_ready_ns - tracker_report_ns) / 1_000_000_000,
+                    )
+                    tracker_report_snapshot = current_tracker_telemetry
+                    tracker_report_ns = result_ready_ns
+                if (
+                    aim_input_telemetry is not None
+                    and aim_input_report_snapshot is not None
+                    and aim_input_report_ns is not None
+                ):
+                    current_aim_input = aim_input_telemetry.snapshot()
+                    summary += " | " + _aim_input_telemetry_summary(
+                        aim_input_report_snapshot,
+                        current_aim_input,
+                        (result_ready_ns - aim_input_report_ns) / 1_000_000_000,
+                    )
+                    aim_input_report_snapshot = current_aim_input
+                    aim_input_report_ns = result_ready_ns
+                if automatic_detail_rescue_enabled:
+                    current_detail_telemetry = (
+                        automatic_detail_telemetry.snapshot()
+                    )
+                    summary += " | " + _automatic_detail_telemetry_summary(
+                        automatic_detail_report_snapshot,
+                        current_detail_telemetry,
+                        (result_ready_ns - last_report_ns) / 1_000_000_000,
+                    )
+                    automatic_detail_report_snapshot = current_detail_telemetry
+                if (
+                    automatic_head_runtime is not None
+                    and head_report_snapshot is not None
+                    and head_report_ns is not None
+                ):
+                    current_head_status = automatic_head_runtime.status
+                    summary += " | " + _head_runtime_telemetry_summary(
+                        head_report_snapshot,
+                        current_head_status,
+                        (result_ready_ns - head_report_ns) / 1_000_000_000,
+                        now_ns=result_ready_ns,
+                        visible_sample=direct_head_sample,
+                    )
+                    head_report_snapshot = current_head_status
+                    head_report_ns = result_ready_ns
+                if (
+                    isinstance(aim_controller, MakcuAimingController)
+                    and makcu_report_snapshot is not None
+                    and makcu_report_ns is not None
+                ):
+                    current_telemetry = aim_controller.telemetry_snapshot()
+                    telemetry_snapshot_ns = perf_counter_ns()
+                    summary += " | " + _makcu_telemetry_summary(
+                        makcu_report_snapshot,
+                        current_telemetry,
+                        (telemetry_snapshot_ns - makcu_report_ns) / 1_000_000_000,
+                    )
+                    makcu_report_snapshot = current_telemetry
+                    makcu_report_ns = telemetry_snapshot_ns
+                if calibration_status is not None:
+                    assert isinstance(aim_controller, MakcuAimingController)
+                    raw_known, raw_pressed = aim_controller.raw_activation_state
+                    raw_button_state = (
+                        "pressed" if raw_pressed else "released"
+                    ) if raw_known else "unknown"
+                    summary += (
+                        f" | CAL {calibration_status.state.value} | "
+                        f"{calibration_target_readiness} | "
+                        f"raw button {raw_button_state} | "
+                        f"counts {calibration_status.emitted_abs_counts}/2400 | "
+                        "qualifying X +/- "
+                        f"{calibration_status.qualifying_x_positive}/"
+                        f"{calibration_status.qualifying_x_negative} | Y +/- "
+                        f"{calibration_status.qualifying_y_positive}/"
+                        f"{calibration_status.qualifying_y_negative}"
+                    )
+                print(summary)
                 last_report_ns = result_ready_ns
-            if not continue_running:
+            if calibration_status is not None and calibration_status.terminal:
+                assert calibration_session is not None
+                assert calibration_session.result is not None
+                termination_reason = (
+                    "aim_calibration_success"
+                    if calibration_session.result.outcome == "success"
+                    else "aim_calibration_aborted"
+                )
                 break
+            if (
+                config.max_frames is not None
+                and processed_frames >= config.max_frames
+            ):
+                termination_reason = "max_frames"
+                break
+            if deadline_ns is not None and perf_counter_ns() >= deadline_ns:
+                termination_reason = "max_seconds"
+                break
+            if not continue_running:
+                termination_reason = "preview_closed"
+                break
+        pipeline_completed_ns = perf_counter_ns()
     finally:
+        primary_exception_active = sys.exc_info()[0] is not None
+
+        def record_cleanup_failure(component: str, detail: object) -> None:
+            message = f"{component}: {detail}"
+            cleanup_failures.append(message)
+            if primary_exception_active:
+                # Preserve the original detector/capture exception while still
+                # exposing every failed cleanup operation to the operator.
+                print(f"Warning: cleanup also failed: {message}", file=sys.stderr)
+
+        if calibration_session is not None:
+            if not calibration_session.terminal:
+                try:
+                    calibration_status = calibration_session.abort(
+                        "pipeline stopped before calibration completed",
+                        now_ns=perf_counter_ns(),
+                    )
+                except Exception as exc:  # noqa: BLE001 - still stop physical output
+                    record_cleanup_failure("calibration abort", exc)
+            result = calibration_session.result
+            if result is None:
+                record_cleanup_failure(
+                    "calibration evidence",
+                    "the session produced no terminal result",
+                )
+            elif not calibration_evidence_written:
+                try:
+                    from aiming.makcu_calibration_session import (
+                        write_session_evidence_exclusive,
+                    )
+
+                    assert config.aim_calibration_evidence is not None
+                    write_session_evidence_exclusive(
+                        config.aim_calibration_evidence,
+                        result.evidence,
+                    )
+                    calibration_evidence_written = True
+                except Exception as exc:  # noqa: BLE001 - still stop physical output
+                    record_cleanup_failure("calibration evidence publication", exc)
+
+        # Stop physical output before waiting for any auxiliary model worker.
+        # This makes pipeline exit an immediate movement revocation even if a
+        # head inference takes its full bounded join interval to return.
         if aim_controller is not None:
-            aim_controller.stop()
-        if aim_sensor is not None:
-            aim_sensor.stop()
-        source.close()
-        if config.preview:
             try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
+                aim_controller.stop()
+            except Exception as exc:  # noqa: BLE001 - aggregate cleanup failures
+                record_cleanup_failure("aim output shutdown", exc)
+        if automatic_head_runtime is not None:
+            try:
+                head_worker_stopped = automatic_head_runtime.stop()
+            except Exception as exc:  # noqa: BLE001 - continue physical shutdown
+                record_cleanup_failure("direct-head worker shutdown", exc)
+            else:
+                if not head_worker_stopped:
+                    record_cleanup_failure(
+                        "direct-head worker shutdown",
+                        "the direct-head localization worker did not stop within its bounded timeout",
+                    )
+                try:
+                    automatic_head_runtime.raise_if_failed()
+                except Exception as exc:  # noqa: BLE001 - report after bounded stop
+                    record_cleanup_failure("direct-head worker", exc)
+        if aim_sensor is not None:
+            try:
+                aim_sensor.stop()
+            except Exception as exc:  # noqa: BLE001 - aggregate bounded cleanup failures
+                record_cleanup_failure("activation sensor shutdown", exc)
+        source_error_before_close = source.error
+        try:
+            source.close()
+        except Exception as exc:  # noqa: BLE001 - still attempt preview shutdown
+            record_cleanup_failure("capture shutdown", exc)
+        else:
+            if source.error and (
+                not primary_exception_active or source.error != source_error_before_close
+            ):
+                record_cleanup_failure("capture shutdown", source.error)
+        if preview_window is not None:
+            try:
+                preview_stopped = preview_window.stop()
+            except Exception as exc:  # noqa: BLE001 - report as qualification failure
+                record_cleanup_failure("preview shutdown", exc)
+            else:
+                if not preview_stopped:
+                    record_cleanup_failure(
+                        "preview shutdown",
+                        "the OpenCV preview worker did not stop within its bounded timeout",
+                    )
+                try:
+                    preview_window.raise_if_failed()
+                except Exception as exc:  # noqa: BLE001 - report worker failure after cleanup
+                    record_cleanup_failure("preview worker", exc)
+
+    if cleanup_failures:
+        raise RuntimeError("Pipeline cleanup failed: " + "; ".join(cleanup_failures))
+
+    if report_destination is not None or active_profile is not None:
+        from utils.live_report import verify_artifact_unchanged
+
+        assert model_artifact_snapshot is not None
+        assert labels_artifact_snapshot is not None
+        verify_artifact_unchanged(
+            config.model_path,
+            model_artifact_snapshot,
+            description="Model artifact",
+        )
+        verify_artifact_unchanged(
+            config.labels_path,
+            labels_artifact_snapshot,
+            description="Labels artifact",
+        )
 
     final = metrics.snapshot()
     capture_stats = source.stats
@@ -596,6 +4190,96 @@ def run(config: AppConfig) -> int:
         f"{capture_stats.frames_overwritten} application overwrite(s), "
         f"{capture_stats.read_failures} capture failure(s)."
     )
+    if report_destination is not None:
+        from utils.live_report import build_live_report, utc_now, write_json_atomic_new
+
+        if pipeline_started_ns is None:
+            # Source/preview startup errors propagate before this point, so the
+            # branch is defensive for custom CaptureSource implementations.
+            elapsed_seconds = 0.0
+        else:
+            completed_ns = pipeline_completed_ns or perf_counter_ns()
+            elapsed_seconds = max(0.0, completed_ns - pipeline_started_ns) / 1e9
+        preview_mode = preview_window.mode if preview_window is not None else "disabled"
+        preview_stats = preview_window.stats if preview_window is not None else {}
+        detail_pass_report = detail_pass_stats.snapshot()
+        detail_pass_report.update(
+            {
+                "mode": detail_pass_mode,
+                "configured_crop_size": config.detail_crop_size,
+                "effective_crop_size": effective_detail_crop_size,
+                "automatic_activation_gated": automatic_detail_rescue_enabled,
+                "automatic_need_gated": automatic_detail_rescue_enabled,
+                "automatic_self_guarded_need": (
+                    automatic_detail_rescue_enabled
+                ),
+                "automatic_self_relative_detail_exclusion_enabled": (
+                    automatic_detail_rescue_enabled
+                ),
+                "automatic_lower_edge_self_fragment_exclusion_enabled": (
+                    automatic_detail_rescue_enabled
+                ),
+                "automatic_lower_edge_self_fragment_margin_model_pixels": (
+                    AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS
+                    if automatic_detail_rescue_enabled
+                    else None
+                ),
+                "automatic_small_target_reference_height": (
+                    AUTOMATIC_DETAIL_REFERENCE_HEIGHT
+                    if automatic_detail_rescue_enabled
+                    else None
+                ),
+                "automatic_small_target_max_reference_height": (
+                    AUTOMATIC_DETAIL_MAX_REFERENCE_HEIGHT
+                    if automatic_detail_rescue_enabled
+                    else None
+                ),
+            }
+        )
+        detail_pass_report.update(automatic_detail_telemetry.snapshot())
+        report = build_live_report(
+            config=config,
+            detector_summary=detector.runtime_summary,
+            source_description=source.description,
+            source_settings=last_source_settings or source.actual_settings,
+            capture_stats=capture_stats,
+            preview_mode=preview_mode,
+            preview_stats=preview_stats,
+            metrics=final,
+            elapsed_seconds=elapsed_seconds,
+            started_utc=pipeline_started_utc or utc_now(),
+            completed_utc=utc_now(),
+            termination_reason=termination_reason,
+            detail_pass_stats=detail_pass_report,
+            model_artifact_snapshot=model_artifact_snapshot,
+            labels_artifact_snapshot=labels_artifact_snapshot,
+        )
+        written = write_json_atomic_new(report_destination, report)
+        print(f"Live pipeline metrics written to {written}")
+    if calibration_requested:
+        assert calibration_session is not None
+        assert calibration_session.result is not None
+        assert calibration_evidence_written
+        calibration_result = calibration_session.result
+        assert config.aim_calibration_evidence is not None
+        print(
+            "MAKCU calibration evidence written: "
+            f"{config.aim_calibration_evidence} | "
+            f"outcome {calibration_result.outcome} | "
+            f"artifact {calibration_result.evidence.artifact_sha256}"
+        )
+        if calibration_result.outcome != "success":
+            raise RuntimeError(
+                f"MAKCU calibration aborted: {calibration_result.reason}"
+            )
+        assert calibration_result.fit is not None
+        print(
+            "MAKCU calibration fit passed: "
+            f"X {calibration_result.fit.x.gain_pixels_per_count:.6g} px/count | "
+            f"Y {calibration_result.fit.y.gain_pixels_per_count:.6g} px/count | "
+            f"delay {calibration_result.fit.delay_seconds * 1000.0:.2f} ms | "
+            "profile remains inactive pending explicit review"
+        )
     return 0
 
 

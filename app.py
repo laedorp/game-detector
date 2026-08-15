@@ -47,6 +47,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         from controller_precision.cli import main as precision_main
 
         return precision_main(arguments[1:])
+    if arguments and arguments[0] == "--benchmark-models":
+        # Keep the reproducible model benchmark inside the exact frozen
+        # runtime under test. This is intentionally separate from live capture
+        # so release qualification can compare providers without UI overhead.
+        from scripts.benchmark_models import main as benchmark_main
+
+        return benchmark_main(arguments[1:])
     if arguments and arguments[0] == "--cli":
         # The existing CLI parser reads sys.argv.  Keep that mature code path
         # unchanged while letting the desktop launcher use the same executable.
@@ -76,6 +83,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if arguments != ["--tk"]:
         print(
             "Usage: app.py [--gui] | app.py --tk | app.py --runtime-info | "
+            "app.py --benchmark-models [options] | "
             "app.py --cli [detector options] | "
             "app.py --controller-precision [options]",
             file=sys.stderr,

@@ -24,6 +24,16 @@ class PreprocessTests(unittest.TestCase):
         self.assertEqual(prepared.tensor.shape, (1, 3, 320, 320))
         self.assertEqual(prepared.tensor.dtype, np.float32)
 
+    @unittest.skipIf(cv2 is None, "OpenCV is not installed")
+    def test_rectangular_input_uses_height_width_tensor_order(self) -> None:
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+        prepared = preprocess_frame(frame, inference_size=(384, 640))
+
+        self.assertEqual(prepared.tensor.shape, (1, 3, 384, 640))
+        self.assertEqual(prepared.transform.model_height, 384)
+        self.assertEqual(prepared.transform.model_width, 640)
+
     def test_letterbox_workspace_is_reused_between_calls(self) -> None:
         if cv2 is None:
             self.skipTest("OpenCV is not installed")
@@ -44,14 +54,35 @@ class PreprocessTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(TypeError):
                 preprocess_frame(frame, inference_size=value)
 
-    def test_crop_size_must_be_a_positive_integer(self) -> None:
+    def test_crop_size_must_have_positive_integer_dimensions(self) -> None:
         frame = np.zeros((10, 10, 3), dtype=np.uint8)
-        for value in (0, -1):
+        for value in (0, -1, (4, 0), (-1, 4)):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 preprocess_frame(frame, inference_size=320, crop_size=value)
-        for value in (True, 4.5):
+        for value in (True, 4.5, (4,), (4, 5, 6), (4, 5.5), [4, 5]):
             with self.subTest(value=value), self.assertRaises(TypeError):
                 preprocess_frame(frame, inference_size=320, crop_size=value)
+
+    @unittest.skipIf(cv2 is None, "OpenCV is not installed")
+    def test_rectangular_crop_uses_explicit_height_width_and_source_offsets(self) -> None:
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+
+        prepared = preprocess_frame(
+            frame,
+            inference_size=(384, 640),
+            crop_size=(48, 80),
+        )
+
+        self.assertFalse(prepared.crop_was_clamped)
+        self.assertEqual(
+            (prepared.transform.crop_x, prepared.transform.crop_y),
+            (60, 26),
+        )
+        self.assertAlmostEqual(prepared.transform.scale, 8.0)
+        self.assertEqual(
+            prepared.transform.to_source_box((0.0, 0.0, 640.0, 384.0)),
+            (60.0, 26.0, 140.0, 74.0),
+        )
 
     def test_empty_frames_are_rejected_before_resize(self) -> None:
         for shape in ((0, 10, 3), (10, 0, 3)):

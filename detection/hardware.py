@@ -16,8 +16,10 @@ module answers two separate questions and keeps them separate on purpose:
 Keeping those apart is what lets the launcher explain "you have a GPU, here is
 the one package you are missing" rather than simply omitting the option.
 
-This module deliberately imports no launcher, capture, or model code, and shells
-out only on Windows, where there is no sysfs equivalent to read.
+This module deliberately imports no launcher or capture code. It reads the
+small release-default pointer so a hardware scan cannot reset a rectangular
+default back to a stale square size. It shells out only on Windows, where there
+is no sysfs equivalent to read.
 """
 
 from __future__ import annotations
@@ -30,6 +32,9 @@ import platform
 import re
 import subprocess
 from typing import Any
+
+from utils.inference_size import InferenceSizeLike
+from utils.release_model_contract import load_release_default_contract
 
 
 LINUX_PCI_ROOT = Path("/sys/bus/pci/devices")
@@ -60,6 +65,14 @@ ACCELERATOR_CLASS_PREFIX = "1200"
 # CPU flags that materially change which precision is worth recommending.
 INT8_ACCELERATION_FLAGS = ("avx512_vnni", "avx_vnni", "amx_int8")
 WIDE_VECTOR_FLAGS = ("avx2", "avx512f")
+
+_RELEASE_DEFAULT = load_release_default_contract(Path(__file__).resolve().parents[1])
+_RELEASE_DEFAULT_HW = tuple(_RELEASE_DEFAULT["input_shape_nchw"][2:4])
+_RELEASE_DEFAULT_INFERENCE_SIZE: InferenceSizeLike = (
+    _RELEASE_DEFAULT_HW[0]
+    if _RELEASE_DEFAULT_HW[0] == _RELEASE_DEFAULT_HW[1]
+    else _RELEASE_DEFAULT_HW
+)
 
 
 class Vendor(str, Enum):
@@ -102,6 +115,22 @@ class Accelerator:
 
 
 @dataclass(frozen=True, slots=True)
+class DirectMLAdapter:
+    """One DXGI adapter in the exact order DirectML uses for ``device_id``."""
+
+    index: int
+    name: str
+    vendor_id: str
+    device_id: str
+    dedicated_vram: int = 0
+    adapter_luid: str = ""
+
+    @property
+    def identifier(self) -> str:
+        return f"{self.vendor_id}:{self.device_id}"
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessorInfo:
     name: str
     logical_cores: int | None = None
@@ -124,6 +153,7 @@ class HardwareProfile:
     processor: ProcessorInfo
     accelerators: tuple[Accelerator, ...]
     runtime_devices: tuple[str, ...] = ()
+    directml_adapters: tuple[DirectMLAdapter, ...] = ()
 
     def of_kind(self, kind: AcceleratorKind) -> tuple[Accelerator, ...]:
         return tuple(item for item in self.accelerators if item.kind is kind)
@@ -137,7 +167,7 @@ class Recommendation:
     backend: str
     device: str
     precision: str
-    inference_size: int
+    inference_size: InferenceSizeLike
     ready: bool
     reason: str
     setup_hint: str = ""
@@ -145,7 +175,13 @@ class Recommendation:
     @property
     def summary(self) -> str:
         if self.ready and self.backend == "onnxruntime":
-            state = "provider found; verified at detector start"
+            if self.device.upper().startswith(("DIRECTML", "DML")):
+                state = (
+                    "provider verified at detector start; DXGI adapter binding "
+                    "must still be confirmed in Task Manager"
+                )
+            else:
+                state = "provider found; verified at detector start"
         else:
             state = "ready" if self.ready else "needs setup"
         return f"{self.accelerator.label} — {self.backend}/{self.device} ({state})"
@@ -286,6 +322,50 @@ WINDOWS_GPU_QUERY = (
 )
 
 
+def scan_windows_directml_adapters() -> tuple[DirectMLAdapter, ...]:
+    """Enumerate all DXGI adapters without guessing from WMI ordering.
+
+    ONNX Runtime documents DirectML's ``device_id`` as the index returned by
+    ``IDXGIFactory::EnumAdapters``. DXcam 0.3.0 uses ``EnumAdapters1`` in that
+    same DXGI factory order and already ships in every Windows bundle, so reuse
+    its audited COM declarations instead of maintaining a second ABI binding.
+    """
+
+    try:
+        import ctypes
+
+        from dxcam._libs.dxgi import DXGI_ADAPTER_DESC1
+        from dxcam.util.io import enum_dxgi_adapters
+    except Exception:
+        return ()
+
+    found: list[DirectMLAdapter] = []
+    try:
+        raw_adapters = enum_dxgi_adapters()
+    except Exception:
+        return ()
+    for index, adapter in enumerate(raw_adapters):
+        try:
+            descriptor = DXGI_ADAPTER_DESC1()
+            adapter.GetDesc1(ctypes.byref(descriptor))
+            found.append(
+                DirectMLAdapter(
+                    index=index,
+                    name=str(descriptor.Description).strip(),
+                    vendor_id=f"{int(descriptor.VendorId):04x}",
+                    device_id=f"{int(descriptor.DeviceId):04x}",
+                    dedicated_vram=max(0, int(descriptor.DedicatedVideoMemory)),
+                    adapter_luid=(
+                        f"0x{int(descriptor.AdapterLuid.HighPart) & 0xffffffff:08x}_"
+                        f"0x{int(descriptor.AdapterLuid.LowPart) & 0xffffffff:08x}"
+                    ),
+                )
+            )
+        except Exception:
+            continue
+    return tuple(found)
+
+
 def parse_windows_video_controllers(text: str) -> tuple[Accelerator, ...]:
     """Parse ``PNPDeviceID|Name|AdapterRAM`` lines into accelerators."""
 
@@ -331,6 +411,7 @@ def scan_hardware(
     cpuinfo_path: Path = LINUX_CPUINFO,
     logical_cores: int | None = None,
     powershell_runner: Callable[[str], str] | None = None,
+    directml_adapter_factory: Callable[[], Sequence[DirectMLAdapter]] | None = None,
     runtime_devices: Iterable[str] | None = None,
 ) -> HardwareProfile:
     """Describe the machine's processor and every accelerator attached to it."""
@@ -351,12 +432,21 @@ def scan_hardware(
         )
         runner = powershell_runner or _default_powershell
         accelerators = parse_windows_video_controllers(runner(WINDOWS_GPU_QUERY))
+        adapter_factory = directml_adapter_factory or scan_windows_directml_adapters
+        try:
+            directml_adapters = tuple(adapter_factory())
+        except Exception:
+            directml_adapters = ()
     else:
         processor = ProcessorInfo(
             name=platform.processor() or "Unknown CPU",
             logical_cores=logical_cores,
         )
         accelerators = ()
+        directml_adapters = ()
+
+    if resolved_system != "windows":
+        directml_adapters = ()
 
     cpu = Accelerator(
         kind=AcceleratorKind.CPU,
@@ -368,6 +458,7 @@ def scan_hardware(
         processor=processor,
         accelerators=(cpu, *accelerators),
         runtime_devices=tuple(str(item).strip().upper() for item in (runtime_devices or ())),
+        directml_adapters=directml_adapters,
     )
 
 
@@ -417,26 +508,63 @@ def recommend(
 
     providers = _onnxruntime_providers(provider_factory)
     windows = profile.system == "windows"
-    entries: list[tuple[int, Recommendation]] = []
+    entries: list[Recommendation] = []
 
     for accelerator in profile.accelerators:
         if accelerator.kind is AcceleratorKind.CPU:
-            entries.append((30, _cpu_recommendation(profile, accelerator)))
+            entries.append(_cpu_recommendation(profile, accelerator))
         elif accelerator.kind is AcceleratorKind.NPU:
             entries.append(
-                (5, _intel_recommendation(profile, accelerator, "NPU", providers))
+                _intel_recommendation(profile, accelerator, "NPU", providers)
             )
         elif accelerator.vendor is Vendor.INTEL:
             entries.append(
-                (10, _intel_recommendation(profile, accelerator, "GPU", providers))
+                _intel_recommendation(profile, accelerator, "GPU", providers)
             )
         elif accelerator.vendor is Vendor.AMD:
-            entries.append((15, _amd_recommendation(accelerator, providers, windows)))
+            entries.append(
+                _amd_recommendation(profile, accelerator, providers, windows)
+            )
         elif accelerator.vendor is Vendor.NVIDIA:
-            entries.append((12, _nvidia_recommendation(accelerator, providers)))
+            entries.append(
+                _nvidia_recommendation(profile, accelerator, providers)
+            )
 
-    entries.sort(key=lambda item: (not item[1].ready, item[0]))
-    return tuple(recommendation for _, recommendation in entries)
+    entries.sort(
+        key=lambda recommendation: (
+            not recommendation.ready,
+            _recommendation_priority(recommendation),
+        )
+    )
+    return tuple(entries)
+
+
+def _recommendation_priority(recommendation: Recommendation) -> int:
+    """Rank usable devices without putting a hybrid laptop's iGPU first.
+
+    Product names and runtime-provider presence cannot predict exact latency,
+    but placement and accelerator class provide a safe coarse ordering.  A
+    discrete GPU should be the one-click choice ahead of an integrated GPU on
+    the same machine; this is especially important for Intel-plus-GeForce
+    laptops where DXGI adapter 0 is commonly the Intel display adapter.
+    """
+
+    accelerator = recommendation.accelerator
+    if accelerator.kind is AcceleratorKind.GPU:
+        if accelerator.discrete is True:
+            return 0
+        # NVIDIA and AMD display adapters are normally discrete even when WMI
+        # reports an unusable/truncated AdapterRAM value.  Prefer them to an
+        # explicitly integrated Intel GPU, while leaving the final provider and
+        # physical-adapter checks to detector startup and the benchmark.
+        if accelerator.vendor in {Vendor.NVIDIA, Vendor.AMD}:
+            return 1
+        if accelerator.discrete is False:
+            return 10
+        return 8
+    if accelerator.kind is AcceleratorKind.NPU:
+        return 5
+    return 30
 
 
 def _cpu_recommendation(
@@ -454,7 +582,9 @@ def _cpu_recommendation(
         backend="openvino",
         device="CPU",
         precision=precision,
-        inference_size=416,
+        inference_size=(
+            416 if precision == "int8" else _RELEASE_DEFAULT_INFERENCE_SIZE
+        ),
         ready=True,
         reason=reason,
     )
@@ -478,9 +608,12 @@ def _intel_recommendation(
         return Recommendation(
             accelerator=accelerator,
             backend="onnxruntime",
-            device="DIRECTML",
-            precision="fp16",
-            inference_size=416,
+            device=_directml_device(profile, accelerator),
+            # Bundled ONNX graphs currently have float32 inputs and weights.
+            # Do not advertise FP16 until a distinct validated FP16 artifact
+            # is actually selected.
+            precision="fp32",
+            inference_size=_RELEASE_DEFAULT_INFERENCE_SIZE,
             ready=True,
             reason=(
                 "OpenVINO does not expose this Intel GPU, but ONNX Runtime "
@@ -502,7 +635,7 @@ def _intel_recommendation(
         device=family,
         # Integrated Intel graphics run FP16 well and gain little from INT8.
         precision="fp16" if family == "GPU" else "int8",
-        inference_size=416,
+        inference_size=_RELEASE_DEFAULT_INFERENCE_SIZE,
         ready=ready,
         reason=reason,
         setup_hint=hint,
@@ -510,27 +643,49 @@ def _intel_recommendation(
 
 
 def _amd_recommendation(
-    accelerator: Accelerator, providers: Sequence[str], windows: bool
+    profile: HardwareProfile,
+    accelerator: Accelerator,
+    providers: Sequence[str],
+    windows: bool,
 ) -> Recommendation:
     # OpenVINO has no AMD GPU plugin at all, so this path is ONNX Runtime only.
-    provider = "DmlExecutionProvider" if windows else "ROCMExecutionProvider"
-    device = "DIRECTML" if windows else "ROCM"
-    ready = provider in providers
+    if windows:
+        provider = "DmlExecutionProvider"
+        device = _directml_device(profile, accelerator)
+        ready = provider in providers
+    else:
+        # ROCMExecutionProvider was removed after ORT 1.22. Prefer its supported
+        # successor when a locally qualified AMD stack exposes it, while
+        # retaining the pinned legacy provider for reproducible old setups.
+        provider, device = next(
+            (
+                pair
+                for pair in (
+                    ("MIGraphXExecutionProvider", "MIGRAPHX"),
+                    ("ROCMExecutionProvider", "ROCM"),
+                )
+                if pair[0] in providers
+            ),
+            ("MIGraphXExecutionProvider", "MIGRAPHX"),
+        )
+        ready = provider in providers
     if ready:
         hint = ""
     elif windows:
         hint = "Install onnxruntime-directml, then re-scan."
     else:
         hint = (
-            "Install ROCm and onnxruntime-rocm (RDNA2 often also needs "
-            "HSA_OVERRIDE_GFX_VERSION=10.3.0), then re-scan."
+            "No qualified AMD provider is installed. Verify the exact GPU/OS in "
+            "AMD's current support matrix and use MIGraphX on supported modern "
+            "stacks; the legacy onnxruntime-rocm 1.22 path is experimental. The "
+            "RX 6950 XT target should use DirectML on Windows."
         )
     return Recommendation(
         accelerator=accelerator,
         backend="onnxruntime",
         device=device,
-        precision="fp16",
-        inference_size=416,
+        precision="fp32",
+        inference_size=_RELEASE_DEFAULT_INFERENCE_SIZE,
         ready=ready,
         reason="AMD GPUs are unsupported by OpenVINO; ONNX Runtime is the usable path",
         setup_hint=hint,
@@ -538,7 +693,9 @@ def _amd_recommendation(
 
 
 def _nvidia_recommendation(
-    accelerator: Accelerator, providers: Sequence[str]
+    profile: HardwareProfile,
+    accelerator: Accelerator,
+    providers: Sequence[str],
 ) -> Recommendation:
     # CUDA is the dependable default shipped by the NVIDIA bundle. TensorRT is
     # optional and may be reported by ORT even when its separate libraries are
@@ -551,12 +708,14 @@ def _nvidia_recommendation(
         ("DmlExecutionProvider", "DIRECTML"),
     ):
         if provider in providers:
+            if device == "DIRECTML":
+                device = _directml_device(profile, accelerator)
             return Recommendation(
                 accelerator=accelerator,
                 backend="onnxruntime",
                 device=device,
-                precision="fp16",
-                inference_size=416,
+                precision="fp32",
+                inference_size=_RELEASE_DEFAULT_INFERENCE_SIZE,
                 ready=True,
                 reason="NVIDIA GPUs run through ONNX Runtime, not OpenVINO",
             )
@@ -564,12 +723,35 @@ def _nvidia_recommendation(
         accelerator=accelerator,
         backend="onnxruntime",
         device="CUDAExecutionProvider",
-        precision="fp16",
-        inference_size=416,
+        precision="fp32",
+        inference_size=_RELEASE_DEFAULT_INFERENCE_SIZE,
         ready=False,
         reason="NVIDIA GPUs are unsupported by OpenVINO; ONNX Runtime is the usable path",
         setup_hint="Install onnxruntime-gpu with a matching CUDA runtime, then re-scan.",
     )
+
+
+def _directml_device(profile: HardwareProfile, accelerator: Accelerator) -> str:
+    """Return a device token bound to one confidently matched DXGI adapter."""
+
+    identifier = accelerator.identifier.casefold()
+    exact = [
+        adapter
+        for adapter in profile.directml_adapters
+        if adapter.identifier.casefold() == identifier
+    ]
+    if len(exact) != 1:
+        name = accelerator.name.casefold().strip()
+        exact = [
+            adapter
+            for adapter in profile.directml_adapters
+            if adapter.name.casefold().strip() == name
+        ]
+    if len(exact) == 1:
+        return f"DIRECTML:{exact[0].index}"
+    # Never invent an adapter index from WMI order. DirectML's documented
+    # default remains available, accompanied by the Task Manager warning.
+    return "DIRECTML"
 
 
 def describe(profile: HardwareProfile, plans: Sequence[Recommendation]) -> str:
@@ -592,6 +774,12 @@ def describe(profile: HardwareProfile, plans: Sequence[Recommendation]) -> str:
         lines.extend(f"  - {item.kind.value.upper()}: {item.label}" for item in accelerators)
     else:
         lines.append("Accelerators: none detected")
+    if profile.directml_adapters:
+        lines.append("DirectML/DXGI adapter order:")
+        lines.extend(
+            f"  - {adapter.index}: {adapter.name} [{adapter.identifier}]"
+            for adapter in profile.directml_adapters
+        )
     lines.append("Recommended order:")
     for index, plan in enumerate(plans, start=1):
         lines.append(f"  {index}. {plan.summary} — {plan.reason}")

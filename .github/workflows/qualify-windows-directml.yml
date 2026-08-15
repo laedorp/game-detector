@@ -1,0 +1,413 @@
+name: Qualify Windows DirectML on physical GPU
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Staged v* tag whose exact candidate is being qualified
+        required: true
+        type: string
+      source_build_run_id:
+        description: Successful tagged Build and stage desktop bundles run ID
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        description: SHA-256 of RELEASE-CANDIDATE-MANIFEST.json in that exact run
+        required: true
+        type: string
+      directml_zip_sha256:
+        description: SHA-256 of ProAim-Windows-x64-DirectML.zip in that manifest
+        required: true
+        type: string
+      gpu_role:
+        description: Required physical DirectML product being qualified by this run
+        required: true
+        type: choice
+        options:
+          - amd_rx_6950_xt
+          - nvidia_rtx_5060_laptop
+      adapter_index:
+        description: Exact DXGI index from ProAim Scan hardware for the named product
+        required: true
+        type: number
+      observer_name:
+        description: Full name of the person watching Task Manager during all GPU passes
+        required: true
+        type: string
+      physical_confirmation:
+        description: Exact I ATTEST... confirmation documented for this tag and GPU role
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: physical-directml-${{ inputs.tag }}-${{ inputs.gpu_role }}
+  cancel-in-progress: false
+
+jobs:
+  collect-physical-evidence:
+    name: Run frozen DirectML candidate on the selected physical GPU
+    runs-on: [self-hosted, Windows, X64, proaim-directml-qualification]
+    timeout-minutes: 45
+    outputs:
+      raw_artifact_id: ${{ steps.raw-artifact.outputs.artifact-id }}
+      raw_content_manifest_sha256: ${{ steps.raw-content.outputs.raw_content_manifest_sha256 }}
+      tag_commit: ${{ steps.source.outputs.tag_commit }}
+      expected_product: ${{ steps.product.outputs.expected_product }}
+    env:
+      REPOSITORY_INPUT: ${{ github.repository }}
+      TAG_INPUT: ${{ inputs.tag }}
+      SOURCE_RUN_INPUT: ${{ inputs.source_build_run_id }}
+      CANDIDATE_MANIFEST_SHA_INPUT: ${{ inputs.candidate_manifest_sha256 }}
+      DIRECTML_ZIP_SHA_INPUT: ${{ inputs.directml_zip_sha256 }}
+      GPU_ROLE_INPUT: ${{ inputs.gpu_role }}
+      ADAPTER_INDEX_INPUT: ${{ inputs.adapter_index }}
+    steps:
+      - name: Require dispatch from protected main workflow source
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Physical DirectML qualification must be dispatched from refs/heads/main."
+          }
+
+      - name: Check out exact qualification workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up qualification Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Resolve fixed required product
+        id: product
+        shell: pwsh
+        run: |
+          $Expected = switch ($env:GPU_ROLE_INPUT) {
+            "amd_rx_6950_xt" { "AMD Radeon RX 6950 XT" }
+            "nvidia_rtx_5060_laptop" { "NVIDIA GeForce RTX 5060 Laptop GPU" }
+            default { throw "Unsupported DirectML GPU role." }
+          }
+          "expected_product=$Expected" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Verify tag, source run, and immutable candidate artifact
+        id: source
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_directml_release.py verify-source `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --source-build-run-id $env:SOURCE_RUN_INPUT `
+            --output verified-source.json
+          $Source = Get-Content -LiteralPath verified-source.json -Raw | ConvertFrom-Json
+          if ([string]$Source.tag_commit -ne $env:GITHUB_SHA) {
+            throw "The staged tag commit must equal this protected qualification workflow SHA."
+          }
+          "tag_commit=$($Source.tag_commit)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "candidate_artifact_id=$($Source.candidate_artifact.id)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download exact candidate artifact by verified numeric ID
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.source.outputs.candidate_artifact_id }}
+          path: downloaded-release-candidate
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Safely inspect and extract exact DirectML candidate
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_directml_release.py inspect-candidate `
+            --downloaded-directory downloaded-release-candidate `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --tag-commit $env:GITHUB_SHA `
+            --source-build-run-id $env:SOURCE_RUN_INPUT `
+            --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT `
+            --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT `
+            --extract-directory extracted-candidate `
+            --output candidate-inspection.json
+
+      - name: Record PID-correlated Windows GPU Engine telemetry during every accelerated pass
+        shell: pwsh
+        env:
+          EXPECTED_PRODUCT_INPUT: ${{ steps.product.outputs.expected_product }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $ExistingProAim = @(Get-Process -Name "ProAimCLI" -ErrorAction SilentlyContinue)
+          if ($ExistingProAim.Count -ne 0) {
+            throw "Qualification requires no pre-existing ProAimCLI process."
+          }
+          $RunnerInvariant = [ordered]@{
+            schema_version = 1
+            status = "passed_before_directml_runs"
+            checked_at_utc = [DateTime]::UtcNow.ToString("o")
+            gpu_role = $env:GPU_ROLE_INPUT
+            expected_product_name = $env:EXPECTED_PRODUCT_INPUT
+            directml_adapter_index = [int]$env:ADAPTER_INDEX_INPUT
+            preexisting_proaim_cli_count = 0
+            telemetry_interval_milliseconds = 500
+          }
+          [System.IO.File]::WriteAllText(
+            (Join-Path $PWD "DIRECTML-RUNNER-INVARIANT.json"),
+            (($RunnerInvariant | ConvertTo-Json -Depth 8) + [Environment]::NewLine),
+            [System.Text.UTF8Encoding]::new($false)
+          )
+          $Telemetry = Join-Path $PWD "directml-gpu-engine-telemetry.jsonl"
+          $Stop = Join-Path $PWD "stop-directml-telemetry"
+          $Recorder = (Resolve-Path -LiteralPath "packaging\windows\Record-ProAimDirectMlTelemetry.ps1").Path
+          $Cli = (Resolve-Path -LiteralPath "extracted-candidate\ProAim\ProAimCLI.exe").Path
+          $RecorderStdout = Join-Path $PWD "directml-telemetry-recorder.stdout.txt"
+          $RecorderStderr = Join-Path $PWD "directml-telemetry-recorder.stderr.txt"
+          $RecorderProcess = Start-Process -FilePath "powershell.exe" `
+            -ArgumentList @(
+              "-NoProfile",
+              "-NonInteractive",
+              "-ExecutionPolicy", "Bypass",
+              "-File", ('"{0}"' -f $Recorder),
+              "-OutputPath", ('"{0}"' -f $Telemetry),
+              "-StopFile", ('"{0}"' -f $Stop),
+              "-AdapterIndex", [string]$RunnerInvariant.directml_adapter_index,
+              "-GpuRole", $env:GPU_ROLE_INPUT,
+              "-ExpectedProductName", ('"{0}"' -f $env:EXPECTED_PRODUCT_INPUT),
+              "-ExpectedExecutablePath", ('"{0}"' -f $Cli),
+              "-IntervalMilliseconds", [string]$RunnerInvariant.telemetry_interval_milliseconds
+            ) `
+            -PassThru `
+            -RedirectStandardOutput $RecorderStdout `
+            -RedirectStandardError $RecorderStderr
+          Start-Sleep -Seconds 2
+          if ($RecorderProcess.HasExited) {
+            $EarlyError = Get-Content -LiteralPath $RecorderStderr -Raw -ErrorAction SilentlyContinue
+            throw "DirectML telemetry recorder failed before qualification: $EarlyError"
+          }
+          $QualificationFailure = $null
+          try {
+            $Bundle = (Resolve-Path -LiteralPath "downloaded-release-candidate\ProAim-Windows-x64-DirectML.zip").Path
+            $Helper = (Resolve-Path -LiteralPath "extracted-candidate\ProAim\Qualify-ProAimGpu.ps1").Path
+            & $Helper -Provider DirectML `
+              -AdapterIndex ([int]$env:ADAPTER_INDEX_INPUT) `
+              -ExpectedAdapterName $env:EXPECTED_PRODUCT_INPUT `
+              -BundleArchivePath $Bundle `
+              -EvidenceDirectory (Join-Path $PWD "software-evidence") `
+              -RunLive `
+              -SkipReadyPrompt
+            if ($RecorderProcess.HasExited) {
+              $EarlyError = Get-Content -LiteralPath $RecorderStderr -Raw -ErrorAction SilentlyContinue
+              throw "DirectML telemetry recorder exited before qualification completed: $EarlyError"
+            }
+          } catch {
+            $QualificationFailure = $_
+          } finally {
+            [System.IO.File]::WriteAllText($Stop, "stop", [System.Text.UTF8Encoding]::new($false))
+            if (-not $RecorderProcess.WaitForExit(30000)) {
+              Stop-Process -Id $RecorderProcess.Id -Force
+              throw "DirectML telemetry recorder did not stop within 30 seconds."
+            }
+          }
+          if ($null -ne $QualificationFailure) { throw $QualificationFailure }
+          if ($RecorderProcess.ExitCode -ne 0) {
+            $RecorderError = Get-Content -LiteralPath $RecorderStderr -Raw -ErrorAction SilentlyContinue
+            throw "DirectML telemetry recorder failed with exit code $($RecorderProcess.ExitCode): $RecorderError"
+          }
+          foreach ($RecorderFile in @($RecorderStdout, $RecorderStderr, $Stop)) {
+            if (Test-Path -LiteralPath $RecorderFile -PathType Leaf) {
+              Remove-Item -LiteralPath $RecorderFile -Force
+            }
+          }
+          if (-not (Test-Path -LiteralPath $Telemetry -PathType Leaf)) {
+            throw "DirectML telemetry recorder did not create its evidence file."
+          }
+
+      - name: Collect local typed observation after all physical GPU runs
+        shell: pwsh
+        env:
+          EXPECTED_PRODUCT_INPUT: ${{ steps.product.outputs.expected_product }}
+          OBSERVER_NAME_INPUT: ${{ inputs.observer_name }}
+          PHYSICAL_CONFIRMATION_INPUT: ${{ inputs.physical_confirmation }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          & "packaging\windows\Complete-ProAimDirectMlObservation.ps1" `
+            -OutputPath (Join-Path $PWD "LOCAL-DIRECTML-OBSERVATION.json") `
+            -Repository $env:REPOSITORY_INPUT `
+            -Tag $env:TAG_INPUT `
+            -GpuRole $env:GPU_ROLE_INPUT `
+            -QualifiedGpu $env:EXPECTED_PRODUCT_INPUT `
+            -AdapterIndex ([int]$env:ADAPTER_INDEX_INPUT) `
+            -ExpectedObserverName $env:OBSERVER_NAME_INPUT `
+            -ExpectedTypedConfirmation $env:PHYSICAL_CONFIRMATION_INPUT `
+            -GitHubActor $env:GITHUB_ACTOR `
+            -GitHubRunId $env:GITHUB_RUN_ID
+
+      - name: Assemble exact raw evidence file set
+        shell: pwsh
+        run: |
+          $Raw = New-Item -ItemType Directory -Path "raw-qualification" -ErrorAction Stop
+          Move-Item -LiteralPath "software-evidence" -Destination (Join-Path $Raw.FullName "software-evidence")
+          foreach ($File in @(
+            "candidate-inspection.json",
+            "verified-source.json",
+            "directml-gpu-engine-telemetry.jsonl",
+            "DIRECTML-RUNNER-INVARIANT.json",
+            "LOCAL-DIRECTML-OBSERVATION.json"
+          )) {
+            Copy-Item -LiteralPath $File -Destination $Raw.FullName
+          }
+
+      - name: Create exact raw-content manifest before upload
+        id: raw-content
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_directml_release.py write-content-manifest `
+            --root raw-qualification `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --tag-commit $env:GITHUB_SHA `
+            --source-build-run-id $env:SOURCE_RUN_INPUT `
+            --qualification-run-id $env:GITHUB_RUN_ID `
+            --qualification-run-attempt $env:GITHUB_RUN_ATTEMPT `
+            --gpu-role $env:GPU_ROLE_INPUT `
+            --adapter-index $env:ADAPTER_INDEX_INPUT `
+            --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT `
+            --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT `
+            --output-name RAW-CONTENT-MANIFEST.json `
+            --result raw-content-result.json
+          $Result = Get-Content -LiteralPath raw-content-result.json -Raw | ConvertFrom-Json
+          "raw_content_manifest_sha256=$($Result.manifest_sha256)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload immutable raw physical evidence for protected review
+        id: raw-artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: raw-proaim-directml-${{ inputs.gpu_role }}-${{ github.run_id }}
+          path: raw-qualification
+          if-no-files-found: error
+          retention-days: 7
+
+  seal-physical-attestation:
+    name: Protected independent review and DirectML evidence seal
+    needs: collect-physical-evidence
+    runs-on: windows-2022
+    timeout-minutes: 15
+    environment:
+      name: directml-${{ inputs.gpu_role }}-physical-attestation
+    permissions:
+      actions: read
+      contents: read
+    env:
+      REPOSITORY_INPUT: ${{ github.repository }}
+      TAG_INPUT: ${{ inputs.tag }}
+      SOURCE_RUN_INPUT: ${{ inputs.source_build_run_id }}
+      CANDIDATE_MANIFEST_SHA_INPUT: ${{ inputs.candidate_manifest_sha256 }}
+      DIRECTML_ZIP_SHA_INPUT: ${{ inputs.directml_zip_sha256 }}
+      GPU_ROLE_INPUT: ${{ inputs.gpu_role }}
+      ADAPTER_INDEX_INPUT: ${{ inputs.adapter_index }}
+      OBSERVER_NAME_INPUT: ${{ inputs.observer_name }}
+      PHYSICAL_CONFIRMATION_INPUT: ${{ inputs.physical_confirmation }}
+      RAW_CONTENT_MANIFEST_SHA256: ${{ needs.collect-physical-evidence.outputs.raw_content_manifest_sha256 }}
+    steps:
+      - name: Require role-specific protected reviewer environment
+        shell: pwsh
+        env:
+          ENVIRONMENT_GUARD: ${{ secrets.DIRECTML_PHYSICAL_ATTESTATION_GUARD }}
+          ENVIRONMENT_POLICY_VERSION: ${{ vars.DIRECTML_PHYSICAL_ATTESTATION_POLICY_VERSION }}
+          REVIEWER_GROUP: ${{ vars.DIRECTML_INDEPENDENT_REVIEWER_GROUP }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:ENVIRONMENT_GUARD)) {
+            throw "The role-specific DirectML attestation environment must define its guard secret."
+          }
+          if ($env:ENVIRONMENT_POLICY_VERSION -ne "required-reviewers-v1") {
+            throw "The DirectML attestation environment must enforce required-reviewers-v1."
+          }
+          $ExpectedGroup = "$($env:GPU_ROLE_INPUT)-independent-reviewers-v1"
+          if ($env:REVIEWER_GROUP -ne $ExpectedGroup) {
+            throw "The DirectML attestation environment has the wrong independent reviewer group marker."
+          }
+
+      - name: Check out exact sealing source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up sealing Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Download exact raw evidence approved by the reviewer
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.collect-physical-evidence.outputs.raw_artifact_id }}
+          path: raw-qualification
+
+      - name: Revalidate and seal physical DirectML evidence
+        id: seal
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/manage_directml_release.py seal-evidence `
+            --raw-directory raw-qualification `
+            --output-directory sealed-evidence `
+            --raw-content-manifest-sha256 $env:RAW_CONTENT_MANIFEST_SHA256 `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --tag-commit $env:GITHUB_SHA `
+            --source-build-run-id $env:SOURCE_RUN_INPUT `
+            --qualification-run-id $env:GITHUB_RUN_ID `
+            --qualification-run-attempt $env:GITHUB_RUN_ATTEMPT `
+            --gpu-role $env:GPU_ROLE_INPUT `
+            --adapter-index $env:ADAPTER_INDEX_INPUT `
+            --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT `
+            --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT `
+            --observer-name $env:OBSERVER_NAME_INPUT `
+            --typed-confirmation $env:PHYSICAL_CONFIRMATION_INPUT `
+            --result sealed-evidence-result.json
+          $Result = Get-Content -LiteralPath sealed-evidence-result.json -Raw | ConvertFrom-Json
+          foreach ($Name in @(
+            "archive_sha256",
+            "qualification_manifest_sha256",
+            "physical_attestation_sha256",
+            "public_receipt_sha256"
+          )) {
+            "$Name=$($Result.$Name)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          }
+
+      - name: Upload role-specific sealed evidence
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ProAim-Windows-DirectML-${{ inputs.gpu_role }}-Qualification-Evidence
+          path: sealed-evidence
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Record immutable evidence hashes for publication handoff
+        shell: pwsh
+        env:
+          ARCHIVE_SHA256: ${{ steps.seal.outputs.archive_sha256 }}
+          QUALIFICATION_MANIFEST_SHA256: ${{ steps.seal.outputs.qualification_manifest_sha256 }}
+          PHYSICAL_ATTESTATION_SHA256: ${{ steps.seal.outputs.physical_attestation_sha256 }}
+          PUBLIC_RECEIPT_SHA256: ${{ steps.seal.outputs.public_receipt_sha256 }}
+        run: |
+          @"
+          ## Sealed physical DirectML evidence
+
+          - GPU role: ``$env:GPU_ROLE_INPUT``
+          - Product: ``${{ needs.collect-physical-evidence.outputs.expected_product }}``
+          - Tag commit: ``${{ needs.collect-physical-evidence.outputs.tag_commit }}``
+          - Evidence archive SHA-256: ``$env:ARCHIVE_SHA256``
+          - Qualification manifest SHA-256: ``$env:QUALIFICATION_MANIFEST_SHA256``
+          - Physical attestation SHA-256: ``$env:PHYSICAL_ATTESTATION_SHA256``
+          - Public redacted receipt SHA-256: ``$env:PUBLIC_RECEIPT_SHA256``
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

@@ -58,5 +58,11 @@ class Detector(ABC):
         raw: np.ndarray,
         transform: Any | None = None,
         frame_shape: Sequence[int] | None = None,
+        *,
+        confidence: float | None = None,
     ) -> list[Detection]:
-        """Decode raw output and map boxes to source-frame coordinates."""
+        """Decode raw output and map boxes to source-frame coordinates.
+
+        ``confidence`` is an optional per-call decode threshold. Implementations
+        use their configured threshold when it is omitted.
+        """

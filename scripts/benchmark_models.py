@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark bundled OpenVINO detectors without changing project state.
+"""Benchmark bundled OpenVINO or ONNX Runtime detectors without changing state.
 
 The benchmark preloads a deterministic set of BGR images, warms each model,
 then measures application-equivalent preprocessing, synchronous batch-one
@@ -32,6 +32,18 @@ import numpy as np
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.inference_size import (  # noqa: E402 - direct-script path bootstrap
+    InferenceSize,
+    InferenceSizeLike,
+    compact_inference_size,
+    normalize_inference_size,
+    parse_inference_size,
+    validate_yolo_inference_size,
+)
+
 DEFAULT_IMAGES = PROJECT_ROOT / "datasets" / "fort_cuh_player" / "images" / "test"
 DEFAULT_LABELS = PROJECT_ROOT / "models" / "fort_player.txt"
 IMAGE_SUFFIXES = frozenset({".bmp", ".jpeg", ".jpg", ".png"})
@@ -41,7 +53,7 @@ IMAGE_SUFFIXES = frozenset({".bmp", ".jpeg", ".jpg", ".png"})
 class ModelSpec:
     key: str
     model: Path
-    inference_size: int
+    inference_size: InferenceSize
     precision: str
 
 
@@ -49,7 +61,7 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
     "fort-320-fp32": ModelSpec(
         key="fort-320-fp32",
         model=PROJECT_ROOT / "models" / "fort_player_openvino_model" / "fort_player.xml",
-        inference_size=320,
+        inference_size=(320, 320),
         precision="FP32",
     ),
     "fort-416-fp32": ModelSpec(
@@ -60,7 +72,7 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
             / "fort_player_416_openvino_model"
             / "fort_player_416.xml"
         ),
-        inference_size=416,
+        inference_size=(416, 416),
         precision="FP32",
     ),
     "fort-416-int8": ModelSpec(
@@ -71,9 +83,34 @@ MODEL_PRESETS: dict[str, ModelSpec] = {
             / "fort_player_416_int8_openvino_model"
             / "fort_player_416_int8.xml"
         ),
-        inference_size=416,
+        inference_size=(416, 416),
         precision="INT8 PTQ",
     ),
+}
+
+ONNXRUNTIME_MODEL_PRESETS: dict[str, ModelSpec] = {
+    "fort-320-fp32": ModelSpec(
+        key="fort-320-fp32",
+        model=PROJECT_ROOT / "models" / "fort_player_onnx" / "fort_player.onnx",
+        inference_size=(320, 320),
+        precision="FP32",
+    ),
+    "fort-416-fp32": ModelSpec(
+        key="fort-416-fp32",
+        model=(
+            PROJECT_ROOT
+            / "models"
+            / "fort_player_416_onnx"
+            / "fort_player_416.onnx"
+        ),
+        inference_size=(416, 416),
+        precision="FP32",
+    ),
+}
+
+BACKEND_MODEL_PRESETS: dict[str, dict[str, ModelSpec]] = {
+    "openvino": MODEL_PRESETS,
+    "onnxruntime": ONNXRUNTIME_MODEL_PRESETS,
 }
 
 
@@ -101,6 +138,13 @@ def positive_int(value: str) -> int:
     if parsed <= 0:
         raise argparse.ArgumentTypeError("must be greater than zero")
     return parsed
+
+
+def inference_size_arg(value: str) -> InferenceSize:
+    try:
+        return validate_yolo_inference_size(parse_inference_size(value))
+    except (TypeError, ValueError) as exc:
+        raise argparse.ArgumentTypeError(str(exc)) from exc
 
 
 def nonnegative_int(value: str) -> int:
@@ -164,6 +208,7 @@ def summarize_ms(values: Sequence[float]) -> dict[str, float | int]:
     return {
         "samples": int(array.size),
         "mean": float(array.mean()),
+        "p50": float(np.percentile(array, 50)),
         "median": float(np.median(array)),
         "p95": float(np.percentile(array, 95)),
         "p99": float(np.percentile(array, 99)),
@@ -176,23 +221,25 @@ def summarize_ms(values: Sequence[float]) -> dict[str, float | int]:
 def _timed_pipeline(
     detector: DetectorLike,
     frames: Sequence[np.ndarray],
-    inference_size: int,
+    inference_size: InferenceSizeLike,
     *,
     warmup: int,
     iterations: int,
     repeats: int,
-    preprocess: Callable[[np.ndarray, int], PreprocessedLike],
+    preprocess: Callable[[np.ndarray, int | InferenceSize], PreprocessedLike],
     clock: Callable[[], int] = perf_counter_ns,
 ) -> dict[str, Any]:
     if not frames:
         raise ValueError("at least one frame is required")
-    if inference_size <= 0 or warmup < 0 or iterations <= 0 or repeats <= 0:
+    canonical_input_size = normalize_inference_size(inference_size)
+    if warmup < 0 or iterations <= 0 or repeats <= 0:
         raise ValueError("invalid benchmark dimensions or iteration counts")
+    preprocess_size = compact_inference_size(canonical_input_size)
 
     def one(index: int) -> tuple[float, float, float, float, int]:
         frame = frames[index % len(frames)]
         started = clock()
-        prepared = preprocess(frame, inference_size)
+        prepared = preprocess(frame, preprocess_size)
         after_preprocess = clock()
         raw = detector.infer(prepared.tensor)
         after_inference = clock()
@@ -278,9 +325,15 @@ def _synthetic_frames(count: int) -> list[np.ndarray]:
     return [rng.integers(0, 256, (720, 1280, 3), dtype=np.uint8) for _ in range(count)]
 
 
-def _artifact_record(model_xml: Path) -> dict[str, Any]:
+def _artifact_record(model_path: Path, backend: str = "openvino") -> dict[str, Any]:
     files: list[dict[str, Any]] = []
-    for path in (model_xml, model_xml.with_suffix(".bin")):
+    if backend == "openvino":
+        paths = (model_path, model_path.with_suffix(".bin"))
+    elif backend == "onnxruntime":
+        paths = (model_path,)
+    else:  # pragma: no cover - parser and run() validate this first
+        raise ValueError(f"unsupported benchmark backend: {backend}")
+    for path in paths:
         if not path.is_file():
             raise FileNotFoundError(f"model artifact not found: {path}")
         try:
@@ -290,11 +343,27 @@ def _artifact_record(model_xml: Path) -> dict[str, Any]:
         files.append(
             {
                 "path": relative,
+                "resolved_path": str(path.resolve()),
                 "bytes": path.stat().st_size,
                 "sha256": sha256_file(path),
             }
         )
     return {"files": files, "bytes_total": sum(item["bytes"] for item in files)}
+
+
+def _verified_artifact_after_run(
+    path: Path,
+    before: dict[str, Any],
+    *,
+    backend: str,
+    description: str,
+) -> dict[str, Any]:
+    """Fingerprint an input again and reject mutation during the benchmark."""
+
+    after = _artifact_record(path, backend)
+    if after != before:
+        raise RuntimeError(f"{description} changed while the benchmark was running")
+    return after
 
 
 def _cpu_model() -> str:
@@ -333,24 +402,61 @@ def _specs_from_args(args: argparse.Namespace) -> list[ModelSpec]:
                 precision=args.precision,
             )
         ]
-    keys = args.preset or list(MODEL_PRESETS)
-    return [MODEL_PRESETS[key] for key in keys]
+    backend = str(args.backend).strip().lower()
+    presets = BACKEND_MODEL_PRESETS[backend]
+    keys = args.preset or list(presets)
+    unavailable = [key for key in keys if key not in presets]
+    if unavailable:
+        supported = ", ".join(presets) or "none"
+        raise ValueError(
+            f"preset {unavailable[0]!r} is not available for {backend}; "
+            f"available presets: {supported}"
+        )
+    return [presets[key] for key in keys]
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--backend",
+        choices=tuple(BACKEND_MODEL_PRESETS),
+        default="openvino",
+        help="Inference runtime to measure (default: openvino).",
+    )
+    parser.add_argument(
         "--preset",
         action="append",
         choices=tuple(MODEL_PRESETS),
-        help="Bundled model to test; repeat for multiple models (default: all three).",
+        help=(
+            "Bundled model to test; repeat for multiple models. The default is all "
+            "presets available for the selected backend."
+        ),
     )
-    parser.add_argument("--model", type=Path, help="Benchmark one custom OpenVINO XML model.")
-    parser.add_argument("--inference-size", type=positive_int)
+    parser.add_argument(
+        "--model",
+        type=Path,
+        help="Benchmark one custom OpenVINO XML or ONNX model.",
+    )
+    parser.add_argument(
+        "--inference-size",
+        type=inference_size_arg,
+        metavar="N|HEIGHTxWIDTH",
+        help=(
+            "Custom model input: legacy N means square, or explicit "
+            "HEIGHTxWIDTH tensor order; each dimension must be divisible by 32."
+        ),
+    )
     parser.add_argument("--name", default="custom", help="JSON key for a custom model.")
     parser.add_argument("--precision", default="unknown", help="Custom model precision label.")
     parser.add_argument("--labels", type=Path, default=DEFAULT_LABELS)
-    parser.add_argument("--device", default="CPU", help="OpenVINO device (default: CPU).")
+    parser.add_argument(
+        "--device",
+        default="CPU",
+        help=(
+            "Runtime device, for example CPU, GPU, CUDA, or DIRECTML "
+            "(default: CPU)."
+        ),
+    )
     parser.add_argument("--images", type=Path, default=DEFAULT_IMAGES)
     parser.add_argument("--samples", type=positive_int, default=32)
     parser.add_argument(
@@ -361,6 +467,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--warmup", type=nonnegative_int, default=20)
     parser.add_argument("--iterations", type=positive_int, default=100)
     parser.add_argument("--repeats", type=positive_int, default=3)
+    parser.add_argument(
+        "--require-full-provider",
+        action="store_true",
+        help=(
+            "ONNX accelerator qualification only: fail session creation if any "
+            "graph node would fall back to CPU."
+        ),
+    )
     return parser
 
 
@@ -370,13 +484,27 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     if str(PROJECT_ROOT) not in sys.path:
         sys.path.insert(0, str(PROJECT_ROOT))
-    from detection.openvino_yolo import OpenVINOYoloDetector
     from utils.preprocess import preprocess_frame
+
+    backend = str(args.backend).strip().lower()
+    if args.require_full_provider and backend != "onnxruntime":
+        raise ValueError("--require-full-provider is available only for ONNX Runtime")
+    if backend == "openvino":
+        from detection.openvino_yolo import OpenVINOYoloDetector
+
+        detector_class = OpenVINOYoloDetector
+    elif backend == "onnxruntime":
+        from detection.onnx_yolo import OnnxRuntimeYoloDetector
+
+        detector_class = OnnxRuntimeYoloDetector
+    else:  # useful for direct run() callers that bypass argparse
+        raise ValueError(f"unsupported benchmark backend: {args.backend}")
 
     specs = _specs_from_args(args)
     labels = args.labels.expanduser().resolve()
     if not labels.is_file():
         raise FileNotFoundError(f"labels file not found: {labels}")
+    labels_artifact_before = _artifact_record(labels, "onnxruntime")
 
     selected_paths: list[Path] = []
     if args.synthetic:
@@ -407,7 +535,13 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     results: list[dict[str, Any]] = []
     for spec in specs:
         print(f"Benchmarking {spec.key} on {args.device}...", file=sys.stderr, flush=True)
-        detector = OpenVINOYoloDetector(
+        model_artifact_before = _artifact_record(spec.model, backend)
+        detector_kwargs: dict[str, Any] = {}
+        if backend == "onnxruntime":
+            detector_kwargs["require_full_provider"] = bool(
+                args.require_full_provider
+            )
+        detector = detector_class(
             model_path=spec.model,
             labels_path=labels,
             device=args.device,
@@ -417,6 +551,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             confidence=0.25,
             iou=0.45,
             output_format="auto",
+            **detector_kwargs,
         )
         measured = _timed_pipeline(
             detector,
@@ -427,12 +562,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             repeats=args.repeats,
             preprocess=preprocess_frame,
         )
+        model_artifact = _verified_artifact_after_run(
+            spec.model,
+            model_artifact_before,
+            backend=backend,
+            description=f"model {spec.key}",
+        )
+        labels_artifact = _verified_artifact_after_run(
+            labels,
+            labels_artifact_before,
+            backend="onnxruntime",
+            description="labels",
+        )
         results.append(
             {
                 "key": spec.key,
                 "precision": spec.precision,
-                "inference_size": spec.inference_size,
-                "artifact": _artifact_record(spec.model),
+                "inference_size": compact_inference_size(spec.inference_size),
+                "input_shape_hw": list(spec.inference_size),
+                "artifact": model_artifact,
+                "labels_artifact": labels_artifact,
                 "runtime": dict(detector.runtime_summary),
                 **measured,
             }
@@ -442,13 +591,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "schema_version": 1,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
         "methodology": {
+            "backend": backend,
+            "requested_device": str(args.device),
             "batch": 1,
             "execution": "synchronous",
-            "performance_hint": "LATENCY",
-            "streams": 1,
+            "performance_hint": "LATENCY" if backend == "openvino" else None,
+            "streams": 1 if backend == "openvino" else None,
             "warmup_per_model": args.warmup,
             "iterations_per_repeat": args.iterations,
             "repeats": args.repeats,
+            "require_full_provider": bool(args.require_full_provider),
             "timer": "time.perf_counter_ns",
             "garbage_collection_during_measurement": "disabled",
             "scope": "preloaded frame; capture, decode, display, and disk I/O excluded",

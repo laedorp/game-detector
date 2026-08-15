@@ -26,7 +26,9 @@ from launcher.settings import (
     SettingsError,
     model_preset,
     model_preset_paths,
+    release_default_model_contract,
 )
+from utils.inference_size import normalize_inference_size
 
 
 def make_bundled_tree(root: Path, backend: str) -> tuple[Path, Path]:
@@ -44,6 +46,18 @@ def make_bundled_tree(root: Path, backend: str) -> tuple[Path, Path]:
 
 
 class PresetFormatTests(unittest.TestCase):
+    def test_release_default_contract_is_derived_from_launcher_default(self) -> None:
+        contract = release_default_model_contract()
+        preset = model_preset(DEFAULT_MODEL_PRESET)
+
+        self.assertEqual(contract["preset"], DEFAULT_MODEL_PRESET)
+        self.assertEqual(contract["model_path"], preset.model_for("onnxruntime"))
+        self.assertEqual(contract["labels_path"], preset.labels_relative)
+        self.assertEqual(
+            contract["input_shape_hw"],
+            list(normalize_inference_size(preset.inference_size)),
+        )
+
     def test_every_portable_bundled_preset_offers_both_model_formats(self) -> None:
         for preset in MODEL_PRESETS:
             if not preset.bundled or preset.key == MODEL_PRESET_FORT_PLAYER_BALANCED_INT8:
@@ -95,6 +109,43 @@ class DetectorArgumentTests(unittest.TestCase):
         self.assertEqual(args[args.index("--backend") + 1], "onnxruntime")
         self.assertEqual(args[args.index("--model") + 1], str(model.resolve()))
         self.assertEqual(args[args.index("--device") + 1], "ROCM")
+        self.assertIn("--require-full-provider", args)
+
+    def test_explicit_onnx_gpu_devices_require_the_full_provider(self) -> None:
+        devices = (
+            "GPU",
+            "AMD",
+            "NVIDIA",
+            "CUDAExecutionProvider",
+            "TENSORRT",
+            "ROCMExecutionProvider",
+            "MIGraphXExecutionProvider",
+            "DmlExecutionProvider",
+            "DIRECTML:1",
+            "DML:2",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_bundled_tree(root, "onnxruntime")
+            with mock.patch("launcher.settings.resource_root", return_value=root):
+                for device in devices:
+                    with self.subTest(device=device):
+                        args = LauncherSettings(
+                            backend="onnxruntime", device=device
+                        ).detector_arguments()
+                        self.assertIn("--require-full-provider", args)
+
+    def test_onnx_cpu_and_auto_devices_do_not_claim_full_gpu_coverage(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            make_bundled_tree(root, "onnxruntime")
+            with mock.patch("launcher.settings.resource_root", return_value=root):
+                for device in ("CPU", "CPUExecutionProvider", "AUTO", "OPENVINO"):
+                    with self.subTest(device=device):
+                        args = LauncherSettings(
+                            backend="onnxruntime", device=device
+                        ).detector_arguments()
+                        self.assertNotIn("--require-full-provider", args)
 
     def test_onnx_backend_does_not_demand_a_bin_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

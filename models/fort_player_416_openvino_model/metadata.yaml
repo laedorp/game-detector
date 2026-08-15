@@ -1,4 +1,4 @@
-description: Ultralytics YOLO26n model trained on /home/laedorp/object detection/datasets/fort_cuh_player/fort_cuh_player.yaml
+description: Ultralytics YOLO26n model trained for one-class player detection.
 author: Ultralytics
 date: '2026-08-10T19:52:18.816049-04:00'
 version: 8.4.116

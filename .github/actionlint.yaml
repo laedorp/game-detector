@@ -1,0 +1,11 @@
+self-hosted-runner:
+  # Interactive Windows runner used only for the protected physical-CUDA
+  # qualification workflow.  Keep this explicit so actionlint still rejects
+  # misspelled or undeclared runner labels everywhere else.
+  labels:
+    - proaim-cuda-qualification
+    - proaim-directml-qualification
+    - proaim-independent-holdout-directml
+    - proaim-rx-6950-xt-holdout
+    - proaim-independent-holdout-directml
+    - proaim-rx-6950-xt-holdout

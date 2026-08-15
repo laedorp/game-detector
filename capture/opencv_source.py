@@ -37,6 +37,7 @@ class OpenCVCaptureSource(CaptureSource):
         live: bool | None = None,
         close_timeout: float = 2.0,
         pixel_format: str | None = None,
+        rotate_180: bool = False,
     ) -> None:
         if isinstance(source, bool):
             raise TypeError("source must be a device index or file path, not bool")
@@ -50,7 +51,10 @@ class OpenCVCaptureSource(CaptureSource):
             raise ValueError("buffer_size must be positive")
         if not math.isfinite(close_timeout) or close_timeout < 0:
             raise ValueError("close_timeout must be finite and non-negative")
+        if not isinstance(rotate_180, bool):
+            raise TypeError("rotate_180 must be bool")
         self._pixel_format = _normalized_pixel_format(pixel_format)
+        self._rotate_180 = rotate_180
 
         self._source: int | str = str(source) if isinstance(source, Path) else source
         self._live = isinstance(source, int) if live is None else bool(live)
@@ -169,6 +173,10 @@ class OpenCVCaptureSource(CaptureSource):
             self._capture = None
             return None
 
+        if self._rotate_180:
+            image = _rotate_frame_180(image)
+            read_completed_ns = perf_counter_ns()
+
         packet = FramePacket(
             image=image,
             sequence=self._sequence,
@@ -263,6 +271,7 @@ class OpenCVCaptureSource(CaptureSource):
             # most common reason a capture card misses its rated frame rate.
             "pixel_format": _fourcc_text(capture),
             "requested_pixel_format": self._pixel_format,
+            "rotation_degrees": 180 if self._rotate_180 else 0,
         }
         with self._settings_lock:
             self._actual_settings = settings
@@ -291,6 +300,10 @@ class OpenCVCaptureSource(CaptureSource):
                     self._record_read_failure()
                     self._finish(f"Read failed for {self.description}")
                     break
+
+                if self._rotate_180:
+                    image = _rotate_frame_180(image)
+                    read_completed_ns = perf_counter_ns()
 
                 packet = FramePacket(
                     image=image,
@@ -324,6 +337,13 @@ class OpenCVCaptureSource(CaptureSource):
             f"Read failed before end of {self.description} "
             f"(frame {position:g} of {frame_count:g})"
         )
+
+
+def _rotate_frame_180(image: Any) -> Any:
+    """Return a contiguous 180-degree copy without changing color channels."""
+
+    assert cv2 is not None
+    return cv2.rotate(image, cv2.ROTATE_180)
 
 
 def _describe_source(source: int | str, live: bool) -> str:

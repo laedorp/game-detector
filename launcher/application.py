@@ -13,6 +13,8 @@ import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
+from utils.inference_size import format_inference_size
+
 from detection.devices import (
     DeviceDiscoveryError,
     available_openvino_devices,
@@ -63,6 +65,7 @@ from .settings import (
     launcher_command,
     load_settings,
     model_preset,
+    model_preset_detail_crop_text,
     model_preset_paths,
     save_settings,
 )
@@ -142,6 +145,8 @@ class DetectorLauncher:
         self.capture_width = tk.StringVar(value=settings.capture_width)
         self.capture_height = tk.StringVar(value=settings.capture_height)
         self.capture_fps = tk.StringVar(value=settings.capture_fps)
+        self.capture_format = tk.StringVar(value=settings.capture_format)
+        self.capture_rotate_180 = tk.BooleanVar(value=settings.capture_rotate_180)
         self.screen_monitor = tk.StringVar(value=settings.screen_monitor)
         self.use_screen_region = tk.BooleanVar(value=settings.use_screen_region)
         self.screen_x = tk.StringVar(value=settings.screen_x)
@@ -173,6 +178,7 @@ class DetectorLauncher:
         self.device_status = tk.StringVar(value="Detecting OpenVINO devices…")
         self.inference_size = tk.StringVar(value=settings.inference_size)
         self.crop_size = tk.StringVar(value=settings.crop_size)
+        self.detail_crop_size = tk.StringVar(value=settings.detail_crop_size)
         self.confidence = tk.DoubleVar(value=self._parse_float(settings.confidence, 0.25))
         self.iou_threshold = tk.StringVar(value=settings.iou_threshold)
         self.output_format = tk.StringVar(value=settings.output_format)
@@ -520,6 +526,11 @@ class DetectorLauncher:
                 ("Width", self.capture_width, ("640", "1280", "1920")),
                 ("Height", self.capture_height, ("480", "720", "1080")),
                 ("Requested FPS", self.capture_fps, ("30", "60", "120")),
+                (
+                    "Pixel format",
+                    self.capture_format,
+                    ("", "NV12", "BGR3", "YUYV", "P010", "MJPG"),
+                ),
             ),
             start=1,
         ):
@@ -531,6 +542,11 @@ class DetectorLauncher:
             panel,
             text="Leave width, height, and FPS blank to use the device defaults.",
             style="Subtitle.TLabel",
+        ).grid(row=4, column=0, columnspan=7, sticky="w", pady=(9, 0))
+        ttk.Checkbutton(
+            panel,
+            text="Rotate capture 180° (fix an upside-down feed)",
+            variable=self.capture_rotate_180,
         ).grid(row=3, column=0, columnspan=7, sticky="w", pady=(9, 0))
         return panel
 
@@ -604,6 +620,28 @@ class DetectorLauncher:
             command=self._browse_labels,
         )
         self.labels_browse_button.grid(row=3, column=2, padx=(8, 0), pady=(8, 0))
+        self.detail_crop_label = ttk.Label(
+            model_frame,
+            text="Experimental detail ROI max width (source px)",
+        )
+        self.detail_crop_label.grid(
+            row=4,
+            column=0,
+            sticky="w",
+            padx=(0, 8),
+            pady=(8, 0),
+        )
+        self.detail_crop_entry = ttk.Combobox(
+            model_frame,
+            textvariable=self.detail_crop_size,
+            values=("", "384", "512", "640", "720", "768"),
+        )
+        self.detail_crop_entry.grid(
+            row=4,
+            column=1,
+            sticky="ew",
+            pady=(8, 0),
+        )
         self._update_model_preset_controls()
 
         runtime = ttk.LabelFrame(
@@ -613,11 +651,15 @@ class DetectorLauncher:
             padding=10,
         )
         runtime.grid(row=2, column=0, sticky="ew", pady=(10, 0))
-        for column in range(5):
+        for column in range(6):
             runtime.columnconfigure(column, weight=1)
         controls = (
             ("OpenVINO device", self.device, ("CPU", "AUTO", "GPU", "NPU")),
-            ("Inference size", self.inference_size, ("256", "320", "416", "640")),
+            (
+                "Inference size (H×W)",
+                self.inference_size,
+                ("256", "320", "416", "640"),
+            ),
             ("Center crop (optional)", self.crop_size, ("", "512", "640", "720", "1080")),
             ("Confidence", self.confidence, ()),
             ("IoU threshold", self.iou_threshold, ("0.30", "0.45", "0.60")),
@@ -1137,7 +1179,7 @@ class DetectorLauncher:
         best = ready[0]
         self.backend.set(best.backend)
         self.device.set(best.device)
-        self.inference_size.set(str(best.inference_size))
+        self.inference_size.set(format_inference_size(best.inference_size))
         if best.backend == "openvino":
             self._refresh_detection_devices(silent=True)
         else:
@@ -1313,14 +1355,16 @@ class DetectorLauncher:
         self._makcu_verify_thread.start()
 
     def _verify_makcu_activation_worker(self, port: str, button: int) -> None:
-        controller = MakcuAimingController(
-            MakcuAimConfig(port=port, activation_button=button)
-        )
+        controller: MakcuAimingController | None = None
+        result: tuple[bool, str, str, str] | None = None
         expected_mask = 1 << button
         saw_neutral = False
         pressed = False
         deadline = time.monotonic() + 10.0
         try:
+            controller = MakcuAimingController(
+                MakcuAimConfig(port=port, activation_button=button)
+            )
             controller.start(output_loop=False)
             while time.monotonic() < deadline and not self._makcu_verify_cancel.is_set():
                 mask = controller.poll_button_mask()
@@ -1330,7 +1374,7 @@ class DetectorLauncher:
                             "Release every mouse button before verification, then try "
                             f"again. MAKCU initially reported mask 0x{mask:02X}."
                         )
-                        self._makcu_verify_result.put((False, port, str(button), detail))
+                        result = (False, port, str(button), detail)
                         return
                     saw_neutral = True
                     time.sleep(0.01)
@@ -1342,27 +1386,46 @@ class DetectorLauncher:
                         f"Expected only {MAKCU_BUTTON_LABELS[button]}, but MAKCU "
                         f"reported mask 0x{mask:02X}. Verification was not saved."
                     )
-                    self._makcu_verify_result.put((False, port, str(button), detail))
+                    result = (False, port, str(button), detail)
                     return
                 elif pressed and mask == 0:
-                    self._makcu_verify_result.put((True, port, str(button), ""))
+                    result = (True, port, str(button), "")
                     return
                 elif pressed and mask != expected_mask:
                     detail = (
                         f"Button report changed to mask 0x{mask:02X} before release. "
                         "Verification was not saved."
                     )
-                    self._makcu_verify_result.put((False, port, str(button), detail))
+                    result = (False, port, str(button), detail)
                     return
                 time.sleep(0.01)
             detail = "Verification cancelled." if self._makcu_verify_cancel.is_set() else (
                 f"No complete {MAKCU_BUTTON_LABELS[button]} press and release was received."
             )
-            self._makcu_verify_result.put((False, port, str(button), detail))
-        except (MakcuError, OSError, ValueError) as exc:
-            self._makcu_verify_result.put((False, port, str(button), str(exc)))
+            result = (False, port, str(button), detail)
+        except Exception as exc:
+            result = (False, port, str(button), str(exc))
         finally:
-            controller.stop()
+            try:
+                if controller is not None:
+                    controller.stop()
+            except Exception as exc:
+                result = (
+                    False,
+                    port,
+                    str(button),
+                    f"MAKCU shutdown failed after verification: {exc}",
+                )
+            if result is None:
+                result = (
+                    False,
+                    port,
+                    str(button),
+                    "MAKCU verification ended without a result.",
+                )
+            # Publish only after cleanup so a shutdown failure can override an
+            # apparent success without leaving a stale second queue result.
+            self._makcu_verify_result.put(result)
 
     def _browse_aim_activate_path(self) -> None:
         selected = filedialog.askopenfilename(
@@ -1414,7 +1477,7 @@ class DetectorLauncher:
             # bundled preset.
             self.output_format.set("auto")
             assert selected.inference_size is not None
-            self.inference_size.set(str(selected.inference_size))
+            self.inference_size.set(format_inference_size(selected.inference_size))
         else:
             model_path = self._custom_model_path
             labels_path = self._custom_labels_path
@@ -1425,6 +1488,11 @@ class DetectorLauncher:
         self.model_path.set(model_path)
         self.labels_path.set(labels_path)
         self._active_model_preset = selected.key
+        if _event is not None:
+            # An explicit preset choice adopts the complete selected workload.
+            # Initial construction has no event, so persisted detail choices
+            # are never overwritten merely by loading a profile.
+            self.detail_crop_size.set(model_preset_detail_crop_text(selected.key))
         self.model_preset_description.set(selected.description)
         self._update_model_preset_controls()
 
@@ -1436,6 +1504,14 @@ class DetectorLauncher:
         self.labels_path_entry.configure(state=entry_state)
         self.model_browse_button.configure(state=button_state)
         self.labels_browse_button.configure(state=button_state)
+        if hasattr(self, "detail_crop_size"):
+            show_detail = editable or bool(self.detail_crop_size.get().strip())
+            if show_detail:
+                self.detail_crop_label.grid()
+                self.detail_crop_entry.grid()
+            else:
+                self.detail_crop_label.grid_remove()
+                self.detail_crop_entry.grid_remove()
 
     def _selected_precision_candidate(self) -> ControllerCandidate | None:
         return self._precision_candidates.get(self.precision_device_choice.get())
@@ -1592,6 +1668,8 @@ class DetectorLauncher:
             capture_width=self.capture_width.get(),
             capture_height=self.capture_height.get(),
             capture_fps=self.capture_fps.get(),
+            capture_format=self.capture_format.get(),
+            capture_rotate_180=self.capture_rotate_180.get(),
             screen_monitor=self.screen_monitor.get(),
             use_screen_region=self.use_screen_region.get(),
             screen_x=self.screen_x.get(),
@@ -1603,11 +1681,20 @@ class DetectorLauncher:
                 self.model_preset.get(),
                 DEFAULT_MODEL_PRESET,
             ),
+            # The legacy Tk UI intentionally has no workload-tier control, so
+            # retain the last normalized tier instead of resetting it whenever
+            # the form is saved.
+            model_tier=self._loaded.model_tier,
             model_path=self.model_path.get(),
             labels_path=self.labels_path.get(),
             device=self.device.get(),
+            backend=self.backend.get(),
+            # Saving from the compatibility form is itself an explicit device
+            # choice; the Qt-only first-run auto-selector must not replace it.
+            hardware_selection_configured=True,
             inference_size=self.inference_size.get(),
             crop_size=self.crop_size.get(),
+            detail_crop_size=self.detail_crop_size.get(),
             confidence=f"{self.confidence.get():.2f}",
             iou_threshold=self.iou_threshold.get(),
             output_format=self.output_format.get(),
@@ -1618,6 +1705,10 @@ class DetectorLauncher:
             ),
             preview=self.preview.get(),
             draw=self.draw.get(),
+            # Preview pacing and advanced MAKCU controls are exposed only by
+            # the primary Qt launcher. Preserve them for source users who
+            # temporarily open the compatibility Tk UI.
+            preview_fps=self._loaded.preview_fps,
             aim=self.aim.get(),
             aim_label=self.aim_label.get().strip(),
             aim_invert_x=self.aim_invert_x.get(),
@@ -1636,6 +1727,19 @@ class DetectorLauncher:
             aim_makcu_strength=self.aim_makcu_strength.get().strip(),
             aim_makcu_smoothing_alpha=f"{self.aim_makcu_smoothing_alpha.get():.2f}",
             aim_makcu_max_step=self.aim_makcu_max_step.get().strip(),
+            aim_makcu_prediction_lead_seconds=(
+                self._loaded.aim_makcu_prediction_lead_seconds
+            ),
+            aim_makcu_derivative_damping_seconds=(
+                self._loaded.aim_makcu_derivative_damping_seconds
+            ),
+            aim_makcu_vertical_rate_ratio=(
+                self._loaded.aim_makcu_vertical_rate_ratio
+            ),
+            # The compatibility UI does not expose calibrated response. Keep
+            # both its physical mode and selected immutable profile intact.
+            aim_makcu_context=self._loaded.aim_makcu_context,
+            aim_makcu_active_profile=self._loaded.aim_makcu_active_profile,
             aim_makcu_verified_port=(
                 self._makcu_verified_port if self._makcu_verification_matches() else ""
             ),

@@ -17,6 +17,7 @@ from utils.render import console_summary
 from utils.self_filter import (
     NormalizedBottomZone,
     SelfAvatarFilter,
+    boxes_are_safely_distinct,
     exclude_self_avatar,
     is_player_like,
 )
@@ -26,9 +27,15 @@ class SelfFilterConfigTests(unittest.TestCase):
     def test_filter_is_opt_in_with_documented_defaults(self) -> None:
         config = parse_args([])
         self.assertFalse(config.ignore_self)
+        self.assertEqual(config.preview_fps, 15.0)
         self.assertEqual(config.self_zone_left, DEFAULT_SELF_ZONE_LEFT)
         self.assertEqual(config.self_zone_width, DEFAULT_SELF_ZONE_WIDTH)
         self.assertEqual(config.self_zone_height, DEFAULT_SELF_ZONE_HEIGHT)
+
+    def test_preview_fps_is_configurable_and_positive(self) -> None:
+        self.assertEqual(parse_args(["--preview-fps", "20"]).preview_fps, 20.0)
+        with self.assertRaises(SystemExit):
+            parse_args(["--preview-fps", "0"])
 
     def test_custom_zone_is_parsed(self) -> None:
         config = parse_args(
@@ -164,6 +171,45 @@ class NormalizedBottomZoneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.zone.pixel_bounds((0, 1920, 3))
 
+    def test_distinct_box_check_rejects_duplicates_but_allows_separate_player(
+        self,
+    ) -> None:
+        confirmed = (430, 560, 850, 1080)
+        overlapping_duplicate = (440, 570, 860, 1080)
+        nested_duplicate = (560, 700, 760, 1050)
+        separate_opponent = (850, 600, 1050, 1080)
+
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                confirmed,
+                overlapping_duplicate,
+                (1080, 1920, 3),
+            )
+        )
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                confirmed,
+                nested_duplicate,
+                (1080, 1920, 3),
+            )
+        )
+        self.assertTrue(
+            boxes_are_safely_distinct(
+                confirmed,
+                separate_opponent,
+                (1080, 1920, 3),
+            )
+        )
+
+    def test_malformed_box_is_never_declared_safely_distinct(self) -> None:
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                (430, 560, 850, 1080),
+                (math.nan, 600, 1050, 1080),
+                (1080, 1920, 3),
+            )
+        )
+
 
 class StatefulSelfAvatarFilterTests(unittest.TestCase):
     frame_shape = (1080, 1920, 3)
@@ -230,6 +276,31 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         duplicate = self.detection((440, 570, 860, 1080), "person")
         result = self.filter.apply([self.avatar, duplicate], self.frame_shape)
         self.assertFalse(result.aim_safe)
+
+    def test_opposite_shoulder_avatar_blocks_aim_until_reacquired(self) -> None:
+        self.acquire()
+        opposite_shoulder = self.detection((1200, 550, 1450, 1080), "person")
+
+        first = self.filter.apply([opposite_shoulder], self.frame_shape)
+        second = self.filter.apply([opposite_shoulder], self.frame_shape)
+        third = self.filter.apply([opposite_shoulder], self.frame_shape)
+
+        self.assertFalse(first.aim_safe)
+        self.assertFalse(second.aim_safe)
+        self.assertEqual(first.detections, (opposite_shoulder,))
+        self.assertEqual(second.detections, (opposite_shoulder,))
+        self.assertTrue(third.aim_safe)
+        self.assertEqual(third.detections, ())
+        self.assertIs(third.ignored_detection, opposite_shoulder)
+
+    def test_bottom_opponent_outside_selected_shoulder_is_not_suppressed(self) -> None:
+        opponent = self.detection((1300, 430, 1550, 1080), "person")
+
+        result = self.filter.apply([opponent], self.frame_shape)
+
+        self.assertEqual(result.detections, (opponent,))
+        self.assertEqual(result.ignored_count, 0)
+        self.assertTrue(result.aim_safe)
 
     def test_one_or_two_frame_transient_is_retained(self) -> None:
         first = self.filter.apply([self.avatar], self.frame_shape)

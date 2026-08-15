@@ -1,0 +1,57 @@
+{
+  "artifacts": {
+    "attribution": {
+      "bytes": 2209,
+      "path": "models/fort_player_416_openvino_model/ATTRIBUTION.md",
+      "sha256": "15f6cd08c899360f632b654936622b51e04a66ce0e8360de70238f252fffe879"
+    },
+    "labels": {
+      "bytes": 7,
+      "path": "models/fort_player.txt",
+      "sha256": "fe68576d2bc2060581151b21c276ff2aa581239794beefefa33cfc679dd96447"
+    },
+    "onnx": {
+      "bytes": 9707811,
+      "path": "models/fort_player_416_onnx/fort_player_416.onnx",
+      "sha256": "295e64295481016ad701fb8ef6b68463f6931e5a1d809e5f0e15ef3d50a7f05d"
+    },
+    "openvino_bin": {
+      "bytes": 9543024,
+      "path": "models/fort_player_416_openvino_model/fort_player_416.bin",
+      "sha256": "c6d908bce89df473a796c8ad72690872f37e776eb41a70686095baeb77e72895"
+    },
+    "openvino_xml": {
+      "bytes": 366406,
+      "path": "models/fort_player_416_openvino_model/fort_player_416.xml",
+      "sha256": "6779ead62c3ace7d4de4b5a43dd3cb2cf8c6be84fa1399cd40db1eaf4b8c6450"
+    }
+  },
+  "content_sha256": "a489125cf7c5386124c7e7e75524069d95eb862bf23057349eb232df9c0aa19a",
+  "detail_crop_size_source_pixels": 0,
+  "input_shape_nchw": [
+    1,
+    3,
+    416,
+    416
+  ],
+  "preset": {
+    "description": "Purpose-trained one-class player detector for stylized game characters.",
+    "key": "fort_player_balanced",
+    "label": "Game players \u2014 Balanced 416 (Recommended)"
+  },
+  "provenance": {
+    "candidate_content_sha256": null,
+    "candidate_manifest_sha256": null,
+    "kind": "existing_release_default_migration",
+    "tournament_selection_sha256": null
+  },
+  "qualification": {
+    "approved": false,
+    "frozen_build_qualified": false,
+    "independent_holdout_qualified": false,
+    "model_accuracy_qualified": false,
+    "target_gpu_latency_qualified": false
+  },
+  "schema_version": 1,
+  "status": "default_selected_not_release_qualified"
+}
