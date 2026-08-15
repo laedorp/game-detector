@@ -119,7 +119,6 @@ def _calibration_source_identity(
     import json
     import os
     import re
-    import re
     import stat
     import subprocess
 
@@ -337,6 +336,7 @@ def _build_calibration_runtime_binding(
     from hashlib import sha256
     import json
     import os
+    import re
 
     if not isinstance(detector_summary, Mapping):
         raise ValueError("Calibration detector runtime summary is unavailable")

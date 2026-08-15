@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import contextlib
+from hashlib import sha256
 import io
 from pathlib import Path
 from types import SimpleNamespace
@@ -188,7 +189,12 @@ class CalibrationInputHelperTests(unittest.TestCase):
                 fitted_gain = -(after_error - before_error) / 10.0
                 self.assertEqual(fitted_gain, 1.0)
 
-    def test_binding_uses_runtime_and_negotiated_capture_identity(self) -> None:
+    @mock.patch.dict(
+        "os.environ",
+        {"ROCR_VISIBLE_DEVICES": "GPU-1621aa76fbfff6bf"},
+        clear=True,
+    )
+    def test_binding_uses_runtime_capture_and_rocr_physical_identity(self) -> None:
         config = parse_args(
             [
                 "--source",
@@ -225,7 +231,6 @@ class CalibrationInputHelperTests(unittest.TestCase):
                 "provider_options_status": "ok",
                 "require_full_provider": True,
                 "runtime_ep_fail_fallback_disabled": True,
-                "physical_device_identity": "GPU-test-rx6950xt",
             },
             capture_settings={
                 "source": 4,
@@ -259,7 +264,10 @@ class CalibrationInputHelperTests(unittest.TestCase):
         self.assertEqual(binding.runtime_version, "1.28.0")
         self.assertEqual(binding.requested_provider, "MIGraphXExecutionProvider")
         self.assertEqual(len(binding.provider_options_sha256), 64)
-        self.assertEqual(len(binding.physical_device_token), 64)
+        self.assertEqual(
+            binding.physical_device_token,
+            sha256(b"rocr:GPU-1621aa76fbfff6bf").hexdigest(),
+        )
         self.assertEqual(binding.active_provider, "MIGraphXExecutionProvider")
         self.assertEqual(binding.active_device, "gfx1030-RX6950XT")
         self.assertEqual((binding.inference_width, binding.inference_height), (640, 384))
