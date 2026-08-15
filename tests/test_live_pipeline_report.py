@@ -858,15 +858,29 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         direct_sample = SimpleNamespace(
             point=(24.0, 5.0),
             source_timestamp_ns=source.base_ns,
-            direct_source_timestamp_ns=source.base_ns - 20_000_000,
+            direct_source_timestamp_ns=source.base_ns,
+            identity_deadline_ns=source.base_ns + 180_000_000,
+            track_generation=1,
+            provenance=DirectHeadProvenance.DIRECT,
+            confidence=0.9,
+            evidence="direct test head box",
+            bridging=False,
+            body_derived_motion_permitted=False,
+            body_derived_motion_deadline_ns=None,
+            corroboration_point=(16.0, 16.0),
+        )
+        display_only_body_jitter = SimpleNamespace(
+            point=(29.0, 9.0),
+            source_timestamp_ns=source.base_ns + 8_000_000,
+            direct_source_timestamp_ns=source.base_ns,
             identity_deadline_ns=source.base_ns + 180_000_000,
             track_generation=1,
             provenance=DirectHeadProvenance.MEASURED_PRIMARY,
             confidence=0.9,
             evidence="filtered direct-head anchor",
             bridging=False,
-            body_derived_motion_permitted=True,
-            body_derived_motion_deadline_ns=source.base_ns + 45_000_000,
+            body_derived_motion_permitted=False,
+            body_derived_motion_deadline_ns=None,
             corroboration_point=None,
         )
         head_runtime = mock.Mock()
@@ -881,7 +895,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             False,
         ]
         head_runtime.take_latest.side_effect = [direct_sample, None]
-        head_runtime.visible_sample.return_value = direct_sample
+        head_runtime.visible_sample.return_value = display_only_body_jitter
         head_runtime.stop.side_effect = lambda: cleanup_order.append("head") or True
 
         config = self._config(
@@ -954,11 +968,11 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_projection_fraction,
-            1.0,
+            0.0,
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_feedforward_fraction,
-            0.25,
+            0.0,
         )
         self.assertEqual(len(controller.updates), 2)
         first_target, _shape, _active, first_keywords = controller.updates[0]
@@ -973,11 +987,8 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         )
         self.assertNotIn("velocity_target", direct_keywords)
         self.assertEqual(direct_keywords["velocity_point"], direct_sample.point)
-        self.assertTrue(direct_keywords["body_derived_motion_permitted"])
-        self.assertEqual(
-            direct_keywords["body_derived_motion_deadline_ns"],
-            direct_sample.body_derived_motion_deadline_ns,
-        )
+        self.assertNotIn("body_derived_motion_permitted", direct_keywords)
+        self.assertNotIn("body_derived_motion_deadline_ns", direct_keywords)
         self.assertEqual(
             direct_keywords["identity_deadline_ns"],
             direct_sample.identity_deadline_ns,
@@ -985,7 +996,17 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertTrue(direct_keywords["measurement_observed"])
         self.assertEqual(
             direct_keywords["motion_corroboration_point"],
-            None,
+            direct_sample.corroboration_point,
+        )
+        self.assertNotEqual(
+            direct_keywords["aim_point"],
+            display_only_body_jitter.point,
+        )
+        self.assertFalse(
+            any(
+                keywords.get("aim_point") == display_only_body_jitter.point
+                for _target, _shape, _active, keywords in controller.updates
+            )
         )
         self.assertEqual(
             controller.control_events,
@@ -1005,10 +1026,12 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             startup,
         )
         self.assertIn("direct-head confidence >= 0.25", startup)
+        self.assertIn("physical position/velocity updates direct-head-only", startup)
         self.assertIn(
-            "explicit feed-forward capped at 25%",
+            "same-source accepted primary center corroborates motion only",
             startup,
         )
+        self.assertIn("no body-mapped physical projection/feed-forward", startup)
         self.assertIn("latest-only 90 Hz", startup)
 
     def test_capture_starvation_surfaces_automatic_head_worker_failure(self) -> None:

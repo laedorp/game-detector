@@ -314,10 +314,16 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         assert sample is not None
         self.assertEqual(sample.point, (321.0, 123.0))
         self.assertEqual(sample.source_timestamp_ns, 100_000_000)
+        self.assertIs(sample.provenance, DirectHeadProvenance.DIRECT)
+        self.assertFalse(sample.body_derived_motion_permitted)
+        self.assertIsNone(sample.body_derived_motion_deadline_ns)
+        self.assertEqual(sample.corroboration_point, (200.0, 400.0))
         # This is intentionally unrelated to the body-box ratio proxy.
         self.assertNotEqual(sample.point, (200.0, 172.0))
 
-    def test_late_direct_result_never_regresses_mapped_output_timestamp(self) -> None:
+    def test_body_frames_and_late_direct_result_never_republish_physical_sample(
+        self,
+    ) -> None:
         self.runtime.accept_body(
             self.player.box,
             aim_box=self.player.box,
@@ -348,12 +354,17 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
                     source_ns=100_000_000,
                     point=(201.0, 151.0),
                 )
-            current = self.runtime.take_latest(now_ns=timestamp_ns + 1_000_000)
-            assert current is not None
-            self.assertEqual(current.source_timestamp_ns, timestamp_ns)
+            self.assertIsNone(
+                self.runtime.take_latest(now_ns=timestamp_ns + 1_000_000)
+            )
+            visible = self.runtime.visible_sample(
+                now_ns=timestamp_ns + 1_000_000
+            )
+            assert visible is not None
+            self.assertEqual(visible.source_timestamp_ns, timestamp_ns)
+            self.assertEqual(visible.direct_source_timestamp_ns, 100_000_000)
 
-        self.assertEqual(current.direct_source_timestamp_ns, 100_000_000)
-        self.assertGreater(current.source_timestamp_ns, first.source_timestamp_ns)
+        self.assertGreater(visible.source_timestamp_ns, first.source_timestamp_ns)
 
     def test_mapped_point_filter_uses_exact_causal_twelve_ms_alpha(self) -> None:
         self.assertEqual(AUTOMATIC_HEAD_MAPPED_FILTER_TIME_CONSTANT_SECONDS, 0.012)
@@ -376,18 +387,16 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
             track_generation=6,
             source_timestamp_ns=112_000_000,
         )
-        filtered = self.runtime.take_latest(now_ns=112_000_000)
+        self.assertIsNone(self.runtime.take_latest(now_ns=112_000_000))
+        filtered = self.runtime.visible_sample(now_ns=112_000_000)
 
         assert filtered is not None
         alpha = 1.0 - math.exp(-1.0)
         self.assertAlmostEqual(filtered.point[0], 200.0 + alpha * 12.0)
         self.assertAlmostEqual(filtered.point[1], 150.0)
         self.assertEqual(filtered.source_timestamp_ns, 112_000_000)
-        self.assertTrue(filtered.body_derived_motion_permitted)
-        self.assertEqual(
-            filtered.body_derived_motion_deadline_ns,
-            165_000_000,
-        )
+        self.assertFalse(filtered.body_derived_motion_permitted)
+        self.assertIsNone(filtered.body_derived_motion_deadline_ns)
         self.assertEqual(filtered.identity_deadline_ns, 300_000_000)
         self.assertIsNone(filtered.corroboration_point)
         self.assertFalse(
@@ -423,7 +432,8 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
                 track_generation=7,
                 source_timestamp_ns=timestamp_ns,
             )
-            last = self.runtime.take_latest(now_ns=timestamp_ns)
+            self.assertIsNone(self.runtime.take_latest(now_ns=timestamp_ns))
+            last = self.runtime.visible_sample(now_ns=timestamp_ns)
             assert last is not None
             radii.append(math.hypot(last.point[0] - 200.0, last.point[1] - 150.0))
 
@@ -450,7 +460,8 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
             track_generation=8,
             source_timestamp_ns=299_000_000,
         )
-        self.assertIsNotNone(self.runtime.take_latest(now_ns=299_000_000))
+        self.assertIsNone(self.runtime.take_latest(now_ns=299_000_000))
+        self.assertIsNotNone(self.runtime.visible_sample(now_ns=299_000_000))
         self.runtime.accept_body(
             self.player.box,
             aim_box=self.player.box,
@@ -484,7 +495,8 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         # Source-100 is stale enough that its exact binding has been pruned.
         # It must be ignored before binding validation, not reset generation 5.
         self.worker.result = _result(source_ns=100_000_000, point=(210.0, 155.0))
-        mapped = self.runtime.take_latest(now_ns=260_000_000)
+        self.assertIsNone(self.runtime.take_latest(now_ns=260_000_000))
+        mapped = self.runtime.visible_sample(now_ns=260_000_000)
 
         assert mapped is not None
         self.assertEqual(mapped.source_timestamp_ns, 260_000_000)
@@ -492,7 +504,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertEqual(self.runtime.identity_generation, 0)
         self.assertTrue(self.runtime.anchor.active)
 
-    def test_body_mapped_anchor_never_uses_body_center_as_corroboration(
+    def test_direct_sample_uses_same_source_body_center_only_as_corroboration(
         self,
     ) -> None:
         previous = self.player.box
@@ -536,8 +548,9 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
 
         assert sample is not None
         self.assertEqual(sample.point, (205.0, 150.0))
-        self.assertIsNone(sample.corroboration_point)
-        self.assertIs(sample.provenance, DirectHeadProvenance.MEASURED_PRIMARY)
+        self.assertEqual(sample.corroboration_point, (210.0, 400.0))
+        self.assertIs(sample.provenance, DirectHeadProvenance.DIRECT)
+        self.assertFalse(sample.body_derived_motion_permitted)
         self.assertFalse(
             self.runtime.consume_motion_corroboration_revocation()
         )
@@ -579,7 +592,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         )
         observed = self.runtime.take_latest(now_ns=102_000_000)
         assert observed is not None
-        self.assertIsNone(observed.corroboration_point)
+        self.assertEqual(observed.corroboration_point, (200.0, 400.0))
 
         # A tracker prediction may retain the bounded direct-head lease but is
         # not an accepted primary measurement and therefore cannot grant FF.
@@ -597,7 +610,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertEqual(bridged.point, observed.point)
         self.assertIsNone(bridged.corroboration_point)
 
-    def test_inflight_exact_head_during_current_prediction_has_no_corroboration(
+    def test_inflight_exact_head_during_prediction_keeps_same_source_corroboration(
         self,
     ) -> None:
         self.runtime.accept_body(
@@ -617,7 +630,12 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
             point=(200.0, 150.0),
         )
 
-        self.assertIsNone(self.runtime.take_latest(now_ns=110_000_000))
+        direct = self.runtime.take_latest(now_ns=110_000_000)
+        assert direct is not None
+        self.assertEqual(direct.point, (200.0, 150.0))
+        self.assertEqual(direct.source_timestamp_ns, 100_000_000)
+        self.assertEqual(direct.corroboration_point, (200.0, 400.0))
+        self.assertIs(direct.provenance, DirectHeadProvenance.DIRECT)
         sample = self.runtime.visible_sample(now_ns=110_000_000)
         assert sample is not None
         self.assertEqual(sample.point, (200.0, 150.0))
@@ -647,7 +665,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         observed = self.runtime.take_latest(now_ns=102_000_000)
         assert observed is not None
         self.assertFalse(observed.bridging)
-        self.assertIsNone(observed.corroboration_point)
+        self.assertEqual(observed.corroboration_point, (200.0, 400.0))
 
         self.runtime.accept_body(
             self.player.box,
@@ -672,7 +690,8 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
             track_generation=2,
             source_timestamp_ns=116_000_000,
         )
-        body_only_reacquired = self.runtime.take_latest(now_ns=118_000_000)
+        self.assertIsNone(self.runtime.take_latest(now_ns=118_000_000))
+        body_only_reacquired = self.runtime.visible_sample(now_ns=118_000_000)
         assert body_only_reacquired is not None
         self.assertFalse(body_only_reacquired.bridging)
         self.assertIsNone(body_only_reacquired.corroboration_point)
@@ -733,7 +752,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
 
         assert sample is not None
         self.assertEqual(sample.point, (1000.0, 260.0))
-        self.assertIsNone(sample.corroboration_point)
+        self.assertEqual(sample.corroboration_point, (1020.0, 500.0))
 
     def test_stale_previous_box_rejects_motion_that_same_frame_box_accepts(
         self,
@@ -770,7 +789,9 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertIsNone(self.runtime.take_latest(now_ns=210_000_000))
         self.assertIsNone(self.runtime.visible_sample(now_ns=210_000_000))
 
-    def test_clustered_head_misses_continue_current_measured_positions(self) -> None:
+    def test_clustered_head_misses_are_display_only_and_never_publish_physical(
+        self,
+    ) -> None:
         self.runtime.accept_body(
             self.player.box,
             corroboration_box=self.player.box,
@@ -805,17 +826,20 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
                     point=None,
                     selected_player_box=translated,
                 )
-            sample = self.runtime.take_latest(now_ns=timestamp_ns + 1_000_000)
+            self.assertIsNone(
+                self.runtime.take_latest(now_ns=timestamp_ns + 1_000_000)
+            )
+            sample = self.runtime.visible_sample(
+                now_ns=timestamp_ns + 1_000_000
+            )
             assert sample is not None
             samples.append(sample)
             self.assertEqual(sample.source_timestamp_ns, timestamp_ns)
             self.assertEqual(sample.direct_source_timestamp_ns, 100_000_000)
             self.assertFalse(sample.bridging)
             self.assertIsNone(sample.corroboration_point)
-            self.assertEqual(
-                sample.body_derived_motion_permitted,
-                timestamp_ns + 1_000_000 - 100_000_000 < 65_000_000,
-            )
+            self.assertFalse(sample.body_derived_motion_permitted)
+            self.assertIsNone(sample.body_derived_motion_deadline_ns)
 
         self.assertGreater(samples[-1].point[0], original.point[0])
         self.assertTrue(
@@ -1003,12 +1027,17 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         )
         sample = self.runtime.take_latest(now_ns=150_000_000)
         assert sample is not None
-        self.assertEqual(sample.point, (1060.0, 260.0))
-        self.assertEqual(sample.source_timestamp_ns, 150_000_000)
+        self.assertEqual(sample.point, (940.0, 260.0))
+        self.assertEqual(sample.source_timestamp_ns, 100_000_000)
         self.assertEqual(sample.direct_source_timestamp_ns, 100_000_000)
+        self.assertEqual(sample.corroboration_point, (900.0, 500.0))
+        visible = self.runtime.visible_sample(now_ns=150_000_000)
+        assert visible is not None
+        self.assertEqual(visible.point, (1060.0, 260.0))
+        self.assertEqual(visible.source_timestamp_ns, 150_000_000)
         self.assertEqual(self.runtime.identity_generation, 0)
 
-    def test_stationary_head_is_not_reprojected_by_oscillating_primary_boxes(
+    def test_body_map_jitter_never_becomes_a_physical_update(
         self,
     ) -> None:
         base = self.player.box
@@ -1025,7 +1054,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         )
         self.assertIsNotNone(self.runtime.take_latest(now_ns=100_000_000))
 
-        points: list[tuple[float, float]] = []
+        display_points: list[tuple[float, float]] = []
         for index, offset in enumerate((4.0, -4.0, 3.5, -3.5, 4.0, -4.0), 1):
             oscillating_box = (
                 base[0] + offset,
@@ -1036,21 +1065,26 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
             self.assertFalse(
                 self.runtime.accept_body(
                     oscillating_box,
-                    aim_box=base,
+                    aim_box=oscillating_box,
                     corroboration_box=oscillating_box,
                     track_generation=3,
                     source_timestamp_ns=100_000_000 + index * 8_000_000,
                 )
             )
-            sample = self.runtime.take_latest(
-                now_ns=100_000_000 + index * 8_000_000
+            now_ns = 100_000_000 + index * 8_000_000
+            self.assertIsNone(self.runtime.take_latest(now_ns=now_ns))
+            visible = self.runtime.visible_sample(
+                now_ns=now_ns
             )
-            assert sample is not None
-            points.append(sample.point)
+            assert visible is not None
+            display_points.append(visible.point)
+            self.assertFalse(visible.body_derived_motion_permitted)
 
-        # The direct head remains exactly fixed, hence far below the 3 px
-        # controller deadband and incapable of producing an orbit command.
-        self.assertEqual(points, [(200.0, 150.0)] * len(points))
+        # Display follows the filtered anchor, proving this loop exercised body
+        # geometry, while take_latest returned no physical controller sample.
+        self.assertTrue(
+            any(point != (200.0, 150.0) for point in display_points)
+        )
 
     def test_nearby_tracker_prediction_retains_bounded_direct_head_lease(self) -> None:
         self.runtime.accept_body(

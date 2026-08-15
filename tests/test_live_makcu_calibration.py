@@ -1127,11 +1127,11 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_projection_fraction,
-            1.0,
+            0.0,
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_feedforward_fraction,
-            0.25,
+            0.0,
         )
         self.assertEqual(numeric.config.position_time_constant_seconds, 0.012)
         self.assertEqual(numeric.config.feedback_deadzone_pixels, 4.0)
@@ -1152,7 +1152,15 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("CPU fallback disabled", output)
         self.assertIn("direct-head confidence >= 0.25", output)
         self.assertIn(
-            "explicit feed-forward capped at 25%",
+            "physical position/velocity updates direct-head-only",
+            output,
+        )
+        self.assertIn(
+            "same-source accepted primary center corroborates motion only",
+            output,
+        )
+        self.assertIn(
+            "no body-mapped physical projection/feed-forward",
             output,
         )
         self.assertIn("position tau/deadzone 12 ms/4 px", output)
@@ -1327,22 +1335,22 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         controller = _FakeMakcuController.instances[0]
         self.assertEqual(controller.corroboration_revocations, 2)
 
-    def test_automatic_mode_publishes_current_anchor_without_resetting_derived_history(self) -> None:
+    def test_automatic_mode_publishes_only_new_direct_worker_sample(self) -> None:
         player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
         _FakeDetector.detections = [player]
         sample = SimpleNamespace(
             point=(915.0, 238.0),
             source_timestamp_ns=123,
-            direct_source_timestamp_ns=100,
+            direct_source_timestamp_ns=123,
             identity_deadline_ns=200_000_100,
             track_generation=1,
-            provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+            provenance=DirectHeadProvenance.DIRECT,
             confidence=0.88,
-            evidence="filtered direct-head anchor",
+            evidence="direct test head box",
             bridging=False,
-            body_derived_motion_permitted=True,
-            body_derived_motion_deadline_ns=65_000_100,
-            corroboration_point=None,
+            body_derived_motion_permitted=False,
+            body_derived_motion_deadline_ns=None,
+            corroboration_point=(900.0, 450.0),
         )
         head_runtime = mock.Mock()
         head_runtime.provider = "MIGraphXExecutionProvider"
@@ -1390,23 +1398,21 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             controller.normal_update_keywords[1]["velocity_point"],
             sample.point,
         )
-        self.assertTrue(
-            controller.normal_update_keywords[1][
-                "body_derived_motion_permitted"
-            ]
+        self.assertNotIn(
+            "body_derived_motion_permitted",
+            controller.normal_update_keywords[1],
         )
-        self.assertEqual(
-            controller.normal_update_keywords[1][
-                "body_derived_motion_deadline_ns"
-            ],
-            sample.body_derived_motion_deadline_ns,
+        self.assertNotIn(
+            "body_derived_motion_deadline_ns",
+            controller.normal_update_keywords[1],
         )
         self.assertEqual(
             controller.normal_update_keywords[1]["identity_deadline_ns"],
             sample.identity_deadline_ns,
         )
-        self.assertIsNone(
-            controller.normal_update_keywords[1]["motion_corroboration_point"]
+        self.assertEqual(
+            controller.normal_update_keywords[1]["motion_corroboration_point"],
+            sample.corroboration_point,
         )
         self.assertEqual(controller.corroboration_revocations, 0)
         self.assertEqual(

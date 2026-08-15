@@ -629,13 +629,12 @@ class _AutomaticHeadRuntime:
         return bool(accepted)
 
     def take_latest(self, *, now_ns: int) -> _AutomaticHeadSample | None:
-        """Ingest direct evidence, then publish only current measured geometry.
+        """Ingest direct evidence and return only a new direct physical sample.
 
-        A completed worker result may be older than a body-derived position
-        already sent to the controller.  It therefore only updates the
-        normalized anchor.  The returned sample, when any, is always mapped
-        through this frame's current accepted primary geometry and carries its
-        current source timestamp.
+        The normalized anchor is still refreshed and mapped through current
+        primary geometry for display and identity validation.  That mapped
+        coordinate is never returned from this method and therefore cannot
+        become a MAKCU position, velocity, projection, or feed-forward input.
         """
 
         current_ns = int(now_ns)
@@ -651,6 +650,7 @@ class _AutomaticHeadRuntime:
                 # result is ignored; it must not revoke a newer live anchor
                 # merely because its exact-source binding has aged out.
                 result = None
+        physical_sample: _AutomaticHeadSample | None = None
         if result is not None:
             current_box = self._current_player_box
             current_body_timestamp_ns = self._current_player_timestamp_ns
@@ -713,10 +713,51 @@ class _AutomaticHeadRuntime:
                     ):
                         self._reset_mapped_filter()
                     self._anchor_evidence = observation.evidence
+                    source_box = source_binding[0]
+                    physical_sample = _AutomaticHeadSample(
+                        # Only the independently localized source-frame point
+                        # is eligible for physical control.  The filtered
+                        # normalized anchor below remains display-only.
+                        point=observation.point,
+                        source_timestamp_ns=result.source_timestamp_ns,
+                        direct_source_timestamp_ns=result.source_timestamp_ns,
+                        identity_deadline_ns=observed.identity_deadline_ns,
+                        track_generation=source_track_generation,
+                        provenance=DirectHeadProvenance.DIRECT,
+                        confidence=observation.confidence,
+                        evidence=observation.evidence,
+                        bridging=False,
+                        body_derived_motion_permitted=False,
+                        body_derived_motion_deadline_ns=None,
+                        # The exact same-source accepted primary center is an
+                        # independent motion-corroboration channel only.  It may
+                        # gate bounded prediction but can never move the point.
+                        corroboration_point=(
+                            (source_box[0] + source_box[2]) * 0.5,
+                            (source_box[1] + source_box[3]) * 0.5,
+                        ),
+                    )
 
-        return self._map_current_anchor(now_ns=current_ns)
+        generation_before_display = self.identity_generation
+        self._map_current_anchor(now_ns=current_ns)
+        if (
+            physical_sample is None
+            or not self.body_valid
+            or self.identity_generation != generation_before_display
+        ):
+            return None
+        previous_timestamp_ns = self._last_physical_source_timestamp_ns
+        if (
+            previous_timestamp_ns is not None
+            and physical_sample.source_timestamp_ns <= previous_timestamp_ns
+        ):
+            return None
+        self._last_physical_source_timestamp_ns = physical_sample.source_timestamp_ns
+        return physical_sample
 
-    def _map_current_anchor(self, *, now_ns: int) -> _AutomaticHeadSample | None:
+    def _map_current_anchor(self, *, now_ns: int) -> None:
+        """Refresh the display-only mapped anchor and its identity boundary."""
+
         current_box = self._current_player_box
         aim_box = self._current_aim_box
         source_timestamp_ns = self._current_player_timestamp_ns
@@ -729,7 +770,7 @@ class _AutomaticHeadRuntime:
         ):
             self._visible_sample = None
             self._reset_mapped_filter()
-            return None
+            return
 
         deadline_ns = self.anchor.identity_deadline_ns
         if deadline_ns is not None and max(now_ns, source_timestamp_ns) >= deadline_ns:
@@ -737,7 +778,7 @@ class _AutomaticHeadRuntime:
             # immediate controller loss instead of extending the last mapped
             # position by the controller's separate 65 ms input lease.
             self.advance_identity()
-            return None
+            return
         anchored = self.anchor.map_primary(
             aim_box,
             track_generation=track_generation,
@@ -747,10 +788,10 @@ class _AutomaticHeadRuntime:
         if anchored is None:
             self._visible_sample = None
             self._reset_mapped_filter()
-            return None
+            return
         if not self._head_point_belongs_to_player(anchored.point, current_box):
             self.advance_identity()
-            return None
+            return
         if self._current_body_observed:
             filtered_point = self._filter_mapped_point(anchored)
             if not self._head_point_belongs_to_player(filtered_point, current_box):
@@ -767,7 +808,6 @@ class _AutomaticHeadRuntime:
         sample = self._runtime_sample(
             anchored,
             point=filtered_point,
-            now_ns=now_ns,
         )
         self._visible_sample = sample
         self._visible_player_box = current_box
@@ -776,20 +816,11 @@ class _AutomaticHeadRuntime:
         if not self._current_body_observed:
             # Predicted primary geometry is display-only. It must revoke every
             # predictive-motion grant immediately, while a measured
-            # BODY_DERIVED sample below carries its own explicit, short-lived
-            # provenance bit into the controller. Broadly revoking here on
-            # every measured frame would reset the derived direction history
-            # before it could ever earn coherent source-age projection.
+            # anchor remains a display-only bridge. Broadly revoking here on
+            # every measured frame would reset independently corroborated
+            # direct-head direction history between worker results.
             self._motion_corroboration_revocation_pending = True
-            return None
-        previous_timestamp_ns = self._last_physical_source_timestamp_ns
-        if (
-            previous_timestamp_ns is not None
-            and source_timestamp_ns <= previous_timestamp_ns
-        ):
-            return None
-        self._last_physical_source_timestamp_ns = source_timestamp_ns
-        return sample
+        return
 
     def _filter_mapped_point(
         self,
@@ -834,24 +865,10 @@ class _AutomaticHeadRuntime:
         sample: DirectHeadAnchorSample,
         *,
         point: tuple[float, float] | None = None,
-        now_ns: int | None = None,
     ) -> _AutomaticHeadSample:
+        """Build a display-only sample from mapped primary geometry."""
+
         bridging = sample.provenance is DirectHeadProvenance.PREDICTED_PRIMARY
-        permission_timestamp_ns = (
-            sample.source_timestamp_ns
-            if now_ns is None
-            else max(int(now_ns), sample.source_timestamp_ns)
-        )
-        direct_age_ns = (
-            permission_timestamp_ns - sample.direct_source_timestamp_ns
-        )
-        body_derived_motion_permitted = bool(
-            sample.provenance is DirectHeadProvenance.MEASURED_PRIMARY
-            and 0 <= direct_age_ns < self.stale_after_ns
-        )
-        body_derived_motion_deadline_ns = (
-            sample.direct_source_timestamp_ns + self.stale_after_ns
-        )
         return _AutomaticHeadSample(
             point=sample.point if point is None else point,
             source_timestamp_ns=sample.source_timestamp_ns,
@@ -862,12 +879,8 @@ class _AutomaticHeadRuntime:
             confidence=sample.confidence,
             evidence=self._anchor_evidence,
             bridging=bridging,
-            body_derived_motion_permitted=body_derived_motion_permitted,
-            body_derived_motion_deadline_ns=(
-                body_derived_motion_deadline_ns
-                if body_derived_motion_permitted
-                else None
-            ),
+            body_derived_motion_permitted=False,
+            body_derived_motion_deadline_ns=None,
             corroboration_point=None,
         )
 
@@ -1120,13 +1133,15 @@ def _automatic_plant_aware_controller(*, max_step: int):
             maximum_observation_interval_seconds=0.040,
             velocity_median_window=5,
             feedback_deadzone_pixels=4.0,
-            # The body-mapped channel is not independent corroboration. Its
-            # explicit provenance is routed separately by the live adapter;
-            # omitting that permission remains an exact-zero predictive path.
+            # Automatic physical samples are direct-head-only. Keep both
+            # body-derived caps at exact zero as defense in depth so a future
+            # caller cannot accidentally turn the display anchor into motion.
+            # Same-source primary centers use the separate independent
+            # corroboration path and retain its existing bounded behavior.
             maximum_velocity_feedforward_fraction=0.95,
             require_motion_corroboration_for_feedforward=True,
-            maximum_body_derived_projection_fraction=1.0,
-            maximum_body_derived_feedforward_fraction=0.25,
+            maximum_body_derived_projection_fraction=0.0,
+            maximum_body_derived_feedforward_fraction=0.0,
         ),
     )
 
@@ -2976,14 +2991,14 @@ def run(config: AppConfig) -> int:
                 f">= {DEFAULT_HEAD_CONFIDENCE:g} | "
                 f"latest-only {AUTOMATIC_HEAD_LOCALIZATION_HZ:g} Hz | "
                 f"direct results accepted within {AUTOMATIC_HEAD_STALE_AFTER_SECONDS * 1000.0:.0f} ms | "
-                "normalized direct-head anchor carried by current measured "
-                "primary boxes for at most "
+                "physical position/velocity updates direct-head-only | "
+                "same-source accepted primary center corroborates motion only | "
+                "normalized direct-head anchor carried by primary boxes for "
+                "display/identity only, at most "
                 f"{DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS * 1000.0:.0f} ms | "
                 "raw primary box remains identity/safety authority | "
-                "body-carried full projection permitted only within the "
-                f"{AUTOMATIC_HEAD_STALE_AFTER_SECONDS * 1000.0:.0f} ms direct lease; "
-                "explicit feed-forward capped at 25% | "
-                "mapped-point LP "
+                "no body-mapped physical projection/feed-forward | "
+                "display mapped-point LP "
                 f"{AUTOMATIC_HEAD_MAPPED_FILTER_TIME_CONSTANT_SECONDS * 1000.0:.0f} ms | "
                 "position tau/deadzone "
                 f"{automatic_control.position_time_constant_seconds * 1000.0:.0f} ms/"
@@ -3679,12 +3694,10 @@ def run(config: AppConfig) -> int:
                                     source_timestamp_ns=packet.read_started_ns,
                                 )
                             if new_head_sample is not None:
-                                # Async direct evidence has already been folded
-                                # into the identity-bound anchor. The point and
-                                # timestamp here both belong to this current
-                                # accepted primary frame, never the older worker
-                                # result. Body-derived motion is intentionally
-                                # not independent corroboration.
+                                # Only a newly accepted direct worker result is
+                                # eligible here. The display anchor is refreshed
+                                # separately and can never publish a physical
+                                # position, velocity, or body-derived grant.
                                 aim_controller.update(
                                     selected_aim_target,
                                     packet.image.shape,
@@ -3695,12 +3708,6 @@ def run(config: AppConfig) -> int:
                                     measurement_observed=True,
                                     aim_point=new_head_sample.point,
                                     velocity_point=new_head_sample.point,
-                                    body_derived_motion_permitted=(
-                                        new_head_sample.body_derived_motion_permitted
-                                    ),
-                                    body_derived_motion_deadline_ns=(
-                                        new_head_sample.body_derived_motion_deadline_ns
-                                    ),
                                     identity_deadline_ns=(
                                         new_head_sample.identity_deadline_ns
                                     ),
