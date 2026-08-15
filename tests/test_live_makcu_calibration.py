@@ -546,6 +546,7 @@ class _FakeMakcuController:
         self.started = False
         self.stopped = False
         self.normal_updates = 0
+        self.normal_update_keywords: list[dict[str, object]] = []
         self.__class__.instances.append(self)
 
     @property
@@ -565,6 +566,7 @@ class _FakeMakcuController:
 
     def update(self, *_arguments, **_keywords) -> None:
         self.normal_updates += 1
+        self.normal_update_keywords.append(dict(_keywords))
         if self.reject_updates:
             raise AssertionError("normal MAKCU update ran during calibration")
 
@@ -897,6 +899,10 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(controller.expected_identity_token, "c" * 64)
         self.assertEqual(controller.config.vertical_rate_ratio, 0.5)
         self.assertEqual(controller.normal_updates, 1)
+        self.assertNotIn(
+            "velocity_target",
+            controller.normal_update_keywords[0],
+        )
         self.assertTrue(controller.stopped)
         self.assertEqual(len(tracker_options), 1)
         self.assertEqual(tracker_options[0]["lost_grace_frames"], 1)
@@ -927,6 +933,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(self.base_config.aim_calibration_context, "hip-fire")
         self.assertIn("control calibrated", output)
+        self.assertNotIn("velocity source raw accepted", output)
         self.assertIn(f"profile {profile.profile_sha256[:12]}", output)
         self.assertIn("context ads-scope", output)
         self.assertNotIn("automatic plant-aware", output)
@@ -1025,13 +1032,17 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIsNone(controller.expected_identity_token)
         self.assertEqual(controller.config.vertical_rate_ratio, 1.0)
         self.assertEqual(controller.normal_updates, 1)
+        self.assertIn(
+            "velocity_target",
+            controller.normal_update_keywords[0],
+        )
         self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.125)
         self.assertEqual(numeric.plant.gain_y_pixels_per_count, 0.120)
         self.assertEqual(numeric.plant.delay_seconds, 0.008)
         self.assertEqual(numeric.config.velocity_median_window, 5)
         self.assertEqual(
             numeric.config.velocity_filter_time_constant_seconds,
-            0.040,
+            0.018,
         )
         self.assertEqual(
             numeric.config.maximum_target_acceleration_pixels_per_second_squared,
@@ -1053,8 +1064,9 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("control automatic plant-aware", output)
         self.assertIn("gains X/Y 0.125/0.12 px/count", output)
         self.assertIn("delay 8.00 ms", output)
+        self.assertIn("velocity source raw accepted", output)
         self.assertIn(
-            "velocity damping median 5 / 40 ms / 20000 px/s^2",
+            "velocity damping median 5 / 18 ms / 20000 px/s^2",
             output,
         )
         self.assertIn("caps X/Y 12000/12000 counts/s", output)

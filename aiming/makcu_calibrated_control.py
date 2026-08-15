@@ -154,11 +154,22 @@ class CalibratedControlConfig:
 
 @dataclass(frozen=True, slots=True)
 class ScreenErrorObservation:
-    """One observed X/Y error in the calibration profile's pixel space."""
+    """One observed X/Y error in the calibration profile's pixel space.
+
+    ``error_*`` is the position-control observation and may therefore be a
+    tracker-smoothed point.  The optional ``velocity_error_*`` pair supplies
+    the accepted raw point from that same target and source timestamp.  A raw
+    velocity channel keeps the exact command ledger in the same measurement
+    domain as the plant calibration instead of differentiating a downstream
+    smoothing filter.  Omitting both optional fields preserves the historical
+    single-channel estimator exactly.
+    """
 
     timestamp_ns: int
     error_x_pixels: float
     error_y_pixels: float
+    velocity_error_x_pixels: float | None = None
+    velocity_error_y_pixels: float | None = None
 
     def __post_init__(self) -> None:
         _timestamp(self.timestamp_ns, "observation timestamp")
@@ -172,6 +183,31 @@ class ScreenErrorObservation:
             "error_y_pixels",
             _finite(self.error_y_pixels, "observation Y error"),
         )
+        paired = (
+            self.velocity_error_x_pixels is not None,
+            self.velocity_error_y_pixels is not None,
+        )
+        if paired[0] != paired[1]:
+            raise ValueError(
+                "velocity X/Y errors must either both be supplied or both be omitted"
+            )
+        if paired[0]:
+            object.__setattr__(
+                self,
+                "velocity_error_x_pixels",
+                _finite(
+                    self.velocity_error_x_pixels,
+                    "observation velocity X error",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "velocity_error_y_pixels",
+                _finite(
+                    self.velocity_error_y_pixels,
+                    "observation velocity Y error",
+                ),
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +282,14 @@ class MakcuCalibratedController:
         window = self.config.velocity_median_window
         self._raw_velocity_x: deque[float] = deque(maxlen=window)
         self._raw_velocity_y: deque[float] = deque(maxlen=window)
+        # The paired raw channel estimates one 2-D trajectory over shared
+        # timestamps. Keep two samples even when the legacy median window is
+        # one so an adjacent secant remains defined.
+        self._paired_velocity_history: deque[tuple[int, float, float]] = deque(
+            maxlen=max(2, window)
+        )
+        self._paired_position_x = 0.0
+        self._paired_position_y = 0.0
 
     @property
     def ready(self) -> bool:
@@ -436,6 +480,9 @@ class MakcuCalibratedController:
         self._velocity_y = 0.0
         self._raw_velocity_x.clear()
         self._raw_velocity_y.clear()
+        self._paired_velocity_history.clear()
+        self._paired_position_x = 0.0
+        self._paired_position_y = 0.0
 
     def _zero(self, now_ns: int, reason: str) -> CalibratedControlOutput:
         return CalibratedControlOutput(
@@ -502,18 +549,51 @@ class MakcuCalibratedController:
             self._seed_observation(observation)
             return "observation-gap"
 
+        paired_velocity = observation.velocity_error_x_pixels is not None
+        previous_paired_velocity = previous.velocity_error_x_pixels is not None
+        if paired_velocity != previous_paired_velocity:
+            # Never splice a differentiated raw point onto a smoothed-point
+            # history (or vice versa). The next continuous pair can confirm a
+            # fresh velocity estimate without manufacturing a jump here.
+            self._seed_observation(observation)
+            return "velocity-channel-change"
+
         count_x, count_y = self._counts_landing_between(
             previous.timestamp_ns,
             observation.timestamp_ns,
         )
+        velocity_error_x = (
+            observation.velocity_error_x_pixels
+            if paired_velocity
+            else observation.error_x_pixels
+        )
+        velocity_error_y = (
+            observation.velocity_error_y_pixels
+            if paired_velocity
+            else observation.error_y_pixels
+        )
+        previous_velocity_error_x = (
+            previous.velocity_error_x_pixels
+            if previous_paired_velocity
+            else previous.error_x_pixels
+        )
+        previous_velocity_error_y = (
+            previous.velocity_error_y_pixels
+            if previous_paired_velocity
+            else previous.error_y_pixels
+        )
+        assert velocity_error_x is not None
+        assert velocity_error_y is not None
+        assert previous_velocity_error_x is not None
+        assert previous_velocity_error_y is not None
         target_delta_x = (
-            observation.error_x_pixels
-            - previous.error_x_pixels
+            velocity_error_x
+            - previous_velocity_error_x
             + self.plant.gain_x_pixels_per_count * count_x
         )
         target_delta_y = (
-            observation.error_y_pixels
-            - previous.error_y_pixels
+            velocity_error_y
+            - previous_velocity_error_y
             + self.plant.gain_y_pixels_per_count * count_y
         )
         jump = self.config.maximum_error_jump_pixels
@@ -522,12 +602,26 @@ class MakcuCalibratedController:
             return "error-jump"
 
         speed_limit = self.config.maximum_target_speed_pixels_per_second
-        raw_x = min(max(target_delta_x / elapsed, -speed_limit), speed_limit)
-        raw_y = min(max(target_delta_y / elapsed, -speed_limit), speed_limit)
-        self._raw_velocity_x.append(raw_x)
-        self._raw_velocity_y.append(raw_y)
-        robust_x = float(statistics.median(self._raw_velocity_x))
-        robust_y = float(statistics.median(self._raw_velocity_y))
+        if paired_velocity:
+            self._paired_position_x += target_delta_x
+            self._paired_position_y += target_delta_y
+            self._paired_velocity_history.append(
+                (
+                    observation.timestamp_ns,
+                    self._paired_position_x,
+                    self._paired_position_y,
+                )
+            )
+            robust_x, robust_y = self._paired_velocity_regression(speed_limit)
+        else:
+            # Preserve the original independent adjacent-frame estimator for
+            # every existing caller which has no separate raw point channel.
+            raw_x = min(max(target_delta_x / elapsed, -speed_limit), speed_limit)
+            raw_y = min(max(target_delta_y / elapsed, -speed_limit), speed_limit)
+            self._raw_velocity_x.append(raw_x)
+            self._raw_velocity_y.append(raw_y)
+            robust_x = float(statistics.median(self._raw_velocity_x))
+            robust_y = float(statistics.median(self._raw_velocity_y))
         alpha = 1.0 - math.exp(
             -elapsed / self.config.velocity_filter_time_constant_seconds
         )
@@ -557,7 +651,85 @@ class MakcuCalibratedController:
     def _seed_observation(self, observation: ScreenErrorObservation) -> None:
         self._reset_tracking()
         self._last_observation = observation
+        if observation.velocity_error_x_pixels is not None:
+            self._paired_velocity_history.append(
+                (observation.timestamp_ns, 0.0, 0.0)
+            )
         self._prune_commands(observation.timestamp_ns)
+
+    def _paired_velocity_regression(
+        self,
+        speed_limit: float,
+    ) -> tuple[float, float]:
+        """Fit one coherent X/Y velocity to shared raw-point timestamps.
+
+        Ordinary least squares over reconstructed target displacement rejects
+        adjacent-frame derivative noise without selecting X from one frame and
+        Y from another.  A shared two-dimensional explained-variance gate
+        suppresses fits dominated by curved/rotating point noise while giving
+        a sufficiently linear trajectory its full slope.  A steady physical
+        motion therefore keeps its feed-forward even when position error is
+        zero.
+        """
+
+        history = tuple(self._paired_velocity_history)
+        if len(history) < 2:
+            return 0.0, 0.0
+        origin_ns = history[0][0]
+        times = [
+            (timestamp_ns - origin_ns) / _NS_PER_SECOND
+            for timestamp_ns, _x, _y in history
+        ]
+        mean_time = sum(times) / len(times)
+        mean_x = sum(item[1] for item in history) / len(history)
+        mean_y = sum(item[2] for item in history) / len(history)
+        denominator = sum((value - mean_time) ** 2 for value in times)
+        if denominator <= 0.0:
+            return 0.0, 0.0
+        slope_x = sum(
+            (time_value - mean_time) * (item[1] - mean_x)
+            for time_value, item in zip(times, history)
+        ) / denominator
+        slope_y = sum(
+            (time_value - mean_time) * (item[2] - mean_y)
+            for time_value, item in zip(times, history)
+        ) / denominator
+
+        total_variation = sum(
+            (item[1] - mean_x) ** 2 + (item[2] - mean_y) ** 2
+            for item in history
+        )
+        if total_variation <= 1e-12:
+            return 0.0, 0.0
+        residual_variation = sum(
+            (
+                item[1]
+                - (mean_x + slope_x * (time_value - mean_time))
+            )
+            ** 2
+            + (
+                item[2]
+                - (mean_y + slope_y * (time_value - mean_time))
+            )
+            ** 2
+            for time_value, item in zip(times, history)
+        )
+        explained_fraction = min(
+            max(1.0 - residual_variation / total_variation, 0.0),
+            1.0,
+        )
+        # R² itself is not a suitable gain: multiplying a real noisy pursuit
+        # by (for example) 0.75 creates avoidable lag.  Below 0.15 the samples
+        # do not establish one velocity vector; above 0.50 the slope is kept
+        # whole.  The bounded transition prevents a hard chatter threshold.
+        coherence = min(max((explained_fraction - 0.15) / 0.35, 0.0), 1.0)
+        slope_x *= coherence
+        slope_y *= coherence
+
+        return (
+            min(max(slope_x, -speed_limit), speed_limit),
+            min(max(slope_y, -speed_limit), speed_limit),
+        )
 
     @staticmethod
     def _filtered_velocity(

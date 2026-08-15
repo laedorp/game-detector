@@ -687,6 +687,10 @@ class MakcuAimingTests(unittest.TestCase):
             self.assertEqual(len(writes_after_confirmation), 1)
             self.assertTrue(controller.calibrated_control_output.valid)
             self.assertTrue(calibrated.ready)
+            observation = calibrated._last_observation
+            assert observation is not None
+            self.assertIsNone(observation.velocity_error_x_pixels)
+            self.assertIsNone(observation.velocity_error_y_pixels)
             telemetry = controller.telemetry_snapshot()
             self.assertEqual(telemetry.control_samples, 1)
             self.assertGreater(telemetry.control_error_abs_x, 0.0)
@@ -725,6 +729,67 @@ class MakcuAimingTests(unittest.TestCase):
             self.assertEqual(len(self._movement_writes(active)), movement_count)
             self.assertEqual(controller._fractional_x, 0.0)
             self.assertEqual(controller._fractional_y, 0.0)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibrated_control_keeps_raw_velocity_point_separate_from_position(
+        self,
+    ) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(velocity_median_window=1),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(
+                head_ratio=0.0,
+                invert_x=True,
+                invert_y=True,
+                output_hz=1000,
+            ),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        smoothed = Detection(
+            0,
+            "player",
+            0.95,
+            (950.0, 400.0, 970.0, 500.0),
+        )
+        raw = Detection(
+            0,
+            "player",
+            0.95,
+            (990.0, 420.0, 1010.0, 520.0),
+        )
+        measurement_ns = 51_000_000_000
+        try:
+            active.responses.extend(bytes((0b00010,)))
+            controller.update(
+                smoothed,
+                (1080, 1920, 3),
+                measurement_ns=measurement_ns,
+                velocity_target=raw,
+            )
+            controller._output_tick(0.001, now_ns=measurement_ns)
+
+            observation = calibrated._last_observation
+            assert observation is not None
+            # Position/safety retains the tracker-smoothed target while only
+            # the velocity estimator receives the exact accepted point.
+            self.assertEqual(observation.error_x_pixels, 0.0)
+            self.assertEqual(observation.error_y_pixels, 140.0)
+            self.assertEqual(observation.velocity_error_x_pixels, -40.0)
+            self.assertEqual(observation.velocity_error_y_pixels, 120.0)
+            self.assertIs(controller._latest_target, smoothed)
         finally:
             controller._output_thread = None
             controller.stop()
@@ -3651,6 +3716,16 @@ class MakcuAimingTests(unittest.TestCase):
                 target,
                 (1080, 1920, 3),
                 measurement_observed=False,
+            )
+        with self.assertRaisesRegex(
+            ValueError,
+            "velocity target requires an observed position target",
+        ):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_observed=False,
+                velocity_target=target,
             )
         self.assertIsNone(controller._latest_target)
         self.assertFalse(controller._measurement_target_present)

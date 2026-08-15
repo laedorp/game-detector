@@ -1010,12 +1010,14 @@ class AimingControllerTests(unittest.TestCase):
 
         tracker.update((high,), (1080, 1920, 3), measurement_ns=base_ns)
         self.assertFalse(tracker.output_is_prediction)
+        self.assertIs(tracker.accepted_measurement, high)
         tracker.update(
             (),
             (1080, 1920, 3),
             measurement_ns=base_ns + 8_000_000,
         )
         self.assertTrue(tracker.output_is_prediction)
+        self.assertIsNone(tracker.accepted_measurement)
         tracker.update(
             (),
             (1080, 1920, 3),
@@ -1023,8 +1025,32 @@ class AimingControllerTests(unittest.TestCase):
             continuation_detections=(continued,),
         )
         self.assertFalse(tracker.output_is_prediction)
+        self.assertIs(tracker.accepted_measurement, continued)
         tracker.reset()
         self.assertFalse(tracker.output_is_prediction)
+        self.assertIsNone(tracker.accepted_measurement)
+
+    def test_accepted_measurement_remains_raw_while_output_is_smoothed(self) -> None:
+        tracker = TargetTracker(label="person")
+        first = Detection(0, "person", 0.90, (700, 250, 900, 850))
+        moved = Detection(0, "person", 0.85, (740, 270, 940, 870))
+        base_ns = 5_750_000_000
+
+        tracker.update(
+            (first,),
+            (1080, 1920, 3),
+            measurement_ns=base_ns,
+        )
+        tracked = tracker.update(
+            (moved,),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 8_000_000,
+        )
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertIs(tracker.accepted_measurement, moved)
+        self.assertNotEqual(tracked.xyxy, moved.xyxy)
 
     def test_prediction_grace_does_not_replace_an_incompatible_detection(self) -> None:
         tracker = TargetTracker(label="person", lost_grace_frames=3)

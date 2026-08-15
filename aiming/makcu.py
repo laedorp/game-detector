@@ -779,6 +779,7 @@ class MakcuAimingController:
         self._latest_measurement_ns = 0
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
+        self._latest_velocity_error: tuple[float, float] | None = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -943,6 +944,7 @@ class MakcuAimingController:
         self._latest_measurement_ns = 0
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
+        self._latest_velocity_error = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -1521,6 +1523,7 @@ class MakcuAimingController:
         self._latest_measurement_ns = 0
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
+        self._latest_velocity_error = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -1803,6 +1806,7 @@ class MakcuAimingController:
         *,
         measurement_ns: int | None = None,
         measurement_observed: bool = True,
+        velocity_target: Detection | None = None,
     ) -> None:
         if self._serial is None:
             raise MakcuError("MAKCU serial connection is not open")
@@ -1817,10 +1821,21 @@ class MakcuAimingController:
             raise TypeError("measurement_observed must be bool")
         if not measurement_observed and target is None:
             raise ValueError("an unobserved measurement requires a predicted target")
+        if velocity_target is not None and (
+            not measurement_observed or target is None
+        ):
+            raise ValueError(
+                "a velocity target requires an observed position target"
+            )
         source_ns = published_ns if measurement_ns is None else measurement_ns
         if source_ns < 0:
             raise ValueError("measurement_ns cannot be negative")
         error_x, error_y = _target_error_pixels(target, frame_shape, self.config)
+        velocity_error = (
+            _target_error_pixels(velocity_target, frame_shape, self.config)
+            if velocity_target is not None
+            else None
+        )
         with self._state_lock:
             if self._calibration_token is not None:
                 raise MakcuError(
@@ -1890,6 +1905,7 @@ class MakcuAimingController:
             self._latest_update_ns = published_ns
             self._latest_source_ns = source_ns
             self._latest_measurement_observed = measurement_observed
+            self._latest_velocity_error = velocity_error
             if measurement_observed:
                 self._latest_measurement_ns = source_ns
                 self._measurement_target_present = target is not None
@@ -2049,6 +2065,7 @@ class MakcuAimingController:
         frame_shape: tuple[int, int, int],
         active: bool,
         measurement_observed: bool,
+        velocity_error: tuple[float, float] | None,
         source_ns: int,
         sample_id: int,
         generation: int,
@@ -2075,6 +2092,16 @@ class MakcuAimingController:
                         source_ns,
                         error_x,
                         error_y,
+                        velocity_error_x_pixels=(
+                            velocity_error[0]
+                            if velocity_error is not None
+                            else None
+                        ),
+                        velocity_error_y_pixels=(
+                            velocity_error[1]
+                            if velocity_error is not None
+                            else None
+                        ),
                     )
                 elif measurement_observed:
                     # This is explicit real detector/tracker loss. A synthetic
@@ -2294,6 +2321,7 @@ class MakcuAimingController:
             measurement_ns = self._latest_measurement_ns
             source_ns = self._latest_source_ns
             measurement_observed = self._latest_measurement_observed
+            velocity_error = self._latest_velocity_error
             velocity_x = self._latest_velocity_x
             velocity_y = self._latest_velocity_y
             sample_id = self._latest_sample_id
@@ -2328,6 +2356,7 @@ class MakcuAimingController:
                 frame_shape=frame_shape,
                 active=active,
                 measurement_observed=measurement_observed,
+                velocity_error=velocity_error,
                 source_ns=source_ns,
                 sample_id=sample_id,
                 generation=generation,
@@ -2757,6 +2786,7 @@ class MakcuAimingController:
         self._latest_measurement_ns = 0
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
+        self._latest_velocity_error = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0

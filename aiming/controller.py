@@ -716,6 +716,7 @@ class TargetTracker:
         self._telemetry_residual_abs_y = 0.0
         self._telemetry_output_present = False
         self._output_is_prediction = False
+        self._accepted_measurement: Detection | None = None
 
     def reset(self) -> None:
         self._reset_tracking_state()
@@ -737,12 +738,26 @@ class TargetTracker:
         self._misses = 0
         self._frame_dimensions = None
         self._output_is_prediction = False
+        self._accepted_measurement = None
 
     @property
     def output_is_prediction(self) -> bool:
         """Whether the most recent output was synthesized through loss grace."""
 
         return self._output_is_prediction
+
+    @property
+    def accepted_measurement(self) -> Detection | None:
+        """Return this update's exact accepted detector measurement, if any.
+
+        The ordinary :meth:`update` result remains the smoothed/predicted
+        position used for selection, safety, and preview. This separate raw
+        value is present only when the current sample physically measured the
+        established target; prediction, loss, pending reacquisition, and reset
+        paths all expose ``None``.
+        """
+
+        return self._accepted_measurement
 
     def telemetry_snapshot(self) -> TargetTrackerTelemetrySnapshot:
         """Return aggregate tracker diagnostics without changing tracker state."""
@@ -775,6 +790,7 @@ class TargetTracker:
     ) -> Detection | None:
         """Record one already-computed result without affecting selection."""
 
+        self._accepted_measurement = measurement
         if count_update:
             self._telemetry_updates += 1
             self._telemetry_candidate_samples += int(candidate is not None)

@@ -89,7 +89,7 @@ def _automatic_plant_aware_controller(*, max_step: int):
             # per second.  The automatic (uncalibrated) path therefore uses a
             # wider robust window and slower acceleration envelope.  Explicit
             # calibration profiles keep the numeric core defaults above.
-            velocity_filter_time_constant_seconds=0.040,
+            velocity_filter_time_constant_seconds=0.018,
             maximum_target_acceleration_pixels_per_second_squared=20_000.0,
             maximum_rate_x_counts_per_second=maximum_rate,
             maximum_rate_y_counts_per_second=maximum_rate,
@@ -1674,6 +1674,7 @@ def run(config: AppConfig) -> int:
                 f"{AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT:g}/"
                 f"{AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT:g} px/count | "
                 f"delay {AUTOMATIC_MAKCU_DELAY_SECONDS * 1000.0:.2f} ms | "
+                "velocity source raw accepted | "
                 "velocity damping median "
                 f"{automatic_control.velocity_median_window} / "
                 f"{automatic_control.velocity_filter_time_constant_seconds * 1000.0:.0f} "
@@ -2184,6 +2185,17 @@ def run(config: AppConfig) -> int:
                                 "measurement_observed": not (
                                     target_tracker is not None
                                     and target_tracker.output_is_prediction
+                                ),
+                                **(
+                                    {
+                                        "velocity_target": (
+                                            target_tracker.accepted_measurement
+                                            if target_tracker is not None
+                                            else None
+                                        )
+                                    }
+                                    if automatic_makcu_requested
+                                    else {}
                                 ),
                             }
                             if isinstance(aim_controller, MakcuAimingController)

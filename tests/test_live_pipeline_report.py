@@ -453,7 +453,26 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         from aiming.controller import TargetTracker as RealTargetTracker
 
         report_path = self.root / "makcu-vertical-cap.json"
-        source = _FakeSource()
+
+        class TimestampedSource(_FakeSource):
+            def __init__(self) -> None:
+                super().__init__()
+                self.base_ns = perf_counter_ns() - 20_000_000
+
+            def read(self, timeout: float | None = None):
+                self.read_calls += 1
+                self.read_timeouts.append(timeout)
+                started_ns = self.base_ns + (self.read_calls - 1) * 8_000_000
+                return FramePacket(
+                    image=np.zeros(self.shape, dtype=np.uint8),
+                    sequence=self.read_calls - 1,
+                    read_started_ns=started_ns,
+                    read_completed_ns=started_ns + 100_000,
+                )
+
+        source = TimestampedSource()
+        raw_target = Detection(0, "player", 0.90, (20, 2, 28, 22))
+        _FakeDetector.detection_batches = [[raw_target], []]
         tracker_options: list[dict[str, object]] = []
 
         def recording_tracker(**options):
@@ -469,13 +488,30 @@ class LivePipelineIntegrationTests(unittest.TestCase):
                 self.activation_pressed = False
                 self.started = False
                 self.stopped = False
+                self.updates: list[
+                    tuple[
+                        Detection | None,
+                        tuple[int, int, int],
+                        bool,
+                        dict[str, object],
+                    ]
+                ] = []
                 self.__class__.instances.append(self)
 
             def start(self) -> None:
                 self.started = True
 
-            def update(self, *_args, **_kwargs) -> None:
-                return None
+            def update(
+                self,
+                target,
+                frame_shape,
+                *,
+                active=True,
+                **kwargs,
+            ) -> None:
+                self.updates.append(
+                    (target, frame_shape, active, dict(kwargs))
+                )
 
             def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
                 return MakcuTelemetrySnapshot()
@@ -486,7 +522,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         config = self._config(
             report_path,
             "--max-frames",
-            "1",
+            "2",
             "--aim",
             "--aim-label",
             "player",
@@ -524,7 +560,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(numeric.config.velocity_median_window, 5)
         self.assertEqual(
             numeric.config.velocity_filter_time_constant_seconds,
-            0.040,
+            0.018,
         )
         self.assertEqual(
             numeric.config.maximum_target_acceleration_pixels_per_second_squared,
@@ -535,10 +571,22 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             numeric.config.maximum_observation_interval_seconds,
             0.040,
         )
+        self.assertEqual(len(controller.updates), 2)
+        first_target, _shape, _active, first_keywords = controller.updates[0]
+        self.assertIs(first_target, raw_target)
+        self.assertIs(first_keywords["velocity_target"], raw_target)
+        self.assertTrue(first_keywords["measurement_observed"])
+        predicted_target, _shape, _active, predicted_keywords = (
+            controller.updates[1]
+        )
+        self.assertIsNotNone(predicted_target)
+        self.assertIsNone(predicted_keywords["velocity_target"])
+        self.assertFalse(predicted_keywords["measurement_observed"])
         startup = output.getvalue()
         self.assertIn("control automatic plant-aware", startup)
+        self.assertIn("velocity source raw accepted", startup)
         self.assertIn(
-            "velocity damping median 5 / 40 ms / 20000 px/s^2",
+            "velocity damping median 5 / 18 ms / 20000 px/s^2",
             startup,
         )
 
