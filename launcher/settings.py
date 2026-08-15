@@ -14,6 +14,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import secrets
+import stat
 import sys
 import tempfile
 from typing import Any, Mapping, Sequence
@@ -35,6 +36,8 @@ AIM_OUTPUT_LOCAL = "local"
 AIM_OUTPUT_REMOTE = "remote"
 AIM_OUTPUT_MAKCU = "makcu"
 AIM_OUTPUTS = (AIM_OUTPUT_LOCAL, AIM_OUTPUT_REMOTE, AIM_OUTPUT_MAKCU)
+DEFAULT_AIM_CALIBRATION_CONTEXT = "hip-fire"
+_AIM_CALIBRATION_CONTEXT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 SELF_POSITION_LEFT = "left"
 SELF_POSITION_CENTER = "center"
 SELF_POSITION_RIGHT = "right"
@@ -48,10 +51,15 @@ SELF_POSITION_GEOMETRY = {
 # preview pacing; version 6 added the opt-in centered detail pass; version 7
 # records whether the user has explicitly chosen (or safely auto-selected) an
 # inference runtime; version 8 binds a fresh profile's optional detail workload
-# to the release-default pointer while preserving every persisted profile. A settings file records
-# the preset key rather than paths into a particular checkout/PyInstaller
-# extraction directory, so its model and labels always move together.
-SETTINGS_VERSION = 8
+# to the release-default pointer while preserving every persisted profile;
+# version 9 adds persisted camera/capture-card format and orientation controls;
+# version 10 adds an explicit, fail-closed MAKCU calibration profile path;
+# version 11 persists the physical hip-fire/ADS context that profile is bound
+# to, so an ADS calibration can never be reused by an implicit hip-fire run.
+# A settings file records the preset key rather than paths into a particular
+# checkout/PyInstaller extraction directory, so its model and labels always move
+# together.
+SETTINGS_VERSION = 11
 
 MODEL_PRESET_FORT_PLAYER_BALANCED = "fort_player_balanced"
 MODEL_PRESET_FORT_PLAYER_BALANCED_INT8 = "fort_player_balanced_int8"
@@ -360,6 +368,8 @@ class LauncherSettings:
     capture_width: str = "1280"
     capture_height: str = "720"
     capture_fps: str = "60"
+    capture_format: str = ""
+    capture_rotate_180: bool = False
     screen_monitor: str = "1"
     use_screen_region: bool = False
     screen_x: str = "0"
@@ -414,6 +424,9 @@ class LauncherSettings:
     aim_makcu_smoothing_alpha: str = "0.78"
     aim_makcu_prediction_lead_seconds: str = "0.03"
     aim_makcu_derivative_damping_seconds: str = "0.008"
+    aim_makcu_vertical_rate_ratio: str = "0.48"
+    aim_makcu_context: str = "hip"
+    aim_makcu_active_profile: str = ""
     aim_makcu_verified_port: str = ""
     aim_makcu_verified_button: str = ""
     aim_activate_path: str = ""
@@ -505,6 +518,11 @@ class LauncherSettings:
                 converted[name] = str(value)
 
         version = _settings_version(values.get("version"))
+        if converted.get("aim_makcu_context") not in {"hip", "ads"}:
+            # This field first exists in v11 and the desktop UI deliberately
+            # offers only the two physical modes. Never silently reinterpret
+            # an arbitrary context string as one of them.
+            converted.pop("aim_makcu_context", None)
         # Loading a persisted profile must never opt it into a newly selected
         # release workload. Only a genuinely fresh LauncherSettings instance
         # inherits the pointer's detail crop; an old/partial profile without
@@ -522,7 +540,7 @@ class LauncherSettings:
                 converted["hardware_selection_configured"] = False
                 converted["backend"] = "openvino"
                 converted["device"] = "CPU"
-            elif version < SETTINGS_VERSION:
+            elif version < 7:
                 # Preserve a pre-v7 runtime only when the serialized object
                 # really contains a usable device/backend choice. Empty or
                 # partial JSON is not evidence that default CPU was
@@ -730,6 +748,11 @@ class LauncherSettings:
             fps = self.capture_fps.strip()
             if fps:
                 args.extend(("--capture-fps", _positive_float_text(fps, "capture FPS")))
+            pixel_format = self.capture_format.strip().upper()
+            if pixel_format:
+                args.extend(("--capture-format", _fourcc_text(pixel_format)))
+            if self.capture_rotate_180:
+                args.append("--capture-rotate-180")
         else:
             video = _existing_file(self.video_path, "video file")
             args.extend(("--source", str(video)))
@@ -829,8 +852,28 @@ class LauncherSettings:
                             "MAKCU derivative damping",
                             0.25,
                         ),
+                        "--aim-makcu-vertical-rate-ratio",
+                        _bounded_positive_float_text(
+                            self.aim_makcu_vertical_rate_ratio,
+                            "MAKCU vertical cap",
+                            1.0,
+                        ),
+                        "--aim-calibration-context",
+                        _launcher_aim_context_text(self.aim_makcu_context),
                     )
                 )
+                active_profile_text = self.aim_makcu_active_profile.strip()
+                if active_profile_text:
+                    active_profile = _existing_non_symlink_file(
+                        active_profile_text,
+                        "MAKCU active calibration profile",
+                    )
+                    args.extend(
+                        (
+                            "--aim-makcu-active-profile",
+                            str(active_profile),
+                        )
+                    )
             else:
                 activation_path = self.aim_activate_path.strip()
                 if not activation_path:
@@ -884,6 +927,61 @@ def launcher_command(
     if not is_frozen:
         prefix.append(str(app_script or (resource_root() / "app.py")))
     return [*prefix, "--cli", *settings.detector_arguments()]
+
+
+def makcu_calibration_command(
+    settings: LauncherSettings,
+    evidence_path: str | Path,
+    context: str = DEFAULT_AIM_CALIBRATION_CONTEXT,
+    *,
+    executable: str | Path | None = None,
+    app_script: str | Path | None = None,
+    frozen: bool | None = None,
+) -> list[str]:
+    """Return a strict, one-shot live MAKCU calibration command.
+
+    Calibration deliberately reuses all ordinary detector/aim validation.  Its
+    evidence destination and context are ephemeral command inputs rather than
+    persisted launcher settings, and the secondary detail pass is removed so
+    every measurement has one unambiguous inference timestamp.
+    """
+
+    if not settings.aim:
+        raise SettingsError("Enable aim before starting MAKCU calibration.")
+    if settings.aim_output != AIM_OUTPUT_MAKCU:
+        raise SettingsError("MAKCU calibration requires MAKCU aim output.")
+    if settings.source_mode not in {SOURCE_SCREEN, SOURCE_CAMERA}:
+        raise SettingsError(
+            "MAKCU calibration requires a live screen or camera/capture-card source."
+        )
+    if settings.aim_makcu_active_profile.strip():
+        raise SettingsError(
+            "MAKCU calibration cannot run while an active calibration profile "
+            "is selected. Clear it before collecting new evidence."
+        )
+    evidence = _new_calibration_output(evidence_path)
+    calibration_context = _aim_calibration_context_text(context)
+    command = launcher_command(
+        settings,
+        executable=executable,
+        app_script=app_script,
+        frozen=frozen,
+    )
+    if "--detail-crop-size" in command:
+        detail_index = command.index("--detail-crop-size")
+        del command[detail_index : detail_index + 2]
+    if "--aim-calibration-context" in command:
+        context_index = command.index("--aim-calibration-context")
+        del command[context_index : context_index + 2]
+    command.extend(
+        (
+            "--aim-calibration-evidence",
+            str(evidence),
+            "--aim-calibration-context",
+            calibration_context,
+        )
+    )
+    return command
 
 
 def load_settings(path: Path | None = None) -> LauncherSettings:
@@ -972,6 +1070,72 @@ def _existing_file(value: str, label: str) -> Path:
     return path
 
 
+def _existing_non_symlink_file(value: str, label: str) -> Path:
+    text = value.strip()
+    if not text:
+        raise SettingsError(f"Choose a {label}.")
+    selected = Path(text).expanduser()
+    try:
+        metadata = selected.lstat()
+    except OSError:
+        raise SettingsError(
+            f"The {label} must be an existing non-symlink regular file: "
+            f"{selected.absolute()}"
+        ) from None
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise SettingsError(
+            f"The {label} must be an existing non-symlink regular file: "
+            f"{selected.absolute()}"
+        )
+    try:
+        path = selected.resolve(strict=True)
+    except OSError:
+        raise SettingsError(
+            f"The {label} could not be resolved to an exact absolute path: "
+            f"{selected.absolute()}"
+        ) from None
+    try:
+        resolved_metadata = path.lstat()
+    except OSError:
+        raise SettingsError(f"The {label} was not found: {path}") from None
+    if not stat.S_ISREG(resolved_metadata.st_mode):
+        raise SettingsError(
+            f"The {label} must resolve to a regular file: {path}"
+        )
+    return path
+
+
+def _new_calibration_output(value: str | Path) -> Path:
+    text = os.fspath(value).strip()
+    if not text:
+        raise SettingsError("Choose a MAKCU calibration evidence output path.")
+    path = Path(text).expanduser().resolve()
+    if os.path.lexists(path):
+        raise SettingsError(
+            f"The MAKCU calibration evidence output already exists: {path}"
+        )
+    return path
+
+
+def _aim_calibration_context_text(value: str) -> str:
+    text = str(value)
+    if _AIM_CALIBRATION_CONTEXT_RE.fullmatch(text) is None:
+        raise SettingsError(
+            "Calibration context must be 1-64 characters, begin with a letter "
+            "or digit, and contain only letters, digits, '.', '_', '+', or '-'."
+        )
+    return text
+
+
+def _launcher_aim_context_text(value: str) -> str:
+    """Return the explicit physical mode offered by the desktop launchers."""
+
+    text = str(value).strip().casefold()
+    if text not in {"hip", "ads"}:
+        raise SettingsError("MAKCU aim context must be either hip fire or ADS.")
+    return text
+
+
 def _integer(value: str, label: str) -> int:
     text = value.strip()
     if not re.fullmatch(r"[+-]?\d+", text):
@@ -1027,6 +1191,15 @@ def _positive_float_text(value: str, label: str) -> str:
     if parsed <= 0:
         raise SettingsError(f"{label.capitalize()} must be greater than zero.")
     return f"{parsed:g}"
+
+
+def _fourcc_text(value: str) -> str:
+    text = str(value).strip().upper()
+    if len(text) != 4 or not text.isalnum():
+        raise SettingsError(
+            "Capture pixel format must be four letters or digits, such as NV12."
+        )
+    return text
 
 
 def _unit_float_text(value: str, label: str) -> str:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 from pathlib import Path
@@ -11,6 +12,7 @@ import unittest
 from unittest import mock
 
 from aiming.makcu import MakcuError
+from config import parse_args
 from launcher.application import DetectorLauncher
 from launcher.process import (
     external_process_environment,
@@ -32,6 +34,7 @@ from launcher.settings import (
     SettingsError,
     launcher_command,
     load_settings,
+    makcu_calibration_command,
     save_settings,
 )
 
@@ -97,6 +100,8 @@ class LauncherSettingsTests(unittest.TestCase):
         self.labels.write_text("target\n", encoding="utf-8")
         self.video = self.root / "game clip.mp4"
         self.video.write_bytes(b"video")
+        self.active_profile = self.root / "active calibration.json"
+        self.active_profile.write_bytes(b"canonical profile placeholder\n")
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -172,13 +177,24 @@ class LauncherSettingsTests(unittest.TestCase):
             capture_width="1920",
             capture_height="1080",
             capture_fps="59.94",
+            capture_format="nv12",
+            capture_rotate_180=True,
             preview=False,
         ).detector_arguments()
         self.assertEqual(args[args.index("--source") + 1], "3")
         self.assertEqual(args[args.index("--capture-size") + 1], "1920x1080")
         self.assertEqual(args[args.index("--capture-fps") + 1], "59.94")
+        self.assertEqual(args[args.index("--capture-format") + 1], "NV12")
+        self.assertIn("--capture-rotate-180", args)
         self.assertIn("--no-preview", args)
         self.assertNotIn("--no-draw", args)
+
+    def test_capture_pixel_format_is_validated(self) -> None:
+        with self.assertRaisesRegex(SettingsError, "pixel format"):
+            self.settings(
+                source_mode="camera",
+                capture_format="not-a-fourcc",
+            ).detector_arguments()
 
     def test_preview_rate_is_bounded_without_throttling_detection(self) -> None:
         args = self.settings(preview=True, preview_fps="30").detector_arguments()
@@ -294,6 +310,7 @@ class LauncherSettingsTests(unittest.TestCase):
             aim_makcu_smoothing_alpha="0.70",
             aim_makcu_prediction_lead_seconds="0.05",
             aim_makcu_derivative_damping_seconds="0.01",
+            aim_makcu_vertical_rate_ratio="0.63",
             aim_makcu_verified_port="/dev/serial/by-id/makcu",
             aim_makcu_verified_button="1",
             aim_activate_path="/dev/input/event0",
@@ -312,8 +329,113 @@ class LauncherSettingsTests(unittest.TestCase):
             args[args.index("--aim-makcu-derivative-damping-seconds") + 1],
             "0.01",
         )
+        self.assertEqual(
+            args[args.index("--aim-makcu-vertical-rate-ratio") + 1],
+            "0.63",
+        )
+        self.assertEqual(
+            args[args.index("--aim-calibration-context") + 1],
+            "hip",
+        )
         self.assertEqual(args[args.index("--aim-head-ratio") + 1], "0.12")
         self.assertNotIn("--aim-activate-path", args)
+        self.assertNotIn("--aim-makcu-active-profile", args)
+
+    def test_makcu_active_profile_emits_exact_absolute_path_only_for_makcu(self) -> None:
+        # Keep this deliberately noncanonical without assuming TEMP and the
+        # checkout occupy the same Windows drive.
+        (self.active_profile.parent / "unused").mkdir()
+        relative_profile = str(
+            self.active_profile.parent / "unused" / ".." / self.active_profile.name
+        )
+        makcu = self.settings(
+            aim=True,
+            aim_label="player",
+            ignore_self=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/serial/by-id/makcu",
+            aim_makcu_button="1",
+            aim_makcu_verified_port="/dev/serial/by-id/makcu",
+            aim_makcu_verified_button="1",
+            aim_makcu_active_profile=relative_profile,
+        ).detector_arguments()
+        self.assertEqual(
+            makcu[makcu.index("--aim-makcu-active-profile") + 1],
+            str(self.active_profile.resolve()),
+        )
+
+        disabled = self.settings(
+            aim=False,
+            aim_makcu_active_profile=str(self.root / "missing.json"),
+        ).detector_arguments()
+        self.assertNotIn("--aim-makcu-active-profile", disabled)
+
+        local = self.settings(
+            aim=True,
+            aim_label="player",
+            ignore_self=True,
+            aim_activate_path="/dev/input/event0",
+            aim_makcu_active_profile=str(self.root / "missing.json"),
+        ).detector_arguments()
+        self.assertNotIn("--aim-makcu-active-profile", local)
+
+    def test_makcu_active_profile_rejects_missing_directory_and_symlink(self) -> None:
+        common = {
+            "aim": True,
+            "aim_label": "player",
+            "ignore_self": True,
+            "aim_output": AIM_OUTPUT_MAKCU,
+            "aim_makcu_port": "/dev/serial/by-id/makcu",
+            "aim_makcu_button": "1",
+            "aim_makcu_verified_port": "/dev/serial/by-id/makcu",
+            "aim_makcu_verified_button": "1",
+        }
+        for profile in (self.root / "missing.json", self.root):
+            with self.subTest(profile=profile), self.assertRaisesRegex(
+                SettingsError,
+                "non-symlink regular file",
+            ):
+                self.settings(
+                    **common,
+                    aim_makcu_active_profile=str(profile),
+                ).detector_arguments()
+
+        link = self.root / "active-profile-link.json"
+        try:
+            link.symlink_to(self.active_profile)
+        except OSError:
+            return
+        with self.assertRaisesRegex(SettingsError, "non-symlink regular file"):
+            self.settings(
+                **common,
+                aim_makcu_active_profile=str(link),
+            ).detector_arguments()
+
+    def test_makcu_vertical_cap_default_emits_and_invalid_values_fail(self) -> None:
+        changes = {
+            "aim": True,
+            "aim_label": "player",
+            "ignore_self": True,
+            "aim_output": AIM_OUTPUT_MAKCU,
+            "aim_makcu_port": "/dev/serial/by-id/makcu",
+            "aim_makcu_button": "1",
+            "aim_makcu_verified_port": "/dev/serial/by-id/makcu",
+            "aim_makcu_verified_button": "1",
+        }
+        args = self.settings(**changes).detector_arguments()
+        self.assertEqual(
+            args[args.index("--aim-makcu-vertical-rate-ratio") + 1],
+            "0.48",
+        )
+        for value in ("0", "-0.1", "1.01", "nan", "inf"):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                SettingsError,
+                "vertical cap",
+            ):
+                self.settings(
+                    **changes,
+                    aim_makcu_vertical_rate_ratio=value,
+                ).detector_arguments()
 
     def test_makcu_requires_matching_verified_device_and_button(self) -> None:
         for verified_port, verified_button in (("", ""), ("/dev/other", "1"), ("/dev/serial/by-id/makcu", "0")):
@@ -354,6 +476,289 @@ class LauncherSettingsTests(unittest.TestCase):
         )
         self.assertEqual(command[:3], ["/runtime/python", "/checkout/app.py", "--cli"])
         self.assertEqual(command[command.index("--source") + 1], str(self.video.resolve()))
+
+    def test_makcu_calibration_command_is_exact_and_ephemeral(self) -> None:
+        evidence = self.root / "evidence" / "hip-fire.json"
+        settings = self.settings(
+            source_mode="camera",
+            detail_crop_size="768",
+            aim=True,
+            aim_label="player",
+            ignore_self=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/serial/by-id/makcu",
+            aim_makcu_button="1",
+            aim_makcu_verified_port="/dev/serial/by-id/makcu",
+            aim_makcu_verified_button="1",
+        )
+        ordinary = launcher_command(
+            settings,
+            executable="/runtime/python",
+            app_script="/checkout/app.py",
+            frozen=False,
+        )
+        expected = list(ordinary)
+        detail_index = expected.index("--detail-crop-size")
+        del expected[detail_index : detail_index + 2]
+        context_index = expected.index("--aim-calibration-context")
+        del expected[context_index : context_index + 2]
+        expected.extend(
+            (
+                "--aim-calibration-evidence",
+                str(evidence.resolve()),
+                "--aim-calibration-context",
+                "hip-fire+solo",
+            )
+        )
+
+        command = makcu_calibration_command(
+            settings,
+            evidence,
+            "hip-fire+solo",
+            executable="/runtime/python",
+            app_script="/checkout/app.py",
+            frozen=False,
+        )
+
+        self.assertEqual(command, expected)
+        self.assertIn("--detail-crop-size", ordinary)
+        self.assertNotIn("--aim-calibration-evidence", ordinary)
+        self.assertEqual(
+            ordinary[ordinary.index("--aim-calibration-context") + 1],
+            "hip",
+        )
+        self.assertNotIn("--detail-crop-size", command)
+
+    def test_makcu_calibration_command_rejects_unsafe_modes(self) -> None:
+        evidence = self.root / "evidence.json"
+        valid = {
+            "source_mode": "camera",
+            "aim": True,
+            "aim_label": "player",
+            "ignore_self": True,
+            "aim_output": AIM_OUTPUT_MAKCU,
+            "aim_makcu_port": "/dev/serial/by-id/makcu",
+            "aim_makcu_button": "1",
+            "aim_makcu_verified_port": "/dev/serial/by-id/makcu",
+            "aim_makcu_verified_button": "1",
+        }
+        cases = (
+            ({"aim": False}, "Enable aim"),
+            ({"aim_output": "local"}, "requires MAKCU"),
+            (
+                {"source_mode": "video", "video_path": str(self.video)},
+                "live screen or camera",
+            ),
+            ({"aim_makcu_verified_button": "0"}, "Verify the selected MAKCU"),
+        )
+        for changes, message in cases:
+            with self.subTest(changes=changes), self.assertRaisesRegex(
+                SettingsError, message
+            ):
+                makcu_calibration_command(
+                    self.settings(**{**valid, **changes}), evidence
+                )
+
+    def test_makcu_calibration_command_rejects_existing_path_and_bad_context(self) -> None:
+        settings = self.settings(
+            source_mode="camera",
+            aim=True,
+            aim_label="player",
+            ignore_self=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/serial/by-id/makcu",
+            aim_makcu_button="1",
+            aim_makcu_verified_port="/dev/serial/by-id/makcu",
+            aim_makcu_verified_button="1",
+        )
+        existing = self.root / "evidence.json"
+        existing.write_text("keep", encoding="utf-8")
+        with self.assertRaisesRegex(SettingsError, "already exists"):
+            makcu_calibration_command(settings, existing)
+        for context in ("", "hip fire", "../hip", "x" * 65):
+            with self.subTest(context=context), self.assertRaisesRegex(
+                SettingsError, "Calibration context"
+            ):
+                makcu_calibration_command(
+                    settings,
+                    self.root / f"new-{len(context)}.json",
+                    context,
+                )
+
+    def test_makcu_calibration_command_rejects_an_active_profile(self) -> None:
+        settings = self.settings(
+            source_mode="camera",
+            aim=True,
+            aim_label="player",
+            ignore_self=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/serial/by-id/makcu",
+            aim_makcu_button="1",
+            aim_makcu_verified_port="/dev/serial/by-id/makcu",
+            aim_makcu_verified_button="1",
+            aim_makcu_active_profile=str(self.active_profile),
+        )
+        with self.assertRaisesRegex(SettingsError, "active calibration profile"):
+            makcu_calibration_command(
+                settings,
+                self.root / "new-evidence.json",
+            )
+
+    def test_calibration_cli_requires_live_bounded_makcu_configuration(self) -> None:
+        evidence = self.root / "calibration.json"
+        base = [
+            "--source",
+            "0",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--aim-output",
+            "makcu",
+            "--aim-makcu-port",
+            "/dev/serial/by-id/makcu",
+            "--ignore-self",
+            "--aim-calibration-evidence",
+            str(evidence),
+        ]
+        parsed = parse_args(
+            [*base, "--aim-calibration-context", "hip-fire+solo"]
+        )
+        self.assertEqual(parsed.aim_calibration_evidence, evidence)
+        self.assertEqual(parsed.aim_calibration_context, "hip-fire+solo")
+
+        invalid = (
+            ([value for value in base if value != "--aim"], "requires --aim"),
+            (
+                [
+                    *("local" if value == "makcu" else value for value in base),
+                    "--aim-activate-path",
+                    "/dev/input/event0",
+                ],
+                "requires --aim-output makcu",
+            ),
+            (
+                [
+                    value
+                    for index, value in enumerate(base)
+                    if index
+                    not in {
+                        base.index("--aim-makcu-port"),
+                        base.index("--aim-makcu-port") + 1,
+                    }
+                ],
+                "explicit --aim-makcu-port",
+            ),
+            (
+                [value for value in base if value != "--ignore-self"],
+                "requires --ignore-self",
+            ),
+            ([*base, "--metrics-json", str(self.root / "metrics.json")], "metrics-json"),
+            ([*base, "--max-frames", "10"], "max-frames"),
+            ([*base, "--max-seconds", "1"], "max-frames or --max-seconds"),
+            ([*base, "--detail-crop-size", "768"], "detail-crop-size"),
+        )
+        for arguments, message in invalid:
+            with self.subTest(message=message), mock.patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as error:
+                with self.assertRaisesRegex(SystemExit, "2"):
+                    parse_args(arguments)
+                self.assertIn(message, error.getvalue())
+
+        with self.assertRaises(SystemExit):
+            parse_args([*base, "--aim-calibration-context", "unsafe context"])
+
+        evidence.write_text("existing", encoding="utf-8")
+        with self.assertRaises(SystemExit):
+            parse_args(base)
+
+        file_source = list(base)
+        source_index = file_source.index("0")
+        file_source[source_index] = str(self.video)
+        with self.assertRaises(SystemExit):
+            parse_args(file_source)
+
+    def test_active_profile_cli_expands_user_and_requires_bounded_makcu(self) -> None:
+        home_profile = self.root / "active.json"
+        home_profile.write_bytes(b"profile\n")
+        base = [
+            "--aim",
+            "--aim-label",
+            "player",
+            "--aim-output",
+            "makcu",
+            "--aim-makcu-port",
+            "/dev/serial/by-id/makcu",
+            "--ignore-self",
+            "--aim-makcu-active-profile",
+            "~/active.json",
+        ]
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root), "USERPROFILE": str(self.root)},
+        ):
+            parsed = parse_args(base)
+        self.assertEqual(parsed.aim_makcu_active_profile, home_profile)
+        self.assertIsNone(parsed.aim_calibration_evidence)
+
+        invalid = (
+            ([value for value in base if value != "--aim"], "requires --aim"),
+            (
+                [
+                    *("local" if value == "makcu" else value for value in base),
+                    "--aim-activate-path",
+                    "/dev/input/event0",
+                ],
+                "requires --aim-output makcu",
+            ),
+            (
+                [
+                    *base,
+                    "--aim-calibration-evidence",
+                    str(self.root / "new-evidence.json"),
+                ],
+                "cannot be combined",
+            ),
+        )
+        with mock.patch.dict(
+            os.environ,
+            {"HOME": str(self.root), "USERPROFILE": str(self.root)},
+        ):
+            for arguments, message in invalid:
+                with self.subTest(message=message), mock.patch(
+                    "sys.stderr", new_callable=io.StringIO
+                ) as error:
+                    with self.assertRaisesRegex(SystemExit, "2"):
+                        parse_args(arguments)
+                    self.assertIn(message, error.getvalue())
+
+    def test_active_profile_cli_rejects_missing_directory_and_symlink(self) -> None:
+        prefix = [
+            "--aim",
+            "--aim-label",
+            "player",
+            "--aim-output",
+            "makcu",
+            "--ignore-self",
+            "--aim-makcu-active-profile",
+        ]
+        for profile in (self.root / "missing-profile.json", self.root):
+            with self.subTest(profile=profile), mock.patch(
+                "sys.stderr", new_callable=io.StringIO
+            ) as error:
+                with self.assertRaisesRegex(SystemExit, "2"):
+                    parse_args([*prefix, str(profile)])
+                self.assertIn("non-symlink regular file", error.getvalue())
+
+        link = self.root / "active-cli-link.json"
+        try:
+            link.symlink_to(self.active_profile)
+        except OSError:
+            return
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as error:
+            with self.assertRaisesRegex(SystemExit, "2"):
+                parse_args([*prefix, str(link)])
+            self.assertIn("non-symlink regular file", error.getvalue())
 
     def test_old_full_onnx_provider_name_is_normalized_to_cli_alias(self) -> None:
         onnx_model = self.root / "detector.onnx"
@@ -422,14 +827,27 @@ class LauncherSettingsTests(unittest.TestCase):
             draw=False,
             ignore_self=True,
             self_position=SELF_POSITION_RIGHT,
+            capture_format="NV12",
+            capture_rotate_180=True,
+            aim_makcu_vertical_rate_ratio="0.67",
+            aim_makcu_context="ads",
+            aim_makcu_active_profile=str(self.active_profile),
         )
         self.assertEqual(save_settings(original, target), target)
         loaded = load_settings(target)
         self.assertEqual(loaded.source_mode, "video")
         self.assertEqual(loaded.video_path, str(self.video))
         self.assertFalse(loaded.draw)
+        self.assertEqual(loaded.capture_format, "NV12")
+        self.assertTrue(loaded.capture_rotate_180)
         self.assertTrue(loaded.ignore_self)
         self.assertEqual(loaded.self_position, SELF_POSITION_RIGHT)
+        self.assertEqual(loaded.aim_makcu_vertical_rate_ratio, "0.67")
+        self.assertEqual(loaded.aim_makcu_context, "ads")
+        self.assertEqual(
+            loaded.aim_makcu_active_profile,
+            str(self.active_profile),
+        )
 
     def test_makcu_verification_binding_round_trip(self) -> None:
         target = self.root / "makcu-settings.json"
@@ -523,6 +941,27 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertTrue(existing.hardware_selection_configured)
         self.assertEqual((existing.backend, existing.device), ("onnxruntime", "CUDA"))
         self.assertFalse(fresh.hardware_selection_configured)
+
+    def test_post_v7_profile_missing_hardware_consent_is_not_authenticated(self) -> None:
+        loaded = LauncherSettings.from_mapping(
+            {"version": 10, "backend": "onnxruntime", "device": "MIGRAPHX"}
+        )
+
+        self.assertFalse(loaded.hardware_selection_configured)
+
+    def test_launcher_context_is_canonicalized_to_explicit_modes(self) -> None:
+        self.assertEqual(
+            LauncherSettings.from_mapping(
+                {"version": SETTINGS_VERSION, "aim_makcu_context": "ads"}
+            ).aim_makcu_context,
+            "ads",
+        )
+        self.assertEqual(
+            LauncherSettings.from_mapping(
+                {"version": SETTINGS_VERSION, "aim_makcu_context": "ads-scope"}
+            ).aim_makcu_context,
+            "hip",
+        )
 
     def test_empty_or_partial_legacy_objects_do_not_authenticate_default_cpu(self) -> None:
         for payload in ({}, {"version": 6}, {"version": 6, "source_mode": "screen"}):

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
+from hashlib import sha256
+import math
 import os
 from pathlib import Path
 import tempfile
@@ -9,18 +12,35 @@ import time
 import unittest
 from unittest import mock
 
+from aiming.controller import TargetTracker
 from aiming.makcu import (
+    CALIBRATION_LEASE_MAX_AGE_SECONDS,
+    CALIBRATION_MAX_EXCURSION_COUNTS,
+    CALIBRATION_MAX_RATE_COUNTS_PER_SECOND,
+    CALIBRATION_MAX_SESSION_ABS_COUNTS,
     MAX_CONTINUOUS_ACTIVATION_SECONDS,
+    MAX_VERTICAL_RATE_RATIO,
     MAKCU_BAUD_CHANGE,
     MAKCU_FAST_BAUD,
     MAKCU_PRODUCT_ID,
     MAKCU_VENDOR_ID,
+    PURSUIT_DEADZONE_LEAK_TIME_SECONDS,
     TARGET_STALE_SECONDS,
     MakcuError,
     MakcuAimConfig,
     MakcuAimingController,
+    MakcuCalibrationSnapshot,
+    MakcuTelemetrySnapshot,
     detect_makcu_port,
     makcu_target_delta,
+)
+from aiming.makcu_calibration import MIN_EXCURSION_PIXELS, MIN_PULSES_PER_POLARITY
+from aiming.makcu_calibrated_control import (
+    CalibratedControlConfig,
+    CalibratedControlOutput,
+    CalibratedPlant,
+    MakcuCalibratedController,
+    ScreenErrorObservation,
 )
 from detection.types import Detection
 
@@ -181,6 +201,210 @@ class MakcuAimingTests(unittest.TestCase):
             threaded_output=False,
         )
 
+    def _start_test_calibration(
+        self,
+        config: MakcuAimConfig | None = None,
+    ) -> tuple[MakcuAimingController, FakeSerial, object]:
+        """Install a deterministic stand-in for the live worker used by a tick test."""
+
+        controller = self.controller(config or MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        controller._output_thread = worker
+        token = controller.enter_calibration_mode()
+        return controller, self.factory.connections[-1], token
+
+    @staticmethod
+    def _movement_writes(connection: FakeSerial) -> tuple[bytes, ...]:
+        return tuple(
+            payload for payload in connection.writes if payload.startswith(b"km.move(")
+        )
+
+    @staticmethod
+    def _queue_button_event(connection: FakeSerial, mask: int) -> None:
+        connection.responses.extend(
+            b"km.buttons" + bytes((mask,)) + b"\r\n"
+        )
+
+    def _queue_calibration_repress(self, connection: FakeSerial) -> None:
+        self._queue_button_event(connection, 0)
+        self._queue_button_event(connection, 0b00010)
+
+    def _ready_calibrated_adapter(
+        self,
+        *,
+        maximum_command_history: int = 4096,
+        plant_delay_seconds: float = 0.0,
+    ) -> tuple[
+        MakcuAimingController,
+        MakcuCalibratedController,
+        FakeSerial,
+        Detection,
+        int,
+    ]:
+        """Return a deterministic adapter with two confirmed real samples."""
+
+        factory = FakeSerialFactory()
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, plant_delay_seconds),
+            CalibratedControlConfig(
+                velocity_median_window=1,
+                maximum_command_history=maximum_command_history,
+            ),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(
+                max_step=320,
+                output_hz=1000,
+                vertical_rate_ratio=1.0,
+            ),
+            calibrated_controller=calibrated,
+            serial_factory=factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        active = factory.connections[-1]
+        target = Detection(
+            0,
+            "player",
+            0.95,
+            (1400.0, 528.0, 1420.0, 628.0),
+        )
+        base_ns = 60_000_000_000
+        active.responses.extend(bytes((0b00010,)))
+        for timestamp_ns in (base_ns, base_ns + 8_000_000):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=timestamp_ns,
+            )
+            controller._output_tick(0.001, now_ns=timestamp_ns)
+        if not calibrated.ready:  # pragma: no cover - test helper invariant
+            raise AssertionError("calibrated adapter did not become ready")
+        return controller, calibrated, active, target, base_ns + 8_000_000
+
+    def _run_horizontal_fake_plant(
+        self,
+        velocity_for_tick: Callable[[int], float],
+        *,
+        ticks: int,
+        integral_time_seconds: float = 0.12,
+    ) -> tuple[list[float], list[float], list[int], list[float]]:
+        """Run the production controller against a deterministic 1-D plant."""
+
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.28,
+                max_step=320,
+                output_hz=1000,
+                deadzone_pixels=2.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = 20_000_000_000
+        visual_error = 0.0
+        plant_gain_pixels_per_count = 0.10
+        write_index = len(active.writes)
+        errors_before_output: list[float] = []
+        errors_after_output: list[float] = []
+        emitted_commands: list[int] = []
+        measured_errors: list[float] = []
+        try:
+            with mock.patch(
+                "aiming.makcu.PURSUIT_INTEGRAL_TIME_SECONDS",
+                integral_time_seconds,
+            ):
+                for tick in range(ticks):
+                    now_ns = base_ns + tick * 1_000_000
+                    if tick % 8 == 0:
+                        target = Detection(
+                            0,
+                            "player",
+                            0.9,
+                            (
+                                950.0 + visual_error,
+                                540.0,
+                                970.0 + visual_error,
+                                640.0,
+                            ),
+                        )
+                        controller.update(
+                            target,
+                            (1080, 1920, 3),
+                            measurement_ns=now_ns,
+                        )
+                    controller._output_tick(0.001, now_ns=now_ns)
+                    emitted_x = 0
+                    for payload in active.writes[write_index:]:
+                        if payload.startswith(b"km.move("):
+                            emitted_x += int(
+                                payload.decode("ascii")
+                                .strip()[8:-1]
+                                .split(",")[0]
+                            )
+                    write_index = len(active.writes)
+                    errors_before_output.append(visual_error)
+                    emitted_commands.append(emitted_x)
+                    measured_errors.append(controller._control_error_x)
+                    visual_error += velocity_for_tick(tick) * 0.001
+                    visual_error -= plant_gain_pixels_per_count * emitted_x
+                    errors_after_output.append(visual_error)
+            return (
+                errors_before_output,
+                errors_after_output,
+                emitted_commands,
+                measured_errors,
+            )
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    @staticmethod
+    def _legacy_opposing_pursuit_stall(
+        error: float,
+        base: float,
+        accumulated: float,
+        *,
+        in_deadzone: bool,
+    ) -> float:
+        """Reproduce the prior zero-output fallback for plant comparisons."""
+
+        correction = base + accumulated
+        if not in_deadzone and correction * error < 0.0:
+            return 0.0
+        return correction
+
+    @staticmethod
+    def _maximum_fresh_zero_run(
+        commands: list[int],
+        measured_errors: list[float],
+        *,
+        start: int,
+        deadzone: float = 2.0,
+    ) -> int:
+        current = 0
+        maximum = 0
+        for command, error in zip(commands[start:], measured_errors[start:]):
+            if abs(error) > deadzone and command == 0:
+                current += 1
+                maximum = max(maximum, current)
+            else:
+                current = 0
+        return maximum
+
     def test_start_discovers_board_switches_to_fast_baud_and_enables_buttons(self) -> None:
         controller = self.controller()
 
@@ -329,6 +553,11 @@ class MakcuAimingTests(unittest.TestCase):
         target = Detection(0, "player", 0.9, (700, 200, 900, 800))
         controller.start()
         active = self.factory.connections[-1]
+        expected_identity = sha256(
+            b"proaim-makcu-identity-v1\0/dev/ttyACM0"
+        ).hexdigest()
+        self.assertEqual(controller.identity_token, expected_identity)
+        self.assertNotIn("ttyACM0", controller.identity_token or "")
 
         controller.update(target, (1080, 1920, 3))
         self.assertNotIn(b"km.move(-40,-67)\r", active.writes)
@@ -340,17 +569,507 @@ class MakcuAimingTests(unittest.TestCase):
         controller.update(target, (1080, 1920, 3))
         self.assertEqual(len(active.writes), before_release)
 
+    def test_calibrated_identity_mismatch_fails_before_button_stream_or_output(self) -> None:
+        calibrated = MakcuCalibratedController(CalibratedPlant(0.10, 0.10, 0.0))
+        controller = MakcuAimingController(
+            MakcuAimConfig(),
+            calibrated_controller=calibrated,
+            expected_identity_token="f" * 64,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        with self.assertRaisesRegex(MakcuError, "identity does not match"):
+            controller.start()
+        self.assertIsNone(controller.identity_token)
+        self.assertIsNone(controller.connected_port)
+        self.assertIsNone(controller._serial)
+        self.assertTrue(all(connection.closed for connection in self.factory.connections))
+        self.assertFalse(
+            any(
+                payload == b"km.buttons(1)\r" or payload.startswith(b"km.move(")
+                for connection in self.factory.connections
+                for payload in connection.writes
+            )
+        )
+
+    def test_calibrated_control_uses_real_samples_and_never_falls_back_to_pi(self) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(
+                velocity_median_window=1,
+                maximum_rate_x_counts_per_second=19_200.0,
+                maximum_rate_y_counts_per_second=19_200.0,
+            ),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(
+                strength=4.0,
+                max_step=320,
+                smoothing_alpha=0.01,
+                output_hz=1000,
+            ),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        self.assertEqual(controller.control_mode, "calibrated")
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        base_ns = 50_000_000_000
+        target = Detection(0, "player", 0.95, (1000.0, 528.0, 1020.0, 628.0))
+        try:
+            active.responses.extend(bytes((0b00010,)))
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=base_ns,
+            )
+            controller._output_tick(0.001, now_ns=base_ns)
+            self.assertEqual(self._movement_writes(active), ())
+
+            second_ns = base_ns + 8_000_000
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=second_ns,
+            )
+            controller._output_tick(0.001, now_ns=second_ns)
+            writes_after_confirmation = self._movement_writes(active)
+            self.assertEqual(len(writes_after_confirmation), 1)
+            self.assertTrue(controller.calibrated_control_output.valid)
+            self.assertTrue(calibrated.ready)
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            self.assertEqual(controller._pursuit_correction_y, 0.0)
+            self.assertEqual(controller._smoothed_rate_x, 0.0)
+            self.assertEqual(controller._smoothed_rate_y, 0.0)
+
+            predicted_ns = second_ns + 8_000_000
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=predicted_ns,
+                measurement_observed=False,
+            )
+            controller._output_tick(0.001, now_ns=predicted_ns)
+            self.assertTrue(calibrated.ready)
+
+            lost_ns = predicted_ns + 8_000_000
+            controller.update(
+                None,
+                (1080, 1920, 3),
+                measurement_ns=lost_ns,
+                measurement_observed=True,
+            )
+            movement_count = len(self._movement_writes(active))
+            controller._output_tick(0.001, now_ns=lost_ns)
+            self.assertFalse(calibrated.ready)
+            self.assertEqual(len(self._movement_writes(active)), movement_count)
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibrated_control_honors_visible_max_step_and_vertical_cap(self) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(
+                velocity_median_window=1,
+                maximum_rate_x_counts_per_second=19_200.0,
+                maximum_rate_y_counts_per_second=19_200.0,
+            ),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(
+                max_step=80,
+                output_hz=1000,
+                vertical_rate_ratio=0.25,
+            ),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        target = Detection(0, "player", 0.95, (1050.0, 628.0, 1070.0, 728.0))
+        base_ns = 52_000_000_000
+        try:
+            active.responses.extend(bytes((0b00010,)))
+            for timestamp_ns in (base_ns, base_ns + 8_000_000):
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=timestamp_ns,
+                )
+                controller._output_tick(0.001, now_ns=timestamp_ns)
+            movement = self._movement_writes(active)
+            self.assertEqual(len(movement), 1)
+            delta_x, delta_y = (
+                int(value)
+                for value in movement[0].decode("ascii").strip()[8:-1].split(",")
+            )
+            self.assertGreater(delta_x, 0)
+            self.assertGreater(delta_y, 0)
+            self.assertLess(delta_y, delta_x)
+            self.assertLessEqual(delta_x, math.ceil(80 * 60 / 1000))
+            self.assertLessEqual(delta_y, math.ceil(80 * 60 * 0.25 / 1000))
+            output = controller.calibrated_control_output
+            assert output is not None
+            self.assertLessEqual(abs(output.rate_x_counts_per_second), 80 * 60)
+            self.assertLessEqual(
+                abs(output.rate_y_counts_per_second),
+                80 * 60 * 0.25,
+            )
+            self.assertTrue(output.saturated_x)
+            self.assertTrue(output.saturated_y)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibrated_failed_write_is_never_recorded_as_physical_history(self) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(velocity_median_window=1),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(max_step=320, output_hz=1000),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        target = Detection(0, "player", 0.95, (1000.0, 528.0, 1020.0, 628.0))
+        base_ns = 54_000_000_000
+        try:
+            active.responses.extend(bytes((0b00010,)))
+            controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+            controller._output_tick(0.001, now_ns=base_ns)
+            second_ns = base_ns + 8_000_000
+            controller.update(target, (1080, 1920, 3), measurement_ns=second_ns)
+            with (
+                mock.patch.object(
+                    controller,
+                    "_command",
+                    side_effect=MakcuError("simulated calibrated serial failure"),
+                ),
+                self.assertRaisesRegex(MakcuError, "simulated calibrated serial failure"),
+            ):
+                controller._output_tick(0.001, now_ns=second_ns)
+            self.assertEqual(tuple(calibrated._commands), ())
+            self.assertEqual(controller.telemetry_snapshot().movement_commands, 0)
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_duplicate_calibrated_tick_is_rejected_before_a_second_write(self) -> None:
+        controller, calibrated, active, _target, ready_ns = (
+            self._ready_calibrated_adapter()
+        )
+        try:
+            movement_before = self._movement_writes(active)
+            history_before = tuple(calibrated._commands)
+
+            controller._output_tick(0.001, now_ns=ready_ns)
+
+            self.assertEqual(self._movement_writes(active), movement_before)
+            self.assertEqual(tuple(calibrated._commands), history_before)
+            output = controller.calibrated_control_output
+            assert output is not None
+            self.assertFalse(output.valid)
+            self.assertEqual(output.reset_reason, "non-monotonic-clock")
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibrated_commit_revalidates_loss_release_and_stop(self) -> None:
+        for revocation in ("target-loss", "release", "stop"):
+            with self.subTest(revocation=revocation):
+                controller, calibrated, active, _target, ready_ns = (
+                    self._ready_calibrated_adapter()
+                )
+                entered = threading.Event()
+                release_step = threading.Event()
+                output_errors: list[BaseException] = []
+                disarm_thread: threading.Thread | None = None
+                original_step = calibrated.step
+
+                def blocked_step(*args, **kwargs):
+                    entered.set()
+                    if not release_step.wait(1.0):
+                        raise AssertionError("timed out waiting to release control step")
+                    return original_step(*args, **kwargs)
+
+                next_ns = ready_ns + 1_000_000
+
+                def output_tick() -> None:
+                    try:
+                        controller._output_tick(0.001, now_ns=next_ns)
+                    except BaseException as exc:  # noqa: BLE001 - assert thread outcome
+                        output_errors.append(exc)
+
+                movement_before = self._movement_writes(active)
+                try:
+                    with mock.patch.object(
+                        calibrated,
+                        "step",
+                        side_effect=blocked_step,
+                    ):
+                        output_thread = threading.Thread(target=output_tick)
+                        output_thread.start()
+                        self.assertTrue(entered.wait(1.0))
+
+                        if revocation == "target-loss":
+                            controller.update(
+                                None,
+                                (1080, 1920, 3),
+                                measurement_ns=next_ns,
+                                measurement_observed=True,
+                            )
+                        elif revocation == "release":
+                            self._queue_button_event(active, 0)
+                            self.assertFalse(
+                                controller.poll_activation(now_ns=next_ns)
+                            )
+                        else:
+                            controller._stop_event.set()
+                            disarm_thread = threading.Thread(
+                                target=controller._disarm_for_shutdown
+                            )
+                            disarm_thread.start()
+
+                        release_step.set()
+                        output_thread.join(1.0)
+                        self.assertFalse(output_thread.is_alive())
+                        if disarm_thread is not None:
+                            disarm_thread.join(1.0)
+                            self.assertFalse(disarm_thread.is_alive())
+
+                    self.assertEqual(output_errors, [])
+                    self.assertEqual(self._movement_writes(active), movement_before)
+                    self.assertFalse(calibrated.ready)
+                    self.assertEqual(controller._fractional_x, 0.0)
+                    self.assertEqual(controller._fractional_y, 0.0)
+                finally:
+                    release_step.set()
+                    controller._output_thread = None
+                    controller.stop()
+
+    def test_zero_rounded_calibrated_tick_discards_superseded_state(self) -> None:
+        controller, calibrated, active, _target, ready_ns = (
+            self._ready_calibrated_adapter()
+        )
+        entered = threading.Event()
+        release_step = threading.Event()
+        original_step = calibrated.step
+
+        def zero_rate_step(*args, **kwargs) -> CalibratedControlOutput:
+            entered.set()
+            if not release_step.wait(1.0):
+                raise AssertionError("timed out waiting to release control step")
+            original = original_step(*args, **kwargs)
+            return CalibratedControlOutput(
+                timestamp_ns=original.timestamp_ns,
+                rate_x_counts_per_second=0.25,
+                rate_y_counts_per_second=0.0,
+                target_velocity_x_pixels_per_second=(
+                    original.target_velocity_x_pixels_per_second
+                ),
+                target_velocity_y_pixels_per_second=(
+                    original.target_velocity_y_pixels_per_second
+                ),
+                projected_error_x_pixels=original.projected_error_x_pixels,
+                projected_error_y_pixels=original.projected_error_y_pixels,
+                valid=True,
+            )
+
+        next_ns = ready_ns + 1_000_000
+        movement_before = self._movement_writes(active)
+        output_errors: list[BaseException] = []
+
+        def output_tick() -> None:
+            try:
+                controller._output_tick(0.001, now_ns=next_ns)
+            except BaseException as exc:  # noqa: BLE001 - assert thread outcome
+                output_errors.append(exc)
+
+        try:
+            with mock.patch.object(calibrated, "step", side_effect=zero_rate_step):
+                worker = threading.Thread(target=output_tick)
+                worker.start()
+                self.assertTrue(entered.wait(1.0))
+                controller.update(
+                    None,
+                    (1080, 1920, 3),
+                    measurement_ns=next_ns,
+                    measurement_observed=True,
+                )
+                release_step.set()
+                worker.join(1.0)
+                self.assertFalse(worker.is_alive())
+            self.assertEqual(output_errors, [])
+            self.assertEqual(self._movement_writes(active), movement_before)
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+            self.assertFalse(calibrated.ready)
+        finally:
+            release_step.set()
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibrated_commit_rechecks_measurement_age_and_hold_deadline(self) -> None:
+        for boundary in ("measurement-age", "maximum-hold"):
+            with self.subTest(boundary=boundary):
+                controller, calibrated, active, _target, ready_ns = (
+                    self._ready_calibrated_adapter()
+                )
+                movement_before = self._movement_writes(active)
+                try:
+                    if boundary == "measurement-age":
+                        next_ns = ready_ns + 39_000_000
+                    else:
+                        next_ns = ready_ns + 1_000_000
+                        with controller._state_lock:
+                            controller._activation_started_ns = (
+                                next_ns
+                                - round(
+                                    MAX_CONTINUOUS_ACTIVATION_SECONDS
+                                    * 1_000_000_000
+                                )
+                                + 1_000_000
+                            )
+                    with mock.patch(
+                        "aiming.makcu.time.perf_counter_ns",
+                        side_effect=(100, 2_000_100),
+                    ):
+                        controller._output_tick(0.001, now_ns=next_ns)
+                    self.assertEqual(
+                        self._movement_writes(active),
+                        movement_before,
+                    )
+                    self.assertFalse(calibrated.ready)
+                    self.assertEqual(controller._fractional_x, 0.0)
+                    self.assertEqual(controller._fractional_y, 0.0)
+                    if boundary == "maximum-hold":
+                        self.assertTrue(controller._activation_requires_release)
+                finally:
+                    controller._output_thread = None
+                    controller.stop()
+
+    def test_calibration_enter_and_exit_synchronously_reset_calibrated_core(self) -> None:
+        controller, calibrated, active, target, ready_ns = (
+            self._ready_calibrated_adapter()
+        )
+        try:
+            self.assertTrue(calibrated.ready)
+            token = controller.enter_calibration_mode()
+            self.assertFalse(calibrated.ready)
+            self.assertIsNone(controller.calibrated_control_output)
+
+            calibrated.step(
+                ready_ns + 1,
+                engaged=True,
+                observation=ScreenErrorObservation(ready_ns + 1, 40.0, 0.0),
+            )
+            calibrated.step(
+                ready_ns + 2,
+                engaged=True,
+                observation=ScreenErrorObservation(ready_ns + 2, 40.0, 0.0),
+            )
+            self.assertTrue(calibrated.ready)
+
+            controller.exit_calibration_mode(token)
+            self.assertFalse(calibrated.ready)
+            self.assertIsNone(controller.calibrated_control_output)
+
+            movement_before = self._movement_writes(active)
+            self._queue_calibration_repress(active)
+            next_ns = ready_ns + 8_000_000
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=next_ns,
+            )
+            controller._output_tick(0.001, now_ns=next_ns)
+            self.assertEqual(self._movement_writes(active), movement_before)
+            self.assertFalse(calibrated.ready)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibrated_history_capacity_fails_before_physical_write(self) -> None:
+        controller, _calibrated, active, target, ready_ns = (
+            self._ready_calibrated_adapter(
+                maximum_command_history=16,
+                plant_delay_seconds=0.25,
+            )
+        )
+        try:
+            timestamp_ns = ready_ns
+            for _attempt in range(32):
+                if len(self._movement_writes(active)) >= 16:
+                    break
+                timestamp_ns += 1_000_000
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=timestamp_ns,
+                )
+                controller._output_tick(0.001, now_ns=timestamp_ns)
+            movement_before = self._movement_writes(active)
+            self.assertEqual(len(movement_before), 16)
+
+            timestamp_ns += 1_000_000
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=timestamp_ns,
+            )
+            with self.assertRaisesRegex(
+                MakcuError,
+                "command preflight.*command-history-overflow",
+            ):
+                controller._output_tick(0.001, now_ns=timestamp_ns)
+            self.assertEqual(self._movement_writes(active), movement_before)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
     def test_activation_poll_is_read_only(self) -> None:
         controller = self.controller()
         controller.start()
         active = self.factory.connections[-1]
         pressed_ns = 1_000_000_000
+        self.assertEqual(controller.raw_activation_state, (False, False))
         active.responses.extend(bytes((0b00010,)))
 
         self.assertTrue(controller.poll_activation(now_ns=pressed_ns))
+        self.assertEqual(controller.raw_activation_state, (True, True))
         self.assertFalse(any(write.startswith(b"km.move(") for write in active.writes))
+        controller._activation_requires_release = True
+        self.assertFalse(controller.activation_pressed)
+        self.assertEqual(controller.raw_activation_state, (True, True))
         active.responses.extend(bytes((0,)))
         self.assertFalse(controller.poll_activation(now_ns=pressed_ns + 1))
+        self.assertEqual(controller.raw_activation_state, (True, False))
 
     def test_poll_button_mask_reports_latest_button_bits(self) -> None:
         controller = self.controller()
@@ -548,6 +1267,654 @@ class MakcuAimingTests(unittest.TestCase):
         controller._output_tick(0.001, now_ns=stale_now)
         self.assertEqual(len(active.writes), before_stale)
 
+    def test_telemetry_observes_gate_duty_and_successful_movement_only(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=0.5,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        base_ns = time.perf_counter_ns()
+        target = Detection(0, "player", 0.9, (1150, 540, 1170, 560))
+        controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+
+        try:
+            self.assertEqual(controller.telemetry_snapshot(), MakcuTelemetrySnapshot())
+            writes_before_snapshot = len(active.writes)
+            controller.telemetry_snapshot()
+            self.assertEqual(len(active.writes), writes_before_snapshot)
+
+            active.responses.extend(bytes((0b00010,)))
+            controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+            controller._output_tick(0.001, now_ns=base_ns + 2_000_000)
+            active.responses.extend(bytes((0,)))
+            controller._output_tick(0.001, now_ns=base_ns + 3_000_000)
+
+            self.assertEqual(
+                controller.telemetry_snapshot(),
+                MakcuTelemetrySnapshot(
+                    output_ticks=3,
+                    active_input_ticks=3,
+                    button_pressed_ticks=2,
+                    target_present_ticks=3,
+                    fresh_target_ticks=3,
+                    authorized_ticks=2,
+                    movement_commands=2,
+                    emitted_x=12,
+                    emitted_y=0,
+                    emitted_abs_x=12,
+                    emitted_abs_y=0,
+                    control_samples=1,
+                    control_error_x=200.0,
+                    control_error_abs_x=200.0,
+                ),
+            )
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_telemetry_distinguishes_missing_and_stale_targets_and_resets_on_start(self) -> None:
+        controller = self.controller(MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = time.perf_counter_ns()
+        target = Detection(0, "player", 0.9, (1060, 480, 1260, 980))
+        controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+
+        try:
+            controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+            stale_ns = base_ns + round((TARGET_STALE_SECONDS + 0.01) * 1e9)
+            controller._output_tick(0.001, now_ns=stale_ns)
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            self.assertEqual(controller._pursuit_correction_y, 0.0)
+            controller.update(None, (1080, 1920, 3), measurement_ns=stale_ns + 1)
+            controller._output_tick(0.001, now_ns=stale_ns + 2)
+
+            snapshot = controller.telemetry_snapshot()
+            self.assertEqual(snapshot.output_ticks, 3)
+            self.assertEqual(snapshot.active_input_ticks, 3)
+            self.assertEqual(snapshot.button_pressed_ticks, 3)
+            self.assertEqual(snapshot.target_present_ticks, 2)
+            self.assertEqual(snapshot.fresh_target_ticks, 1)
+            self.assertEqual(snapshot.authorized_ticks, 1)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+        controller.start(output_loop=False)
+        try:
+            self.assertEqual(controller.telemetry_snapshot(), MakcuTelemetrySnapshot())
+        finally:
+            controller.stop()
+
+    def test_control_telemetry_is_detector_sample_based_and_resets_once_per_gap(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=110,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = time.perf_counter_ns()
+        target = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+
+        try:
+            controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+            controller._output_tick(0.0, now_ns=base_ns)
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 12_000_000,
+            )
+            controller._output_tick(0.012, now_ns=base_ns + 12_000_000)
+
+            # Replaying the held detector sample at 1 kHz must not multiply
+            # either its visual-error or pursuit observation.
+            for offset_ms in range(13, 63):
+                controller._output_tick(
+                    0.001,
+                    now_ns=base_ns + offset_ms * 1_000_000,
+                )
+
+            snapshot = controller.telemetry_snapshot()
+            self.assertEqual(snapshot.control_samples, 2)
+            self.assertAlmostEqual(snapshot.control_error_x, 200.0)
+            self.assertAlmostEqual(snapshot.control_error_abs_x, 200.0)
+            self.assertAlmostEqual(snapshot.pursuit_x, 10.0)
+            self.assertAlmostEqual(snapshot.pursuit_abs_x, 10.0)
+            self.assertEqual(snapshot.saturated_x_samples, 1)
+            self.assertEqual(snapshot.pursuit_resets, 0)
+
+            missing_ns = base_ns + 63_000_000
+            controller.update(None, (1080, 1920, 3), measurement_ns=missing_ns)
+            controller._output_tick(0.001, now_ns=missing_ns)
+            for offset_ms in range(64, 74):
+                controller._output_tick(
+                    0.001,
+                    now_ns=base_ns + offset_ms * 1_000_000,
+                )
+
+            self.assertEqual(controller.telemetry_snapshot().pursuit_resets, 1)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_telemetry_keeps_absolute_motion_and_ignores_failed_commands(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=0.5,
+                max_step=1000,
+                deadzone_pixels=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        right = Detection(0, "player", 0.9, (1150, 540, 1170, 560))
+        left = Detection(0, "player", 0.9, (750, 540, 770, 560))
+
+        try:
+            controller.update(right, (1080, 1920, 3))
+            controller.update(left, (1080, 1920, 3))
+            snapshot = controller.telemetry_snapshot()
+            self.assertEqual(snapshot.movement_commands, 2)
+            self.assertEqual(snapshot.emitted_x, 0)
+            self.assertEqual(snapshot.emitted_abs_x, 200)
+
+            with (
+                mock.patch.object(
+                    controller,
+                    "_command",
+                    side_effect=MakcuError("simulated serial failure"),
+                ),
+                self.assertRaisesRegex(MakcuError, "simulated serial failure"),
+            ):
+                controller.update(right, (1080, 1920, 3))
+            failed_snapshot = controller.telemetry_snapshot()
+            self.assertEqual(failed_snapshot.output_ticks, 3)
+            self.assertEqual(failed_snapshot.authorized_ticks, 3)
+            self.assertEqual(failed_snapshot.movement_commands, 2)
+            self.assertEqual(failed_snapshot.emitted_x, 0)
+            self.assertEqual(failed_snapshot.emitted_abs_x, 200)
+        finally:
+            controller.stop()
+
+    def test_calibration_requires_a_live_exact_1000hz_worker(self) -> None:
+        controller = self.controller(MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        try:
+            with self.assertRaisesRegex(MakcuError, "live 1 kHz output worker"):
+                controller.enter_calibration_mode()
+
+            stopped_worker = mock.Mock()
+            stopped_worker.is_alive.return_value = False
+            controller._output_thread = stopped_worker
+            with self.assertRaisesRegex(MakcuError, "live 1 kHz output worker"):
+                controller.enter_calibration_mode()
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+        controller = self.controller(MakcuAimConfig(output_hz=500))
+        controller.start(output_loop=False)
+        try:
+            live_worker = mock.Mock()
+            live_worker.is_alive.return_value = True
+            controller._output_thread = live_worker
+            with self.assertRaisesRegex(MakcuError, "live 1 kHz output worker"):
+                controller.enter_calibration_mode()
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_held_at_entry_requires_release_and_new_press(self) -> None:
+        controller = self.controller(MakcuAimConfig(output_hz=1000))
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        base_ns = 15_000_000_000
+        active.responses.extend(bytes((0b00010,)))
+        self.assertTrue(controller.poll_activation(now_ns=base_ns))
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        token = controller.enter_calibration_mode()
+        try:
+            controller.publish_calibration_lease(True, base_ns, token)
+            controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+            self.assertFalse(
+                controller._activation_pressed_at(base_ns + 1_000_000)
+            )
+            self.assertEqual(self._movement_writes(active), ())
+
+            self._queue_calibration_repress(active)
+            controller._output_tick(0.001, now_ns=base_ns + 2_000_000)
+            controller.publish_calibration_lease(
+                True,
+                base_ns + 2_000_000,
+                token,
+            )
+            controller.request_calibration_pulse("x", 1, 1000.0, token)
+            controller._output_tick(0.001, now_ns=base_ns + 3_000_000)
+
+            self.assertEqual(self._movement_writes(active), (b"km.move(1,0)\r",))
+            self.assertEqual(
+                controller.calibration_snapshot().emitted_events,
+                ((base_ns + 3_000_000, 1, 0),),
+            )
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_excludes_normal_output_and_rejects_token_misuse(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(output_hz=1000, head_ratio=0.0)
+        )
+        controller.start(output_loop=False)
+        target = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        controller.update(target, (1080, 1920, 3), measurement_ns=1_000_000_000)
+        controller._fractional_x = 0.75
+        controller._smoothed_rate_x = 500.0
+        controller._pursuit_correction_x = 25.0
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        token = controller.enter_calibration_mode()
+        wrong_token = object()
+        try:
+            self.assertIsNone(controller._latest_target)
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._smoothed_rate_x, 0.0)
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            with self.assertRaisesRegex(MakcuError, "already active"):
+                controller.enter_calibration_mode()
+            with self.assertRaisesRegex(MakcuError, "invalid or inactive"):
+                controller.publish_calibration_lease(True, 1_000_000_000, wrong_token)
+            with self.assertRaisesRegex(MakcuError, "invalid or inactive"):
+                controller.request_calibration_pulse("x", 1, 1000.0, wrong_token)
+            with self.assertRaisesRegex(MakcuError, "invalid or inactive"):
+                controller.exit_calibration_mode(wrong_token)
+            with self.assertRaisesRegex(MakcuError, "unavailable during calibration"):
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=1_000_000_001,
+                )
+
+            controller.exit_calibration_mode(token)
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=1_000_000_002,
+            )
+            self.assertIs(controller._latest_target, target)
+        finally:
+            if controller.calibration_snapshot().active:
+                controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_rejects_pulse_bounds_and_parallel_axes(self) -> None:
+        controller, _active, token = self._start_test_calibration()
+        base_ns = 20_000_000_000
+        try:
+            controller.publish_calibration_lease(True, base_ns, token)
+            with self.assertRaisesRegex(ValueError, "axis"):
+                controller.request_calibration_pulse("z", 1, 1000.0, token)
+            for invalid_counts in (True, 1.5):
+                with self.subTest(counts=invalid_counts):
+                    with self.assertRaises(TypeError):
+                        controller.request_calibration_pulse(
+                            "x", invalid_counts, 1000.0, token
+                        )
+            with self.assertRaisesRegex(ValueError, "cannot be zero"):
+                controller.request_calibration_pulse("x", 0, 1000.0, token)
+            with self.assertRaisesRegex(ValueError, "cannot exceed"):
+                controller.request_calibration_pulse(
+                    "x", CALIBRATION_MAX_EXCURSION_COUNTS + 1, 1000.0, token
+                )
+            for invalid_rate in (
+                True,
+                0.0,
+                math.nan,
+                CALIBRATION_MAX_RATE_COUNTS_PER_SECOND + 1.0,
+            ):
+                with self.subTest(rate=invalid_rate):
+                    with self.assertRaisesRegex(ValueError, "pulse rate"):
+                        controller.request_calibration_pulse(
+                            "x", 1, invalid_rate, token
+                        )
+
+            controller.request_calibration_pulse("x", 10, 1000.0, token)
+            with self.assertRaisesRegex(MakcuError, "already pending"):
+                controller.request_calibration_pulse("y", 10, 1000.0, token)
+            snapshot = controller.calibration_snapshot()
+            self.assertEqual(snapshot.pending_axis, "x")
+            self.assertEqual(snapshot.pending_counts, 10)
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_session_budget_uses_actual_absolute_counts(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        self._queue_calibration_repress(active)
+        base_ns = 30_000_000_000
+        now_ns = base_ns
+        # At the validated low-end response of 0.10 px/count, a 120-count
+        # excursion reaches the fitter's 12px quality floor. Two symmetric
+        # pulses per polarity and axis consume 960 counts, leaving 1,440 for
+        # bounded adaptive scouts/returns without weakening the core gates.
+        minimum_qualifying_counts = math.ceil(
+            MIN_EXCURSION_PIXELS / 0.10
+        )
+        minimum_evidence = (
+            ("x", minimum_qualifying_counts),
+            ("x", -minimum_qualifying_counts),
+            ("x", minimum_qualifying_counts),
+            ("x", -minimum_qualifying_counts),
+            ("y", minimum_qualifying_counts),
+            ("y", -minimum_qualifying_counts),
+            ("y", minimum_qualifying_counts),
+            ("y", -minimum_qualifying_counts),
+        )
+        self.assertEqual(MIN_PULSES_PER_POLARITY, 2)
+        self.assertLessEqual(
+            minimum_qualifying_counts,
+            CALIBRATION_MAX_EXCURSION_COUNTS,
+        )
+        self.assertEqual(
+            sum(abs(counts) for _axis, counts in minimum_evidence),
+            960,
+        )
+        reserve = (
+            ("x", 200),
+            ("x", -200),
+            ("y", 200),
+            ("y", -200),
+            ("x", 200),
+            ("x", -200),
+            ("y", 200),
+            ("y", -40),
+        )
+        excursions = minimum_evidence + reserve
+        self.assertEqual(
+            sum(abs(counts) for _axis, counts in excursions),
+            CALIBRATION_MAX_SESSION_ABS_COUNTS,
+        )
+        try:
+            for axis, counts in excursions:
+                controller.publish_calibration_lease(True, now_ns, token)
+                controller.request_calibration_pulse(
+                    axis,
+                    counts,
+                    CALIBRATION_MAX_RATE_COUNTS_PER_SECOND,
+                    token,
+                )
+                while controller.calibration_snapshot().pending_counts:
+                    now_ns += 1_000_000
+                    if (now_ns - base_ns) % 20_000_000 == 0:
+                        controller.publish_calibration_lease(True, now_ns, token)
+                    controller._output_tick(0.001, now_ns=now_ns)
+
+            snapshot = controller.calibration_snapshot()
+            self.assertEqual(
+                snapshot.emitted_abs_counts,
+                CALIBRATION_MAX_SESSION_ABS_COUNTS,
+            )
+            self.assertEqual(snapshot.movement_commands, len(snapshot.emitted_events))
+            self.assertLessEqual(
+                len(snapshot.emitted_events),
+                CALIBRATION_MAX_SESSION_ABS_COUNTS,
+            )
+            self.assertTrue(
+                all(
+                    bool(delta_x) != bool(delta_y)
+                    for _, delta_x, delta_y in snapshot.emitted_events
+                )
+            )
+
+            controller.publish_calibration_lease(True, now_ns, token)
+            with self.assertRaisesRegex(ValueError, "session cannot exceed"):
+                controller.request_calibration_pulse("x", 1, 1.0, token)
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_snapshot_records_exact_successful_emission_order(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        self._queue_calibration_repress(active)
+        base_ns = 40_000_000_000
+        try:
+            controller.publish_calibration_lease(True, base_ns, token)
+            controller.request_calibration_pulse("x", 5, 2400.0, token)
+            for offset_ms in (1, 2, 3):
+                controller._output_tick(
+                    0.001,
+                    now_ns=base_ns + offset_ms * 1_000_000,
+                )
+            controller.publish_calibration_lease(
+                True,
+                base_ns + 3_000_000,
+                token,
+            )
+            controller.request_calibration_pulse("y", -4, 2400.0, token)
+            # Even a delayed tick cannot collapse 10 ms of backlog into a
+            # command above the hard three-count per-tick ceiling.
+            controller._output_tick(0.010, now_ns=base_ns + 13_000_000)
+            controller._output_tick(0.001, now_ns=base_ns + 14_000_000)
+
+            expected_events = (
+                (base_ns + 1_000_000, 2, 0),
+                (base_ns + 2_000_000, 2, 0),
+                (base_ns + 3_000_000, 1, 0),
+                (base_ns + 13_000_000, 0, -3),
+                (base_ns + 14_000_000, 0, -1),
+            )
+            self.assertEqual(
+                controller.calibration_snapshot(),
+                MakcuCalibrationSnapshot(
+                    active=True,
+                    emitted_x=5,
+                    emitted_y=-4,
+                    emitted_abs_counts=9,
+                    movement_commands=5,
+                    first_emitted_ns=expected_events[0][0],
+                    last_emitted_ns=expected_events[-1][0],
+                    emitted_events=expected_events,
+                ),
+            )
+            self.assertGreater(controller.calibration_snapshot().captured_ns, 0)
+            self.assertEqual(
+                self._movement_writes(active),
+                (
+                    b"km.move(2,0)\r",
+                    b"km.move(2,0)\r",
+                    b"km.move(1,0)\r",
+                    b"km.move(0,-3)\r",
+                    b"km.move(0,-1)\r",
+                ),
+            )
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_release_aborts_partial_pulse_without_return_motion(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        base_ns = 50_000_000_000
+        self._queue_calibration_repress(active)
+        try:
+            controller.publish_calibration_lease(True, base_ns, token)
+            controller.request_calibration_pulse("x", 10, 1000.0, token)
+            controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+            with controller._state_lock:
+                controller._fractional_x = 0.75
+                controller._smoothed_rate_x = 500.0
+                controller._pursuit_correction_x = 25.0
+                controller._latest_active = True
+            writes_after_first_count = self._movement_writes(active)
+
+            self._queue_button_event(active, 0)
+            controller._output_tick(0.001, now_ns=base_ns + 2_000_000)
+            snapshot = controller.calibration_snapshot()
+            self.assertEqual(snapshot.pending_counts, 0)
+            self.assertEqual(snapshot.emitted_abs_counts, 1)
+            self.assertEqual(snapshot.emitted_events, ((base_ns + 1_000_000, 1, 0),))
+            self.assertIn("physical activation was released", snapshot.abort_reason or "")
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._smoothed_rate_x, 0.0)
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            self.assertFalse(controller._latest_active)
+
+            self._queue_button_event(active, 0b00010)
+            controller._output_tick(0.010, now_ns=base_ns + 12_000_000)
+            self.assertEqual(self._movement_writes(active), writes_after_first_count)
+            with self.assertRaisesRegex(MakcuError, "session is aborted"):
+                controller.publish_calibration_lease(
+                    True, base_ns + 12_000_000, token
+                )
+            with self.assertRaisesRegex(MakcuError, "session is aborted"):
+                controller.request_calibration_pulse("x", 1, 1000.0, token)
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_stale_lease_aborts_before_any_motion(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        base_ns = 60_000_000_000
+        self._queue_calibration_repress(active)
+        try:
+            controller.publish_calibration_lease(True, base_ns, token)
+            controller.request_calibration_pulse("x", 10, 1000.0, token)
+            stale_ns = base_ns + round(
+                CALIBRATION_LEASE_MAX_AGE_SECONDS * 1_000_000_000
+            ) + 1
+            controller._output_tick(0.001, now_ns=stale_ns)
+
+            snapshot = controller.calibration_snapshot()
+            self.assertEqual(snapshot.pending_counts, 0)
+            self.assertEqual(snapshot.emitted_events, ())
+            self.assertIn("lease expired", snapshot.abort_reason or "")
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_invalid_lease_atomically_cancels_pending_motion(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        base_ns = 70_000_000_000
+        try:
+            controller.publish_calibration_lease(True, base_ns, token)
+            controller.request_calibration_pulse("y", -10, 1000.0, token)
+            controller.publish_calibration_lease(False, base_ns + 1, token)
+
+            snapshot = controller.calibration_snapshot()
+            self.assertEqual(snapshot.pending_counts, 0)
+            self.assertEqual(snapshot.emitted_events, ())
+            self.assertIn("lease was invalidated", snapshot.abort_reason or "")
+            self._queue_calibration_repress(active)
+            controller._output_tick(0.010, now_ns=base_ns + 10_000_000)
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_write_failure_is_excluded_from_evidence_and_aborts(self) -> None:
+        controller, active, token = self._start_test_calibration()
+        base_ns = 80_000_000_000
+        self._queue_calibration_repress(active)
+        try:
+            controller.publish_calibration_lease(True, base_ns, token)
+            controller.request_calibration_pulse("x", 10, 1000.0, token)
+            with (
+                mock.patch.object(
+                    controller,
+                    "_command",
+                    side_effect=MakcuError("simulated serial failure"),
+                ),
+                self.assertRaisesRegex(MakcuError, "simulated serial failure"),
+            ):
+                controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+
+            failed = controller.calibration_snapshot()
+            self.assertEqual(failed.emitted_events, ())
+            self.assertEqual(failed.emitted_abs_counts, 0)
+            self.assertEqual(failed.movement_commands, 0)
+            self.assertEqual(failed.pending_counts, 0)
+            self.assertIn("movement write failed", failed.abort_reason or "")
+            self.assertEqual(controller.telemetry_snapshot().movement_commands, 0)
+
+            controller._output_tick(0.010, now_ns=base_ns + 11_000_000)
+            self.assertEqual(self._movement_writes(active), ())
+        finally:
+            controller.exit_calibration_mode(token)
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibration_stop_invalidates_token_and_restart_erases_evidence(self) -> None:
+        controller, active, old_token = self._start_test_calibration()
+        base_ns = 90_000_000_000
+        self._queue_calibration_repress(active)
+        controller.publish_calibration_lease(True, base_ns, old_token)
+        controller.request_calibration_pulse("x", 10, 1000.0, old_token)
+        controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+        controller._output_thread = None
+        controller.stop()
+
+        stopped = controller.calibration_snapshot()
+        self.assertFalse(stopped.active)
+        self.assertEqual(stopped.pending_counts, 0)
+        self.assertEqual(stopped.emitted_events, ((base_ns + 1_000_000, 1, 0),))
+        self.assertIn("stopped during calibration", stopped.abort_reason or "")
+        with self.assertRaisesRegex(MakcuError, "invalid or inactive"):
+            controller.publish_calibration_lease(
+                True, base_ns + 2_000_000, old_token
+            )
+
+        controller.start(output_loop=False)
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        new_token = controller.enter_calibration_mode()
+        try:
+            self.assertIsNot(new_token, old_token)
+            self.assertEqual(
+                controller.calibration_snapshot(),
+                MakcuCalibrationSnapshot(active=True),
+            )
+            with self.assertRaisesRegex(MakcuError, "invalid or inactive"):
+                controller.exit_calibration_mode(old_token)
+        finally:
+            controller.exit_calibration_mode(new_token)
+            controller._output_thread = None
+            controller.stop()
+
     def test_velocity_uses_detector_sample_times_and_persists_between_ticks(self) -> None:
         controller = self.controller(
             MakcuAimConfig(
@@ -587,6 +1954,922 @@ class MakcuAimingTests(unittest.TestCase):
             abs(second_tick_rate - first_tick_rate),
             abs(first_tick_rate) * 0.05,
         )
+
+    def test_approaching_velocity_cannot_reduce_current_error_correction(self) -> None:
+        cases = (
+            (
+                "horizontal",
+                Detection(0, "player", 0.9, (1076, 540, 1096, 640)),
+                Detection(0, "player", 0.9, (1050, 540, 1070, 640)),
+                "_smoothed_rate_x",
+            ),
+            (
+                "vertical",
+                Detection(0, "player", 0.9, (950, 666, 970, 766)),
+                Detection(0, "player", 0.9, (950, 640, 970, 740)),
+                "_smoothed_rate_y",
+            ),
+        )
+        for axis, earlier, current, rate_attribute in cases:
+            with self.subTest(axis=axis):
+                controller = self.controller(
+                    MakcuAimConfig(
+                        strength=0.5,
+                        max_step=1000,
+                        output_hz=1000,
+                        deadzone_pixels=0.0,
+                        smoothing_alpha=1.0,
+                        prediction_lead_seconds=0.03,
+                        derivative_damping_seconds=0.008,
+                        head_ratio=0.0,
+                    )
+                )
+                controller.start(output_loop=False)
+                controller._output_thread = object()
+                active = self.factory.connections[-1]
+                active.responses.extend(bytes((0b00010,)))
+                base_ns = 9_000_000_000
+                try:
+                    controller.update(
+                        earlier,
+                        (1080, 1920, 3),
+                        measurement_ns=base_ns,
+                    )
+                    controller.update(
+                        current,
+                        (1080, 1920, 3),
+                        measurement_ns=base_ns + 10_000_000,
+                    )
+
+                    controller._output_tick(
+                        0.001,
+                        now_ns=base_ns + 22_000_000,
+                    )
+
+                    self.assertAlmostEqual(
+                        getattr(controller, "_latest_velocity_" + rate_attribute[-1]),
+                        -2600.0,
+                    )
+                    # Pure proportional correction is 100px * .5 * 60Hz.
+                    # Closing velocity may not brake that measured command;
+                    # the small pursuit term can only increase it.
+                    self.assertGreaterEqual(getattr(controller, rate_attribute), 3000.0)
+                finally:
+                    controller._output_thread = None
+                    controller.stop()
+
+    def test_pursuit_integral_is_time_based_persists_at_crossing_and_unwinds(self) -> None:
+        def response_after(
+            duration_seconds: float,
+            rate_hz: int,
+        ) -> tuple[float, float]:
+            controller = self.controller(
+                MakcuAimConfig(
+                    strength=0.5,
+                    max_step=1000,
+                    output_hz=rate_hz,
+                    deadzone_pixels=0.0,
+                    smoothing_alpha=1.0,
+                    prediction_lead_seconds=0.0,
+                    derivative_damping_seconds=0.0,
+                    head_ratio=0.0,
+                )
+            )
+            controller.start(output_loop=False)
+            controller._output_thread = object()
+            active = self.factory.connections[-1]
+            active.responses.extend(bytes((0b00010,)))
+            base_ns = 10_000_000_000
+            right = Detection(0, "player", 0.9, (1150, 540, 1170, 640))
+            controller.update(right, (1080, 1920, 3), measurement_ns=base_ns)
+            period = 1.0 / rate_hz
+            try:
+                controller._output_tick(0.0, now_ns=base_ns)
+                detector_stride = rate_hz // 100
+                for index in range(round(duration_seconds * rate_hz)):
+                    measurement_ns = base_ns + round((index + 1) * period * 1e9)
+                    if (index + 1) % detector_stride == 0:
+                        controller.update(
+                            right,
+                            (1080, 1920, 3),
+                            measurement_ns=measurement_ns,
+                        )
+                    controller._output_tick(
+                        period,
+                        now_ns=measurement_ns,
+                    )
+                return controller._pursuit_correction_x, controller._smoothed_rate_x
+            finally:
+                controller._output_thread = None
+                controller.stop()
+
+        responses: dict[float, list[tuple[float, float]]] = {}
+        for duration_seconds in (0.05, 0.12):
+            responses[duration_seconds] = [
+                response_after(duration_seconds, rate_hz)
+                for rate_hz in (100, 1000, 2000)
+            ]
+
+        # A 200px error at strength 0.5 contributes 100 correction units.
+        # The pursuit term reaches 50/120 of that after 50ms and the full
+        # proportional amount after the configured 120ms buildup.
+        expected_integrals = {0.05: 100.0 * 0.05 / 0.12, 0.12: 100.0}
+        for duration_seconds, duration_responses in responses.items():
+            expected_integral = expected_integrals[duration_seconds]
+            reference_integral, reference_rate = duration_responses[0]
+            self.assertAlmostEqual(reference_integral, expected_integral)
+            for integral, rate in duration_responses[1:]:
+                self.assertAlmostEqual(integral, reference_integral)
+                self.assertAlmostEqual(rate, reference_rate, delta=1.0)
+        self.assertGreater(responses[0.05][-1][1], 200.0 * 0.5 * 60.0)
+
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = 11_000_000_000
+        right = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        left = Detection(0, "player", 0.9, (940, 540, 960, 640))
+        far_left = Detection(0, "player", 0.9, (850, 540, 870, 640))
+        try:
+            controller.update(right, (1080, 1920, 3), measurement_ns=base_ns)
+            controller._output_tick(0.0, now_ns=base_ns)
+            for index in range(100):
+                measurement_ns = base_ns + (index + 1) * 1_000_000
+                if (index + 1) % 10 == 0:
+                    controller.update(
+                        right,
+                        (1080, 1920, 3),
+                        measurement_ns=measurement_ns,
+                    )
+                controller._output_tick(
+                    0.001,
+                    now_ns=measurement_ns,
+                )
+            retained = controller._pursuit_correction_x
+            resets_before_crossing = controller.telemetry_snapshot().pursuit_resets
+            self.assertGreater(retained, 0.0)
+            controller.update(
+                left,
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 101_000_000,
+            )
+            controller._output_tick(0.001, now_ns=base_ns + 102_000_000)
+            # One ordinary center crossing is evidence that the learned rate
+            # should start unwinding, not evidence that it should disappear.
+            # The retained internal rate must neither produce wrong-way output
+            # nor suppress the fresh positional term on the new side. The
+            # exact fallback includes the allowed 1 ms same-direction sample-
+            # age assist: (-10px + -2600px/s * .001s) * 60Hz.
+            self.assertGreater(controller._pursuit_correction_x, 0.0)
+            self.assertLess(controller._pursuit_correction_x, retained)
+            expected_reversal_rate = (
+                controller._control_error_x
+                + controller._latest_velocity_x * 0.001
+            ) * controller.config.strength * 60.0
+            self.assertAlmostEqual(
+                controller._smoothed_rate_x,
+                expected_reversal_rate,
+            )
+            self.assertLess(controller._smoothed_rate_x, 0.0)
+            self.assertEqual(
+                controller.telemetry_snapshot().pursuit_resets,
+                resets_before_crossing,
+            )
+
+            # Sustained fresh error on the other side naturally unwinds and
+            # then reverses the learned rate without an explicit reset.
+            for index in range(11):
+                measurement_ns = base_ns + (111 + index * 10) * 1_000_000
+                controller.update(
+                    far_left,
+                    (1080, 1920, 3),
+                    measurement_ns=measurement_ns,
+                )
+                controller._output_tick(0.01, now_ns=measurement_ns)
+            self.assertLess(controller._pursuit_correction_x, 0.0)
+            self.assertLess(controller._smoothed_rate_x, 0.0)
+            controller.update(
+                None,
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 222_000_000,
+            )
+            controller._output_tick(0.001, now_ns=base_ns + 222_000_000)
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            self.assertEqual(controller._pursuit_correction_y, 0.0)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_pursuit_integral_respects_ratio_and_remaining_headroom(self) -> None:
+        cases = (
+            (
+                "half-limit cap",
+                Detection(0, "player", 0.9, (970, 540, 990, 560)),
+                0.40,
+                50.0,
+                70.0 * 60.0,
+            ),
+            (
+                "remaining headroom",
+                Detection(0, "player", 0.9, (1040, 540, 1060, 560)),
+                0.02,
+                10.0,
+                100.0 * 60.0,
+            ),
+        )
+        for name, target, duration_seconds, expected_integral, expected_rate in cases:
+            with self.subTest(name=name):
+                controller = self.controller(
+                    MakcuAimConfig(
+                        strength=1.0,
+                        max_step=100,
+                        output_hz=100,
+                        deadzone_pixels=0.0,
+                        smoothing_alpha=1.0,
+                        prediction_lead_seconds=0.0,
+                        derivative_damping_seconds=0.0,
+                        head_ratio=0.0,
+                    )
+                )
+                controller.start(output_loop=False)
+                controller._output_thread = object()
+                active = self.factory.connections[-1]
+                active.responses.extend(bytes((0b00010,)))
+                base_ns = 10_500_000_000
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=base_ns,
+                )
+                try:
+                    controller._output_tick(0.0, now_ns=base_ns)
+                    steps = round(duration_seconds * 100)
+                    for index in range(steps):
+                        measurement_ns = base_ns + (index + 1) * 10_000_000
+                        controller.update(
+                            target,
+                            (1080, 1920, 3),
+                            measurement_ns=measurement_ns,
+                        )
+                        controller._output_tick(
+                            0.01,
+                            now_ns=measurement_ns,
+                        )
+
+                    self.assertAlmostEqual(
+                        controller._pursuit_correction_x,
+                        expected_integral,
+                    )
+                    self.assertAlmostEqual(controller._smoothed_rate_x, expected_rate)
+                finally:
+                    controller._output_thread = None
+                    controller.stop()
+
+    def test_centered_measurement_retains_learned_rate_without_reset(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=2.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = 10_800_000_000
+        right = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        centered = Detection(0, "player", 0.9, (950, 540, 970, 640))
+        try:
+            controller.update(right, (1080, 1920, 3), measurement_ns=base_ns)
+            controller._output_tick(0.0, now_ns=base_ns)
+            for index in range(1, 7):
+                measurement_ns = base_ns + index * 10_000_000
+                controller.update(
+                    right,
+                    (1080, 1920, 3),
+                    measurement_ns=measurement_ns,
+                )
+                controller._output_tick(0.01, now_ns=measurement_ns)
+
+            retained = controller._pursuit_correction_x
+            resets_before_center = controller.telemetry_snapshot().pursuit_resets
+            self.assertGreater(retained, 0.0)
+            centered_ns = base_ns + 70_000_000
+            controller.update(
+                centered,
+                (1080, 1920, 3),
+                measurement_ns=centered_ns,
+            )
+            controller._output_tick(0.01, now_ns=centered_ns)
+
+            expected = retained * math.exp(
+                -0.01 / PURSUIT_DEADZONE_LEAK_TIME_SECONDS
+            )
+            self.assertAlmostEqual(controller._pursuit_correction_x, expected)
+            self.assertAlmostEqual(controller._smoothed_rate_x, expected * 60.0)
+            self.assertGreater(controller._smoothed_rate_x, 0.0)
+            self.assertEqual(
+                controller.telemetry_snapshot().pursuit_resets,
+                resets_before_center,
+            )
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_deadzone_pursuit_leak_is_detector_rate_invariant(self) -> None:
+        def retained_after(rate_hz: int, duration_seconds: float) -> float:
+            controller = self.controller(
+                MakcuAimConfig(
+                    strength=1.0,
+                    max_step=1000,
+                    output_hz=1000,
+                    deadzone_pixels=2.0,
+                    smoothing_alpha=1.0,
+                    prediction_lead_seconds=0.0,
+                    derivative_damping_seconds=0.0,
+                    head_ratio=0.0,
+                )
+            )
+            controller.start(output_loop=False)
+            controller._output_thread = object()
+            active = self.factory.connections[-1]
+            active.responses.extend(bytes((0b00010,)))
+            centered = Detection(0, "player", 0.9, (950, 540, 970, 640))
+            base_ns = 10_900_000_000
+            try:
+                controller.update(
+                    centered,
+                    (1080, 1920, 3),
+                    measurement_ns=base_ns,
+                )
+                controller._output_tick(0.0, now_ns=base_ns)
+                controller._pursuit_correction_x = 70.0
+                period = 1.0 / rate_hz
+                steps = round(duration_seconds * rate_hz)
+                for index in range(1, steps + 1):
+                    measurement_ns = base_ns + round(index * period * 1e9)
+                    controller.update(
+                        centered,
+                        (1080, 1920, 3),
+                        measurement_ns=measurement_ns,
+                    )
+                    controller._output_tick(period, now_ns=measurement_ns)
+                return controller._pursuit_correction_x
+            finally:
+                controller._output_thread = None
+                controller.stop()
+
+        duration_seconds = 0.40
+        expected = 70.0 * math.exp(
+            -duration_seconds / PURSUIT_DEADZONE_LEAK_TIME_SECONDS
+        )
+        results = [retained_after(rate, duration_seconds) for rate in (50, 100, 200)]
+        for result in results:
+            self.assertAlmostEqual(result, expected, places=10)
+        self.assertAlmostEqual(max(results), min(results), places=10)
+
+    def test_persistent_pursuit_reduces_constant_velocity_fake_plant_rms(self) -> None:
+        def rms_error(integral_time_seconds: float) -> float:
+            _before, after, _commands, _measurements = (
+                self._run_horizontal_fake_plant(
+                    lambda _tick: 800.0,
+                    ticks=1500,
+                    integral_time_seconds=integral_time_seconds,
+                )
+            )
+            steady_errors = after[500:]
+            return math.sqrt(
+                sum(error * error for error in steady_errors)
+                / len(steady_errors)
+            )
+
+        persistent_rms = rms_error(0.12)
+        proportional_only_rms = rms_error(1e12)
+
+        self.assertLess(persistent_rms, 10.0)
+        self.assertGreater(proportional_only_rms, 90.0)
+        self.assertLess(persistent_rms, proportional_only_rms * 0.10)
+
+    def test_abrupt_stop_has_bounded_wrong_way_fake_plant_displacement(self) -> None:
+        before, after, commands, measured = self._run_horizontal_fake_plant(
+            lambda tick: 800.0 if tick < 750 else 0.0,
+            ticks=2500,
+        )
+        with mock.patch(
+            "aiming.makcu._combine_pursuit_correction",
+            side_effect=self._legacy_opposing_pursuit_stall,
+        ):
+            _legacy_before, legacy_after, legacy_commands, legacy_measured = (
+                self._run_horizontal_fake_plant(
+                    lambda tick: 800.0 if tick < 750 else 0.0,
+                    ticks=2500,
+                )
+            )
+
+        # No command may oppose the latest fresh measurement once that
+        # measurement is outside the deadzone.
+        for command, error in zip(commands, measured):
+            if abs(error) > 2.0:
+                self.assertGreaterEqual(command * error, 0.0)
+
+        wrong_way_burst = 0.0
+        maximum_wrong_way_burst = 0.0
+        for command, actual_error in zip(commands[750:], before[750:]):
+            if abs(actual_error) > 2.0 and command * actual_error < 0.0:
+                wrong_way_burst += abs(command) * 0.10
+            else:
+                maximum_wrong_way_burst = max(
+                    maximum_wrong_way_burst,
+                    wrong_way_burst,
+                )
+                wrong_way_burst = 0.0
+        maximum_wrong_way_burst = max(maximum_wrong_way_burst, wrong_way_burst)
+
+        # Only commands already authorized by the preceding 8 ms detector
+        # sample can carry across the true zero crossing.
+        self.assertLessEqual(maximum_wrong_way_burst, 5.0)
+        self.assertGreaterEqual(min(after[750:]), -8.0)
+        self.assertLess(abs(after[-1]), 4.0)
+
+        # The old zero fallback could remain motionless against a fresh error
+        # for the rest of the run. The base fallback never stalls longer than
+        # one detector interval and roughly halves post-stop integrated error.
+        current_zero_run = self._maximum_fresh_zero_run(
+            commands,
+            measured,
+            start=750,
+        )
+        legacy_zero_run = self._maximum_fresh_zero_run(
+            legacy_commands,
+            legacy_measured,
+            start=750,
+        )
+        self.assertLessEqual(current_zero_run, 8)
+        self.assertGreater(legacy_zero_run, 1000)
+        current_integrated_error = sum(abs(error) for error in after[750:])
+        legacy_integrated_error = sum(
+            abs(error) for error in legacy_after[750:]
+        )
+        self.assertLess(
+            current_integrated_error,
+            legacy_integrated_error * 0.60,
+        )
+
+    def test_target_reversal_has_bounded_wrong_way_fake_plant_displacement(self) -> None:
+        before, after, commands, measured = self._run_horizontal_fake_plant(
+            lambda tick: 800.0 if tick < 750 else -800.0,
+            ticks=2500,
+        )
+        with mock.patch(
+            "aiming.makcu._combine_pursuit_correction",
+            side_effect=self._legacy_opposing_pursuit_stall,
+        ):
+            _legacy_before, legacy_after, legacy_commands, legacy_measured = (
+                self._run_horizontal_fake_plant(
+                    lambda tick: 800.0 if tick < 750 else -800.0,
+                    ticks=2500,
+                )
+            )
+
+        for command, error in zip(commands, measured):
+            if abs(error) > 2.0:
+                self.assertGreaterEqual(command * error, 0.0)
+
+        wrong_way_burst = 0.0
+        maximum_wrong_way_burst = 0.0
+        for command, actual_error in zip(commands[750:], before[750:]):
+            if abs(actual_error) > 2.0 and command * actual_error < 0.0:
+                wrong_way_burst += abs(command) * 0.10
+            else:
+                maximum_wrong_way_burst = max(
+                    maximum_wrong_way_burst,
+                    wrong_way_burst,
+                )
+                wrong_way_burst = 0.0
+        maximum_wrong_way_burst = max(maximum_wrong_way_burst, wrong_way_burst)
+
+        self.assertLessEqual(maximum_wrong_way_burst, 6.0)
+        self.assertGreaterEqual(min(after[750:]), -101.0)
+        self.assertLess(abs(after[-1]), 3.0)
+
+        current_zero_run = self._maximum_fresh_zero_run(
+            commands,
+            measured,
+            start=750,
+        )
+        legacy_zero_run = self._maximum_fresh_zero_run(
+            legacy_commands,
+            legacy_measured,
+            start=750,
+        )
+        self.assertLessEqual(current_zero_run, 8)
+        self.assertGreaterEqual(legacy_zero_run, 80)
+        current_initial_error = sum(abs(error) for error in after[750:900])
+        legacy_initial_error = sum(
+            abs(error) for error in legacy_after[750:900]
+        )
+        self.assertLess(current_initial_error, legacy_initial_error * 0.80)
+        self.assertGreater(
+            min(after[750:]),
+            min(legacy_after[750:]) + 5.0,
+        )
+
+    def test_gate_loss_resets_pursuit_and_emits_no_movement(self) -> None:
+        config = MakcuAimConfig(
+            strength=1.0,
+            max_step=1000,
+            output_hz=1000,
+            deadzone_pixels=0.0,
+            smoothing_alpha=1.0,
+            prediction_lead_seconds=0.0,
+            derivative_damping_seconds=0.0,
+            head_ratio=0.0,
+        )
+        target = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+
+        for gate_loss in ("physical release", "inactive input"):
+            with self.subTest(gate_loss=gate_loss):
+                controller = self.controller(config)
+                controller.start(output_loop=False)
+                controller._output_thread = object()
+                active = self.factory.connections[-1]
+                active.responses.extend(bytes((0b00010,)))
+                base_ns = time.perf_counter_ns()
+                try:
+                    controller.update(
+                        target,
+                        (1080, 1920, 3),
+                        measurement_ns=base_ns,
+                    )
+                    controller._output_tick(0.0, now_ns=base_ns)
+                    controller.update(
+                        target,
+                        (1080, 1920, 3),
+                        measurement_ns=base_ns + 20_000_000,
+                    )
+                    controller._output_tick(
+                        0.02,
+                        now_ns=base_ns + 20_000_000,
+                    )
+                    self.assertGreater(controller._pursuit_correction_x, 0.0)
+                    movement_count = sum(
+                        write.startswith(b"km.move(") for write in active.writes
+                    )
+
+                    if gate_loss == "physical release":
+                        active.responses.extend(bytes((0,)))
+                    else:
+                        controller.update(
+                            target,
+                            (1080, 1920, 3),
+                            active=False,
+                            measurement_ns=base_ns + 21_000_000,
+                        )
+                    controller._output_tick(
+                        0.001,
+                        now_ns=base_ns + 21_000_000,
+                    )
+
+                    self.assertEqual(controller._pursuit_correction_x, 0.0)
+                    self.assertEqual(controller._pursuit_correction_y, 0.0)
+                    self.assertEqual(
+                        sum(write.startswith(b"km.move(") for write in active.writes),
+                        movement_count,
+                    )
+                finally:
+                    controller._output_thread = None
+                    controller.stop()
+
+    def test_stop_and_restart_clear_pursuit_memory(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        target = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = 11_500_000_000
+        controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+        controller._output_tick(0.0, now_ns=base_ns)
+        controller.update(
+            target,
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 20_000_000,
+        )
+        controller._output_tick(0.02, now_ns=base_ns + 20_000_000)
+        self.assertGreater(controller._pursuit_correction_x, 0.0)
+
+        controller._output_thread = None
+        controller.stop()
+        self.assertEqual(controller._pursuit_correction_x, 0.0)
+        self.assertEqual(controller._pursuit_correction_y, 0.0)
+        self.assertEqual(controller._pursuit_measurement_ns, 0)
+
+        controller.start(output_loop=False)
+        try:
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            self.assertEqual(controller._pursuit_correction_y, 0.0)
+            self.assertEqual(controller._pursuit_measurement_ns, 0)
+        finally:
+            controller.stop()
+
+    def test_prediction_gap_preserves_pursuit_until_tracker_grace_expires(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        tracker = TargetTracker(
+            label="player",
+            head_ratio=0.0,
+            lost_grace_frames=1,
+        )
+        target = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = time.perf_counter_ns()
+        try:
+            first = tracker.update(
+                [target],
+                (1080, 1920, 3),
+                measurement_ns=base_ns,
+            )
+            controller.update(first, (1080, 1920, 3), measurement_ns=base_ns)
+            controller._output_tick(0.0, now_ns=base_ns)
+
+            measured_ns = base_ns + 8_000_000
+            measured = tracker.update(
+                [target],
+                (1080, 1920, 3),
+                measurement_ns=measured_ns,
+            )
+            controller.update(
+                measured,
+                (1080, 1920, 3),
+                measurement_ns=measured_ns,
+            )
+            controller._output_tick(0.008, now_ns=measured_ns)
+            accumulated = controller._pursuit_correction_x
+            self.assertGreater(accumulated, 0.0)
+            resets_before_gap = controller.telemetry_snapshot().pursuit_resets
+            control_samples_before_gap = (
+                controller.telemetry_snapshot().control_samples
+            )
+
+            bridged_ns = base_ns + 16_000_000
+            bridged = tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=bridged_ns,
+            )
+            self.assertIsNotNone(bridged)
+            controller.update(
+                bridged,
+                (1080, 1920, 3),
+                measurement_ns=bridged_ns,
+                measurement_observed=False,
+            )
+            controller._output_tick(0.008, now_ns=bridged_ns)
+            self.assertEqual(controller._pursuit_correction_x, accumulated)
+            self.assertEqual(
+                controller.telemetry_snapshot().pursuit_resets,
+                resets_before_gap,
+            )
+            self.assertEqual(
+                controller.telemetry_snapshot().control_samples,
+                control_samples_before_gap,
+            )
+
+            expired_ns = measured_ns + 16_666_668
+            expired = tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=expired_ns,
+            )
+            self.assertIsNone(expired)
+            controller.update(
+                expired,
+                (1080, 1920, 3),
+                measurement_ns=expired_ns,
+            )
+            controller._output_tick(0.001, now_ns=expired_ns)
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            self.assertEqual(
+                controller.telemetry_snapshot().pursuit_resets,
+                resets_before_gap + 1,
+            )
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_physical_release_during_predicted_gap_emits_no_movement(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        tracker = TargetTracker(
+            label="player",
+            head_ratio=0.0,
+            lost_grace_frames=1,
+        )
+        target = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        base_ns = time.perf_counter_ns()
+        try:
+            measured = tracker.update(
+                [target],
+                (1080, 1920, 3),
+                measurement_ns=base_ns,
+            )
+            controller.update(
+                measured,
+                (1080, 1920, 3),
+                measurement_ns=base_ns,
+            )
+            controller._output_tick(0.008, now_ns=base_ns)
+            movement_count = sum(
+                write.startswith(b"km.move(") for write in active.writes
+            )
+
+            predicted_ns = base_ns + 8_000_000
+            predicted = tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=predicted_ns,
+            )
+            self.assertIsNotNone(predicted)
+            controller.update(
+                predicted,
+                (1080, 1920, 3),
+                measurement_ns=predicted_ns,
+                measurement_observed=False,
+            )
+            active.responses.extend(bytes((0,)))
+            controller._output_tick(0.008, now_ns=predicted_ns)
+
+            self.assertFalse(controller.activation_pressed)
+            self.assertEqual(
+                sum(write.startswith(b"km.move(") for write in active.writes),
+                movement_count,
+            )
+            self.assertEqual(controller._pursuit_correction_x, 0.0)
+            self.assertEqual(controller._pursuit_correction_y, 0.0)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_held_detector_sample_does_not_grow_pursuit_integral(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        target = Detection(0, "player", 0.9, (1050, 540, 1070, 640))
+        base_ns = time.perf_counter_ns()
+        try:
+            controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+            controller._output_tick(0.0, now_ns=base_ns)
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 10_000_000,
+            )
+            controller._output_tick(0.01, now_ns=base_ns + 10_000_000)
+            accumulated = controller._pursuit_correction_x
+            self.assertGreater(accumulated, 0.0)
+
+            for offset_ms in range(11, 141):
+                controller._output_tick(
+                    0.001,
+                    now_ns=base_ns + offset_ms * 1_000_000,
+                )
+
+            self.assertEqual(controller._pursuit_correction_x, accumulated)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_confidence_does_not_scale_pure_proportional_rate(self) -> None:
+        def horizontal_rate(confidence: float) -> float:
+            controller = self.controller(
+                MakcuAimConfig(
+                    strength=0.5,
+                    max_step=1000,
+                    output_hz=1000,
+                    deadzone_pixels=0.0,
+                    smoothing_alpha=1.0,
+                    prediction_lead_seconds=0.0,
+                    derivative_damping_seconds=0.0,
+                    head_ratio=0.0,
+                )
+            )
+            controller.start(output_loop=False)
+            controller._output_thread = object()
+            active = self.factory.connections[-1]
+            active.responses.extend(bytes((0b00010,)))
+            target = Detection(0, "player", confidence, (1150, 540, 1170, 640))
+            base_ns = time.perf_counter_ns()
+            try:
+                controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+                controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+                return controller._smoothed_rate_x
+            finally:
+                controller._output_thread = None
+                controller.stop()
+
+        low_confidence_rate = horizontal_rate(0.05)
+        high_confidence_rate = horizontal_rate(0.99)
+        self.assertEqual(low_confidence_rate, high_confidence_rate)
+        self.assertEqual(low_confidence_rate, 200.0 * 0.5 * 60.0)
+
+    def test_small_static_error_receives_full_proportional_rate(self) -> None:
+        controller = self.controller(
+            MakcuAimConfig(
+                strength=1.0,
+                max_step=1000,
+                output_hz=1000,
+                deadzone_pixels=0.0,
+                smoothing_alpha=1.0,
+                prediction_lead_seconds=0.0,
+                derivative_damping_seconds=0.0,
+                head_ratio=0.0,
+            )
+        )
+        controller.start(output_loop=False)
+        controller._output_thread = object()
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        # A 64px error is below the removed 130px close-range slowdown band.
+        target = Detection(0, "player", 0.9, (1014, 540, 1034, 640))
+        base_ns = time.perf_counter_ns()
+        try:
+            controller.update(target, (1080, 1920, 3), measurement_ns=base_ns)
+            controller._output_tick(0.001, now_ns=base_ns + 1_000_000)
+
+            self.assertEqual(controller._smoothed_rate_x, 64.0 * 1.0 * 60.0)
+        finally:
+            controller._output_thread = None
+            controller.stop()
 
     def test_old_source_measurement_expires_even_if_just_published(self) -> None:
         controller = self.controller(MakcuAimConfig(output_hz=1000))
@@ -637,10 +2920,28 @@ class MakcuAimingTests(unittest.TestCase):
                 )
             return controller._smoothed_rate_x
 
-        self.assertAlmostEqual(response_after_10ms(100), response_after_10ms(1000), delta=1.0)
+        # Isolate the smoothing filter from the independently tested pursuit
+        # ramp so this remains a strict output-rate-invariance check.
+        with mock.patch(
+            "aiming.makcu.PURSUIT_INTEGRAL_TIME_SECONDS",
+            1e12,
+        ):
+            self.assertAlmostEqual(
+                response_after_10ms(100),
+                response_after_10ms(1000),
+                delta=1.0,
+            )
 
     def test_vertical_motion_is_time_based_across_output_rates(self) -> None:
-        def movement_after_50ms(rate_hz: int) -> int:
+        def movement_after_50ms(
+            rate_hz: int,
+            vertical_rate_ratio: float | None = None,
+        ) -> int:
+            ratio_options = (
+                {}
+                if vertical_rate_ratio is None
+                else {"vertical_rate_ratio": vertical_rate_ratio}
+            )
             controller = self.controller(
                 MakcuAimConfig(
                     strength=1.0,
@@ -651,6 +2952,7 @@ class MakcuAimingTests(unittest.TestCase):
                     prediction_lead_seconds=0.0,
                     derivative_damping_seconds=0.0,
                     head_ratio=0.0,
+                    **ratio_options,
                 )
             )
             controller.start(output_loop=False)
@@ -680,6 +2982,21 @@ class MakcuAimingTests(unittest.TestCase):
             movement_after_50ms(100),
             movement_after_50ms(1000),
             delta=1,
+        )
+        default_movement = movement_after_50ms(1000)
+        self.assertEqual(
+            default_movement,
+            movement_after_50ms(1000, MAX_VERTICAL_RATE_RATIO),
+        )
+        self.assertAlmostEqual(
+            movement_after_50ms(1000, 1.0),
+            default_movement / MAX_VERTICAL_RATE_RATIO,
+            delta=2,
+        )
+        self.assertAlmostEqual(
+            movement_after_50ms(1000, MAX_VERTICAL_RATE_RATIO / 2.0),
+            default_movement / 2.0,
+            delta=2,
         )
 
     def test_saturated_horizontal_motion_is_time_based_across_output_rates(self) -> None:
@@ -821,6 +3138,45 @@ class MakcuAimingTests(unittest.TestCase):
                     measurement_ns=invalid,
                 )
 
+    def test_measurement_observed_requires_bool_and_a_predicted_target(self) -> None:
+        controller = self.controller()
+        controller.start(output_loop=False)
+        target = Detection(0, "player", 0.9, (950, 540, 970, 640))
+
+        with self.assertRaisesRegex(TypeError, "measurement_observed must be bool"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_observed=1,  # type: ignore[arg-type]
+            )
+        with self.assertRaisesRegex(ValueError, "requires a predicted target"):
+            controller.update(
+                None,
+                (1080, 1920, 3),
+                measurement_observed=False,
+            )
+        with self.assertRaisesRegex(ValueError, "requires a prior observed target"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_observed=False,
+            )
+        self.assertIsNone(controller._latest_target)
+        self.assertFalse(controller._measurement_target_present)
+
+        controller.update(target, (1080, 1920, 3), measurement_ns=1_000_000_000)
+        controller.update(None, (1080, 1920, 3), measurement_ns=1_010_000_000)
+        with self.assertRaisesRegex(ValueError, "requires a prior observed target"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=1_020_000_000,
+                measurement_observed=False,
+            )
+        self.assertIsNone(controller._latest_target)
+        self.assertFalse(controller._measurement_target_present)
+        self.assertEqual(controller._latest_source_ns, 1_010_000_000)
+
     def test_backwards_measurement_timestamp_cannot_overwrite_newer_target(self) -> None:
         controller = self.controller(MakcuAimConfig(head_ratio=0.0))
         controller.start(output_loop=False)
@@ -898,6 +3254,19 @@ class MakcuAimingTests(unittest.TestCase):
         self.assertLessEqual(abs(delta_y), 640)
         with self.assertRaises(ValueError):
             MakcuAimConfig(strength=4.01)
+
+    def test_vertical_rate_ratio_default_and_validation(self) -> None:
+        self.assertEqual(
+            MakcuAimConfig().vertical_rate_ratio,
+            MAX_VERTICAL_RATE_RATIO,
+        )
+        self.assertEqual(MakcuAimConfig(vertical_rate_ratio=1.0).vertical_rate_ratio, 1.0)
+        for value in (True, "0.48", 0.0, -0.01, 1.01, math.nan, math.inf):
+            with self.subTest(value=value), self.assertRaisesRegex(
+                ValueError,
+                "vertical rate ratio",
+            ):
+                MakcuAimConfig(vertical_rate_ratio=value)
 
     def test_detect_makcu_port_returns_single_matching_device(self) -> None:
         detected = detect_makcu_port(ports_provider=lambda: (self.port,))

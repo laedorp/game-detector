@@ -739,6 +739,37 @@ class DetectorContractTests(unittest.TestCase):
         self.assertEqual(len(detections), 1)
         self.assertAlmostEqual(detections[0].confidence, 0.9, places=5)
 
+    def test_postprocess_override_does_not_change_configured_default(self) -> None:
+        raw = np.zeros((1, 300, 6), np.float32)
+        raw[0, 0] = (100.0, 120.0, 200.0, 300.0, 0.9, 0.0)
+        raw[0, 1] = (220.0, 120.0, 320.0, 300.0, 0.18, 0.0)
+        detector = make_detector(
+            confidence=0.25,
+            session_kwargs={"output": raw},
+        )
+        inferred = detector.infer(np.zeros((1, 3, 416, 416), np.float32))
+
+        configured = detector.postprocess(inferred, frame_shape=(416, 416, 3))
+        continuation_decode = detector.postprocess(
+            inferred,
+            frame_shape=(416, 416, 3),
+            confidence=0.15,
+        )
+
+        self.assertEqual(len(configured), 1)
+        self.assertAlmostEqual(configured[0].confidence, 0.9, places=5)
+        self.assertEqual(len(continuation_decode), 2)
+        self.assertAlmostEqual(continuation_decode[1].confidence, 0.18, places=5)
+        self.assertEqual(detector.confidence, 0.25)
+
+        for invalid in (-0.1, 1.1, float("nan")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                detector.postprocess(
+                    inferred,
+                    frame_shape=(416, 416, 3),
+                    confidence=invalid,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

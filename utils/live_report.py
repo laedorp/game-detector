@@ -243,6 +243,7 @@ def _config_record(config: AppConfig) -> dict[str, Any]:
             "size": list(config.capture_size) if config.capture_size else None,
             "fps": config.capture_fps,
             "pixel_format": config.capture_format,
+            "rotation_degrees": 180 if config.capture_rotate_180 else 0,
             "screen_monitor": config.screen_monitor,
             "screen_region": (
                 list(config.screen_region) if config.screen_region else None

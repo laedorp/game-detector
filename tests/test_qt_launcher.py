@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -13,6 +15,7 @@ os.environ["QT_QPA_PLATFORM"] = "offscreen"
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 from aiming.makcu import MakcuError
+from aiming.makcu_calibration_session import CalibrationEvidenceError
 from controller_precision.linux_evdev import ControllerCandidate
 from detection.hardware import (
     Accelerator,
@@ -85,6 +88,31 @@ def recommendation(
     )
 
 
+def successful_calibration_evidence() -> SimpleNamespace:
+    x_fit = SimpleNamespace(gain_pixels_per_count=0.14)
+    y_fit = SimpleNamespace(gain_pixels_per_count=0.10)
+    fit = SimpleNamespace(x=x_fit, y=y_fit, delay_seconds=0.024)
+    binding = SimpleNamespace(
+        active_provider="MIGraphXExecutionProvider",
+        active_device="gfx1030-RX6950XT",
+        capture_width=1920,
+        capture_height=1080,
+        capture_fps=240.0,
+        pixel_format="NV12",
+        context_name="ads",
+        aim_mode="ads",
+    )
+    return SimpleNamespace(
+        outcome="success",
+        evidence_complete=True,
+        cleanup_error=None,
+        fit=fit,
+        binding=binding,
+        artifact_sha256="a" * 64,
+        core_evidence_sha256="b" * 64,
+    )
+
+
 class FakeProcess:
     def __init__(self, returncode: int | None = None) -> None:
         self.returncode = returncode
@@ -93,6 +121,15 @@ class FakeProcess:
 
     def poll(self) -> int | None:
         return self.returncode
+
+    def send_signal(self, _signal: int) -> None:
+        self.returncode = -2
+
+    def terminate(self) -> None:
+        self.returncode = -15
+
+    def kill(self) -> None:
+        self.returncode = -9
 
 
 class FakeMakcuVerifier:
@@ -127,6 +164,22 @@ class QtLauncherTests(unittest.TestCase):
             result = LauncherWindow(settings or LauncherSettings())
         self.addCleanup(result.close)
         return result
+
+    def calibration_settings(self, **changes: object) -> LauncherSettings:
+        values: dict[str, object] = {
+            "source_mode": "screen",
+            "aim": True,
+            "aim_output": AIM_OUTPUT_MAKCU,
+            "aim_label": "player",
+            "ignore_self": True,
+            "aim_makcu_port": "/dev/ttyACM0",
+            "aim_makcu_button": "1",
+            "aim_makcu_verified_port": "/dev/ttyACM0",
+            "aim_makcu_verified_button": "1",
+            "aim_makcu_context": "ads",
+        }
+        values.update(changes)
+        return LauncherSettings(**values)  # type: ignore[arg-type]
 
     def test_screen_region_crop_output_and_shortcuts_are_exposed_and_collected(self) -> None:
         settings = LauncherSettings(
@@ -344,6 +397,46 @@ class QtLauncherTests(unittest.TestCase):
         self.assertTrue(any("serial close timed out" in message for message in progress))
         verifier.stop.assert_called_once_with()
 
+    def test_makcu_verification_cannot_overlap_button_monitor(self) -> None:
+        settings = LauncherSettings(
+            aim=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/ttyACM0",
+        )
+        window = self.window(settings)
+        monitor_thread = mock.Mock()
+        monitor_thread.is_alive.return_value = True
+        window._makcu_monitor_thread = monitor_thread
+
+        window._update_aim_state()
+
+        self.assertFalse(window.verify_makcu_button.isEnabled())
+        with mock.patch("launcher.qt_app.threading.Thread") as thread:
+            window.verify_makcu_activation()
+        thread.assert_not_called()
+
+    def test_makcu_button_monitor_cannot_overlap_verification(self) -> None:
+        settings = LauncherSettings(
+            aim=True,
+            aim_output=AIM_OUTPUT_MAKCU,
+            aim_makcu_port="/dev/ttyACM0",
+        )
+        window = self.window(settings)
+        verify_thread = mock.Mock()
+        verify_thread.is_alive.return_value = True
+
+        with mock.patch(
+            "launcher.qt_app.threading.Thread", return_value=verify_thread
+        ) as thread:
+            window.verify_makcu_activation()
+            self.assertFalse(window.verify_makcu_button.isEnabled())
+            self.assertFalse(window.monitor_makcu_button.isEnabled())
+            window.monitor_makcu_buttons()
+
+        thread.assert_called_once()
+        verify_thread.start.assert_called_once_with()
+        self.assertIsNone(window._makcu_monitor_thread)
+
     def test_cancelled_makcu_monitor_completes_normally_once(self) -> None:
         window = self.window()
         window._makcu_monitor_cancel.set()
@@ -414,6 +507,478 @@ class QtLauncherTests(unittest.TestCase):
                     window._verify_makcu_activation_worker("/dev/ttyACM0", 1)
 
                 self.assertFalse(window._makcu_verification_matches())
+
+    def test_private_calibration_paths_are_randomized_private_and_nonexisting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_target = Path(temporary) / "proaim" / "settings.json"
+            with (
+                mock.patch("launcher.qt_app.settings_path", return_value=settings_target),
+                mock.patch(
+                    "launcher.qt_app.secrets.token_hex",
+                    side_effect=("1" * 32, "2" * 32),
+                ),
+            ):
+                first = qt_app._private_calibration_path("evidence", "session")
+                self.assertFalse(os.path.lexists(first))
+                self.assertEqual(first.name, f"session-{'1' * 32}.json")
+                if os.name == "posix":
+                    self.assertEqual(stat.S_IMODE(first.parent.stat().st_mode), 0o700)
+                first.write_bytes(b"reserved")
+                second = qt_app._private_calibration_path("evidence", "session")
+
+            self.assertNotEqual(first, second)
+            self.assertFalse(os.path.lexists(second))
+            self.assertTrue(str(second).startswith(str(settings_target.parent)))
+
+    def test_calibration_motion_warning_defaults_to_no_and_creates_nothing(self) -> None:
+        window = self.window(self.calibration_settings())
+        with (
+            mock.patch.dict(os.environ, {"XDG_SESSION_TYPE": "x11"}),
+            mock.patch(
+                "launcher.qt_app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ) as question,
+            mock.patch("launcher.qt_app._private_calibration_path") as private_path,
+            mock.patch("launcher.qt_app.start_detector") as start,
+        ):
+            window.start_makcu_calibration()
+
+        self.assertEqual(
+            question.call_args.args[-1],
+            QMessageBox.StandardButton.No,
+        )
+        self.assertIn("never activated automatically", question.call_args.args[2])
+        private_path.assert_not_called()
+        start.assert_not_called()
+        self.assertIsNone(window.calibration_process)
+        self.assertEqual(window.settings.aim_makcu_active_profile, "")
+
+    def test_calibration_context_is_explicit_noneditable_and_collected(self) -> None:
+        window = self.window(self.calibration_settings())
+
+        self.assertFalse(window.aim_makcu_context.isEditable())
+        self.assertEqual(
+            [
+                window.aim_makcu_context.itemData(index)
+                for index in range(window.aim_makcu_context.count())
+            ],
+            ["hip", "ads"],
+        )
+        self.assertEqual(window.aim_makcu_context.currentData(), "ads")
+        self.assertEqual(window.collect().aim_makcu_context, "ads")
+
+    def test_calibration_uses_a_separate_managed_child_and_exact_private_path(self) -> None:
+        window = self.window(self.calibration_settings())
+        process = FakeProcess()
+        with tempfile.TemporaryDirectory() as temporary:
+            settings_target = Path(temporary) / "proaim" / "settings.json"
+            with (
+                mock.patch.dict(os.environ, {"XDG_SESSION_TYPE": "x11"}),
+                mock.patch(
+                    "launcher.qt_app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                mock.patch(
+                    "launcher.qt_app.settings_path",
+                    return_value=settings_target,
+                ),
+                mock.patch(
+                    "launcher.qt_app.start_detector",
+                    return_value=process,
+                ) as start,
+            ):
+                window.start_makcu_calibration()
+
+            command = start.call_args.args[0]
+            evidence = Path(
+                command[command.index("--aim-calibration-evidence") + 1]
+            )
+            self.assertTrue(evidence.is_absolute())
+            self.assertFalse(os.path.lexists(evidence))
+            self.assertEqual(evidence.parent.name, "evidence")
+            if os.name == "posix":
+                self.assertEqual(stat.S_IMODE(evidence.parent.stat().st_mode), 0o700)
+            self.assertNotIn("--aim-makcu-active-profile", command)
+            self.assertEqual(command.count("--aim-calibration-context"), 1)
+            self.assertEqual(
+                command[command.index("--aim-calibration-context") + 1],
+                "ads",
+            )
+            self.assertIs(window.calibration_process, process)
+            self.assertIsNone(window.process)
+            self.assertFalse(window.start_button.isEnabled())
+            self.assertTrue(window.stop_button.isEnabled())
+
+        window.calibration_process = None
+
+    def test_exit_zero_strictly_stages_success_without_auto_activation(self) -> None:
+        window = self.window(self.calibration_settings())
+        process = FakeProcess(returncode=0)
+        evidence_path = Path("/private/session.json")
+        evidence = successful_calibration_evidence()
+        window.calibration_process = process  # type: ignore[assignment]
+        window._calibration_evidence_path = evidence_path
+        window._calibration_launch_arguments = tuple(
+            window.collect().detector_arguments()
+        )
+        window._calibration_context = "ads"
+
+        with (
+            mock.patch(
+                "launcher.qt_app.load_session_evidence",
+                return_value=evidence,
+            ) as strict_load,
+            mock.patch("launcher.qt_app.activate_session_evidence_file") as activate,
+            mock.patch("launcher.qt_app.QMessageBox.information"),
+        ):
+            window._poll_calibration_process()
+
+        strict_load.assert_called_once_with(evidence_path)
+        activate.assert_not_called()
+        self.assertIs(window._pending_calibration_evidence, evidence)
+        self.assertEqual(window._pending_calibration_path, evidence_path)
+        self.assertEqual(window.settings.aim_makcu_active_profile, "")
+        self.assertTrue(window.activate_makcu_calibration_button.isEnabled())
+        self.assertIn("not active yet", window.aim_makcu_calibration_status.text())
+
+    def test_activation_requires_second_default_no_confirmation(self) -> None:
+        window = self.window(self.calibration_settings())
+        evidence = successful_calibration_evidence()
+        evidence_path = Path("/private/session.json")
+        window._pending_calibration_evidence = evidence  # type: ignore[assignment]
+        window._pending_calibration_path = evidence_path
+        window._calibration_launch_arguments = tuple(
+            window.collect().detector_arguments()
+        )
+        window._calibration_context = "ads"
+        with (
+            mock.patch(
+                "launcher.qt_app.load_session_evidence",
+                return_value=evidence,
+            ),
+            mock.patch(
+                "launcher.qt_app.QMessageBox.question",
+                return_value=QMessageBox.StandardButton.No,
+            ) as question,
+            mock.patch("launcher.qt_app.activate_session_evidence_file") as activate,
+        ):
+            window.activate_staged_makcu_calibration()
+
+        self.assertEqual(
+            question.call_args.args[-1],
+            QMessageBox.StandardButton.No,
+        )
+        activate.assert_not_called()
+        self.assertIs(window._pending_calibration_evidence, evidence)
+        self.assertEqual(window.settings.aim_makcu_active_profile, "")
+
+    def test_second_confirmation_activates_privately_and_persists_selection(self) -> None:
+        window = self.window(self.calibration_settings())
+        evidence = successful_calibration_evidence()
+        evidence_path = Path("/private/session.json")
+        window._pending_calibration_evidence = evidence  # type: ignore[assignment]
+        window._pending_calibration_path = evidence_path
+        window._calibration_launch_arguments = tuple(
+            window.collect().detector_arguments()
+        )
+        window._calibration_context = "ads"
+        profile = SimpleNamespace(
+            session_artifact_sha256=evidence.artifact_sha256,
+            core_evidence_sha256=evidence.core_evidence_sha256,
+            binding=evidence.binding,
+            fit=evidence.fit,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            active_path = Path(temporary) / "private" / "profile.json"
+            settings_target = Path(temporary) / "settings.json"
+            with (
+                mock.patch(
+                    "launcher.qt_app.load_session_evidence",
+                    return_value=evidence,
+                ) as strict_load,
+                mock.patch(
+                    "launcher.qt_app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                mock.patch(
+                    "launcher.qt_app._private_calibration_path",
+                    return_value=active_path,
+                ),
+                mock.patch(
+                    "launcher.qt_app.activate_session_evidence_file",
+                    return_value=profile,
+                ) as activate,
+                mock.patch(
+                    "launcher.qt_app.settings_path",
+                    return_value=settings_target,
+                ),
+                mock.patch("launcher.qt_app.save_settings") as save,
+                mock.patch("launcher.qt_app.QMessageBox.information"),
+            ):
+                window.activate_staged_makcu_calibration()
+
+        strict_load.assert_called_once_with(evidence_path)
+        activate.assert_called_once_with(
+            evidence_path,
+            active_path,
+            expected_binding=evidence.binding,
+        )
+        save.assert_called_once()
+        self.assertEqual(
+            window.settings.aim_makcu_active_profile,
+            str(active_path.resolve()),
+        )
+        self.assertIsNone(window._pending_calibration_evidence)
+        self.assertFalse(window.activate_makcu_calibration_button.isEnabled())
+
+    def test_activation_save_failure_restores_selection_and_removes_new_profile(self) -> None:
+        window = self.window(self.calibration_settings())
+        evidence = successful_calibration_evidence()
+        evidence_path = Path("/private/session.json")
+        window._pending_calibration_evidence = evidence  # type: ignore[assignment]
+        window._pending_calibration_path = evidence_path
+        window._calibration_launch_arguments = tuple(
+            window.collect().detector_arguments()
+        )
+        window._calibration_context = "ads"
+        old_selection = "/private/old-profile.json"
+        window.settings.aim_makcu_active_profile = old_selection
+        profile = SimpleNamespace(
+            session_artifact_sha256=evidence.artifact_sha256,
+            core_evidence_sha256=evidence.core_evidence_sha256,
+            binding=evidence.binding,
+            fit=evidence.fit,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            active_path = Path(temporary) / "profile.json"
+
+            def publish(*_args: object, **_kwargs: object) -> object:
+                active_path.write_bytes(b"published")
+                return profile
+
+            with (
+                mock.patch(
+                    "launcher.qt_app.load_session_evidence",
+                    return_value=evidence,
+                ),
+                mock.patch(
+                    "launcher.qt_app.QMessageBox.question",
+                    return_value=QMessageBox.StandardButton.Yes,
+                ),
+                mock.patch(
+                    "launcher.qt_app._private_calibration_path",
+                    return_value=active_path,
+                ),
+                mock.patch(
+                    "launcher.qt_app.activate_session_evidence_file",
+                    side_effect=publish,
+                ),
+                mock.patch(
+                    "launcher.qt_app.save_settings",
+                    side_effect=OSError("settings unavailable"),
+                ),
+                mock.patch("launcher.qt_app.QMessageBox.critical") as critical,
+            ):
+                window.activate_staged_makcu_calibration()
+
+            self.assertFalse(active_path.exists())
+        self.assertEqual(window.settings.aim_makcu_active_profile, old_selection)
+        self.assertIs(window._pending_calibration_evidence, evidence)
+        critical.assert_called_once()
+
+    def test_activation_rejects_changed_or_malformed_staged_evidence(self) -> None:
+        window = self.window(self.calibration_settings())
+        evidence = successful_calibration_evidence()
+        window._pending_calibration_evidence = evidence  # type: ignore[assignment]
+        window._pending_calibration_path = Path("/private/session.json")
+        window._calibration_launch_arguments = tuple(
+            window.collect().detector_arguments()
+        )
+        window._calibration_context = "ads"
+        with (
+            mock.patch(
+                "launcher.qt_app.load_session_evidence",
+                side_effect=CalibrationEvidenceError("artifact hash changed"),
+            ),
+            mock.patch("launcher.qt_app.activate_session_evidence_file") as activate,
+            mock.patch("launcher.qt_app.save_settings") as save,
+            mock.patch("launcher.qt_app.QMessageBox.critical") as critical,
+        ):
+            window.activate_staged_makcu_calibration()
+
+        activate.assert_not_called()
+        save.assert_not_called()
+        critical.assert_called_once()
+        self.assertIsNone(window._pending_calibration_evidence)
+        self.assertEqual(window.settings.aim_makcu_active_profile, "")
+
+    def test_nonzero_stopped_missing_malformed_or_aborted_never_stage_or_activate(self) -> None:
+        cases: tuple[tuple[str, int, bool, object], ...] = (
+            ("nonzero", 7, False, successful_calibration_evidence()),
+            ("stopped", 0, True, successful_calibration_evidence()),
+            ("missing", 0, False, FileNotFoundError("missing")),
+            (
+                "malformed",
+                0,
+                False,
+                CalibrationEvidenceError("malformed"),
+            ),
+            (
+                "aborted",
+                0,
+                False,
+                SimpleNamespace(
+                    outcome="aborted",
+                    evidence_complete=True,
+                    cleanup_error=None,
+                    fit=None,
+                    core_evidence_sha256=None,
+                ),
+            ),
+        )
+        for name, return_code, stopped, load_result in cases:
+            with self.subTest(name=name):
+                window = self.window(self.calibration_settings())
+                process = FakeProcess(returncode=return_code)
+                window.calibration_process = process  # type: ignore[assignment]
+                window._calibration_stop_requested = stopped
+                window._calibration_evidence_path = Path(f"/{name}.json")
+                window._calibration_launch_arguments = ("launch",)
+                window._calibration_context = "ads"
+                load_patch = mock.patch("launcher.qt_app.load_session_evidence")
+                with (
+                    load_patch as strict_load,
+                    mock.patch("launcher.qt_app.activate_session_evidence_file") as activate,
+                    mock.patch("launcher.qt_app.QMessageBox.warning"),
+                ):
+                    if isinstance(load_result, BaseException):
+                        strict_load.side_effect = load_result
+                    else:
+                        strict_load.return_value = load_result
+                    window._finish_calibration_process(process, return_code)  # type: ignore[arg-type]
+
+                if name in {"nonzero", "stopped"}:
+                    strict_load.assert_not_called()
+                activate.assert_not_called()
+                self.assertIsNone(window._pending_calibration_evidence)
+                self.assertEqual(window.settings.aim_makcu_active_profile, "")
+
+    def test_calibration_is_mutually_exclusive_with_all_live_workers(self) -> None:
+        window = self.window(self.calibration_settings())
+        running = FakeProcess()
+        window.process = running  # type: ignore[assignment]
+        with (
+            mock.patch("launcher.qt_app.QMessageBox.information") as information,
+            mock.patch("launcher.qt_app.QMessageBox.question") as question,
+            mock.patch("launcher.qt_app.start_detector") as start,
+        ):
+            window.start_makcu_calibration()
+        information.assert_called_once()
+        question.assert_not_called()
+        start.assert_not_called()
+        window.process = None
+
+        window.calibration_process = running  # type: ignore[assignment]
+        with (
+            mock.patch("launcher.qt_app.QMessageBox.information"),
+            mock.patch("launcher.qt_app.start_detector") as start,
+            mock.patch("launcher.qt_app.threading.Thread") as thread,
+            mock.patch.object(window, "_start_precision_child") as precision,
+        ):
+            window._start()
+            window.verify_makcu_activation()
+            window.monitor_makcu_buttons()
+            window.verify_precision_mapping()
+            window.start_precision()
+
+        start.assert_not_called()
+        thread.assert_not_called()
+        precision.assert_not_called()
+        window.calibration_process = None
+
+    def test_detail_pass_blocks_calibration_instead_of_silently_changing_it(self) -> None:
+        window = self.window(self.calibration_settings(detail_crop_size="640"))
+        with (
+            mock.patch.dict(os.environ, {"XDG_SESSION_TYPE": "x11"}),
+            mock.patch("launcher.qt_app.QMessageBox.warning") as warning,
+            mock.patch("launcher.qt_app.QMessageBox.question") as question,
+            mock.patch("launcher.qt_app.start_detector") as start,
+        ):
+            window.start_makcu_calibration()
+
+        self.assertIn("detail pass", warning.call_args.args[1].lower())
+        question.assert_not_called()
+        start.assert_not_called()
+
+    def test_changing_context_unstages_evidence(self) -> None:
+        window = self.window(self.calibration_settings())
+        window._pending_calibration_evidence = successful_calibration_evidence()  # type: ignore[assignment]
+        window._pending_calibration_path = Path("/private/session.json")
+        window._calibration_launch_arguments = ("launch",)
+        window._calibration_context = "ads"
+
+        window.aim_makcu_context.setCurrentIndex(
+            window.aim_makcu_context.findData("hip")
+        )
+
+        self.assertIsNone(window._pending_calibration_evidence)
+        self.assertIsNone(window._pending_calibration_path)
+        self.assertIn("no longer staged", window.aim_makcu_calibration_status.text())
+
+    def test_normal_start_waits_for_live_makcu_monitor_but_allows_precision(self) -> None:
+        window = self.window(self.calibration_settings())
+        monitor = mock.Mock()
+        monitor.is_alive.return_value = True
+        window._makcu_monitor_thread = monitor
+        with (
+            mock.patch("launcher.qt_app.QMessageBox.information") as information,
+            mock.patch("launcher.qt_app.start_detector") as start,
+        ):
+            window._start()
+
+        start.assert_not_called()
+        self.assertIn("monitor", information.call_args.args[1].lower())
+
+        window._makcu_monitor_thread = None
+        window.precision_process = FakeProcess()
+        launched = FakeProcess()
+        with (
+            mock.patch.dict(os.environ, {"XDG_SESSION_TYPE": "x11"}),
+            mock.patch("launcher.qt_app.save_settings"),
+            mock.patch("launcher.qt_app.start_detector", return_value=launched) as start,
+        ):
+            window._start()
+
+        start.assert_called_once()
+        self.assertIs(window.process, launched)
+        window.process = None
+        window.precision_process = None
+
+    def test_escape_stop_escalates_calibration_without_activating(self) -> None:
+        window = self.window(self.calibration_settings())
+        process = FakeProcess()
+        window.calibration_process = process  # type: ignore[assignment]
+        callbacks: list[object] = []
+        with (
+            mock.patch("launcher.qt_app.request_stop") as request,
+            mock.patch("launcher.qt_app.force_stop") as force,
+            mock.patch("launcher.qt_app.kill_process") as kill,
+            mock.patch("launcher.qt_app.activate_session_evidence_file") as activate,
+            mock.patch(
+                "launcher.qt_app.QTimer.singleShot",
+                side_effect=lambda _delay, callback: callbacks.append(callback),
+            ),
+        ):
+            window._stop()
+            callbacks[0]()  # type: ignore[operator]
+            callbacks[1]()  # type: ignore[operator]
+
+        request.assert_called_once_with(process)
+        force.assert_called_once_with(process)
+        kill.assert_called_once_with(process)
+        activate.assert_not_called()
+        self.assertTrue(window._calibration_stop_requested)
+        window.calibration_process = None
 
     def test_hardware_selection_preserves_player_model_semantics(self) -> None:
         window = self.window()
@@ -699,6 +1264,79 @@ class QtLauncherTests(unittest.TestCase):
         self.assertEqual(window.screen_fps.text(), "60")
         self.assertEqual(window.capture_fps.text(), "60")
         self.assertEqual(window.model_preset.currentData(), "fort_player_balanced")
+
+    def test_capture_orientation_and_format_load_and_collect(self) -> None:
+        window = self.window(
+            LauncherSettings(
+                source_mode="camera",
+                capture_format="NV12",
+                capture_rotate_180=True,
+            )
+        )
+
+        self.assertEqual(window.capture_format.currentText(), "NV12")
+        self.assertTrue(window.capture_rotate_180.isChecked())
+        collected = window.collect()
+        self.assertEqual(collected.capture_format, "NV12")
+        self.assertTrue(collected.capture_rotate_180)
+
+    def test_makcu_motion_controls_round_trip_safely(self) -> None:
+        window = self.window(
+            LauncherSettings(
+                aim=True,
+                aim_makcu_prediction_lead_seconds="0.047",
+                aim_makcu_derivative_damping_seconds="0.013",
+                aim_makcu_vertical_rate_ratio="0.63",
+            )
+        )
+
+        self.assertFalse(window.aim_makcu_prediction_lead_seconds.isHidden())
+        self.assertFalse(window.aim_makcu_derivative_damping_seconds.isHidden())
+        self.assertFalse(window.aim_makcu_vertical_rate_ratio.isHidden())
+        self.assertTrue(window.aim_makcu_prediction_lead_seconds.isEnabled())
+        self.assertTrue(window.aim_makcu_derivative_damping_seconds.isEnabled())
+        self.assertTrue(window.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertAlmostEqual(window.aim_makcu_prediction_lead_seconds.value(), 0.047)
+        self.assertAlmostEqual(window.aim_makcu_derivative_damping_seconds.value(), 0.013)
+        self.assertAlmostEqual(window.aim_makcu_vertical_rate_ratio.value(), 0.63)
+        self.assertEqual(window.aim_makcu_prediction_lead_seconds.minimum(), 0.0)
+        self.assertEqual(window.aim_makcu_prediction_lead_seconds.maximum(), 0.25)
+        self.assertEqual(window.aim_makcu_derivative_damping_seconds.minimum(), 0.0)
+        self.assertEqual(window.aim_makcu_derivative_damping_seconds.maximum(), 0.25)
+        self.assertEqual(window.aim_makcu_vertical_rate_ratio.minimum(), 0.10)
+        self.assertEqual(window.aim_makcu_vertical_rate_ratio.maximum(), 1.00)
+        self.assertEqual(window.aim_makcu_vertical_rate_ratio.singleStep(), 0.05)
+        self.assertEqual(window.aim_makcu_vertical_rate_ratio.suffix(), " ×")
+
+        window.aim_makcu_prediction_lead_seconds.setValue(0.061)
+        window.aim_makcu_derivative_damping_seconds.setValue(0.015)
+        window.aim_makcu_vertical_rate_ratio.setValue(0.70)
+        collected = window.collect()
+        self.assertEqual(collected.aim_makcu_prediction_lead_seconds, "0.061")
+        self.assertEqual(collected.aim_makcu_derivative_damping_seconds, "0.015")
+        self.assertEqual(collected.aim_makcu_vertical_rate_ratio, "0.7")
+
+        restored = self.window(collected)
+        self.assertAlmostEqual(restored.aim_makcu_prediction_lead_seconds.value(), 0.061)
+        self.assertAlmostEqual(restored.aim_makcu_derivative_damping_seconds.value(), 0.015)
+        self.assertAlmostEqual(restored.aim_makcu_vertical_rate_ratio.value(), 0.70)
+
+        restored.aim.setChecked(False)
+        self.assertFalse(restored.aim_makcu_vertical_rate_ratio.isEnabled())
+
+    def test_nonfinite_persisted_motion_controls_use_safe_defaults(self) -> None:
+        window = self.window(
+            LauncherSettings(
+                aim=True,
+                aim_makcu_prediction_lead_seconds="inf",
+                aim_makcu_derivative_damping_seconds="-inf",
+                aim_makcu_vertical_rate_ratio="nan",
+            )
+        )
+
+        self.assertAlmostEqual(window.aim_makcu_prediction_lead_seconds.value(), 0.03)
+        self.assertAlmostEqual(window.aim_makcu_derivative_damping_seconds.value(), 0.008)
+        self.assertAlmostEqual(window.aim_makcu_vertical_rate_ratio.value(), 0.48)
 
     def test_int8_cpu_hardware_selects_int8_but_onnx_hides_it(self) -> None:
         window = self.window()

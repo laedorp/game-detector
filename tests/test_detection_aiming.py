@@ -10,12 +10,14 @@ from unittest.mock import patch
 import numpy as np
 
 from aiming.protocol import decode_aim_command
+from aiming.makcu import MakcuTelemetrySnapshot
 from aiming.controller import (
     AimActivationSensor,
     AimingController,
     AimConfig,
     LOCAL_TARGET_STALE_SECONDS,
     TargetTracker,
+    TargetTrackerTelemetrySnapshot,
     UdpAimingController,
     choose_target,
     head_target_point,
@@ -24,12 +26,18 @@ from controller_precision.codes import EV_ABS, EV_SYN
 from config import parse_args
 from detection.types import Detection
 from main import (
+    AimInputTelemetry,
     _aim_status,
+    _aim_input_telemetry_summary,
+    _apply_hard_aim_guard,
+    _makcu_telemetry_summary,
     _start_optional_aiming,
+    _target_tracker_telemetry_summary,
     _update_aim_target,
     _validate_aim_safety,
 )
 from utils.render import draw_aim_target
+from utils.self_filter import NormalizedBottomZone
 
 
 @dataclass(frozen=True)
@@ -104,6 +112,204 @@ class FailingAimController:
 
 
 class AimingControllerTests(unittest.TestCase):
+    def test_makcu_telemetry_summary_reports_gate_and_real_command_rates(self) -> None:
+        previous = MakcuTelemetrySnapshot(
+            output_ticks=100,
+            button_pressed_ticks=50,
+            target_present_ticks=80,
+            fresh_target_ticks=75,
+            authorized_ticks=40,
+            movement_commands=20,
+            emitted_x=-5,
+            emitted_y=10,
+            emitted_abs_x=25,
+            emitted_abs_y=30,
+            control_samples=10,
+            control_error_abs_x=100.0,
+            control_error_abs_y=50.0,
+            pursuit_abs_x=20.0,
+            pursuit_abs_y=10.0,
+            saturated_x_samples=1,
+            pursuit_resets=2,
+        )
+        current = MakcuTelemetrySnapshot(
+            output_ticks=1100,
+            button_pressed_ticks=850,
+            target_present_ticks=980,
+            fresh_target_ticks=925,
+            authorized_ticks=740,
+            movement_commands=620,
+            emitted_x=395,
+            emitted_y=-190,
+            emitted_abs_x=2425,
+            emitted_abs_y=1230,
+            control_samples=60,
+            control_error_abs_x=600.0,
+            control_error_abs_y=300.0,
+            pursuit_abs_x=120.0,
+            pursuit_abs_y=60.0,
+            saturated_x_samples=6,
+            pursuit_resets=5,
+        )
+
+        summary = _makcu_telemetry_summary(previous, current, 1.0)
+
+        self.assertIn("MAKCU loop 1000 Hz", summary)
+        self.assertIn("button 80%", summary)
+        self.assertIn("target 90%", summary)
+        self.assertIn("fresh 85%", summary)
+        self.assertIn("authorized 70%", summary)
+        self.assertIn("moves 600/s", summary)
+        self.assertIn("abs counts X/Y 2400/1200/s", summary)
+        self.assertIn("net X/Y +400/-200/s", summary)
+        self.assertIn("CTRL samples 50/s", summary)
+        self.assertIn("error abs X/Y 10.0/5.0px", summary)
+        self.assertIn("pursuit X/Y 120/60 cps", summary)
+        self.assertIn("saturation X/Y 10/0%", summary)
+        self.assertIn("pursuit resets 3", summary)
+
+    def test_tracker_telemetry_summary_reports_aggregate_residuals_only(self) -> None:
+        previous = TargetTrackerTelemetrySnapshot(
+            updates=10,
+            candidate_samples=8,
+            measurement_samples=7,
+            continuation_measurement_samples=2,
+            output_samples=7,
+            compared_samples=6,
+            target_loss_transitions=1,
+            residual_x=10.0,
+            residual_y=5.0,
+            residual_abs_x=20.0,
+            residual_abs_y=10.0,
+        )
+        current = TargetTrackerTelemetrySnapshot(
+            updates=110,
+            candidate_samples=98,
+            measurement_samples=87,
+            continuation_measurement_samples=14,
+            output_samples=92,
+            compared_samples=86,
+            target_loss_transitions=3,
+            residual_x=50.0,
+            residual_y=-11.0,
+            residual_abs_x=260.0,
+            residual_abs_y=130.0,
+        )
+
+        summary = _target_tracker_telemetry_summary(previous, current, 1.0)
+
+        self.assertIn("TRACK samples 100/s", summary)
+        self.assertIn("raw/out 80/85/s", summary)
+        self.assertIn("continued-low 12/s", summary)
+        self.assertIn("rejected 10/s", summary)
+        self.assertIn("raw-track abs X/Y 3.0/1.5px", summary)
+        self.assertIn("signed +0.5/-0.2px", summary)
+        self.assertIn("losses 2", summary)
+
+    def test_hard_aim_guard_attributes_in_zone_exact_label_removal(self) -> None:
+        zone = NormalizedBottomZone(left=0.25, width=0.5, height=0.5)
+        self_candidate = Detection(0, "player", 0.9, (40, 35, 60, 100))
+
+        result = _apply_hard_aim_guard(
+            [self_candidate],
+            (100, 100, 3),
+            self_zone=zone,
+            aim_label="PLAYER",
+        )
+
+        self.assertEqual(result.detections, ())
+        self.assertEqual(result.removed_exact_label_boxes, 1)
+        self.assertTrue(result.targetless_after_exact_removal)
+
+    def test_hard_aim_guard_does_not_block_when_same_label_survives(self) -> None:
+        zone = NormalizedBottomZone(left=0.25, width=0.5, height=0.5)
+        self_candidate = Detection(0, "player", 0.9, (40, 35, 60, 100))
+        opponent = Detection(0, "player", 0.9, (80, 20, 96, 75))
+
+        result = _apply_hard_aim_guard(
+            [self_candidate, opponent],
+            (100, 100, 3),
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.25,
+        )
+
+        self.assertEqual(result.detections, (opponent,))
+        self.assertEqual(result.removed_exact_label_boxes, 1)
+        self.assertFalse(result.targetless_after_exact_removal)
+
+    def test_hard_guard_weak_survivor_cannot_preserve_removed_strong_target(
+        self,
+    ) -> None:
+        zone = NormalizedBottomZone(left=0.25, width=0.5, height=0.5)
+        self_candidate = Detection(0, "player", 0.90, (40, 35, 60, 100))
+        far_weak = Detection(0, "player", 0.18, (0, 0, 10, 20))
+
+        result = _apply_hard_aim_guard(
+            [self_candidate, far_weak],
+            (100, 100, 3),
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.25,
+        )
+
+        self.assertEqual(result.detections, (far_weak,))
+        self.assertEqual(result.removed_exact_label_boxes, 1)
+        self.assertTrue(result.targetless_after_exact_removal)
+
+    def test_hard_aim_guard_non_target_label_does_not_revoke_grace(self) -> None:
+        zone = NormalizedBottomZone(left=0.25, width=0.5, height=0.5)
+        unrelated_player_label = Detection(
+            0,
+            "person",
+            0.9,
+            (40, 35, 60, 100),
+        )
+
+        result = _apply_hard_aim_guard(
+            [unrelated_player_label],
+            (100, 100, 3),
+            self_zone=zone,
+            aim_label="player",
+        )
+
+        self.assertEqual(result.detections, ())
+        self.assertEqual(result.removed_exact_label_boxes, 0)
+        self.assertFalse(result.targetless_after_exact_removal)
+
+    def test_aim_input_telemetry_reports_per_interval_cause_deltas(self) -> None:
+        telemetry = AimInputTelemetry("player")
+        previous = telemetry.snapshot()
+        exact = Detection(0, "PLAYER", 0.9, (80, 20, 96, 75))
+        unrelated = Detection(1, "prop", 0.9, (10, 10, 20, 20))
+        zone = NormalizedBottomZone(left=0.25, width=0.5, height=0.5)
+        guarded = Detection(0, "player", 0.9, (40, 35, 60, 100))
+
+        telemetry.record_sample([exact])
+        telemetry.record_self_filter(aim_safe=True)
+        telemetry.record_sample([unrelated])
+        telemetry.record_self_filter(aim_safe=False)
+        telemetry.record_hard_guard(
+            _apply_hard_aim_guard(
+                [guarded],
+                (100, 100, 3),
+                self_zone=zone,
+                aim_label="player",
+            )
+        )
+
+        summary = _aim_input_telemetry_summary(
+            previous,
+            telemetry.snapshot(),
+            0.5,
+        )
+
+        self.assertIn("AIM INPUT 4/s", summary)
+        self.assertIn("exact 2/s", summary)
+        self.assertIn("self-unsafe 1", summary)
+        self.assertIn("guard exact boxes 1", summary)
+        self.assertIn("guard targetless 1", summary)
+
     def test_aim_overlay_names_the_configured_physical_gate(self) -> None:
         frame = np.zeros((100, 200, 3), dtype=np.uint8)
         with (
@@ -328,25 +534,402 @@ class AimingControllerTests(unittest.TestCase):
             self.assertIsNotNone(tracker.update((), (1080, 1920, 3)))
         self.assertIsNone(tracker.update((), (1080, 1920, 3)))
 
-    def test_unsafe_self_exclusion_resets_tracker_without_grace(self) -> None:
-        tracker = TargetTracker(label="person", lost_grace_frames=18)
+    def test_one_reference_frame_grace_bridges_8_and_16_ms_then_expires(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
         target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        base_ns = 1_000_000_000
+
+        self.assertIs(
+            tracker.update(
+                [target],
+                (1080, 1920, 3),
+                measurement_ns=base_ns,
+            ),
+            target,
+        )
+        self.assertIsNotNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+            )
+        )
+        self.assertIsNotNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_000_000,
+            )
+        )
+
+        bridged = tracker.telemetry_snapshot()
+        self.assertEqual(bridged.updates, 3)
+        self.assertEqual(bridged.candidate_samples, 1)
+        self.assertEqual(bridged.measurement_samples, 1)
+        self.assertEqual(bridged.output_samples, 3)
+        self.assertEqual(bridged.compared_samples, 1)
+        self.assertEqual(bridged.target_loss_transitions, 0)
+
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_666_668,
+            )
+        )
+        expired = tracker.telemetry_snapshot()
+        self.assertEqual(expired.updates, 4)
+        self.assertEqual(expired.candidate_samples, 1)
+        self.assertEqual(expired.measurement_samples, 1)
+        self.assertEqual(expired.output_samples, 3)
+        self.assertEqual(expired.compared_samples, 1)
+        self.assertEqual(expired.target_loss_transitions, 1)
+
+    def test_within_grace_reacquisition_is_measured_without_a_loss(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        first = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        reacquired = Detection(0, "person", 0.85, (808, 300, 1008, 900))
+        base_ns = 2_000_000_000
+
+        tracker.update([first], (1080, 1920, 3), measurement_ns=base_ns)
+        prediction = tracker.update(
+            (),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 8_000_000,
+        )
+        self.assertIsNotNone(prediction)
+        resumed = tracker.update(
+            [reacquired],
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 16_000_000,
+        )
+
+        self.assertIsNotNone(resumed)
+        telemetry = tracker.telemetry_snapshot()
+        self.assertEqual(telemetry.updates, 3)
+        self.assertEqual(telemetry.candidate_samples, 2)
+        self.assertEqual(telemetry.measurement_samples, 2)
+        self.assertEqual(telemetry.continuation_measurement_samples, 0)
+        self.assertEqual(telemetry.output_samples, 3)
+        self.assertEqual(telemetry.compared_samples, 2)
+        self.assertEqual(telemetry.target_loss_transitions, 0)
+
+    def test_low_confidence_box_continues_only_an_active_geometric_track(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=0)
+        acquired = Detection(0, "person", 0.90, (700, 250, 900, 850))
+        continued = Detection(0, "person", 0.18, (708, 250, 908, 850))
+        base_ns = 2_500_000_000
+
+        self.assertIs(
+            tracker.update(
+                (acquired,),
+                (1080, 1920, 3),
+                measurement_ns=base_ns,
+            ),
+            acquired,
+        )
+        tracked = tracker.update(
+            (),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 8_000_000,
+            continuation_detections=(continued,),
+        )
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertEqual(tracked.confidence, continued.confidence)
+        self.assertFalse(tracker.output_is_prediction)
+        telemetry = tracker.telemetry_snapshot()
+        self.assertEqual(telemetry.measurement_samples, 2)
+        self.assertEqual(telemetry.continuation_measurement_samples, 1)
+        self.assertEqual(telemetry.output_samples, 2)
+
+    def test_low_confidence_box_cannot_acquire_or_enter_reacquisition(self) -> None:
+        fresh_tracker = TargetTracker(label="person", lost_grace_frames=0)
+        low = Detection(0, "person", 0.18, (700, 250, 900, 850))
+        self.assertIsNone(
+            fresh_tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=1_000_000_000,
+                continuation_detections=(low,),
+            )
+        )
+
+        tracker = TargetTracker(
+            label="person",
+            lost_grace_frames=0,
+            reacquire_confirmations=2,
+        )
+        original = Detection(0, "person", 0.90, (200, 250, 400, 850))
+        low_rival = Detection(0, "person", 0.18, (1100, 250, 1300, 850))
+        high_rival = Detection(0, "person", 0.90, low_rival.xyxy)
+        base_ns = 2_000_000_000
+        tracker.update((original,), (1080, 1920, 3), measurement_ns=base_ns)
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+            )
+        )
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_000_000,
+                continuation_detections=(low_rival,),
+            )
+        )
+        # The low rival did not enter pending reacquisition, so the first
+        # configured-confidence rival still cannot revive output.
+        self.assertIsNone(
+            tracker.update(
+                (high_rival,),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 24_000_000,
+            )
+        )
+        self.assertIsNotNone(
+            tracker.update(
+                (high_rival,),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 32_000_000,
+            )
+        )
+
+    def test_low_confidence_box_cannot_revive_a_dropped_track(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=0)
+        high = Detection(0, "person", 0.90, (700, 250, 900, 850))
+        low = Detection(0, "person", 0.18, (708, 250, 908, 850))
+        base_ns = 3_500_000_000
+
+        tracker.update((high,), (1080, 1920, 3), measurement_ns=base_ns)
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+            )
+        )
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_000_000,
+                continuation_detections=(low,),
+            )
+        )
+
+    def test_low_confidence_continuation_expires_100_ms_after_strong_measurement(
+        self,
+    ) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        strong = Detection(0, "person", 0.90, (700, 250, 900, 850))
+        weak = Detection(0, "person", 0.18, (704, 250, 904, 850))
+        base_ns = 7_000_000_000
+        tracker.update((strong,), (1080, 1920, 3), measurement_ns=base_ns)
+
+        for elapsed_ms in range(10, 101, 10):
+            self.assertIsNotNone(
+                tracker.update(
+                    (),
+                    (1080, 1920, 3),
+                    measurement_ns=base_ns + elapsed_ms * 1_000_000,
+                    continuation_detections=(weak,),
+                )
+            )
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 110_000_000,
+                continuation_detections=(weak,),
+            )
+        )
+        self.assertEqual(
+            tracker.telemetry_snapshot().continuation_measurement_samples,
+            10,
+        )
+
+    def test_release_then_repress_cannot_authorize_a_weak_only_track(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        strong = Detection(0, "person", 0.90, (700, 250, 900, 850))
+        weak = Detection(0, "person", 0.18, (704, 250, 904, 850))
+        base_ns = 8_000_000_000
+        tracker.update((strong,), (1080, 1920, 3), measurement_ns=base_ns)
+        self.assertIsNotNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+                continuation_detections=(weak,),
+                continuation_allowed=True,
+            )
+        )
+
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_000_000,
+                continuation_detections=(weak,),
+                continuation_allowed=False,
+            )
+        )
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 24_000_000,
+                continuation_detections=(weak,),
+                continuation_allowed=True,
+            )
+        )
+
+    def test_low_continuation_rejects_zero_iou_box_90_pixels_away(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        strong = Detection(0, "person", 0.90, (700, 250, 780, 850))
+        weak = Detection(0, "person", 0.18, (790, 250, 870, 850))
+        base_ns = 9_000_000_000
+        tracker.update((strong,), (1080, 1920, 3), measurement_ns=base_ns)
+
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+                continuation_detections=(weak,),
+            )
+        )
+
+    def test_low_continuation_rejects_large_box_area_jump(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        strong = Detection(0, "person", 0.90, (700, 250, 900, 850))
+        weak = Detection(0, "person", 0.18, (600, 100, 1000, 1000))
+        base_ns = 10_000_000_000
+        tracker.update((strong,), (1080, 1920, 3), measurement_ns=base_ns)
+
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+                continuation_detections=(weak,),
+            )
+        )
+
+    def test_continuation_allowed_requires_a_boolean(self) -> None:
+        tracker = TargetTracker(label="person")
+        with self.assertRaisesRegex(TypeError, "continuation_allowed must be bool"):
+            tracker.update((), (1080, 1920, 3), continuation_allowed=1)
+
+    def test_low_confidence_continuation_must_pass_geometric_association(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=0)
+        high = Detection(0, "person", 0.90, (200, 250, 400, 850))
+        far_low = Detection(0, "person", 0.18, (1300, 250, 1500, 850))
+        base_ns = 4_500_000_000
+
+        tracker.update((high,), (1080, 1920, 3), measurement_ns=base_ns)
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+                continuation_detections=(far_low,),
+            )
+        )
+
+    def test_prediction_flag_is_true_only_for_synthetic_grace_output(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        high = Detection(0, "person", 0.90, (700, 250, 900, 850))
+        continued = Detection(0, "person", 0.18, (708, 250, 908, 850))
+        base_ns = 5_500_000_000
+
+        tracker.update((high,), (1080, 1920, 3), measurement_ns=base_ns)
+        self.assertFalse(tracker.output_is_prediction)
+        tracker.update(
+            (),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 8_000_000,
+        )
+        self.assertTrue(tracker.output_is_prediction)
+        tracker.update(
+            (),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 16_000_000,
+            continuation_detections=(continued,),
+        )
+        self.assertFalse(tracker.output_is_prediction)
+        tracker.reset()
+        self.assertFalse(tracker.output_is_prediction)
+
+    def test_prediction_grace_does_not_replace_an_incompatible_detection(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        original = Detection(0, "person", 0.8, (200, 300, 400, 900))
+        incompatible = Detection(0, "person", 0.9, (1200, 300, 1400, 900))
+        base_ns = 3_000_000_000
+
+        tracker.update([original], (1080, 1920, 3), measurement_ns=base_ns)
+
+        self.assertIsNone(
+            tracker.update(
+                [incompatible],
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 8_000_000,
+            )
+        )
+
+    def test_target_tracker_counts_one_loss_per_contiguous_missing_interval(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=0)
+        target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+
         tracker.update([target], (1080, 1920, 3))
+        tracker.update([], (1080, 1920, 3))
+        tracker.update([], (1080, 1920, 3))
+        self.assertEqual(tracker.telemetry_snapshot().target_loss_transitions, 1)
+
+        tracker.update([target], (1080, 1920, 3))
+        tracker.reset()
+        tracker.reset()
+        self.assertEqual(tracker.telemetry_snapshot().target_loss_transitions, 2)
+
+    def test_unsafe_self_exclusion_resets_tracker_without_grace(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        base_ns = 4_000_000_000
+        tracker.update(
+            [target],
+            (1080, 1920, 3),
+            measurement_ns=base_ns,
+        )
 
         selected = _update_aim_target(
             tracker,
             (),
             (1080, 1920, 3),
             self_exclusion_safe=False,
+            measurement_ns=base_ns + 8_000_000,
         )
 
         self.assertIsNone(selected)
-        self.assertIsNone(tracker.update((), (1080, 1920, 3)))
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_000_000,
+            )
+        )
 
     def test_disabled_aim_runtime_cannot_select_or_retain_a_draw_target(self) -> None:
-        tracker = TargetTracker(label="person", lost_grace_frames=18)
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
         target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
-        tracker.update([target], (1080, 1920, 3))
+        base_ns = 5_000_000_000
+        tracker.update(
+            [target],
+            (1080, 1920, 3),
+            measurement_ns=base_ns,
+        )
 
         selected = _update_aim_target(
             tracker,
@@ -354,10 +937,41 @@ class AimingControllerTests(unittest.TestCase):
             (1080, 1920, 3),
             self_exclusion_safe=True,
             aim_runtime_enabled=False,
+            measurement_ns=base_ns + 8_000_000,
         )
 
         self.assertIsNone(selected)
-        self.assertIsNone(tracker.update((), (1080, 1920, 3)))
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_000_000,
+            )
+        )
+
+    def test_non_detector_empty_sample_revokes_prediction_grace(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        base_ns = 6_000_000_000
+        tracker.update([target], (1080, 1920, 3), measurement_ns=base_ns)
+
+        selected = _update_aim_target(
+            tracker,
+            (),
+            (1080, 1920, 3),
+            self_exclusion_safe=True,
+            prediction_grace_safe=False,
+            measurement_ns=base_ns + 8_000_000,
+        )
+
+        self.assertIsNone(selected)
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                measurement_ns=base_ns + 16_000_000,
+            )
+        )
 
     def test_target_tracker_smooths_small_box_jitter(self) -> None:
         tracker = TargetTracker(label="person")
@@ -400,6 +1014,13 @@ class AimingControllerTests(unittest.TestCase):
                 measurement_ns=1_066_000_000,
             )
         )
+        telemetry = tracker.telemetry_snapshot()
+        self.assertEqual(telemetry.updates, 3)
+        self.assertEqual(telemetry.candidate_samples, 3)
+        self.assertEqual(telemetry.measurement_samples, 2)
+        self.assertEqual(telemetry.output_samples, 2)
+        self.assertEqual(telemetry.compared_samples, 2)
+        self.assertEqual(telemetry.target_loss_transitions, 1)
 
     def test_target_tracker_association_keeps_exact_identity_over_confidence(self) -> None:
         tracker = TargetTracker(label="person")
@@ -442,6 +1063,16 @@ class AimingControllerTests(unittest.TestCase):
         assert tracked is not None
         self.assertEqual(tracked.confidence, tracked_low_confidence.confidence)
         self.assertLess(head_target_point(tracked)[0], 825.0)
+        telemetry = tracker.telemetry_snapshot()
+        raw_x, raw_y = head_target_point(tracked_low_confidence)
+        tracked_x, tracked_y = head_target_point(tracked)
+        # The residual uses the low-confidence identity match actually accepted
+        # by the tracker, not the closer high-confidence rival that a second
+        # independent target-selection call could choose.
+        self.assertEqual(telemetry.measurement_samples, 2)
+        self.assertEqual(telemetry.compared_samples, 2)
+        self.assertAlmostEqual(telemetry.residual_x, raw_x - tracked_x)
+        self.assertAlmostEqual(telemetry.residual_y, raw_y - tracked_y)
 
     def test_target_tracker_velocity_is_time_based_across_detector_rates(self) -> None:
         def run(rate_hz: int) -> tuple[float, float]:
@@ -680,6 +1311,8 @@ class AimingControllerTests(unittest.TestCase):
                 "0.04",
                 "--aim-makcu-derivative-damping-seconds",
                 "0.01",
+                "--aim-makcu-vertical-rate-ratio",
+                "0.63",
             ]
         )
         self.assertEqual(config.aim_output, "makcu")
@@ -691,6 +1324,17 @@ class AimingControllerTests(unittest.TestCase):
         self.assertEqual(config.aim_makcu_smoothing_alpha, 0.72)
         self.assertEqual(config.aim_makcu_prediction_lead_seconds, 0.04)
         self.assertEqual(config.aim_makcu_derivative_damping_seconds, 0.01)
+        self.assertEqual(config.aim_makcu_vertical_rate_ratio, 0.63)
+
+    def test_makcu_vertical_rate_ratio_cli_is_bounded(self) -> None:
+        self.assertEqual(parse_args([]).aim_makcu_vertical_rate_ratio, 0.48)
+        for value in ("0", "-0.1", "1.01", "nan", "inf"):
+            with (
+                self.subTest(value=value),
+                contextlib.redirect_stderr(io.StringIO()),
+                self.assertRaises(SystemExit),
+            ):
+                parse_args(["--aim-makcu-vertical-rate-ratio", value])
 
     def test_aim_cli_requires_self_filter(self) -> None:
         with contextlib.redirect_stderr(io.StringIO()) as error, self.assertRaises(SystemExit):

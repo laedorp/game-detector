@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import re
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, Sequence
@@ -22,6 +24,8 @@ APPLICATION_ROOT = Path(__file__).resolve().parent
 DEFAULT_SELF_ZONE_LEFT = 0.18
 DEFAULT_SELF_ZONE_WIDTH = 0.34
 DEFAULT_SELF_ZONE_HEIGHT = 0.10
+DEFAULT_AIM_CALIBRATION_CONTEXT = "hip-fire"
+_AIM_CALIBRATION_CONTEXT_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,63}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,6 +66,9 @@ class AppConfig:
     # usually exist only in a specific mode, so the format must be asked
     # for explicitly rather than left at the driver default.
     capture_format: str | None = None
+    # Apply before inference so preview, detections, and aim coordinates all
+    # share the same upright camera/capture-card orientation.
+    capture_rotate_180: bool = False
     ignore_self: bool = False
     self_zone_left: float = DEFAULT_SELF_ZONE_LEFT
     self_zone_width: float = DEFAULT_SELF_ZONE_WIDTH
@@ -82,6 +89,10 @@ class AppConfig:
     aim_makcu_smoothing_alpha: float = 0.78
     aim_makcu_prediction_lead_seconds: float = 0.03
     aim_makcu_derivative_damping_seconds: float = 0.008
+    aim_makcu_vertical_rate_ratio: float = 0.48
+    aim_makcu_active_profile: Path | None = None
+    aim_calibration_evidence: Path | None = None
+    aim_calibration_context: str = DEFAULT_AIM_CALIBRATION_CONTEXT
     aim_activate_path: str | None = None
     aim_activate_axis: int = ABS_BRAKE
     aim_activate_threshold: float = 0.35
@@ -99,6 +110,16 @@ def _fourcc(value: str) -> str:
     if len(text) != 4 or not text.isalnum():
         raise argparse.ArgumentTypeError(
             "must be a four-character alphanumeric FOURCC code, such as NV12"
+        )
+    return text
+
+
+def _aim_calibration_context(value: str) -> str:
+    text = str(value)
+    if _AIM_CALIBRATION_CONTEXT_RE.fullmatch(text) is None:
+        raise argparse.ArgumentTypeError(
+            "must be 1-64 characters, begin with a letter or digit, and contain "
+            "only letters, digits, '.', '_', '+', or '-'"
         )
     return text
 
@@ -287,6 +308,14 @@ def build_parser() -> argparse.ArgumentParser:
         "--capture-fps",
         type=_positive_float,
         help="Requested camera/capture-card frame rate.",
+    )
+    parser.add_argument(
+        "--capture-rotate-180",
+        action="store_true",
+        help=(
+            "Rotate camera, capture-card, or video frames 180 degrees before "
+            "inference and preview."
+        ),
     )
     parser.add_argument(
         "--inference-size",
@@ -518,6 +547,43 @@ def build_parser() -> argparse.ArgumentParser:
         help="Velocity damping horizon in seconds (default: 0.008).",
     )
     parser.add_argument(
+        "--aim-makcu-vertical-rate-ratio",
+        type=_positive_unit_float,
+        default=0.48,
+        help=(
+            "Vertical-to-horizontal MAKCU rate cap ratio in (0,1] "
+            "(default: 0.48)."
+        ),
+    )
+    parser.add_argument(
+        "--aim-makcu-active-profile",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Use one explicitly activated MAKCU calibration profile. "
+            "Requires MAKCU aim and cannot be combined with calibration capture."
+        ),
+    )
+    parser.add_argument(
+        "--aim-calibration-evidence",
+        type=Path,
+        metavar="PATH",
+        help=(
+            "Write one non-overwriting MAKCU calibration evidence record. "
+            "Requires live camera/screen input and explicitly configured MAKCU aim."
+        ),
+    )
+    parser.add_argument(
+        "--aim-calibration-context",
+        type=_aim_calibration_context,
+        default=DEFAULT_AIM_CALIBRATION_CONTEXT,
+        metavar="NAME",
+        help=(
+            "Safe calibration context name used to distinguish physical aim modes "
+            f"(default: {DEFAULT_AIM_CALIBRATION_CONTEXT})."
+        ),
+    )
+    parser.add_argument(
         "--aim-activate-path",
         metavar="PATH",
         help="Required for local output: physical input path whose LT axis gates every update.",
@@ -586,6 +652,77 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
             "--crop-size and --detail-crop-size cannot be combined; the detail "
             "mode requires a full-frame primary pass"
         )
+    calibration_evidence = (
+        args.aim_calibration_evidence.expanduser()
+        if args.aim_calibration_evidence is not None
+        else None
+    )
+    active_profile = (
+        args.aim_makcu_active_profile.expanduser()
+        if args.aim_makcu_active_profile is not None
+        else None
+    )
+    if active_profile is not None:
+        if not args.aim:
+            parser.error("--aim-makcu-active-profile requires --aim")
+        if args.aim_output != "makcu":
+            parser.error(
+                "--aim-makcu-active-profile requires --aim-output makcu"
+            )
+        if calibration_evidence is not None:
+            parser.error(
+                "--aim-makcu-active-profile cannot be combined with "
+                "--aim-calibration-evidence"
+            )
+        try:
+            active_profile_metadata = active_profile.lstat()
+        except OSError:
+            parser.error(
+                "--aim-makcu-active-profile must be an existing non-symlink "
+                "regular file"
+            )
+        if stat.S_ISLNK(active_profile_metadata.st_mode) or not stat.S_ISREG(
+            active_profile_metadata.st_mode
+        ):
+            parser.error(
+                "--aim-makcu-active-profile must be an existing non-symlink "
+                "regular file"
+            )
+    if calibration_evidence is not None:
+        if not args.aim:
+            parser.error("--aim-calibration-evidence requires --aim")
+        if args.aim_output != "makcu":
+            parser.error(
+                "--aim-calibration-evidence requires --aim-output makcu"
+            )
+        if not (args.aim_makcu_port or "").strip():
+            parser.error(
+                "--aim-calibration-evidence requires an explicit --aim-makcu-port"
+            )
+        if args.source.kind not in {"device", "screen"}:
+            parser.error(
+                "--aim-calibration-evidence requires a live camera/capture-card "
+                "or screen source; video files are not accepted"
+            )
+        if not args.ignore_self:
+            parser.error("--aim-calibration-evidence requires --ignore-self")
+        if os.path.lexists(calibration_evidence):
+            parser.error(
+                "--aim-calibration-evidence output already exists; refusing to overwrite"
+            )
+        if args.metrics_json is not None:
+            parser.error(
+                "--aim-calibration-evidence cannot be combined with --metrics-json"
+            )
+        if args.max_frames is not None or args.max_seconds is not None:
+            parser.error(
+                "--aim-calibration-evidence cannot be combined with --max-frames "
+                "or --max-seconds"
+            )
+        if args.detail_crop_size is not None:
+            parser.error(
+                "--aim-calibration-evidence cannot be combined with --detail-crop-size"
+            )
     if args.aim:
         args.aim_label = (args.aim_label or "").strip()
         if not args.aim_label:
@@ -604,6 +741,11 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
             )
         args.aim_activate_path = (args.aim_activate_path or "").strip() or None
     source: SourceSpec = args.source
+    if args.capture_rotate_180 and source.kind == "screen":
+        parser.error(
+            "--capture-rotate-180 is only available for camera, capture-card, "
+            "or video sources"
+        )
     screen_monitor = (
         int(source.value)
         if source.kind == "screen" and source.value is not None
@@ -618,6 +760,7 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         device=args.device.strip().upper(),
         backend=args.backend.strip().lower(),
         capture_format=args.capture_format,
+        capture_rotate_180=args.capture_rotate_180,
         capture_size=args.capture_size,
         capture_fps=args.capture_fps,
         inference_size=args.inference_size,
@@ -653,6 +796,10 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         aim_makcu_smoothing_alpha=args.aim_makcu_smoothing_alpha,
         aim_makcu_prediction_lead_seconds=args.aim_makcu_prediction_lead_seconds,
         aim_makcu_derivative_damping_seconds=args.aim_makcu_derivative_damping_seconds,
+        aim_makcu_vertical_rate_ratio=args.aim_makcu_vertical_rate_ratio,
+        aim_makcu_active_profile=active_profile,
+        aim_calibration_evidence=calibration_evidence,
+        aim_calibration_context=args.aim_calibration_context,
         aim_activate_path=args.aim_activate_path,
         aim_activate_axis=args.aim_activate_axis,
         aim_activate_threshold=args.aim_activate_threshold,

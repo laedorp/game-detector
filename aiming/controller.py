@@ -21,11 +21,14 @@ LOCAL_TARGET_STALE_SECONDS = 0.15
 LOCAL_WATCHDOG_INTERVAL_SECONDS = 0.025
 TARGET_TRACK_REFERENCE_HZ = 60.0
 TARGET_TRACK_MEMORY_SECONDS = 0.20
+TARGET_CONTINUATION_STRONG_WINDOW_SECONDS = 0.10
 TARGET_REACQUIRE_CONFIRMATIONS = 2
 TARGET_POSITION_TIME_CONSTANT_SECONDS = 0.020
 TARGET_VELOCITY_TIME_CONSTANT_SECONDS = 0.060
 TARGET_MAX_SPEED_DIAGONALS_PER_SECOND = 2.0
 TARGET_MAX_ACCELERATION_DIAGONALS_PER_SECOND_SQUARED = 6.0
+TARGET_TELEMETRY_REFERENCE_WIDTH = 1920.0
+TARGET_TELEMETRY_REFERENCE_HEIGHT = 1080.0
 
 try:
     import evdev as _evdev
@@ -638,6 +641,28 @@ def choose_target(
     return min(candidates, key=target_key)
 
 
+@dataclass(frozen=True, slots=True)
+class TargetTrackerTelemetrySnapshot:
+    """Monotonic, aggregate observations of the target tracking path.
+
+    Residual totals compare the exact accepted detector measurement with the
+    tracker output from that same sample.  They are expressed in 1920x1080
+    reference pixels, and contain no absolute screen coordinates.
+    """
+
+    updates: int = 0
+    candidate_samples: int = 0
+    measurement_samples: int = 0
+    continuation_measurement_samples: int = 0
+    output_samples: int = 0
+    compared_samples: int = 0
+    target_loss_transitions: int = 0
+    residual_x: float = 0.0
+    residual_y: float = 0.0
+    residual_abs_x: float = 0.0
+    residual_abs_y: float = 0.0
+
+
 class TargetTracker:
     """Keep one measured target stable without frame-rate-dependent motion state."""
 
@@ -668,6 +693,7 @@ class TargetTracker:
         self._last_observed_box: tuple[float, float, float, float] | None = None
         self._box_velocity = (0.0, 0.0, 0.0, 0.0)  # pixels per second
         self._last_measurement_ns: int | None = None
+        self._last_strong_measurement_ns: int | None = None
         self._last_sample_ns: int | None = None
         self._synthetic_measurement_ns = 0
         self._pending_target: Detection | None = None
@@ -675,19 +701,112 @@ class TargetTracker:
         self._ever_tracked = False
         self._misses = 0
         self._frame_dimensions: tuple[int, int] | None = None
+        self._telemetry_updates = 0
+        self._telemetry_candidate_samples = 0
+        self._telemetry_measurement_samples = 0
+        self._telemetry_continuation_measurement_samples = 0
+        self._telemetry_output_samples = 0
+        self._telemetry_compared_samples = 0
+        self._telemetry_target_loss_transitions = 0
+        self._telemetry_residual_x = 0.0
+        self._telemetry_residual_y = 0.0
+        self._telemetry_residual_abs_x = 0.0
+        self._telemetry_residual_abs_y = 0.0
+        self._telemetry_output_present = False
+        self._output_is_prediction = False
 
     def reset(self) -> None:
+        self._reset_tracking_state()
+        # A safety reset is an observable output loss, but repeated resets
+        # while already missing remain one contiguous loss interval.
+        self._record_observation(None, None, None, None, count_update=False)
+
+    def _reset_tracking_state(self) -> None:
         self._target = None
         self._smoothed_box = None
         self._last_observed_box = None
         self._box_velocity = (0.0, 0.0, 0.0, 0.0)
         self._last_measurement_ns = None
+        self._last_strong_measurement_ns = None
         self._last_sample_ns = None
         self._synthetic_measurement_ns = 0
         self._clear_pending()
         self._ever_tracked = False
         self._misses = 0
         self._frame_dimensions = None
+        self._output_is_prediction = False
+
+    @property
+    def output_is_prediction(self) -> bool:
+        """Whether the most recent output was synthesized through loss grace."""
+
+        return self._output_is_prediction
+
+    def telemetry_snapshot(self) -> TargetTrackerTelemetrySnapshot:
+        """Return aggregate tracker diagnostics without changing tracker state."""
+
+        return TargetTrackerTelemetrySnapshot(
+            updates=self._telemetry_updates,
+            candidate_samples=self._telemetry_candidate_samples,
+            measurement_samples=self._telemetry_measurement_samples,
+            continuation_measurement_samples=(
+                self._telemetry_continuation_measurement_samples
+            ),
+            output_samples=self._telemetry_output_samples,
+            compared_samples=self._telemetry_compared_samples,
+            target_loss_transitions=self._telemetry_target_loss_transitions,
+            residual_x=self._telemetry_residual_x,
+            residual_y=self._telemetry_residual_y,
+            residual_abs_x=self._telemetry_residual_abs_x,
+            residual_abs_y=self._telemetry_residual_abs_y,
+        )
+
+    def _record_observation(
+        self,
+        candidate: Detection | None,
+        measurement: Detection | None,
+        output: Detection | None,
+        dimensions: tuple[int, int] | None,
+        *,
+        count_update: bool = True,
+        continuation_measurement: bool = False,
+    ) -> Detection | None:
+        """Record one already-computed result without affecting selection."""
+
+        if count_update:
+            self._telemetry_updates += 1
+            self._telemetry_candidate_samples += int(candidate is not None)
+            self._telemetry_measurement_samples += int(measurement is not None)
+            self._telemetry_continuation_measurement_samples += int(
+                continuation_measurement and measurement is not None
+            )
+            self._telemetry_output_samples += int(output is not None)
+
+        output_present = output is not None
+        if self._telemetry_output_present and not output_present:
+            self._telemetry_target_loss_transitions += 1
+        self._telemetry_output_present = output_present
+
+        if count_update and measurement is not None and output is not None:
+            assert dimensions is not None
+            height, width = dimensions
+            if width > 0 and height > 0:
+                raw_x, raw_y = head_target_point(measurement, self.head_ratio)
+                tracked_x, tracked_y = head_target_point(output, self.head_ratio)
+                # Positive means the accepted raw point lies right/below the
+                # tracker output. Absolute totals remain useful across turns.
+                residual_x = (raw_x - tracked_x) * (
+                    TARGET_TELEMETRY_REFERENCE_WIDTH / width
+                )
+                residual_y = (raw_y - tracked_y) * (
+                    TARGET_TELEMETRY_REFERENCE_HEIGHT / height
+                )
+                self._telemetry_compared_samples += 1
+                self._telemetry_residual_x += residual_x
+                self._telemetry_residual_y += residual_y
+                self._telemetry_residual_abs_x += abs(residual_x)
+                self._telemetry_residual_abs_y += abs(residual_y)
+        return output
 
     def update(
         self,
@@ -695,13 +814,24 @@ class TargetTracker:
         frame_shape: tuple[int, ...],
         *,
         measurement_ns: int | None = None,
+        continuation_detections: list[Detection] | tuple[Detection, ...] = (),
+        continuation_allowed: bool = True,
     ) -> Detection | None:
+        if not isinstance(continuation_allowed, bool):
+            raise TypeError("continuation_allowed must be bool")
+        # This state describes only the result of the current call. Every path
+        # other than the explicit missing-target predictor remains measured or
+        # targetless.
+        self._output_is_prediction = False
         dimensions = (int(frame_shape[0]), int(frame_shape[1]))
         if self._frame_dimensions is not None and dimensions != self._frame_dimensions:
-            self.reset()
+            # A resolution change resets temporal geometry, but the target
+            # selected in this same update is not a missing-output interval.
+            self._reset_tracking_state()
         self._frame_dimensions = dimensions
         sample_ns = self._sample_time_ns(measurement_ns)
         candidates = list(detections)
+        continuation_candidates = list(continuation_detections)
         if self.label is not None:
             normalized_label = self.label.strip().lower()
             candidates = [
@@ -709,24 +839,64 @@ class TargetTracker:
                 for detection in candidates
                 if detection.class_name.strip().lower() == normalized_label
             ]
+            continuation_candidates = [
+                detection
+                for detection in continuation_candidates
+                if detection.class_name.strip().lower() == normalized_label
+            ]
 
         if self._track_memory_expired(sample_ns):
             self._forget_track()
 
-        if not candidates:
+        # Below-threshold detections are continuation evidence only. They can
+        # be geometrically associated while a physical output is still active,
+        # but can never start a track, enter pending reacquisition, or revive a
+        # target after output has dropped.
+        associated_from_continuation = False
+        associated = self._associated_candidate(candidates, dimensions, sample_ns)
+        if (
+            associated is None
+            and self._target is not None
+            and continuation_allowed
+            and self._continuation_is_recent(sample_ns)
+            and continuation_candidates
+        ):
+            associated = self._associated_candidate(
+                continuation_candidates,
+                dimensions,
+                sample_ns,
+                strict_continuation=True,
+            )
+            associated_from_continuation = associated is not None
+
+        if not candidates and associated is None:
             self._clear_pending()
+            if continuation_candidates:
+                # A weak box was physically present but failed provenance,
+                # lease, or strict identity checks. This is not a genuine
+                # detector-empty sample and must not borrow prediction grace.
+                self._target = None
+                self._misses += 1
+                return self._record_observation(None, None, None, dimensions)
             if self._target is not None and self._within_prediction_grace(sample_ns):
                 self._misses += 1
                 self._target = self._predict_missing_target(dimensions, sample_ns)
-                return self._target
+                self._output_is_prediction = True
+                return self._record_observation(
+                    None,
+                    None,
+                    self._target,
+                    dimensions,
+                )
             # Stop output immediately after grace, but retain the last measured
             # identity briefly. A returning nearby box can resume the same
             # track; a different player must pass reacquisition confirmation.
             self._target = None
             self._misses += 1
-            return None
+            return self._record_observation(None, None, None, dimensions)
 
-        associated = self._associated_candidate(candidates, dimensions, sample_ns)
+        candidate: Detection
+        measurement: Detection | None
         if associated is None:
             selected = choose_target(
                 candidates,
@@ -734,9 +904,12 @@ class TargetTracker:
                 head_ratio=self.head_ratio,
             )
             assert selected is not None
+            candidate = selected
             if self._smoothed_box is None and not self._ever_tracked:
+                measurement = selected
                 self._target = self._start_track(selected, sample_ns)
             elif self._confirm_reacquisition(selected, dimensions):
+                measurement = selected
                 self._target = self._start_track(selected, sample_ns)
             else:
                 # Never snap a physical output to an incompatible detection in
@@ -744,8 +917,15 @@ class TargetTracker:
                 # memory; returning None makes this interval fail closed.
                 self._target = None
                 self._misses += 1
-                return None
+                return self._record_observation(
+                    candidate,
+                    None,
+                    None,
+                    dimensions,
+                )
         else:
+            candidate = associated
+            measurement = associated
             self._clear_pending()
             self._target = self._smooth_measurement(
                 associated,
@@ -753,7 +933,15 @@ class TargetTracker:
                 sample_ns,
             )
         self._misses = 0
-        return self._target
+        if not associated_from_continuation:
+            self._last_strong_measurement_ns = sample_ns
+        return self._record_observation(
+            candidate,
+            measurement,
+            self._target,
+            dimensions,
+            continuation_measurement=associated_from_continuation,
+        )
 
     def _start_track(self, detection: Detection, measurement_ns: int) -> Detection:
         self._smoothed_box = detection.xyxy
@@ -862,6 +1050,8 @@ class TargetTracker:
         candidates: list[Detection],
         dimensions: tuple[int, int],
         measurement_ns: int,
+        *,
+        strict_continuation: bool = False,
     ) -> Detection | None:
         if self._smoothed_box is None:
             return None
@@ -876,10 +1066,20 @@ class TargetTracker:
             dimensions,
         )
         predicted_point = _box_target_point(predicted_box, self.head_ratio)
+        predicted_area = _box_area(predicted_box)
         distance_gate = min(max(0.035 + elapsed * 1.5, 0.045), 0.10)
         scored: list[tuple[float, float, float, Detection]] = []
         for candidate in candidates:
             iou = _box_iou_tuple(predicted_box, candidate.xyxy)
+            if strict_continuation:
+                candidate_area = _box_area(candidate.xyxy)
+                area_ratio = (
+                    candidate_area / predicted_area
+                    if predicted_area > 0.0
+                    else math.inf
+                )
+                if iou < 0.15 or not 0.5 <= area_ratio <= 2.0:
+                    continue
             point = head_target_point(candidate, self.head_ratio)
             distance = math.hypot(
                 point[0] - predicted_point[0],
@@ -909,6 +1109,16 @@ class TargetTracker:
             finalists,
             key=lambda item: (item[1], item[0], item[2]),
         )[3]
+
+    def _continuation_is_recent(self, measurement_ns: int) -> bool:
+        if self._last_strong_measurement_ns is None:
+            return False
+        elapsed_ns = measurement_ns - self._last_strong_measurement_ns
+        return (
+            elapsed_ns >= 0
+            and elapsed_ns
+            <= round(TARGET_CONTINUATION_STRONG_WINDOW_SECONDS * 1_000_000_000)
+        )
 
     def _sample_time_ns(self, measurement_ns: int | None) -> int:
         if measurement_ns is not None:
@@ -986,6 +1196,7 @@ class TargetTracker:
         self._last_observed_box = None
         self._box_velocity = (0.0, 0.0, 0.0, 0.0)
         self._last_measurement_ns = None
+        self._last_strong_measurement_ns = None
         self._misses = 0
         self._clear_pending()
 
@@ -1011,6 +1222,10 @@ def _box_iou_tuple(
     second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
     union = first_area + second_area - intersection
     return intersection / union if union > 0.0 else 0.0
+
+
+def _box_area(box: tuple[float, float, float, float]) -> float:
+    return max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
 
 
 def _box_target_point(

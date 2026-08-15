@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import contextlib
+import io
 import json
 from pathlib import Path
 import tempfile
@@ -11,6 +13,7 @@ from unittest import mock
 
 import numpy as np
 
+from aiming.makcu import MakcuTelemetrySnapshot
 from capture.base import CaptureStats, FramePacket
 from config import parse_args
 from detection.hardware import DirectMLAdapter
@@ -34,6 +37,7 @@ class _FakeDetector:
         self.available_devices = ("CPU",)
         self.infer_calls = 0
         self.postprocess_calls = 0
+        self.postprocess_confidences: list[float | None] = []
         self.tensor_shapes: list[tuple[int, ...]] = []
         self.runtime_summary = {
             "runtime": "test-runtime",
@@ -57,8 +61,9 @@ class _FakeDetector:
             raise RuntimeError("synthetic detail inference failure")
         return np.zeros((1, 0, 6), dtype=np.float32)
 
-    def postprocess(self, _raw, *, transform, frame_shape):
+    def postprocess(self, _raw, *, transform, frame_shape, confidence=None):
         del transform, frame_shape
+        self.postprocess_confidences.append(confidence)
         index = self.postprocess_calls
         self.postprocess_calls += 1
         if index < len(self.detection_batches):
@@ -242,6 +247,7 @@ class LiveReportUnitTests(unittest.TestCase):
                 aim_pairing_key="do-not-leak",
                 aim_activate_path="/private/controller/device",
                 aim_makcu_port="/private/serial/device",
+                capture_rotate_180=True,
             )
             metrics = RollingMetrics(4)
             for index in range(1, 4):
@@ -289,6 +295,9 @@ class LiveReportUnitTests(unittest.TestCase):
             self.assertEqual(report["pipeline"]["update_fps"], 1000.0)
             self.assertEqual(report["capture"]["frames_overwritten"], 17)
             self.assertEqual(report["source"]["backend"], "dxcam-dxgi")
+            self.assertEqual(
+                report["config"]["capture"]["rotation_degrees"], 180
+            )
             self.assertEqual(report["directml_adapter"]["effective_index"], 1)
             self.assertFalse(report["directml_adapter"]["requested_provider_mismatch"])
             self.assertEqual(
@@ -440,6 +449,63 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(timings["detail_inference_ms"], 0.0)
             self.assertEqual(timings["detail_postprocess_ms"], 0.0)
 
+    def test_makcu_startup_receives_and_reports_vertical_cap(self) -> None:
+        report_path = self.root / "makcu-vertical-cap.json"
+        source = _FakeSource()
+
+        class RecordingMakcuController:
+            instances: list["RecordingMakcuController"] = []
+
+            def __init__(self, config) -> None:
+                self.config = config
+                self.activation_pressed = False
+                self.started = False
+                self.stopped = False
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                self.started = True
+
+            def update(self, *_args, **_kwargs) -> None:
+                return None
+
+            def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
+                return MakcuTelemetrySnapshot()
+
+            def stop(self) -> None:
+                self.stopped = True
+
+        config = self._config(
+            report_path,
+            "--max-frames",
+            "1",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "makcu",
+            "--aim-makcu-port",
+            "/dev/serial/by-id/test-makcu",
+            "--aim-makcu-vertical-rate-ratio",
+            "0.63",
+        )
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        controller = RecordingMakcuController.instances[0]
+        self.assertTrue(controller.started)
+        self.assertTrue(controller.stopped)
+        self.assertEqual(controller.config.vertical_rate_ratio, 0.63)
+        self.assertIn("vertical cap 0.63", output.getvalue())
+
     def test_detail_pass_runs_same_model_twice_and_reports_actual_geometry(self) -> None:
         report_path = self.root / "detail.json"
         source = _FakeSource(shape=(72, 128, 3))
@@ -567,23 +633,38 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(report["detail_pass"]["frames_redundant"], 1)
         self.assertEqual(report["detail_pass"]["frames_applied"], 0)
 
-    def test_aim_and_self_filter_each_receive_the_merged_result_once(self) -> None:
+    def test_aim_continuation_is_safety_filtered_but_not_a_display_detection(self) -> None:
         report_path = self.root / "detail-aim.json"
         source = _FakeSource(shape=(72, 128, 3))
         primary = Detection(0, "player", 0.60, (40, 15, 70, 60))
         detail = Detection(0, "player", 0.90, (41, 16, 71, 61))
-        _FakeDetector.detection_batches = [[primary], [detail]]
+        low_continuation = Detection(0, "player", 0.18, (90, 10, 110, 60))
+        guarded_low = Detection(0, "player", 0.17, (40, 35, 60, 72))
+        _FakeDetector.detection_batches = [
+            [primary, low_continuation, guarded_low],
+            [detail],
+        ]
 
         class FakeTracker:
             instances: list["FakeTracker"] = []
 
-            def __init__(self, **_kwargs) -> None:
+            def __init__(self, **options) -> None:
+                self.options = options
                 self.updates: list[list[Detection]] = []
+                self.continuation_updates: list[list[Detection]] = []
                 self.__class__.instances.append(self)
 
-            def update(self, detections, _frame_shape, **_kwargs):
+            def update(
+                self,
+                detections,
+                _frame_shape,
+                *,
+                continuation_detections=(),
+                **_kwargs,
+            ):
                 copied = list(detections)
                 self.updates.append(copied)
+                self.continuation_updates.append(list(continuation_detections))
                 return copied[0] if copied else None
 
             def reset(self) -> None:
@@ -661,9 +742,312 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             result = run(config)
 
         self.assertEqual(result, 0)
-        self.assertEqual(FakeSelfFilter.instances[0].calls, [[detail]])
+        self.assertEqual(
+            FakeSelfFilter.instances[0].calls,
+            [[detail, low_continuation, guarded_low]],
+        )
+        self.assertEqual(FakeTracker.instances[0].options["lost_grace_frames"], 1)
         self.assertEqual(FakeTracker.instances[0].updates, [[detail]])
+        self.assertEqual(
+            FakeTracker.instances[0].continuation_updates,
+            [[low_continuation]],
+        )
         self.assertEqual(FakeController.instances[0].updates, [detail])
+        detector = _FakeDetector.instances[0]
+        self.assertEqual(detector.postprocess_confidences, [0.15, 0.15])
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        self.assertEqual(report["detail_pass"]["primary_detections"], 1)
+        self.assertEqual(report["detail_pass"]["detail_detections"], 1)
+
+    def test_release_repress_requires_configured_confidence_again(self) -> None:
+        report_path = self.root / "release-repress.json"
+        source = _FakeSource(shape=(72, 128, 3))
+        strong = Detection(0, "player", 0.90, (80, 15, 100, 65))
+        weak = Detection(0, "player", 0.18, (81, 15, 101, 65))
+        _FakeDetector.detection_batches = [[strong], [weak], [weak]]
+
+        class FakeController:
+            instances: list["FakeController"] = []
+
+            def __init__(self, _config) -> None:
+                self.updates: list[tuple[Detection | None, bool]] = []
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, target, _frame_shape, *, active=True) -> None:
+                self.updates.append((target, active))
+
+        class SequencedSensor:
+            def __init__(self, *_args, **_kwargs) -> None:
+                self.states = iter((True, False, True))
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def read(self) -> bool:
+                return next(self.states)
+
+        class AlwaysSafeSelfFilter:
+            def __init__(self, _zone) -> None:
+                pass
+
+            def apply(self, detections, _frame_shape):
+                copied = tuple(detections)
+                return SimpleNamespace(
+                    detections=copied,
+                    ignored_count=0,
+                    ignored_detection=None,
+                    aim_safe=True,
+                )
+
+        config = self._config(
+            report_path,
+            "--max-frames",
+            "3",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "local",
+            "--aim-activate-path",
+            "/synthetic/controller",
+        )
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("aiming.AimingController", FakeController),
+            mock.patch("aiming.AimActivationSensor", SequencedSensor),
+            mock.patch("utils.self_filter.SelfAvatarFilter", AlwaysSafeSelfFilter),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        updates = FakeController.instances[0].updates
+        self.assertEqual(updates[0], (strong, True))
+        self.assertEqual(updates[1], (None, False))
+        self.assertEqual(updates[2], (None, True))
+
+    def test_low_continuation_boxes_never_reach_detection_drawing(self) -> None:
+        report_path = self.root / "draw-confidence.json"
+        source = _FakeSource(shape=(72, 128, 3))
+        strong = Detection(0, "player", 0.90, (80, 15, 100, 65))
+        weak = Detection(0, "player", 0.18, (100, 15, 120, 65))
+        _FakeDetector.detection_batches = [[strong, weak]]
+        drawn: list[tuple[Detection, ...]] = []
+
+        class FakeController:
+            def __init__(self, _config) -> None:
+                pass
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, _target, _frame_shape, *, active=True) -> None:
+                del active
+
+        class ActiveSensor:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def read(self) -> bool:
+                return True
+
+        class AlwaysSafeSelfFilter:
+            def __init__(self, _zone) -> None:
+                pass
+
+            def apply(self, detections, _frame_shape):
+                copied = tuple(detections)
+                return SimpleNamespace(
+                    detections=copied,
+                    ignored_count=0,
+                    ignored_detection=None,
+                    aim_safe=True,
+                )
+
+        class RecordingPreview:
+            mode = "inline"
+            stats = PreviewStats(1, 1, 0)
+
+            def start(self) -> None:
+                return None
+
+            def poll(self) -> bool:
+                return True
+
+            def submit(self, _frame) -> bool:
+                return True
+
+            def should_continue(self) -> bool:
+                return True
+
+            def stop(self) -> bool:
+                return True
+
+            def raise_if_failed(self) -> None:
+                return None
+
+        config = replace(
+            self._config(
+                report_path,
+                "--max-frames",
+                "1",
+                "--aim",
+                "--aim-label",
+                "player",
+                "--ignore-self",
+                "--aim-output",
+                "local",
+                "--aim-activate-path",
+                "/synthetic/controller",
+            ),
+            preview=True,
+            draw=True,
+        )
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("aiming.AimingController", FakeController),
+            mock.patch("aiming.AimActivationSensor", ActiveSensor),
+            mock.patch("utils.self_filter.SelfAvatarFilter", AlwaysSafeSelfFilter),
+            mock.patch(
+                "utils.preview.create_preview_window",
+                return_value=RecordingPreview(),
+            ),
+            mock.patch(
+                "utils.render.draw_detections",
+                side_effect=lambda _frame, detections: drawn.append(tuple(detections)),
+            ),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(drawn, [(strong,)])
+
+    def test_hard_self_guard_empty_sample_cannot_use_physical_prediction_grace(
+        self,
+    ) -> None:
+        report_path = self.root / "hard-guard-aim.json"
+
+        class TimestampedSource(_FakeSource):
+            def __init__(self) -> None:
+                super().__init__(shape=(72, 128, 3))
+                self.base_ns = perf_counter_ns() - 20_000_000
+
+            def read(self, timeout: float | None = None):
+                self.read_calls += 1
+                self.read_timeouts.append(timeout)
+                started_ns = self.base_ns + (self.read_calls - 1) * 8_000_000
+                return FramePacket(
+                    image=np.zeros(self.shape, dtype=np.uint8),
+                    sequence=self.read_calls - 1,
+                    read_started_ns=started_ns,
+                    read_completed_ns=started_ns + 100_000,
+                )
+
+        class FakeController:
+            instances: list["FakeController"] = []
+
+            def __init__(self, _config) -> None:
+                self.updates: list[Detection | None] = []
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, target, _frame_shape, *, active=True) -> None:
+                self.updates.append(target if active else None)
+
+        class FakeSensor:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def read(self) -> bool:
+                return True
+
+        class AlwaysSafeSelfFilter:
+            def __init__(self, _zone) -> None:
+                pass
+
+            def apply(self, detections, _frame_shape):
+                copied = tuple(detections)
+                return SimpleNamespace(
+                    detections=copied,
+                    ignored_count=0,
+                    ignored_detection=None,
+                    aim_safe=True,
+                )
+
+        # The first player is outside the bottom-center guard and establishes
+        # a physical target. A guarded non-target player-like label at +8 ms
+        # must leave genuine empty-target prediction grace intact. An exact
+        # target-label self candidate at +16 ms must revoke that grace.
+        opponent = Detection(0, "player", 0.9, (80, 20, 100, 65))
+        self_candidate = Detection(0, "player", 0.9, (40, 35, 60, 72))
+        guarded_non_target = Detection(1, "person", 0.9, (40, 35, 60, 72))
+        _FakeDetector.detection_batches = [
+            [opponent],
+            [guarded_non_target],
+            [self_candidate],
+        ]
+        source = TimestampedSource()
+        config = self._config(
+            report_path,
+            "--max-frames",
+            "3",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "local",
+            "--aim-activate-path",
+            "/synthetic/controller",
+        )
+
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("aiming.AimingController", FakeController),
+            mock.patch("aiming.AimActivationSensor", FakeSensor),
+            mock.patch("utils.self_filter.SelfAvatarFilter", AlwaysSafeSelfFilter),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        updates = FakeController.instances[0].updates
+        self.assertEqual(len(updates), 3)
+        self.assertEqual(updates[0], opponent)
+        self.assertIsNotNone(updates[1])
+        self.assertEqual(updates[1].class_name, "player")
+        self.assertIsNone(updates[2])
 
     def test_max_seconds_stops_a_static_source_on_the_bounded_read(self) -> None:
         report_path = self.root / "static.json"

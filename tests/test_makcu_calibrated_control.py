@@ -1,0 +1,706 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import math
+import unittest
+
+from aiming.makcu_calibrated_control import (
+    CalibratedControlConfig,
+    CalibratedControlOutput,
+    CalibratedPlant,
+    EmittedMouseCommand,
+    MakcuCalibratedController,
+    ScreenErrorObservation,
+)
+
+
+NS_PER_MS = 1_000_000
+NS_PER_SECOND = 1_000_000_000
+
+
+def _test_config(**overrides: object) -> CalibratedControlConfig:
+    values: dict[str, object] = {
+        "position_time_constant_seconds": 0.060,
+        "velocity_filter_time_constant_seconds": 0.018,
+        "maximum_target_speed_pixels_per_second": 3000.0,
+        "maximum_target_acceleration_pixels_per_second_squared": 90_000.0,
+        "maximum_rate_x_counts_per_second": 16_000.0,
+        "maximum_rate_y_counts_per_second": 10_000.0,
+        "stale_after_seconds": 0.040,
+        "maximum_observation_interval_seconds": 0.040,
+        "maximum_error_jump_pixels": 180.0,
+        "feedback_deadzone_pixels": 0.50,
+        "wrong_way_guard_pixels": 2.0,
+        "velocity_median_window": 3,
+    }
+    values.update(overrides)
+    return CalibratedControlConfig(**values)  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True, slots=True)
+class _RunResult:
+    errors: tuple[tuple[float, float], ...]
+    outputs: tuple[CalibratedControlOutput | tuple[float, float], ...]
+
+
+class _CurrentProportionalPi:
+    """Small numeric reproduction of the current proportional/pursuit PI law."""
+
+    def __init__(self, config: CalibratedControlConfig) -> None:
+        self.config = config
+        self.error_x = 0.0
+        self.error_y = 0.0
+        self.integral_x = 0.0
+        self.integral_y = 0.0
+        self.last_sample_ns: int | None = None
+        self.last_observed_ns: int | None = None
+        self.ready = False
+
+    def step(
+        self,
+        now_ns: int,
+        observation: ScreenErrorObservation | None,
+    ) -> tuple[float, float]:
+        if observation is not None:
+            elapsed = 0.0
+            if self.last_sample_ns is not None:
+                elapsed = (observation.timestamp_ns - self.last_sample_ns) / NS_PER_SECOND
+            self.last_sample_ns = observation.timestamp_ns
+            self.last_observed_ns = observation.timestamp_ns
+            self.error_x = observation.error_x_pixels
+            self.error_y = observation.error_y_pixels
+            self.ready = True
+            self.integral_x = self._integrate(
+                self.error_x,
+                self.integral_x,
+                elapsed,
+                self.config.maximum_rate_x_counts_per_second,
+            )
+            self.integral_y = self._integrate(
+                self.error_y,
+                self.integral_y,
+                elapsed,
+                self.config.maximum_rate_y_counts_per_second,
+            )
+        if (
+            not self.ready
+            or self.last_observed_ns is None
+            or now_ns - self.last_observed_ns
+            > round(self.config.stale_after_seconds * NS_PER_SECOND)
+        ):
+            self.integral_x = 0.0
+            self.integral_y = 0.0
+            self.ready = False
+            return 0.0, 0.0
+        return (
+            self._rate(
+                self.error_x,
+                self.integral_x,
+                self.config.maximum_rate_x_counts_per_second,
+            ),
+            self._rate(
+                self.error_y,
+                self.integral_y,
+                self.config.maximum_rate_y_counts_per_second,
+            ),
+        )
+
+    @staticmethod
+    def _integrate(error: float, accumulated: float, elapsed: float, limit: float) -> float:
+        # Current production tuning: strength 1.28 at a 60 Hz reference,
+        # pursuit buildup over 120 ms, with a 50% output-limit integral cap.
+        increment = error * 1.28 * 60.0 * max(elapsed, 0.0) / 0.12
+        base = error * 1.28 * 60.0
+        if increment > 0.0 and base + accumulated < limit:
+            accumulated += min(increment, limit - base - accumulated)
+        elif increment < 0.0 and base + accumulated > -limit:
+            accumulated += max(increment, -limit - base - accumulated)
+        return min(max(accumulated, -limit * 0.50), limit * 0.50)
+
+    @staticmethod
+    def _rate(error: float, integral: float, limit: float) -> float:
+        base = error * 1.28 * 60.0
+        requested = base + integral
+        if abs(error) > 2.0 and requested * error < 0.0:
+            requested = base
+        return min(max(requested, -limit), limit)
+
+
+def _target_velocity(elapsed: float) -> tuple[float, float]:
+    if elapsed < 0.65:
+        return 760.0, -380.0
+    if elapsed < 0.92:
+        return 0.0, 0.0
+    if elapsed < 1.58:
+        return -690.0, 440.0
+    if elapsed < 1.86:
+        return 0.0, 0.0
+    if elapsed < 2.45:
+        return 420.0, -250.0
+    return 0.0, 0.0
+
+
+def _observation_noise(index: int) -> tuple[float, float]:
+    return (
+        0.55 * math.sin(index * 1.73) + 0.22 * math.sin(index * 0.37),
+        0.48 * math.sin(index * 1.21 + 0.4) + 0.18 * math.sin(index * 0.29),
+    )
+
+
+def _run_fake_plant(
+    delay_ms: int,
+    *,
+    calibrated: bool,
+    duration_ms: int = 3000,
+    loss_after_ms: int | None = None,
+) -> _RunResult:
+    """Run a deterministic unequal-axis, delayed, integer-command plant."""
+
+    plant = CalibratedPlant(0.075, 0.14, delay_ms / 1000.0)
+    config = _test_config()
+    controller = MakcuCalibratedController(plant, config) if calibrated else None
+    baseline = None if calibrated else _CurrentProportionalPi(config)
+    error_x = 95.0
+    error_y = -62.0
+    fractional_x = 0.0
+    fractional_y = 0.0
+    # (visible timestamp, delta X, delta Y)
+    delayed: list[tuple[int, int, int]] = []
+    delayed_index = 0
+    prior_emitted: tuple[EmittedMouseCommand, ...] = ()
+    observation_period_ns = round(NS_PER_SECOND / 130.0)
+    next_observation_ns = 0
+    observation_index = 0
+    skipped_observations = {57, 58, 173, 291, 292}
+    errors: list[tuple[float, float]] = []
+    outputs: list[CalibratedControlOutput | tuple[float, float]] = []
+
+    for tick in range(duration_ms):
+        now_ns = tick * NS_PER_MS
+        if tick:
+            velocity_x, velocity_y = _target_velocity(tick / 1000.0)
+            error_x += velocity_x * 0.001
+            error_y += velocity_y * 0.001
+        while delayed_index < len(delayed) and delayed[delayed_index][0] <= now_ns:
+            _impact_ns, delta_x, delta_y = delayed[delayed_index]
+            delayed_index += 1
+            error_x -= plant.gain_x_pixels_per_count * delta_x
+            error_y -= plant.gain_y_pixels_per_count * delta_y
+
+        observation: ScreenErrorObservation | None = None
+        if now_ns >= next_observation_ns:
+            noise_x, noise_y = _observation_noise(observation_index)
+            if (
+                observation_index not in skipped_observations
+                and (loss_after_ms is None or tick < loss_after_ms)
+            ):
+                observation = ScreenErrorObservation(
+                    now_ns,
+                    error_x + noise_x,
+                    error_y + noise_y,
+                )
+            observation_index += 1
+            next_observation_ns += observation_period_ns
+
+        if controller is not None:
+            output = controller.step(
+                now_ns,
+                engaged=True,
+                observation=observation,
+                emitted_commands=prior_emitted,
+            )
+            rate_x = output.rate_x_counts_per_second
+            rate_y = output.rate_y_counts_per_second
+            outputs.append(output)
+        else:
+            assert baseline is not None
+            rate_x, rate_y = baseline.step(now_ns, observation)
+            outputs.append((rate_x, rate_y))
+
+        fractional_x += rate_x * 0.001
+        fractional_y += rate_y * 0.001
+        delta_x = math.trunc(fractional_x)
+        delta_y = math.trunc(fractional_y)
+        fractional_x -= delta_x
+        fractional_y -= delta_y
+        if delta_x or delta_y:
+            delayed.append((now_ns + delay_ms * NS_PER_MS, delta_x, delta_y))
+            prior_emitted = (
+                EmittedMouseCommand(now_ns, delta_x, delta_y),
+            )
+        else:
+            prior_emitted = ()
+        errors.append((error_x, error_y))
+    return _RunResult(tuple(errors), tuple(outputs))
+
+
+def _rms(values: list[float]) -> float:
+    return math.sqrt(sum(value * value for value in values) / len(values))
+
+
+def _percentile_95(values: list[float]) -> float:
+    ordered = sorted(values)
+    return ordered[math.ceil(len(ordered) * 0.95) - 1]
+
+
+class CalibratedControlUnitTests(unittest.TestCase):
+    def test_default_calibrated_envelope_has_no_hidden_vertical_ratio(self) -> None:
+        config = CalibratedControlConfig()
+        self.assertEqual(
+            config.maximum_rate_y_counts_per_second,
+            config.maximum_rate_x_counts_per_second,
+        )
+        self.assertEqual(config.maximum_rate_y_counts_per_second, 19_200.0)
+
+    def test_delay_corrected_velocity_uses_only_actual_emitted_counts(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.20, 0.012),
+            _test_config(
+                velocity_filter_time_constant_seconds=0.0001,
+                maximum_target_acceleration_pixels_per_second_squared=1e9,
+                velocity_median_window=1,
+            ),
+        )
+        first = controller.step(
+            100 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(100 * NS_PER_MS, 10.0, -4.0),
+        )
+        self.assertFalse(first.valid)
+        # Twenty X and -10 Y counts become visible at 117 ms.  During the 20 ms
+        # interval the target moves (+8, -6) px, so observed error moves only
+        # (+6, -4): target motion minus each unequal calibrated response.
+        second = controller.step(
+            120 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(120 * NS_PER_MS, 16.0, -8.0),
+            emitted_commands=(
+                EmittedMouseCommand(105 * NS_PER_MS, 20, -10),
+            ),
+        )
+        self.assertTrue(second.valid)
+        self.assertAlmostEqual(
+            second.target_velocity_x_pixels_per_second,
+            400.0,
+            delta=0.1,
+        )
+        self.assertAlmostEqual(
+            second.target_velocity_y_pixels_per_second,
+            -300.0,
+            delta=0.1,
+        )
+
+    def test_successful_recorded_write_reduces_projected_error_exactly_once(self) -> None:
+        def established_controller() -> tuple[
+            MakcuCalibratedController,
+            CalibratedControlOutput,
+        ]:
+            controller = MakcuCalibratedController(
+                CalibratedPlant(0.10, 0.20, 0.020),
+                _test_config(velocity_median_window=1),
+            )
+            controller.step(
+                0,
+                engaged=True,
+                observation=ScreenErrorObservation(0, 100.0, 0.0),
+            )
+            ready = controller.step(
+                10 * NS_PER_MS,
+                engaged=True,
+                observation=ScreenErrorObservation(10 * NS_PER_MS, 100.0, 0.0),
+            )
+            return controller, ready
+
+        controller, ready = established_controller()
+        self.assertAlmostEqual(ready.projected_error_x_pixels, 100.0)
+        controller.step(11 * NS_PER_MS, engaged=True)
+        controller.record_emitted(
+            EmittedMouseCommand(11 * NS_PER_MS, 100, 0)
+        )
+        accounted = controller.step(15 * NS_PER_MS, engaged=True)
+        self.assertTrue(accounted.valid)
+        self.assertAlmostEqual(accounted.projected_error_x_pixels, 90.0)
+        self.assertLess(
+            accounted.rate_x_counts_per_second,
+            ready.rate_x_counts_per_second,
+        )
+
+        # A failed write or a tick that rounds to zero is represented by no
+        # record_emitted call, so it cannot be mistaken for physical motion.
+        absent, absent_ready = established_controller()
+        absent.step(11 * NS_PER_MS, engaged=True)
+        unchanged = absent.step(15 * NS_PER_MS, engaged=True)
+        self.assertAlmostEqual(unchanged.projected_error_x_pixels, 100.0)
+        self.assertAlmostEqual(
+            unchanged.rate_x_counts_per_second,
+            absent_ready.rate_x_counts_per_second,
+        )
+
+    def test_record_emitted_rejects_duplicate_nonmonotonic_and_future_events(self) -> None:
+        def controller_at(now_ms: int) -> MakcuCalibratedController:
+            controller = MakcuCalibratedController(
+                CalibratedPlant(0.10, 0.20, 0.020),
+                _test_config(velocity_median_window=1),
+            )
+            controller.step(
+                0,
+                engaged=True,
+                observation=ScreenErrorObservation(0, 20.0, 0.0),
+            )
+            controller.step(
+                now_ms * NS_PER_MS,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    now_ms * NS_PER_MS,
+                    20.0,
+                    0.0,
+                ),
+            )
+            return controller
+
+        duplicate = controller_at(10)
+        command = EmittedMouseCommand(10 * NS_PER_MS, 4, -2)
+        duplicate.record_emitted(command)
+        with self.assertRaisesRegex(ValueError, "non-monotonic-command-history"):
+            duplicate.record_emitted(command)
+        self.assertFalse(duplicate.ready)
+
+        nonmonotonic = controller_at(10)
+        nonmonotonic.record_emitted(EmittedMouseCommand(10 * NS_PER_MS, 4, -2))
+        nonmonotonic.step(11 * NS_PER_MS, engaged=True)
+        with self.assertRaisesRegex(ValueError, "non-monotonic-command-history"):
+            nonmonotonic.record_emitted(
+                EmittedMouseCommand(9 * NS_PER_MS, 1, 0)
+            )
+        self.assertFalse(nonmonotonic.ready)
+
+        future = controller_at(10)
+        with self.assertRaisesRegex(ValueError, "future-command"):
+            future.record_emitted(EmittedMouseCommand(11 * NS_PER_MS, 1, 0))
+        self.assertFalse(future.ready)
+
+        before_step = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.20, 0.020),
+            _test_config(velocity_median_window=1),
+        )
+        with self.assertRaisesRegex(RuntimeError, "before a control step"):
+            before_step.record_emitted(EmittedMouseCommand(0, 1, 0))
+
+    def test_duplicate_control_timestamp_is_invalid_before_command_decision(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.20, 0.020),
+            _test_config(velocity_median_window=1),
+        )
+        controller.step(
+            0,
+            engaged=True,
+            observation=ScreenErrorObservation(0, 20.0, 0.0),
+        )
+        ready = controller.step(
+            10 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(10 * NS_PER_MS, 20.0, 0.0),
+        )
+        self.assertTrue(ready.valid)
+
+        duplicate = controller.step(10 * NS_PER_MS, engaged=True)
+
+        self.assertFalse(duplicate.valid)
+        self.assertEqual(duplicate.reset_reason, "non-monotonic-clock")
+        self.assertEqual(duplicate.rate_x_counts_per_second, 0.0)
+        self.assertFalse(controller.ready)
+
+    def test_zero_current_error_retains_target_velocity_feed_forward(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.08, 0.15, 0.024),
+            _test_config(
+                velocity_filter_time_constant_seconds=0.0001,
+                maximum_target_acceleration_pixels_per_second_squared=1e9,
+                velocity_median_window=1,
+            ),
+        )
+        controller.step(
+            0,
+            engaged=True,
+            observation=ScreenErrorObservation(0, -8.0, 0.0),
+        )
+        output = controller.step(
+            10 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(10 * NS_PER_MS, 0.0, 0.0),
+        )
+        self.assertTrue(output.valid)
+        self.assertGreater(output.target_velocity_x_pixels_per_second, 790.0)
+        self.assertGreater(output.rate_x_counts_per_second, 0.0)
+
+    def test_release_loss_stale_and_jump_fail_closed_and_require_reconfirmation(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.12, 0.024),
+            _test_config(velocity_median_window=1),
+        )
+
+        def establish(base_ms: int, error: float = 30.0) -> None:
+            controller.step(
+                base_ms * NS_PER_MS,
+                engaged=True,
+                observation=ScreenErrorObservation(base_ms * NS_PER_MS, error, 0.0),
+            )
+            output = controller.step(
+                (base_ms + 8) * NS_PER_MS,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    (base_ms + 8) * NS_PER_MS,
+                    error + 1.0,
+                    0.0,
+                ),
+            )
+            self.assertTrue(output.valid)
+
+        establish(0)
+        released = controller.step(9 * NS_PER_MS, engaged=False)
+        self.assertEqual(released.rate_x_counts_per_second, 0.0)
+        self.assertEqual(released.reset_reason, "released")
+        self.assertFalse(
+            controller.step(10 * NS_PER_MS, engaged=True).valid
+        )
+
+        establish(20)
+        lost = controller.step(
+            29 * NS_PER_MS,
+            engaged=True,
+            target_lost=True,
+        )
+        self.assertEqual(lost.reset_reason, "target-lost")
+        self.assertEqual(lost.rate_x_counts_per_second, 0.0)
+
+        establish(40)
+        stale = controller.step(89 * NS_PER_MS, engaged=True)
+        self.assertEqual(stale.reset_reason, "stale-observation")
+        self.assertEqual(stale.rate_y_counts_per_second, 0.0)
+
+        establish(100)
+        jumped = controller.step(
+            116 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(116 * NS_PER_MS, 500.0, 0.0),
+        )
+        self.assertEqual(jumped.reset_reason, "error-jump")
+        self.assertFalse(controller.ready)
+        held = controller.step(117 * NS_PER_MS, engaged=True)
+        self.assertEqual(held.reset_reason, "awaiting-confirmation")
+        self.assertEqual(held.rate_x_counts_per_second, 0.0)
+
+    def test_prediction_or_missing_callback_does_not_invent_target_loss(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.12, 0.024),
+            _test_config(velocity_median_window=1),
+        )
+        controller.step(
+            0,
+            engaged=True,
+            observation=ScreenErrorObservation(0, 20.0, 0.0),
+        )
+        established = controller.step(
+            8 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(8 * NS_PER_MS, 22.0, 0.0),
+        )
+        self.assertTrue(established.valid)
+        for gap_ms in (16, 24):
+            with self.subTest(gap_ms=gap_ms):
+                # A tracker prediction has no real observation, but is not an
+                # explicit detector/tracker revocation either.
+                output = controller.step(
+                    gap_ms * NS_PER_MS,
+                    engaged=True,
+                    target_lost=False,
+                )
+                self.assertTrue(output.valid)
+                self.assertIsNone(output.reset_reason)
+
+    def test_legacy_observation_expected_alias_means_explicit_target_loss(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.12, 0.024),
+            _test_config(velocity_median_window=1),
+        )
+        controller.step(
+            0,
+            engaged=True,
+            observation=ScreenErrorObservation(0, 20.0, 0.0),
+        )
+        lost = controller.step(
+            8 * NS_PER_MS,
+            engaged=True,
+            observation_expected=True,
+        )
+        self.assertEqual(lost.reset_reason, "target-lost")
+        self.assertFalse(controller.ready)
+
+    def test_release_preserves_pending_physical_command_correction(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.20, 0.020),
+            _test_config(
+                velocity_filter_time_constant_seconds=0.0001,
+                maximum_target_acceleration_pixels_per_second_squared=1e9,
+                velocity_median_window=1,
+            ),
+        )
+        controller.step(
+            0,
+            engaged=True,
+            observation=ScreenErrorObservation(0, 0.0, 0.0),
+        )
+        controller.step(
+            10 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(10 * NS_PER_MS, 0.0, 0.0),
+        )
+        controller.step(11 * NS_PER_MS, engaged=True)
+        controller.record_emitted(
+            EmittedMouseCommand(11 * NS_PER_MS, 100, 0)
+        )
+
+        released = controller.step(12 * NS_PER_MS, engaged=False)
+        self.assertEqual(released.reset_reason, "released")
+        controller.step(
+            20 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(20 * NS_PER_MS, 0.0, 0.0),
+        )
+        after_impact = controller.step(
+            35 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(35 * NS_PER_MS, -10.0, 0.0),
+        )
+        self.assertTrue(after_impact.valid)
+        self.assertAlmostEqual(
+            after_impact.target_velocity_x_pixels_per_second,
+            0.0,
+            delta=0.1,
+        )
+
+    def test_limits_and_wrong_way_guard_are_hard_invariants(self) -> None:
+        config = _test_config(
+            maximum_rate_x_counts_per_second=700.0,
+            maximum_rate_y_counts_per_second=350.0,
+            maximum_error_jump_pixels=1000.0,
+            velocity_median_window=1,
+        )
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.05, 0.21, 0.050),
+            config,
+        )
+        controller.step(
+            0,
+            engaged=True,
+            observation=ScreenErrorObservation(0, 0.0, 0.0),
+        )
+        output = controller.step(
+            10 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(10 * NS_PER_MS, 100.0, -80.0),
+        )
+        self.assertTrue(output.valid)
+        self.assertLessEqual(abs(output.rate_x_counts_per_second), 700.0)
+        self.assertLessEqual(abs(output.rate_y_counts_per_second), 350.0)
+        self.assertTrue(math.isfinite(output.rate_x_counts_per_second))
+        self.assertTrue(math.isfinite(output.rate_y_counts_per_second))
+        for rate, error in (
+            (output.rate_x_counts_per_second, output.projected_error_x_pixels),
+            (output.rate_y_counts_per_second, output.projected_error_y_pixels),
+        ):
+            if abs(error) > config.wrong_way_guard_pixels:
+                self.assertGreaterEqual(rate * error, 0.0)
+
+    def test_invalid_numeric_inputs_never_enter_control_state(self) -> None:
+        for plant_args in ((0.0, 0.1, 0.02), (0.1, math.nan, 0.02), (0.1, 0.1, -0.1)):
+            with self.subTest(plant_args=plant_args), self.assertRaises(ValueError):
+                CalibratedPlant(*plant_args)
+        with self.assertRaises(ValueError):
+            ScreenErrorObservation(0, math.inf, 0.0)
+        with self.assertRaises(ValueError):
+            EmittedMouseCommand(0, 0, 0)
+
+
+class CalibratedControlPlantTests(unittest.TestCase):
+    def test_calibrated_control_beats_current_pi_across_gains_and_delays(self) -> None:
+        for delay_ms in (12, 24, 50):
+            with self.subTest(delay_ms=delay_ms):
+                calibrated = _run_fake_plant(delay_ms, calibrated=True)
+                baseline = _run_fake_plant(delay_ms, calibrated=False)
+                # Exclude acquisition but retain every stop, reversal, noisy
+                # sample, and one/two-frame detector callback gap.
+                start = 180
+                calibrated_radial = [
+                    math.hypot(x, y) for x, y in calibrated.errors[start:]
+                ]
+                baseline_radial = [
+                    math.hypot(x, y) for x, y in baseline.errors[start:]
+                ]
+                calibrated_rms = _rms(calibrated_radial)
+                baseline_rms = _rms(baseline_radial)
+                calibrated_p95 = _percentile_95(calibrated_radial)
+                baseline_p95 = _percentile_95(baseline_radial)
+                self.assertLess(calibrated_rms, baseline_rms * 0.55)
+                self.assertLess(calibrated_p95, baseline_p95 * 0.60)
+
+                config = _test_config()
+                maximum_true_error = max(calibrated_radial)
+                self.assertLess(maximum_true_error, 260.0)
+                for output in calibrated.outputs:
+                    self.assertIsInstance(output, CalibratedControlOutput)
+                    assert isinstance(output, CalibratedControlOutput)
+                    self.assertTrue(
+                        math.isfinite(output.rate_x_counts_per_second)
+                    )
+                    self.assertTrue(
+                        math.isfinite(output.rate_y_counts_per_second)
+                    )
+                    self.assertLessEqual(
+                        abs(output.rate_x_counts_per_second),
+                        config.maximum_rate_x_counts_per_second,
+                    )
+                    self.assertLessEqual(
+                        abs(output.rate_y_counts_per_second),
+                        config.maximum_rate_y_counts_per_second,
+                    )
+                    if output.valid:
+                        for rate, error in (
+                            (
+                                output.rate_x_counts_per_second,
+                                output.projected_error_x_pixels,
+                            ),
+                            (
+                                output.rate_y_counts_per_second,
+                                output.projected_error_y_pixels,
+                            ),
+                        ):
+                            if abs(error) > config.wrong_way_guard_pixels:
+                                self.assertGreaterEqual(rate * error, 0.0)
+
+    def test_sustained_measurement_loss_stops_without_stored_motion(self) -> None:
+        loss_after_ms = 300
+        result = _run_fake_plant(
+            50,
+            calibrated=True,
+            duration_ms=650,
+            loss_after_ms=loss_after_ms,
+        )
+        before_loss = result.outputs[loss_after_ms - 1]
+        self.assertIsInstance(before_loss, CalibratedControlOutput)
+        assert isinstance(before_loss, CalibratedControlOutput)
+        self.assertNotEqual(before_loss.rate_x_counts_per_second, 0.0)
+
+        # This includes delayed plant effects from commands issued before
+        # freshness expired.  They may still land, but no stored controller
+        # motion survives the bounded observation-loss interval.
+        for output in result.outputs[loss_after_ms + 45 :]:
+            self.assertIsInstance(output, CalibratedControlOutput)
+            assert isinstance(output, CalibratedControlOutput)
+            self.assertFalse(output.valid)
+            self.assertEqual(output.rate_x_counts_per_second, 0.0)
+            self.assertEqual(output.rate_y_counts_per_second, 0.0)
+
+
+if __name__ == "__main__":
+    unittest.main()

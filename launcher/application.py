@@ -145,6 +145,8 @@ class DetectorLauncher:
         self.capture_width = tk.StringVar(value=settings.capture_width)
         self.capture_height = tk.StringVar(value=settings.capture_height)
         self.capture_fps = tk.StringVar(value=settings.capture_fps)
+        self.capture_format = tk.StringVar(value=settings.capture_format)
+        self.capture_rotate_180 = tk.BooleanVar(value=settings.capture_rotate_180)
         self.screen_monitor = tk.StringVar(value=settings.screen_monitor)
         self.use_screen_region = tk.BooleanVar(value=settings.use_screen_region)
         self.screen_x = tk.StringVar(value=settings.screen_x)
@@ -524,6 +526,11 @@ class DetectorLauncher:
                 ("Width", self.capture_width, ("640", "1280", "1920")),
                 ("Height", self.capture_height, ("480", "720", "1080")),
                 ("Requested FPS", self.capture_fps, ("30", "60", "120")),
+                (
+                    "Pixel format",
+                    self.capture_format,
+                    ("", "NV12", "BGR3", "YUYV", "P010", "MJPG"),
+                ),
             ),
             start=1,
         ):
@@ -535,6 +542,11 @@ class DetectorLauncher:
             panel,
             text="Leave width, height, and FPS blank to use the device defaults.",
             style="Subtitle.TLabel",
+        ).grid(row=4, column=0, columnspan=7, sticky="w", pady=(9, 0))
+        ttk.Checkbutton(
+            panel,
+            text="Rotate capture 180° (fix an upside-down feed)",
+            variable=self.capture_rotate_180,
         ).grid(row=3, column=0, columnspan=7, sticky="w", pady=(9, 0))
         return panel
 
@@ -1656,6 +1668,8 @@ class DetectorLauncher:
             capture_width=self.capture_width.get(),
             capture_height=self.capture_height.get(),
             capture_fps=self.capture_fps.get(),
+            capture_format=self.capture_format.get(),
+            capture_rotate_180=self.capture_rotate_180.get(),
             screen_monitor=self.screen_monitor.get(),
             use_screen_region=self.use_screen_region.get(),
             screen_x=self.screen_x.get(),
@@ -1691,9 +1705,9 @@ class DetectorLauncher:
             ),
             preview=self.preview.get(),
             draw=self.draw.get(),
-            # Preview pacing and the two advanced MAKCU timing values are
-            # exposed only by the primary Qt launcher.  Preserve them for
-            # source users who temporarily open the compatibility Tk UI.
+            # Preview pacing and advanced MAKCU controls are exposed only by
+            # the primary Qt launcher. Preserve them for source users who
+            # temporarily open the compatibility Tk UI.
             preview_fps=self._loaded.preview_fps,
             aim=self.aim.get(),
             aim_label=self.aim_label.get().strip(),
@@ -1719,6 +1733,13 @@ class DetectorLauncher:
             aim_makcu_derivative_damping_seconds=(
                 self._loaded.aim_makcu_derivative_damping_seconds
             ),
+            aim_makcu_vertical_rate_ratio=(
+                self._loaded.aim_makcu_vertical_rate_ratio
+            ),
+            # The compatibility UI does not expose calibrated response. Keep
+            # both its physical mode and selected immutable profile intact.
+            aim_makcu_context=self._loaded.aim_makcu_context,
+            aim_makcu_active_profile=self._loaded.aim_makcu_active_profile,
             aim_makcu_verified_port=(
                 self._makcu_verified_port if self._makcu_verification_matches() else ""
             ),

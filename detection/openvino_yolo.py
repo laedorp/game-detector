@@ -324,14 +324,21 @@ class OpenVINOYoloDetector(Detector):
         raw: np.ndarray,
         transform: FrameTransformLike | None = None,
         frame_shape: Sequence[int] | None = None,
+        *,
+        confidence: float | None = None,
     ) -> list[Detection]:
+        decode_confidence = (
+            self.confidence if confidence is None else float(confidence)
+        )
+        if not np.isfinite(decode_confidence) or not 0.0 <= decode_confidence <= 1.0:
+            raise ValueError("confidence must be a finite value between 0 and 1.")
         if self._decoder is None:
             return decode_yolo_output(
                 raw,
                 transform=transform,
                 frame_shape=frame_shape,
                 labels=self.labels,
-                confidence=self.confidence,
+                confidence=decode_confidence,
                 iou=self.iou,
                 output_format=self.output_format,
             )
@@ -342,7 +349,7 @@ class OpenVINOYoloDetector(Detector):
                     transform=transform,
                     frame_shape=frame_shape,
                     labels=self.labels,
-                    confidence=self.confidence,
+                    confidence=decode_confidence,
                     iou=self.iou,
                 )
             )
