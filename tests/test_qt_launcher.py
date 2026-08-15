@@ -553,6 +553,8 @@ class QtLauncherTests(unittest.TestCase):
             question.call_args.args[-1],
             QMessageBox.StandardButton.No,
         )
+        self.assertIn("Normal Start works without", question.call_args.args[2])
+        self.assertIn("automatic plant-aware", question.call_args.args[2])
         self.assertIn("never activated automatically", question.call_args.args[2])
         self.assertIn("KEEP Right Mouse RELEASED", question.call_args.args[2])
         self.assertIn("Release confirmation is automatic", question.call_args.args[2])
@@ -562,10 +564,41 @@ class QtLauncherTests(unittest.TestCase):
         self.assertIsNone(window.calibration_process)
         self.assertEqual(window.settings.aim_makcu_active_profile, "")
 
+    def test_calibration_ui_marks_advanced_measurement_optional(self) -> None:
+        window = self.window(self.calibration_settings())
+
+        self.assertEqual(
+            window.calibrate_makcu_button.text(),
+            "Optional advanced response calibration…",
+        )
+        self.assertIn(
+            "Normal Start does not require",
+            window.aim_makcu_calibration_help.text(),
+        )
+        self.assertIn(
+            "automatic plant-aware",
+            window.aim_makcu_calibration_help.text(),
+        )
+        self.assertIn(
+            "Optional advanced response calibration",
+            window.aim_makcu_calibration_step.text(),
+        )
+        self.assertIn(
+            "Normal Start already works without calibration",
+            window.aim_makcu_calibration_instruction.text(),
+        )
+
     def test_calibration_guide_makes_each_physical_action_visible(self) -> None:
         window = self.window(self.calibration_settings())
 
-        self.assertIn("Before calibration", window.aim_makcu_calibration_step.text())
+        self.assertIn(
+            "Optional advanced response calibration",
+            window.aim_makcu_calibration_step.text(),
+        )
+        self.assertIn(
+            "Before calibration",
+            window.aim_makcu_calibration_instruction.text(),
+        )
         self.assertIn("Keep Right Mouse released", window.aim_makcu_calibration_instruction.text())
 
         window._handle_calibration_output_line(
@@ -888,6 +921,11 @@ class QtLauncherTests(unittest.TestCase):
         )
         self.assertIsNone(window._pending_calibration_evidence)
         self.assertFalse(window.activate_makcu_calibration_button.isEnabled())
+        self.assertTrue(window.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertIn(
+            "Measured plant-aware profile",
+            window.aim_makcu_control_mode_note.text(),
+        )
 
     def test_activation_save_failure_restores_selection_and_removes_new_profile(self) -> None:
         window = self.window(self.calibration_settings())
@@ -1438,10 +1476,12 @@ class QtLauncherTests(unittest.TestCase):
         self.assertEqual(collected.capture_format, "NV12")
         self.assertTrue(collected.capture_rotate_180)
 
-    def test_makcu_motion_controls_round_trip_safely(self) -> None:
+    def test_automatic_makcu_controls_show_only_effective_rate_envelope(self) -> None:
         window = self.window(
             LauncherSettings(
                 aim=True,
+                aim_makcu_strength="0.91",
+                aim_makcu_smoothing_alpha="0.67",
                 aim_makcu_prediction_lead_seconds="0.047",
                 aim_makcu_derivative_damping_seconds="0.013",
                 aim_makcu_vertical_rate_ratio="0.63",
@@ -1451,9 +1491,20 @@ class QtLauncherTests(unittest.TestCase):
         self.assertFalse(window.aim_makcu_prediction_lead_seconds.isHidden())
         self.assertFalse(window.aim_makcu_derivative_damping_seconds.isHidden())
         self.assertFalse(window.aim_makcu_vertical_rate_ratio.isHidden())
-        self.assertTrue(window.aim_makcu_prediction_lead_seconds.isEnabled())
-        self.assertTrue(window.aim_makcu_derivative_damping_seconds.isEnabled())
-        self.assertTrue(window.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertTrue(window.aim_makcu_max_step.isEnabled())
+        self.assertFalse(window.aim_makcu_strength.isEnabled())
+        self.assertFalse(window.aim_makcu_smoothing.isEnabled())
+        self.assertFalse(window.aim_makcu_prediction_lead_seconds.isEnabled())
+        self.assertFalse(window.aim_makcu_derivative_damping_seconds.isEnabled())
+        self.assertFalse(window.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertIn(
+            "Automatic plant-aware control",
+            window.aim_makcu_control_mode_note.text(),
+        )
+        self.assertIn("Max step", window.aim_makcu_control_mode_note.text())
+        self.assertIn("equal X/Y", window.aim_makcu_control_mode_note.text())
+        self.assertEqual(window.collect().aim_makcu_strength, "0.91")
+        self.assertEqual(window.collect().aim_makcu_smoothing_alpha, "0.67")
         self.assertAlmostEqual(window.aim_makcu_prediction_lead_seconds.value(), 0.047)
         self.assertAlmostEqual(window.aim_makcu_derivative_damping_seconds.value(), 0.013)
         self.assertAlmostEqual(window.aim_makcu_vertical_rate_ratio.value(), 0.63)
@@ -1470,17 +1521,48 @@ class QtLauncherTests(unittest.TestCase):
         window.aim_makcu_derivative_damping_seconds.setValue(0.015)
         window.aim_makcu_vertical_rate_ratio.setValue(0.70)
         collected = window.collect()
+        self.assertEqual(collected.aim_makcu_strength, "0.91")
+        self.assertEqual(collected.aim_makcu_smoothing_alpha, "0.67")
         self.assertEqual(collected.aim_makcu_prediction_lead_seconds, "0.061")
         self.assertEqual(collected.aim_makcu_derivative_damping_seconds, "0.015")
         self.assertEqual(collected.aim_makcu_vertical_rate_ratio, "0.7")
 
         restored = self.window(collected)
+        self.assertEqual(restored.collect().aim_makcu_strength, "0.91")
+        self.assertEqual(restored.collect().aim_makcu_smoothing_alpha, "0.67")
         self.assertAlmostEqual(restored.aim_makcu_prediction_lead_seconds.value(), 0.061)
         self.assertAlmostEqual(restored.aim_makcu_derivative_damping_seconds.value(), 0.015)
         self.assertAlmostEqual(restored.aim_makcu_vertical_rate_ratio.value(), 0.70)
+        self.assertFalse(restored.aim_makcu_prediction_lead_seconds.isEnabled())
+        self.assertFalse(restored.aim_makcu_derivative_damping_seconds.isEnabled())
+        self.assertFalse(restored.aim_makcu_vertical_rate_ratio.isEnabled())
 
         restored.aim.setChecked(False)
         self.assertFalse(restored.aim_makcu_vertical_rate_ratio.isEnabled())
+
+    def test_active_profile_exposes_only_its_effective_envelope_controls(self) -> None:
+        window = self.window(
+            LauncherSettings(
+                aim=True,
+                aim_makcu_active_profile="/private/profile.json",
+                aim_makcu_vertical_rate_ratio="0.63",
+            )
+        )
+
+        self.assertTrue(window.aim_makcu_max_step.isEnabled())
+        self.assertTrue(window.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertFalse(window.aim_makcu_strength.isEnabled())
+        self.assertFalse(window.aim_makcu_smoothing.isEnabled())
+        self.assertFalse(window.aim_makcu_prediction_lead_seconds.isEnabled())
+        self.assertFalse(window.aim_makcu_derivative_damping_seconds.isEnabled())
+        self.assertIn(
+            "Measured plant-aware profile",
+            window.aim_makcu_control_mode_note.text(),
+        )
+        self.assertIn(
+            "Max step and Vertical cap",
+            window.aim_makcu_control_mode_note.text(),
+        )
 
     def test_nonfinite_persisted_motion_controls_use_safe_defaults(self) -> None:
         window = self.window(

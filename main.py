@@ -12,6 +12,9 @@ from utils.inference_size import compact_inference_size
 
 WINDOW_NAME = "ProAim"
 AIM_CONTINUATION_CONFIDENCE_FLOOR = 0.15
+AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT = 0.125
+AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT = 0.120
+AUTOMATIC_MAKCU_DELAY_SECONDS = 0.008
 
 
 def _calibration_requested(config: AppConfig) -> bool:
@@ -55,6 +58,31 @@ def _calibrated_controller_from_active_profile(
         CalibratedControlConfig(
             maximum_rate_x_counts_per_second=maximum_rate_x,
             maximum_rate_y_counts_per_second=maximum_rate_y,
+        ),
+    )
+
+
+def _automatic_plant_aware_controller(*, max_step: int):
+    """Build bounded normal control from conservative host response seeds."""
+
+    from aiming.makcu_calibrated_control import (
+        CalibratedControlConfig,
+        CalibratedPlant,
+        MakcuCalibratedController,
+    )
+
+    if isinstance(max_step, bool) or not isinstance(max_step, int) or max_step <= 0:
+        raise ValueError("automatic maximum step must be a positive integer")
+    maximum_rate = float(max_step) * 60.0
+    return MakcuCalibratedController(
+        CalibratedPlant(
+            AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT,
+            AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT,
+            AUTOMATIC_MAKCU_DELAY_SECONDS,
+        ),
+        CalibratedControlConfig(
+            maximum_rate_x_counts_per_second=maximum_rate,
+            maximum_rate_y_counts_per_second=maximum_rate,
         ),
     )
 
@@ -1266,6 +1294,7 @@ def run(config: AppConfig) -> int:
     active_profile_requested = _active_profile_requested(config)
     active_profile = None
     calibrated_numeric_controller = None
+    automatic_numeric_controller = None
     if active_profile_requested:
         from aiming.makcu_calibration_activation import load_active_profile
 
@@ -1471,13 +1500,25 @@ def run(config: AppConfig) -> int:
                 smoothing_alpha=config.aim_makcu_smoothing_alpha,
                 prediction_lead_seconds=config.aim_makcu_prediction_lead_seconds,
                 derivative_damping_seconds=config.aim_makcu_derivative_damping_seconds,
-                vertical_rate_ratio=config.aim_makcu_vertical_rate_ratio,
+                vertical_rate_ratio=(
+                    1.0
+                    if active_profile is None and not calibration_requested
+                    else config.aim_makcu_vertical_rate_ratio
+                ),
                 invert_x=config.aim_invert_x,
                 invert_y=config.aim_invert_y,
                 head_ratio=config.aim_head_ratio,
             )
-            if active_profile is None:
+            if active_profile is None and calibration_requested:
                 aim_controller = MakcuAimingController(makcu_config)
+            elif active_profile is None:
+                automatic_numeric_controller = _automatic_plant_aware_controller(
+                    max_step=config.aim_makcu_max_step,
+                )
+                aim_controller = MakcuAimingController(
+                    makcu_config,
+                    calibrated_controller=automatic_numeric_controller,
+                )
             else:
                 assert calibrated_numeric_controller is not None
                 aim_controller = MakcuAimingController(
@@ -1487,7 +1528,12 @@ def run(config: AppConfig) -> int:
                         active_profile.binding.makcu_identity_token
                     ),
                 )
-            if active_profile is None:
+            if automatic_numeric_controller is not None:
+                aim_control_description = (
+                    "automatic plant-aware control at "
+                    f"{aim_controller.config.output_hz} Hz"
+                )
+            elif active_profile is None:
                 aim_control_description = (
                     f"{aim_controller.config.output_hz} Hz control"
                 )
@@ -1585,20 +1631,23 @@ def run(config: AppConfig) -> int:
             # therefore cannot move during this startup boundary.
             pass
         elif config.aim_output == "makcu":
+            assert automatic_numeric_controller is not None
             activation = (
                 f"MAKCU mouse button {config.aim_makcu_button} | "
                 f"control loop {aim_controller.config.output_hz} Hz"
             )
             output = f"MAKCU {config.aim_makcu_port or 'auto-detect'}"
+            automatic_control = automatic_numeric_controller.config
             print(
                 f"Detection-driven aim: enabled | target {config.aim_label} | "
                 f"output {output} | activation {activation} | "
-                f"strength {aim_controller.config.strength:g} | "
-                f"max step {aim_controller.config.max_step} | "
-                f"smoothing {aim_controller.config.smoothing_alpha:g} | "
-                f"prediction {aim_controller.config.prediction_lead_seconds:g}s | "
-                f"damping {aim_controller.config.derivative_damping_seconds:g}s | "
-                f"vertical cap {aim_controller.config.vertical_rate_ratio:g}"
+                "control automatic plant-aware | gains X/Y "
+                f"{AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT:g}/"
+                f"{AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT:g} px/count | "
+                f"delay {AUTOMATIC_MAKCU_DELAY_SECONDS * 1000.0:.2f} ms | "
+                "caps X/Y "
+                f"{automatic_control.maximum_rate_x_counts_per_second:.0f}/"
+                f"{automatic_control.maximum_rate_y_counts_per_second:.0f} counts/s"
             )
         else:
             activation = (

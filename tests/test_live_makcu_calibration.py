@@ -730,6 +730,8 @@ class LiveCalibrationArbitrationTests(unittest.TestCase):
         self.assertEqual(result, 0)
         controller = _FakeMakcuController.instances[0]
         session = _FakeCalibrationSession.instances[0]
+        self.assertIsNone(controller.calibrated_controller)
+        self.assertEqual(controller.config.vertical_rate_ratio, 0.48)
         self.assertTrue(controller.started)
         self.assertTrue(controller.stopped)
         self.assertEqual(controller.normal_updates, 0)
@@ -885,6 +887,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         numeric = controller.calibrated_controller
         self.assertIsNotNone(numeric)
         self.assertEqual(controller.expected_identity_token, "c" * 64)
+        self.assertEqual(controller.config.vertical_rate_ratio, 0.5)
         self.assertEqual(controller.normal_updates, 1)
         self.assertTrue(controller.stopped)
         self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.075)
@@ -902,6 +905,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("control calibrated", output)
         self.assertIn(f"profile {profile.profile_sha256[:12]}", output)
         self.assertIn("context ads-scope", output)
+        self.assertNotIn("automatic plant-aware", output)
         self.assertNotIn(str(self.profile_path), output)
         self.assertNotIn("c" * 64, output)
 
@@ -987,16 +991,33 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         ):
             run(config)
 
-    def test_absent_profile_preserves_legacy_controller_selection(self) -> None:
+    def test_absent_profile_selects_automatic_plant_aware_controller(self) -> None:
         result, output = self._run(self.base_config)
 
         self.assertEqual(result, 0)
         controller = _FakeMakcuController.instances[0]
-        self.assertIsNone(controller.calibrated_controller)
+        numeric = controller.calibrated_controller
+        self.assertIsNotNone(numeric)
         self.assertIsNone(controller.expected_identity_token)
+        self.assertEqual(controller.config.vertical_rate_ratio, 1.0)
         self.assertEqual(controller.normal_updates, 1)
-        self.assertIn("strength", output)
+        self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.125)
+        self.assertEqual(numeric.plant.gain_y_pixels_per_count, 0.120)
+        self.assertEqual(numeric.plant.delay_seconds, 0.008)
+        self.assertEqual(
+            numeric.config.maximum_rate_x_counts_per_second,
+            12_000.0,
+        )
+        self.assertEqual(
+            numeric.config.maximum_rate_y_counts_per_second,
+            12_000.0,
+        )
+        self.assertIn("control automatic plant-aware", output)
+        self.assertIn("gains X/Y 0.125/0.12 px/count", output)
+        self.assertIn("delay 8.00 ms", output)
+        self.assertIn("caps X/Y 12000/12000 counts/s", output)
         self.assertNotIn("control calibrated", output)
+        self.assertNotIn("calibrated profile", output)
 
 
 if __name__ == "__main__":

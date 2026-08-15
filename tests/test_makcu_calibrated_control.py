@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import math
 import unittest
 
+from aiming.controller import TargetTracker, head_target_point
 from aiming.makcu_calibrated_control import (
     CalibratedControlConfig,
     CalibratedControlOutput,
@@ -12,6 +13,7 @@ from aiming.makcu_calibrated_control import (
     MakcuCalibratedController,
     ScreenErrorObservation,
 )
+from detection.types import Detection
 
 
 NS_PER_MS = 1_000_000
@@ -153,12 +155,24 @@ def _run_fake_plant(
     calibrated: bool,
     duration_ms: int = 3000,
     loss_after_ms: int | None = None,
+    physical_gain_x: float = 0.075,
+    physical_gain_y: float = 0.14,
+    controller_plant: CalibratedPlant | None = None,
+    control_config: CalibratedControlConfig | None = None,
 ) -> _RunResult:
     """Run a deterministic unequal-axis, delayed, integer-command plant."""
 
-    plant = CalibratedPlant(0.075, 0.14, delay_ms / 1000.0)
-    config = _test_config()
-    controller = MakcuCalibratedController(plant, config) if calibrated else None
+    plant = CalibratedPlant(
+        physical_gain_x,
+        physical_gain_y,
+        delay_ms / 1000.0,
+    )
+    config = control_config or _test_config()
+    controller = (
+        MakcuCalibratedController(controller_plant or plant, config)
+        if calibrated
+        else None
+    )
     baseline = None if calibrated else _CurrentProportionalPi(config)
     error_x = 95.0
     error_y = -62.0
@@ -623,6 +637,222 @@ class CalibratedControlUnitTests(unittest.TestCase):
 
 
 class CalibratedControlPlantTests(unittest.TestCase):
+    def test_automatic_seed_tracks_through_duplicate_box_mode_noise(self) -> None:
+        """Exercise tracker arbitration and delayed control as one closed loop."""
+
+        control_config = _test_config(
+            maximum_rate_x_counts_per_second=19_200.0,
+            maximum_rate_y_counts_per_second=19_200.0,
+        )
+        frame_shape = (1080, 1920, 3)
+        center_x = frame_shape[1] / 2.0
+        center_y = frame_shape[0] / 2.0
+        head_ratio = 0.12
+        narrow_width = frame_shape[1] * 0.078
+        narrow_height = frame_shape[0] * 0.355
+        wide_width = frame_shape[1] * 0.092
+        wide_height = frame_shape[0] * 0.371
+
+        def run(*, automatic: bool) -> dict[str, object]:
+            controller = (
+                MakcuCalibratedController(
+                    CalibratedPlant(0.125, 0.120, 0.008),
+                    control_config,
+                )
+                if automatic
+                else None
+            )
+            legacy = None if automatic else _CurrentProportionalPi(control_config)
+            tracker = TargetTracker(label="player", lost_grace_frames=1)
+            error_x = 95.0
+            error_y = 0.0
+            fractional_x = 0.0
+            fractional_y = 0.0
+            delayed: list[tuple[int, int, int]] = []
+            delayed_index = 0
+            observation_index = 0
+            radial_errors: list[float] = []
+            tracked_head_y_offsets: list[float] = []
+            maximum_rate = 0.0
+            emitted_y = 0
+
+            for tick in range(1, 3001):
+                now_ns = tick * NS_PER_MS
+                target_velocity_x, _target_velocity_y = _target_velocity(
+                    tick / 1000.0
+                )
+                error_x += target_velocity_x * 0.001
+                while (
+                    delayed_index < len(delayed)
+                    and delayed[delayed_index][0] <= now_ns
+                ):
+                    _impact_ns, delta_x, delta_y = delayed[delayed_index]
+                    delayed_index += 1
+                    error_x -= 0.125 * delta_x
+                    error_y -= 0.112 * delta_y
+
+                observation = None
+                if tick == 1 or (tick - 1) % 8 == 0:
+                    true_head_x = center_x + error_x
+                    true_head_y = center_y + error_y
+
+                    def detection(
+                        width: float,
+                        height: float,
+                        target_y: float,
+                        confidence: float,
+                    ) -> Detection:
+                        return Detection(
+                            0,
+                            "player",
+                            confidence,
+                            (
+                                true_head_x - width / 2.0,
+                                target_y - head_ratio * height,
+                                true_head_x + width / 2.0,
+                                target_y + (1.0 - head_ratio) * height,
+                            ),
+                        )
+
+                    narrow_confidence = (
+                        0.78 if observation_index % 2 else 0.91
+                    )
+                    wide_confidence = (
+                        0.91 if observation_index % 2 else 0.78
+                    )
+                    narrow = detection(
+                        narrow_width,
+                        narrow_height,
+                        true_head_y,
+                        narrow_confidence,
+                    )
+                    # The alternative detector mode is wider and places its
+                    # derived head 18 px higher. Its confidence wins every
+                    # other frame, which would create vertical aim wiggle if
+                    # association alternated box modes.
+                    wide = detection(
+                        wide_width,
+                        wide_height,
+                        true_head_y - 18.0,
+                        wide_confidence,
+                    )
+                    candidates = (narrow,) if observation_index == 0 else (wide, narrow)
+                    tracked = tracker.update(
+                        candidates,
+                        frame_shape,
+                        measurement_ns=now_ns,
+                    )
+                    self.assertIsNotNone(tracked)
+                    assert tracked is not None
+                    self.assertEqual(tracked.confidence, narrow_confidence)
+                    tracked_head_x, tracked_head_y = head_target_point(
+                        tracked,
+                        head_ratio,
+                    )
+                    tracked_head_y_offsets.append(tracked_head_y - true_head_y)
+                    observation = ScreenErrorObservation(
+                        now_ns,
+                        tracked_head_x - center_x,
+                        tracked_head_y - center_y,
+                    )
+                    observation_index += 1
+
+                if controller is not None:
+                    output = controller.step(
+                        now_ns,
+                        engaged=True,
+                        observation=observation,
+                    )
+                    rate_x = output.rate_x_counts_per_second
+                    rate_y = output.rate_y_counts_per_second
+                else:
+                    assert legacy is not None
+                    rate_x, rate_y = legacy.step(now_ns, observation)
+                maximum_rate = max(maximum_rate, abs(rate_x), abs(rate_y))
+
+                fractional_x += rate_x * 0.001
+                fractional_y += rate_y * 0.001
+                delta_x = math.trunc(fractional_x)
+                delta_y = math.trunc(fractional_y)
+                fractional_x -= delta_x
+                fractional_y -= delta_y
+                if delta_x or delta_y:
+                    if controller is not None:
+                        emitted = EmittedMouseCommand(now_ns, delta_x, delta_y)
+                        controller.preflight_emitted(emitted)
+                        controller.record_emitted(emitted)
+                    delayed.append(
+                        (now_ns + 8 * NS_PER_MS, delta_x, delta_y)
+                    )
+                    emitted_y += abs(delta_y)
+                radial_errors.append(math.hypot(error_x, error_y))
+
+            return {
+                "errors": radial_errors[300:],
+                "head_y_offsets": tracked_head_y_offsets,
+                "maximum_rate": maximum_rate,
+                "emitted_y": emitted_y,
+            }
+
+        automatic = run(automatic=True)
+        legacy = run(automatic=False)
+        automatic_errors = automatic["errors"]
+        legacy_errors = legacy["errors"]
+        assert isinstance(automatic_errors, list)
+        assert isinstance(legacy_errors, list)
+        self.assertLess(_rms(automatic_errors), _rms(legacy_errors) * 0.30)
+        self.assertLess(
+            _percentile_95(automatic_errors),
+            _percentile_95(legacy_errors) * 0.35,
+        )
+        self.assertLess(max(automatic_errors), 25.0)
+        self.assertLessEqual(automatic["maximum_rate"], 19_200.0)
+        self.assertEqual(automatic["emitted_y"], 0)
+        head_y_offsets = automatic["head_y_offsets"]
+        assert isinstance(head_y_offsets, list)
+        self.assertLess(max(head_y_offsets) - min(head_y_offsets), 1e-9)
+
+    def test_automatic_host_seed_beats_legacy_across_observed_response_modes(self) -> None:
+        seed = CalibratedPlant(0.125, 0.120, 0.008)
+        config = _test_config(
+            maximum_rate_x_counts_per_second=19_200.0,
+            maximum_rate_y_counts_per_second=19_200.0,
+        )
+        for gain_x in (0.118, 0.125, 0.127):
+            for gain_y in (0.104, 0.120, 0.129):
+                with self.subTest(gain_x=gain_x, gain_y=gain_y):
+                    automatic = _run_fake_plant(
+                        8,
+                        calibrated=True,
+                        physical_gain_x=gain_x,
+                        physical_gain_y=gain_y,
+                        controller_plant=seed,
+                        control_config=config,
+                    )
+                    legacy = _run_fake_plant(
+                        8,
+                        calibrated=False,
+                        physical_gain_x=gain_x,
+                        physical_gain_y=gain_y,
+                        control_config=config,
+                    )
+                    start = 300
+                    automatic_error = [
+                        math.hypot(x, y) for x, y in automatic.errors[start:]
+                    ]
+                    legacy_error = [
+                        math.hypot(x, y) for x, y in legacy.errors[start:]
+                    ]
+                    self.assertLess(
+                        _rms(automatic_error),
+                        _rms(legacy_error) * 0.25,
+                    )
+                    self.assertLess(
+                        _percentile_95(automatic_error),
+                        _percentile_95(legacy_error) * 0.30,
+                    )
+                    self.assertLess(max(automatic_error), 25.0)
+
     def test_calibrated_control_beats_current_pi_across_gains_and_delays(self) -> None:
         for delay_ms in (12, 24, 50):
             with self.subTest(delay_ms=delay_ms):

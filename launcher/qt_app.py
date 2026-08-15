@@ -963,7 +963,13 @@ class LauncherWindow(QMainWindow):
         self.verify_makcu_button.clicked.connect(self.verify_makcu_activation)
         self.monitor_makcu_button = QPushButton("Monitor Mouse Clicks…")
         self.monitor_makcu_button.clicked.connect(self.monitor_makcu_buttons)
-        self.calibrate_makcu_button = QPushButton("Calibrate response…")
+        self.calibrate_makcu_button = QPushButton(
+            "Optional advanced response calibration…"
+        )
+        self.calibrate_makcu_button.setToolTip(
+            "Normal Start works without calibration by using automatic plant-aware "
+            "MAKCU control. Run this only to measure an optional mode-specific profile."
+        )
         self.calibrate_makcu_button.clicked.connect(self.start_makcu_calibration)
         self.activate_makcu_calibration_button = QPushButton(
             "Review and activate…"
@@ -980,28 +986,40 @@ class LauncherWindow(QMainWindow):
             self._calibration_context_changed
         )
         self.aim_makcu_context.setToolTip(
-            "Choose the exact in-game aim mode used during calibration. The active "
-            "profile is bound to this choice."
+            "Choose the exact in-game aim mode used during optional advanced "
+            "calibration. The active profile is bound to this choice."
         )
         self.aim_makcu_strength = QSlider(Qt.Orientation.Horizontal)
         self.aim_makcu_strength.setRange(5, 250)
         self.aim_makcu_strength.setSingleStep(1)
+        self.aim_makcu_strength.setToolTip(
+            "Stored for compatibility. Plant-aware automatic and measured-profile "
+            "control do not use this value."
+        )
         self.aim_makcu_strength_value = _label("0.50", "subtitle")
         self.aim_makcu_strength.valueChanged.connect(self._sync_strength_label)
         self.aim_makcu_smoothing = QSlider(Qt.Orientation.Horizontal)
         self.aim_makcu_smoothing.setRange(10, 100)
         self.aim_makcu_smoothing.setSingleStep(1)
+        self.aim_makcu_smoothing.setToolTip(
+            "Stored for compatibility. Plant-aware automatic and measured-profile "
+            "control do not use this value."
+        )
         self.aim_makcu_smoothing_value = _label("0.78", "subtitle")
         self.aim_makcu_smoothing.valueChanged.connect(self._sync_smoothing_label)
         self.aim_makcu_max_step = QLineEdit()
+        self.aim_makcu_max_step.setToolTip(
+            "Sets the active plant-aware mouse-rate envelope. Automatic control "
+            "uses the same envelope for X and Y."
+        )
         self.aim_makcu_prediction_lead_seconds = QDoubleSpinBox()
         self.aim_makcu_prediction_lead_seconds.setRange(0.0, 0.25)
         self.aim_makcu_prediction_lead_seconds.setDecimals(3)
         self.aim_makcu_prediction_lead_seconds.setSingleStep(0.001)
         self.aim_makcu_prediction_lead_seconds.setSuffix(" s")
         self.aim_makcu_prediction_lead_seconds.setToolTip(
-            "Projects same-direction target motion forward. Raise this in small "
-            "increments; too much lead can overshoot a moving target."
+            "Stored for compatibility. Plant-aware automatic and measured-profile "
+            "control estimate target motion directly and do not use this value."
         )
         self.aim_makcu_derivative_damping_seconds = QDoubleSpinBox()
         self.aim_makcu_derivative_damping_seconds.setRange(0.0, 0.25)
@@ -1009,8 +1027,8 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_derivative_damping_seconds.setSingleStep(0.001)
         self.aim_makcu_derivative_damping_seconds.setSuffix(" s")
         self.aim_makcu_derivative_damping_seconds.setToolTip(
-            "Adds a small response to target velocity. Raise this cautiously; "
-            "too much can overshoot or amplify noisy motion."
+            "Stored for compatibility. Plant-aware automatic and measured-profile "
+            "control estimate target motion directly and do not use this value."
         )
         self.aim_makcu_vertical_rate_ratio = QDoubleSpinBox()
         self.aim_makcu_vertical_rate_ratio.setRange(0.10, 1.00)
@@ -1018,8 +1036,8 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_vertical_rate_ratio.setSingleStep(0.05)
         self.aim_makcu_vertical_rate_ratio.setSuffix(" ×")
         self.aim_makcu_vertical_rate_ratio.setToolTip(
-            "Caps vertical mouse rate as a fraction of the horizontal cap. "
-            "The default 0.48 preserves the tested fallback behavior."
+            "Caps vertical mouse rate only when an active measured response profile "
+            "is selected. Automatic plant-aware control uses an equal X/Y envelope."
         )
         self.aim_makcu_verification_status = _label("", "subtitle")
         self.aim_makcu_verification_status.setWordWrap(True)
@@ -1087,21 +1105,33 @@ class LauncherWindow(QMainWindow):
         _field_row(grid, 3, "Hold to activate", button_row)
         _field_row(grid, 4, "Tuning", tuning_row)
         _field_row(grid, 5, "Motion tuning", motion_tuning_row)
-        _field_row(grid, 6, "Calibration context", self.aim_makcu_context)
-        _field_row(grid, 7, "Measured response", calibration_row)
+        _field_row(grid, 6, "Optional calibration mode", self.aim_makcu_context)
+        _field_row(grid, 7, "Advanced response profile", calibration_row)
         layout.addLayout(grid)
+        self.aim_makcu_control_mode_note = _label("", "subtitle")
+        self.aim_makcu_control_mode_note.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_control_mode_note)
         self.aim_makcu_summary = _label("", "subtitle")
         self.aim_makcu_summary.setWordWrap(True)
         layout.addWidget(self.aim_makcu_summary)
         layout.addWidget(self.aim_makcu_verification_status)
+        self.aim_makcu_calibration_help = _label(
+            "Normal Start does not require a response calibration profile. When no "
+            "profile is active, ProAim uses automatic plant-aware MAKCU control. "
+            "Advanced response calibration is optional and creates a profile for one "
+            "exact aim mode only after you review and activate it.",
+            "subtitle",
+        )
+        self.aim_makcu_calibration_help.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_calibration_help)
         self.aim_makcu_calibration_status = _label(
-            "No calibration evidence is staged for activation.",
+            "No optional advanced response profile is staged for activation.",
             "subtitle",
         )
         self.aim_makcu_calibration_status.setWordWrap(True)
         layout.addWidget(self.aim_makcu_calibration_status)
         self.aim_makcu_calibration_step = _label(
-            "Calibration guide — ready",
+            "Optional advanced response calibration — ready",
             "title",
         )
         self.aim_makcu_calibration_step.setWordWrap(True)
@@ -2257,14 +2287,36 @@ class LauncherWindow(QMainWindow):
             self.browse_makcu_button,
             self.aim_makcu_button,
             self.aim_makcu_context,
-            self.aim_makcu_strength,
-            self.aim_makcu_smoothing,
             self.aim_makcu_max_step,
-            self.aim_makcu_prediction_lead_seconds,
-            self.aim_makcu_derivative_damping_seconds,
-            self.aim_makcu_vertical_rate_ratio,
         ):
             widget.setEnabled(enabled)
+        # The normal MAKCU path is plant-aware with or without a measured
+        # profile. These legacy shaping values remain loaded and collected for
+        # settings compatibility, but neither plant-aware controller consumes
+        # them. Do not present them as live tracking controls.
+        for widget in (
+            self.aim_makcu_strength,
+            self.aim_makcu_strength_value,
+            self.aim_makcu_smoothing,
+            self.aim_makcu_smoothing_value,
+            self.aim_makcu_prediction_lead_seconds,
+            self.aim_makcu_derivative_damping_seconds,
+        ):
+            widget.setEnabled(False)
+        active_profile = bool(self.settings.aim_makcu_active_profile.strip())
+        self.aim_makcu_vertical_rate_ratio.setEnabled(enabled and active_profile)
+        if active_profile:
+            self.aim_makcu_control_mode_note.setText(
+                "Measured plant-aware profile: Max step and Vertical cap set the "
+                "rate envelope. Strength, Smoothing, Prediction lead, and Damping "
+                "are stored compatibility values and do not affect profile control."
+            )
+        else:
+            self.aim_makcu_control_mode_note.setText(
+                "Automatic plant-aware control: Max step sets the equal X/Y rate "
+                "envelope. Strength, Smoothing, Prediction lead, Damping, and "
+                "Vertical cap are stored but do not affect normal tracking."
+            )
         verify_busy = (
             self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive()
         )
@@ -2391,12 +2443,15 @@ class LauncherWindow(QMainWindow):
         descriptions = {
             "ready": (
                 0,
-                "Before calibration — set up a stationary target",
-                "Ready",
-                "In the game, show at least one fully visible stationary player and "
+                "Optional advanced response calibration — ready",
+                "Optional — not started",
+                "Normal Start already works without calibration by using automatic "
+                "plant-aware control. Only continue if you intentionally want a "
+                "mode-specific response profile. Before calibration, show at least "
+                "one fully visible stationary player in the game; "
                 "ProAim will use the player nearest the center. "
-                f"{context_setup} Keep {button} Mouse released, then click Calibrate "
-                "response.",
+                f"{context_setup} Keep {button} Mouse released, then click Optional "
+                "advanced response calibration.",
             ),
             "loading": (
                 1,
@@ -2478,8 +2533,8 @@ class LauncherWindow(QMainWindow):
                 "Calibration stopped safely — nothing was activated",
                 "Stopped — retry",
                 detail
-                or "Correct the condition shown below, then click Calibrate response "
-                "to try again.",
+                or "Correct the condition shown below, then click Optional advanced "
+                "response calibration to try again.",
             ),
         }
         if stage not in descriptions:
@@ -2764,7 +2819,10 @@ class LauncherWindow(QMainWindow):
         )
         answer = QMessageBox.question(
             self,
-            "MAKCU calibration will move the pointer",
+            "Optional advanced calibration will move the pointer",
+            "Normal Start works without this calibration by using automatic "
+            "plant-aware MAKCU control. Continue only if you intentionally want an "
+            "advanced mode-specific response profile.\n\n"
             "Calibration sends only a short, bounded sequence of horizontal and "
             "vertical mouse movements through MAKCU. Nothing is activated "
             "automatically.\n\n"
@@ -2966,7 +3024,7 @@ class LauncherWindow(QMainWindow):
         self._set_calibration_guide(
             "failed",
             "Stopping safely. No calibration profile will be activated; wait for "
-            "shutdown, then click Calibrate response to retry.",
+            "shutdown, then click Optional advanced response calibration to retry.",
         )
         self._set_status("Stopping MAKCU calibration…", "warn")
         self.stop_button.setEnabled(False)
@@ -3152,6 +3210,7 @@ class LauncherWindow(QMainWindow):
             "binding before using it."
         )
         self._set_calibration_guide("active")
+        self._update_aim_state()
         self._set_status("MAKCU calibration profile activated.", "ok")
         QMessageBox.information(
             self,

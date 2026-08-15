@@ -1201,6 +1201,127 @@ class AimingControllerTests(unittest.TestCase):
         self.assertAlmostEqual(telemetry.residual_x, raw_x - tracked_x)
         self.assertAlmostEqual(telemetry.residual_y, raw_y - tracked_y)
 
+    def test_target_tracker_keeps_established_bbox_mode_across_confidence_ties(
+        self,
+    ) -> None:
+        tracker = TargetTracker(label="person")
+        frame_shape = (1080, 1920, 3)
+        frame_height, frame_width = frame_shape[:2]
+        narrow_width = frame_width * 0.078
+        narrow_height = frame_height * 0.355
+        wide_width = frame_width * 0.092
+        wide_height = frame_height * 0.371
+
+        def box(
+            center_x: float,
+            center_y: float,
+            width: float,
+            height: float,
+        ) -> tuple[float, float, float, float]:
+            return (
+                center_x - width / 2.0,
+                center_y - height / 2.0,
+                center_x + width / 2.0,
+                center_y + height / 2.0,
+            )
+
+        base_ns = 10_000_000_000
+        center_x = 850.0
+        center_y = 600.0
+        initial = Detection(
+            0,
+            "person",
+            0.85,
+            box(center_x, center_y + 20.0, narrow_width, narrow_height),
+        )
+        self.assertIs(
+            tracker.update(
+                (initial,),
+                frame_shape,
+                measurement_ns=base_ns,
+            ),
+            initial,
+        )
+
+        tracked_head_y: list[float] = []
+        for index in range(1, 9):
+            # Fast genuine horizontal motion makes both overlapping boxes a
+            # close geometric association. Their confidence ordering flips on
+            # every sample, reproducing the observed detector mode alternation.
+            center_x += 24.0
+            narrow_confidence = 0.78 if index % 2 else 0.91
+            wide_confidence = 0.91 if index % 2 else 0.78
+            narrow = Detection(
+                0,
+                "person",
+                narrow_confidence,
+                box(center_x, center_y + 20.0, narrow_width, narrow_height),
+            )
+            wide = Detection(
+                0,
+                "person",
+                wide_confidence,
+                box(center_x, center_y + 10.0, wide_width, wide_height),
+            )
+
+            tracked = tracker.update(
+                (wide, narrow),
+                frame_shape,
+                measurement_ns=base_ns + index * 8_000_000,
+            )
+
+            self.assertIsNotNone(tracked)
+            assert tracked is not None
+            self.assertEqual(tracked.confidence, narrow_confidence)
+            self.assertAlmostEqual(tracked.x2 - tracked.x1, narrow_width)
+            self.assertAlmostEqual(tracked.y2 - tracked.y1, narrow_height)
+            tracked_head_y.append(head_target_point(tracked)[1])
+
+        # Horizontal target motion must not turn confidence-only box-mode
+        # flips into vertical head-point motion.
+        self.assertAlmostEqual(max(tracked_head_y), min(tracked_head_y))
+
+    def test_target_tracker_allows_sustained_gradual_scale_change_and_motion(
+        self,
+    ) -> None:
+        tracker = TargetTracker(label="person")
+        frame_shape = (1080, 1920, 3)
+        base_ns = 11_000_000_000
+        initial_width = 150.0
+        initial_height = 384.0
+        center_x = 700.0
+        center_y = 600.0
+        tracked = None
+
+        for index in range(33):
+            scale = 1.0 + index * 0.0125
+            center_x += 6.0
+            width = initial_width * scale
+            height = initial_height * scale
+            measurement = Detection(
+                0,
+                "person",
+                0.85,
+                (
+                    center_x - width / 2.0,
+                    center_y - height / 2.0,
+                    center_x + width / 2.0,
+                    center_y + height / 2.0,
+                ),
+            )
+            tracked = tracker.update(
+                (measurement,),
+                frame_shape,
+                measurement_ns=base_ns + index * 8_000_000,
+            )
+            self.assertIsNotNone(tracked)
+            self.assertFalse(tracker.output_is_prediction)
+
+        assert tracked is not None
+        self.assertGreater(tracked.x2 - tracked.x1, initial_width * 1.30)
+        self.assertGreater(tracked.y2 - tracked.y1, initial_height * 1.30)
+        self.assertGreater(head_target_point(tracked)[0], 850.0)
+
     def test_target_tracker_velocity_is_time_based_across_detector_rates(self) -> None:
         def run(rate_hz: int) -> tuple[float, float]:
             tracker = TargetTracker(label="person")

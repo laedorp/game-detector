@@ -29,6 +29,8 @@ TARGET_MAX_SPEED_DIAGONALS_PER_SECOND = 2.0
 TARGET_MAX_ACCELERATION_DIAGONALS_PER_SECOND_SQUARED = 6.0
 TARGET_TELEMETRY_REFERENCE_WIDTH = 1920.0
 TARGET_TELEMETRY_REFERENCE_HEIGHT = 1080.0
+TARGET_ASSOCIATION_IDENTITY_TOLERANCE = 0.03
+TARGET_ASSOCIATION_SHAPE_TOLERANCE = 0.06
 
 try:
     import evdev as _evdev
@@ -1068,7 +1070,14 @@ class TargetTracker:
         predicted_point = _box_target_point(predicted_box, self.head_ratio)
         predicted_area = _box_area(predicted_box)
         distance_gate = min(max(0.035 + elapsed * 1.5, 0.045), 0.10)
-        scored: list[tuple[float, float, float, Detection]] = []
+        # The last raw measurement is a better mode reference than the
+        # smoothed/predicted box. Some detectors emit two heavily-overlapping
+        # boxes for the same player (for example, a narrow torso box and a
+        # slightly wider full-player box). Mixing those shapes into the filter
+        # lets confidence noise alternate the selected measurement and moves
+        # the derived head point even when the physical player is steady.
+        mode_reference = self._last_observed_box or predicted_box
+        scored: list[tuple[float, float, float, float, Detection]] = []
         for candidate in candidates:
             iou = _box_iou_tuple(predicted_box, candidate.xyxy)
             if strict_continuation:
@@ -1093,22 +1102,43 @@ class TargetTracker:
                 # breaks close association ties, but cannot make a nearby rival
                 # steal a well-overlapping established track in one frame.
                 identity_score = iou * 0.70 + proximity * 0.30
+                shape_continuity = _box_shape_similarity(
+                    mode_reference,
+                    candidate.xyxy,
+                )
                 scored.append(
-                    (identity_score, confidence, -normalized_distance, candidate)
+                    (
+                        identity_score,
+                        shape_continuity,
+                        confidence,
+                        -normalized_distance,
+                        candidate,
+                    )
                 )
         if not scored:
             return None
         best_identity = max(item[0] for item in scored)
-        identity_tolerance = 0.03
         finalists = [
             item
             for item in scored
-            if best_identity - item[0] <= identity_tolerance
+            if best_identity - item[0] <= TARGET_ASSOCIATION_IDENTITY_TOLERANCE
+        ]
+
+        # Apply shape hysteresis only inside the existing close identity tie.
+        # A clearly better geometric association still wins, and a sole box
+        # remains free to move or change scale. Within a near-tie, however,
+        # retain the established width/height mode unless its shape continuity
+        # is itself nearly tied; only then may confidence break the tie.
+        best_shape = max(item[1] for item in finalists)
+        mode_finalists = [
+            item
+            for item in finalists
+            if best_shape - item[1] <= TARGET_ASSOCIATION_SHAPE_TOLERANCE
         ]
         return max(
-            finalists,
-            key=lambda item: (item[1], item[0], item[2]),
-        )[3]
+            mode_finalists,
+            key=lambda item: (item[2], item[0], item[1], item[3]),
+        )[4]
 
     def _continuation_is_recent(self, measurement_ns: int) -> bool:
         if self._last_strong_measurement_ns is None:
@@ -1222,6 +1252,29 @@ def _box_iou_tuple(
     second_area = max(0.0, second[2] - second[0]) * max(0.0, second[3] - second[1])
     union = first_area + second_area - intersection
     return intersection / union if union > 0.0 else 0.0
+
+
+def _box_shape_similarity(
+    reference: tuple[float, float, float, float],
+    candidate: tuple[float, float, float, float],
+) -> float:
+    """Return translation-independent width/height continuity in ``[0, 1]``."""
+
+    reference_width = max(0.0, reference[2] - reference[0])
+    reference_height = max(0.0, reference[3] - reference[1])
+    candidate_width = max(0.0, candidate[2] - candidate[0])
+    candidate_height = max(0.0, candidate[3] - candidate[1])
+    if min(
+        reference_width,
+        reference_height,
+        candidate_width,
+        candidate_height,
+    ) <= 0.0:
+        return 0.0
+    log_shape_change = abs(math.log(candidate_width / reference_width)) + abs(
+        math.log(candidate_height / reference_height)
+    )
+    return math.exp(-log_shape_change)
 
 
 def _box_area(box: tuple[float, float, float, float]) -> float:

@@ -449,15 +449,16 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(timings["detail_inference_ms"], 0.0)
             self.assertEqual(timings["detail_postprocess_ms"], 0.0)
 
-    def test_makcu_startup_receives_and_reports_vertical_cap(self) -> None:
+    def test_makcu_automatic_startup_uses_equal_axis_caps(self) -> None:
         report_path = self.root / "makcu-vertical-cap.json"
         source = _FakeSource()
 
         class RecordingMakcuController:
             instances: list["RecordingMakcuController"] = []
 
-            def __init__(self, config) -> None:
+            def __init__(self, config, *, calibrated_controller=None) -> None:
                 self.config = config
+                self.calibrated_controller = calibrated_controller
                 self.activation_pressed = False
                 self.started = False
                 self.stopped = False
@@ -503,8 +504,14 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         controller = RecordingMakcuController.instances[0]
         self.assertTrue(controller.started)
         self.assertTrue(controller.stopped)
-        self.assertEqual(controller.config.vertical_rate_ratio, 0.63)
-        self.assertIn("vertical cap 0.63", output.getvalue())
+        self.assertEqual(controller.config.vertical_rate_ratio, 1.0)
+        numeric = controller.calibrated_controller
+        self.assertIsNotNone(numeric)
+        self.assertEqual(
+            numeric.config.maximum_rate_x_counts_per_second,
+            numeric.config.maximum_rate_y_counts_per_second,
+        )
+        self.assertIn("control automatic plant-aware", output.getvalue())
 
     def test_detail_pass_runs_same_model_twice_and_reports_actual_geometry(self) -> None:
         report_path = self.root / "detail.json"
