@@ -450,8 +450,15 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(timings["detail_postprocess_ms"], 0.0)
 
     def test_makcu_automatic_startup_uses_equal_axis_caps(self) -> None:
+        from aiming.controller import TargetTracker as RealTargetTracker
+
         report_path = self.root / "makcu-vertical-cap.json"
         source = _FakeSource()
+        tracker_options: list[dict[str, object]] = []
+
+        def recording_tracker(**options):
+            tracker_options.append(options)
+            return RealTargetTracker(**options)
 
         class RecordingMakcuController:
             instances: list["RecordingMakcuController"] = []
@@ -497,6 +504,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             mock.patch("main._build_capture", return_value=source),
             mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
             mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
+            mock.patch("aiming.TargetTracker", side_effect=recording_tracker),
         ):
             result = run(config)
 
@@ -505,13 +513,34 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertTrue(controller.started)
         self.assertTrue(controller.stopped)
         self.assertEqual(controller.config.vertical_rate_ratio, 1.0)
+        self.assertEqual(len(tracker_options), 1)
+        self.assertEqual(tracker_options[0]["lost_grace_frames"], 3)
         numeric = controller.calibrated_controller
         self.assertIsNotNone(numeric)
         self.assertEqual(
             numeric.config.maximum_rate_x_counts_per_second,
             numeric.config.maximum_rate_y_counts_per_second,
         )
-        self.assertIn("control automatic plant-aware", output.getvalue())
+        self.assertEqual(numeric.config.velocity_median_window, 5)
+        self.assertEqual(
+            numeric.config.velocity_filter_time_constant_seconds,
+            0.040,
+        )
+        self.assertEqual(
+            numeric.config.maximum_target_acceleration_pixels_per_second_squared,
+            20_000.0,
+        )
+        self.assertEqual(numeric.config.stale_after_seconds, 0.065)
+        self.assertEqual(
+            numeric.config.maximum_observation_interval_seconds,
+            0.040,
+        )
+        startup = output.getvalue()
+        self.assertIn("control automatic plant-aware", startup)
+        self.assertIn(
+            "velocity damping median 5 / 40 ms / 20000 px/s^2",
+            startup,
+        )
 
     def test_detail_pass_runs_same_model_twice_and_reports_actual_geometry(self) -> None:
         report_path = self.root / "detail.json"

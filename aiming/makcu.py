@@ -2145,6 +2145,25 @@ class MakcuAimingController:
                     reset_reason=output.reset_reason,
                 )
             self._calibrated_last_output = output
+            if observation is not None and output.valid:
+                # Reuse the existing sample-based control telemetry for the
+                # plant-aware path.  Here ``pursuit`` is the independent
+                # target-velocity feed-forward expressed in 60 Hz correction
+                # units; the formatter converts it back to counts/second.
+                self._record_control_sample(
+                    observation.error_x_pixels,
+                    observation.error_y_pixels,
+                    output.target_velocity_x_pixels_per_second
+                    / controller.plant.gain_x_pixels_per_count
+                    / REFERENCE_CONTROL_HZ,
+                    output.target_velocity_y_pixels_per_second
+                    / controller.plant.gain_y_pixels_per_count
+                    / REFERENCE_CONTROL_HZ,
+                    bounded_rate_x / REFERENCE_CONTROL_HZ,
+                    bounded_rate_y / REFERENCE_CONTROL_HZ,
+                    rate_limit_x / REFERENCE_CONTROL_HZ,
+                    rate_limit_y / REFERENCE_CONTROL_HZ,
+                )
             if not output.valid:
                 self._fractional_x = 0.0
                 self._fractional_y = 0.0

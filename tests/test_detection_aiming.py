@@ -712,6 +712,41 @@ class AimingControllerTests(unittest.TestCase):
         self.assertEqual(expired.compared_samples, 1)
         self.assertEqual(expired.target_loss_transitions, 1)
 
+    def test_three_reference_frame_grace_bridges_fifty_ms_then_expires(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
+        target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        base_ns = 1_500_000_000
+
+        tracker.update(
+            (target,),
+            (1080, 1920, 3),
+            measurement_ns=base_ns,
+        )
+        for elapsed_ms in (8, 24, 40, 50):
+            with self.subTest(elapsed_ms=elapsed_ms):
+                self.assertIsNotNone(
+                    tracker.update(
+                        (),
+                        (1080, 1920, 3),
+                        measurement_ns=base_ns + elapsed_ms * 1_000_000,
+                    )
+                )
+                self.assertTrue(tracker.output_is_prediction)
+
+        self.assertIsNone(
+            tracker.update(
+                (),
+                (1080, 1920, 3),
+                # Three rounded 60 Hz reference frames equal 50,000,001 ns.
+                measurement_ns=base_ns + 50_000_002,
+            )
+        )
+        self.assertFalse(tracker.output_is_prediction)
+        self.assertEqual(
+            tracker.telemetry_snapshot().target_loss_transitions,
+            1,
+        )
+
     def test_within_grace_reacquisition_is_measured_without_a_loss(self) -> None:
         tracker = TargetTracker(label="person", lost_grace_frames=1)
         first = Detection(0, "person", 0.8, (800, 300, 1000, 900))
@@ -915,7 +950,7 @@ class AimingControllerTests(unittest.TestCase):
         )
 
     def test_low_continuation_rejects_zero_iou_box_90_pixels_away(self) -> None:
-        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
         strong = Detection(0, "person", 0.90, (700, 250, 780, 850))
         weak = Detection(0, "person", 0.18, (790, 250, 870, 850))
         base_ns = 9_000_000_000
@@ -992,7 +1027,7 @@ class AimingControllerTests(unittest.TestCase):
         self.assertFalse(tracker.output_is_prediction)
 
     def test_prediction_grace_does_not_replace_an_incompatible_detection(self) -> None:
-        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
         original = Detection(0, "person", 0.8, (200, 300, 400, 900))
         incompatible = Detection(0, "person", 0.9, (1200, 300, 1400, 900))
         base_ns = 3_000_000_000
@@ -1022,7 +1057,7 @@ class AimingControllerTests(unittest.TestCase):
         self.assertEqual(tracker.telemetry_snapshot().target_loss_transitions, 2)
 
     def test_unsafe_self_exclusion_resets_tracker_without_grace(self) -> None:
-        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
         target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
         base_ns = 4_000_000_000
         tracker.update(
@@ -1077,7 +1112,7 @@ class AimingControllerTests(unittest.TestCase):
         )
 
     def test_non_detector_empty_sample_revokes_prediction_grace(self) -> None:
-        tracker = TargetTracker(label="person", lost_grace_frames=1)
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
         target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
         base_ns = 6_000_000_000
         tracker.update([target], (1080, 1920, 3), measurement_ns=base_ns)
@@ -1204,7 +1239,9 @@ class AimingControllerTests(unittest.TestCase):
     def test_target_tracker_keeps_established_bbox_mode_across_confidence_ties(
         self,
     ) -> None:
-        tracker = TargetTracker(label="person")
+        # Automatic MAKCU's longer empty-only lease must not alter measured-box
+        # association or its established shape-mode arbitration.
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
         frame_shape = (1080, 1920, 3)
         frame_height, frame_width = frame_shape[:2]
         narrow_width = frame_width * 0.078

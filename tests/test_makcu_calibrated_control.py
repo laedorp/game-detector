@@ -248,6 +248,130 @@ def _run_fake_plant(
     return _RunResult(tuple(errors), tuple(outputs))
 
 
+@dataclass(frozen=True, slots=True)
+class _TrackedJitterRunResult:
+    radial_errors: tuple[float, ...]
+    steady_abs_counts_per_second: float
+    maximum_requested_axis_rate: float
+
+
+def _run_tracked_jitter_plant(
+    controller: MakcuCalibratedController,
+) -> _TrackedJitterRunResult:
+    """Exercise the real target filter and numeric controller under box jitter."""
+
+    tracker = TargetTracker(label="player", lost_grace_frames=1)
+    frame_shape = (1080, 1920, 3)
+    error_x = 95.0
+    error_y = -40.0
+    fractional_x = 0.0
+    fractional_y = 0.0
+    delayed: list[tuple[int, int, int]] = []
+    delayed_index = 0
+    observation_index = 0
+    radial_errors: list[float] = []
+    emitted: list[tuple[int, int, int]] = []
+    maximum_requested_axis_rate = 0.0
+
+    for tick in range(4000):
+        now_ns = tick * NS_PER_MS
+        elapsed = tick / 1000.0
+        if elapsed < 1.2:
+            velocity_x, velocity_y = 760.0, -380.0
+        elif elapsed < 2.0:
+            velocity_x, velocity_y = 0.0, 0.0
+        elif elapsed < 3.2:
+            velocity_x, velocity_y = -690.0, 440.0
+        else:
+            velocity_x, velocity_y = 0.0, 0.0
+        error_x += velocity_x * 0.001
+        error_y += velocity_y * 0.001
+
+        while delayed_index < len(delayed) and delayed[delayed_index][0] <= now_ns:
+            _impact_ns, delta_x, delta_y = delayed[delayed_index]
+            delayed_index += 1
+            error_x -= 0.125 * delta_x
+            error_y -= 0.120 * delta_y
+
+        observation = None
+        if tick % 8 == 0:
+            # Eight reference pixels is representative of the 2--15 px
+            # raw-versus-track residuals in the physical 130 Hz run. Mixed
+            # frequencies keep this deterministic without creating a single
+            # easy-to-notch alternating pattern.
+            noise_x = 8.0 * (
+                0.70 * math.sin(observation_index * 1.91)
+                + 0.30 * math.sin(observation_index * 0.47 + 0.3)
+            )
+            noise_y = 8.0 * (
+                0.72 * math.sin(observation_index * 1.57 + 0.2)
+                + 0.28 * math.sin(observation_index * 0.39)
+            )
+            width = 160.0 + 6.4 * math.sin(observation_index * 1.31)
+            height = 390.0 + 12.0 * math.sin(observation_index * 1.73 + 0.5)
+            measured_head_x = 960.0 + error_x + noise_x
+            measured_head_y = 540.0 + error_y + noise_y
+            measured = Detection(
+                0,
+                "player",
+                0.90,
+                (
+                    measured_head_x - width / 2.0,
+                    measured_head_y - 0.12 * height,
+                    measured_head_x + width / 2.0,
+                    measured_head_y + 0.88 * height,
+                ),
+            )
+            tracked = tracker.update(
+                (measured,),
+                frame_shape,
+                measurement_ns=now_ns,
+            )
+            assert tracked is not None
+            tracked_x, tracked_y = head_target_point(tracked, 0.12)
+            observation = ScreenErrorObservation(
+                now_ns,
+                tracked_x - 960.0,
+                tracked_y - 540.0,
+            )
+            observation_index += 1
+
+        output = controller.step(
+            now_ns,
+            engaged=True,
+            observation=observation,
+        )
+        maximum_requested_axis_rate = max(
+            maximum_requested_axis_rate,
+            abs(output.rate_x_counts_per_second),
+            abs(output.rate_y_counts_per_second),
+        )
+        fractional_x += output.rate_x_counts_per_second * 0.001
+        fractional_y += output.rate_y_counts_per_second * 0.001
+        delta_x = math.trunc(fractional_x)
+        delta_y = math.trunc(fractional_y)
+        fractional_x -= delta_x
+        fractional_y -= delta_y
+        if delta_x or delta_y:
+            command = EmittedMouseCommand(now_ns, delta_x, delta_y)
+            controller.preflight_emitted(command)
+            controller.record_emitted(command)
+            delayed.append((now_ns + 8 * NS_PER_MS, delta_x, delta_y))
+            emitted.append((tick, delta_x, delta_y))
+        radial_errors.append(math.hypot(error_x, error_y))
+
+    steady_abs_counts = sum(
+        abs(delta_x) + abs(delta_y)
+        for tick, delta_x, delta_y in emitted
+        if tick >= 3300
+    )
+    return _TrackedJitterRunResult(
+        tuple(radial_errors),
+        steady_abs_counts / 0.7,
+        maximum_requested_axis_rate,
+    )
+
+
 def _rms(values: list[float]) -> float:
     return math.sqrt(sum(value * value for value in values) / len(values))
 
@@ -265,6 +389,95 @@ class CalibratedControlUnitTests(unittest.TestCase):
             config.maximum_rate_x_counts_per_second,
         )
         self.assertEqual(config.maximum_rate_y_counts_per_second, 19_200.0)
+
+    def test_automatic_empty_only_bridge_remains_valid_with_processing_age(self) -> None:
+        from main import _automatic_plant_aware_controller
+
+        tracker = TargetTracker(label="player", lost_grace_frames=3)
+        controller = _automatic_plant_aware_controller(max_step=320)
+        frame_shape = (1080, 1920, 3)
+        target = Detection(0, "player", 0.9, (900.0, 280.0, 1100.0, 880.0))
+        base_ns = NS_PER_SECOND
+
+        def publish(
+            source_ms: int,
+            detections: tuple[Detection, ...],
+        ) -> tuple[Detection | None, CalibratedControlOutput]:
+            source_ns = base_ns + source_ms * NS_PER_MS
+            tracked = tracker.update(
+                detections,
+                frame_shape,
+                measurement_ns=source_ns,
+            )
+            observation = None
+            if tracked is not None and not tracker.output_is_prediction:
+                point_x, point_y = head_target_point(tracked, 0.12)
+                observation = ScreenErrorObservation(
+                    source_ns,
+                    point_x - frame_shape[1] / 2.0,
+                    point_y - frame_shape[0] / 2.0,
+                )
+            output = controller.step(
+                source_ns + 12 * NS_PER_MS,
+                engaged=True,
+                observation=observation,
+                target_lost=tracked is None,
+            )
+            return tracked, output
+
+        _first_target, first = publish(0, (target,))
+        self.assertFalse(first.valid)
+        _second_target, second = publish(8, (target,))
+        self.assertTrue(second.valid)
+
+        # The physical run's common empty intervals were around 50 ms, while
+        # completed detector results arrived about 12 ms after their source
+        # timestamp. The numeric lease must cover both without treating a
+        # synthetic tracker prediction as a new observation.
+        for source_ms in (16, 32, 48, 58):
+            with self.subTest(source_ms=source_ms):
+                predicted, output = publish(source_ms, ())
+                self.assertIsNotNone(predicted)
+                self.assertTrue(tracker.output_is_prediction)
+                self.assertTrue(output.valid)
+
+        expired, output = publish(59, ())
+        self.assertIsNone(expired)
+        self.assertFalse(output.valid)
+        self.assertEqual(output.reset_reason, "target-lost")
+
+    def test_automatic_numeric_lease_expires_after_sixty_five_ms(self) -> None:
+        from main import _automatic_plant_aware_controller
+
+        controller = _automatic_plant_aware_controller(max_step=320)
+        base_ns = NS_PER_SECOND
+        controller.step(
+            base_ns + 12 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(base_ns, 40.0, -20.0),
+        )
+        ready = controller.step(
+            base_ns + 20 * NS_PER_MS,
+            engaged=True,
+            observation=ScreenErrorObservation(
+                base_ns + 8 * NS_PER_MS,
+                40.0,
+                -20.0,
+            ),
+        )
+        self.assertTrue(ready.valid)
+
+        at_boundary = controller.step(
+            base_ns + 73 * NS_PER_MS,
+            engaged=True,
+        )
+        self.assertTrue(at_boundary.valid)
+        expired = controller.step(
+            base_ns + 73 * NS_PER_MS + 1,
+            engaged=True,
+        )
+        self.assertFalse(expired.valid)
+        self.assertEqual(expired.reset_reason, "stale-observation")
 
     def test_delay_corrected_velocity_uses_only_actual_emitted_counts(self) -> None:
         controller = MakcuCalibratedController(
@@ -637,6 +850,64 @@ class CalibratedControlUnitTests(unittest.TestCase):
 
 
 class CalibratedControlPlantTests(unittest.TestCase):
+    def test_automatic_velocity_damping_rejects_live_scale_box_jitter(self) -> None:
+        from main import _automatic_plant_aware_controller
+
+        automatic = _run_tracked_jitter_plant(
+            _automatic_plant_aware_controller(max_step=320),
+        )
+        short_filter = _run_tracked_jitter_plant(
+            MakcuCalibratedController(
+                CalibratedPlant(0.125, 0.120, 0.008),
+                CalibratedControlConfig(
+                    maximum_rate_x_counts_per_second=19_200.0,
+                    maximum_rate_y_counts_per_second=19_200.0,
+                ),
+            ),
+        )
+
+        # The final 700 ms are a stationary target. Do not turn small box
+        # geometry changes into a near-continuous stream of opposing counts.
+        self.assertLess(
+            automatic.steady_abs_counts_per_second,
+            short_filter.steady_abs_counts_per_second * 0.45,
+        )
+        self.assertLess(automatic.steady_abs_counts_per_second, 850.0)
+        automatic_stationary = automatic.radial_errors[3300:]
+        short_filter_stationary = short_filter.radial_errors[3300:]
+        self.assertLess(
+            _rms(list(automatic_stationary)),
+            _rms(list(short_filter_stationary)),
+        )
+        self.assertLess(_rms(list(automatic_stationary)), 4.0)
+
+        # Damping still has to pursue both high-speed directions rather than
+        # buying quiet output by falling materially behind the moving target.
+        automatic_moving = automatic.radial_errors[300:3200]
+        short_filter_moving = short_filter.radial_errors[300:3200]
+        self.assertLess(
+            _rms(list(automatic_moving)),
+            _rms(list(short_filter_moving)) * 1.15,
+        )
+        self.assertLess(_rms(list(automatic_moving)), 10.0)
+
+        # Aggregate pursuit metrics can hide a sluggish response immediately
+        # after the target reverses. Keep the first 300 ms of the second
+        # pursuit bounded as well as the longer moving interval above.
+        automatic_reversal = automatic.radial_errors[2000:2300]
+        short_filter_reversal = short_filter.radial_errors[2000:2300]
+        self.assertLess(
+            _rms(list(automatic_reversal)),
+            _rms(list(short_filter_reversal)) * 1.30,
+        )
+        self.assertLess(_rms(list(automatic_reversal)), 18.0)
+        self.assertLess(max(automatic_reversal), 35.0)
+        self.assertLess(
+            automatic.maximum_requested_axis_rate,
+            short_filter.maximum_requested_axis_rate * 0.85,
+        )
+        self.assertLessEqual(automatic.maximum_requested_axis_rate, 19_200.0)
+
     def test_automatic_seed_tracks_through_duplicate_box_mode_noise(self) -> None:
         """Exercise tracker arbitration and delayed control as one closed loop."""
 

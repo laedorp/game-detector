@@ -15,6 +15,8 @@ AIM_CONTINUATION_CONFIDENCE_FLOOR = 0.15
 AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT = 0.125
 AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT = 0.120
 AUTOMATIC_MAKCU_DELAY_SECONDS = 0.008
+AUTOMATIC_MAKCU_EMPTY_GRACE_FRAMES = 3
+AUTOMATIC_MAKCU_STALE_AFTER_SECONDS = 0.065
 
 
 def _calibration_requested(config: AppConfig) -> bool:
@@ -81,8 +83,24 @@ def _automatic_plant_aware_controller(*, max_step: int):
             AUTOMATIC_MAKCU_DELAY_SECONDS,
         ),
         CalibratedControlConfig(
+            # Normal detection boxes carry several pixels of frame-to-frame
+            # geometry noise even after target tracking.  A short derivative
+            # filter turns that noise into thousands of feed-forward counts
+            # per second.  The automatic (uncalibrated) path therefore uses a
+            # wider robust window and slower acceleration envelope.  Explicit
+            # calibration profiles keep the numeric core defaults above.
+            velocity_filter_time_constant_seconds=0.040,
+            maximum_target_acceleration_pixels_per_second_squared=20_000.0,
             maximum_rate_x_counts_per_second=maximum_rate,
             maximum_rate_y_counts_per_second=maximum_rate,
+            # Three 60 Hz reference frames bridge the observed short detector-
+            # empty intervals for 50 ms.  Keep the numeric lease slightly
+            # wider so a normal ~12 ms processing age does not expire a valid
+            # prediction before the tracker does.  A longer observation gap
+            # still reseeds velocity rather than estimating motion through it.
+            stale_after_seconds=AUTOMATIC_MAKCU_STALE_AFTER_SECONDS,
+            maximum_observation_interval_seconds=0.040,
+            velocity_median_window=5,
         ),
     )
 
@@ -1307,6 +1325,12 @@ def run(config: AppConfig) -> int:
             max_step=config.aim_makcu_max_step,
             vertical_rate_ratio=config.aim_makcu_vertical_rate_ratio,
         )
+    automatic_makcu_requested = bool(
+        config.aim
+        and config.aim_output == "makcu"
+        and active_profile is None
+        and not calibration_requested
+    )
     if config.crop_size is not None and config.detail_crop_size is not None:
         raise ValueError(
             "The detail pass requires a full-frame primary inference; "
@@ -1480,10 +1504,15 @@ def run(config: AppConfig) -> int:
             target_tracker = TargetTracker(
                 label=config.aim_label,
                 head_ratio=config.aim_head_ratio,
-                # Bridge only one 60 Hz reference frame (16.7 ms). At the measured
-                # ~130 Hz detector rate this covers an isolated empty result
-                # without carrying physical movement through a sustained loss.
-                lost_grace_frames=1,
+                # Only automatic no-profile MAKCU receives the measured 50 ms
+                # genuine-empty bridge. Local aim and explicit profiles retain
+                # the original single-frame window; every unsafe/non-empty
+                # revocation path still resets the tracker immediately.
+                lost_grace_frames=(
+                    AUTOMATIC_MAKCU_EMPTY_GRACE_FRAMES
+                    if automatic_makcu_requested
+                    else 1
+                ),
             )
         aim_config = AimConfig(
             invert_x=config.aim_invert_x,
@@ -1501,8 +1530,7 @@ def run(config: AppConfig) -> int:
                 prediction_lead_seconds=config.aim_makcu_prediction_lead_seconds,
                 derivative_damping_seconds=config.aim_makcu_derivative_damping_seconds,
                 vertical_rate_ratio=(
-                    1.0
-                    if active_profile is None and not calibration_requested
+                    1.0 if automatic_makcu_requested
                     else config.aim_makcu_vertical_rate_ratio
                 ),
                 invert_x=config.aim_invert_x,
@@ -1512,6 +1540,7 @@ def run(config: AppConfig) -> int:
             if active_profile is None and calibration_requested:
                 aim_controller = MakcuAimingController(makcu_config)
             elif active_profile is None:
+                assert automatic_makcu_requested
                 automatic_numeric_controller = _automatic_plant_aware_controller(
                     max_step=config.aim_makcu_max_step,
                 )
@@ -1645,6 +1674,12 @@ def run(config: AppConfig) -> int:
                 f"{AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT:g}/"
                 f"{AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT:g} px/count | "
                 f"delay {AUTOMATIC_MAKCU_DELAY_SECONDS * 1000.0:.2f} ms | "
+                "velocity damping median "
+                f"{automatic_control.velocity_median_window} / "
+                f"{automatic_control.velocity_filter_time_constant_seconds * 1000.0:.0f} "
+                "ms / "
+                f"{automatic_control.maximum_target_acceleration_pixels_per_second_squared:.0f} "
+                "px/s^2 | "
                 "caps X/Y "
                 f"{automatic_control.maximum_rate_x_counts_per_second:.0f}/"
                 f"{automatic_control.maximum_rate_y_counts_per_second:.0f} counts/s"

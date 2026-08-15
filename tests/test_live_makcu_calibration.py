@@ -878,9 +878,17 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         return result, output.getvalue()
 
     def test_valid_ads_inverted_profile_selects_calibrated_controller_and_caps(self) -> None:
-        profile = self._write_profile()
+        from aiming.controller import TargetTracker as RealTargetTracker
 
-        result, output = self._run()
+        profile = self._write_profile()
+        tracker_options: list[dict[str, object]] = []
+
+        def recording_tracker(**options):
+            tracker_options.append(options)
+            return RealTargetTracker(**options)
+
+        with mock.patch("aiming.TargetTracker", side_effect=recording_tracker):
+            result, output = self._run()
 
         self.assertEqual(result, 0)
         controller = _FakeMakcuController.instances[0]
@@ -890,9 +898,25 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(controller.config.vertical_rate_ratio, 0.5)
         self.assertEqual(controller.normal_updates, 1)
         self.assertTrue(controller.stopped)
+        self.assertEqual(len(tracker_options), 1)
+        self.assertEqual(tracker_options[0]["lost_grace_frames"], 1)
         self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.075)
         self.assertEqual(numeric.plant.gain_y_pixels_per_count, 0.14)
         self.assertEqual(numeric.plant.delay_seconds, 0.012)
+        self.assertEqual(numeric.config.velocity_median_window, 3)
+        self.assertEqual(
+            numeric.config.velocity_filter_time_constant_seconds,
+            0.018,
+        )
+        self.assertEqual(
+            numeric.config.maximum_target_acceleration_pixels_per_second_squared,
+            90_000.0,
+        )
+        self.assertEqual(numeric.config.stale_after_seconds, 0.040)
+        self.assertEqual(
+            numeric.config.maximum_observation_interval_seconds,
+            0.040,
+        )
         self.assertEqual(
             numeric.config.maximum_rate_x_counts_per_second,
             12_000.0,
@@ -1004,6 +1028,20 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.125)
         self.assertEqual(numeric.plant.gain_y_pixels_per_count, 0.120)
         self.assertEqual(numeric.plant.delay_seconds, 0.008)
+        self.assertEqual(numeric.config.velocity_median_window, 5)
+        self.assertEqual(
+            numeric.config.velocity_filter_time_constant_seconds,
+            0.040,
+        )
+        self.assertEqual(
+            numeric.config.maximum_target_acceleration_pixels_per_second_squared,
+            20_000.0,
+        )
+        self.assertEqual(numeric.config.stale_after_seconds, 0.065)
+        self.assertEqual(
+            numeric.config.maximum_observation_interval_seconds,
+            0.040,
+        )
         self.assertEqual(
             numeric.config.maximum_rate_x_counts_per_second,
             12_000.0,
@@ -1015,6 +1053,10 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("control automatic plant-aware", output)
         self.assertIn("gains X/Y 0.125/0.12 px/count", output)
         self.assertIn("delay 8.00 ms", output)
+        self.assertIn(
+            "velocity damping median 5 / 40 ms / 20000 px/s^2",
+            output,
+        )
         self.assertIn("caps X/Y 12000/12000 counts/s", output)
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)

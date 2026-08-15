@@ -687,6 +687,12 @@ class MakcuAimingTests(unittest.TestCase):
             self.assertEqual(len(writes_after_confirmation), 1)
             self.assertTrue(controller.calibrated_control_output.valid)
             self.assertTrue(calibrated.ready)
+            telemetry = controller.telemetry_snapshot()
+            self.assertEqual(telemetry.control_samples, 1)
+            self.assertGreater(telemetry.control_error_abs_x, 0.0)
+            self.assertEqual(telemetry.control_error_abs_y, 0.0)
+            self.assertEqual(telemetry.pursuit_abs_x, 0.0)
+            self.assertEqual(telemetry.pursuit_abs_y, 0.0)
             self.assertEqual(controller._pursuit_correction_x, 0.0)
             self.assertEqual(controller._pursuit_correction_y, 0.0)
             self.assertEqual(controller._smoothed_rate_x, 0.0)
@@ -701,6 +707,10 @@ class MakcuAimingTests(unittest.TestCase):
             )
             controller._output_tick(0.001, now_ns=predicted_ns)
             self.assertTrue(calibrated.ready)
+            self.assertEqual(
+                controller.telemetry_snapshot().control_samples,
+                telemetry.control_samples,
+            )
 
             lost_ns = predicted_ns + 8_000_000
             controller.update(
@@ -776,6 +786,10 @@ class MakcuAimingTests(unittest.TestCase):
             )
             self.assertTrue(output.saturated_x)
             self.assertTrue(output.saturated_y)
+            telemetry = controller.telemetry_snapshot()
+            self.assertEqual(telemetry.control_samples, 1)
+            self.assertEqual(telemetry.saturated_x_samples, 1)
+            self.assertEqual(telemetry.saturated_y_samples, 1)
         finally:
             controller._output_thread = None
             controller.stop()
