@@ -56,8 +56,9 @@ def draw_aim_target(
     *,
     active: bool,
     activation_name: str = "physical control",
+    source_label: str = "head target",
 ) -> None:
-    """Mark the exact selected head point and whether activation is held."""
+    """Mark the supplied aim point and name the evidence that produced it."""
 
     import cv2
 
@@ -77,7 +78,8 @@ def draw_aim_target(
         cv2.LINE_AA,
     )
     gate = str(activation_name).strip() or "physical control"
-    label = "HEAD AIM ACTIVE" if active else f"HEAD TARGET - HOLD {gate.upper()}"
+    source = str(source_label).strip().upper() or "HEAD TARGET"
+    label = f"{source} ACTIVE" if active else f"{source} - HOLD {gate.upper()}"
     cv2.putText(
         frame,
         label,

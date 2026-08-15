@@ -32,6 +32,8 @@ REQUIRED_MODEL_ASSETS = (
     "models/fort_player_416_int8_openvino_model/fort_player_416_int8.bin",
     "models/fort_player_416_int8_openvino_model/metadata.yaml",
     "models/fort_player_416_int8_openvino_model/ATTRIBUTION.md",
+    "models/sunxds_head_onnx/sunxds_0.8.0.onnx",
+    "models/sunxds_head_onnx/ATTRIBUTION.md",
     "models/RELEASE-MANIFEST.sha256",
     "models/yolo26n_openvino_model/yolo26n.xml",
     "models/yolo26n_openvino_model/yolo26n.bin",

@@ -682,6 +682,56 @@ def _target_error_pixels(
     return error_x, error_y
 
 
+def _explicit_point_error_pixels(
+    point: tuple[float, float],
+    frame_shape: tuple[int, ...],
+    config: MakcuAimConfig,
+    *,
+    name: str,
+) -> tuple[float, float]:
+    """Validate and map one source-frame point into reference error space."""
+
+    if not isinstance(point, tuple) or len(point) != 2:
+        raise TypeError(f"{name} must be an (x, y) tuple")
+    coordinates: list[float] = []
+    for axis, value in zip(("X", "Y"), point, strict=True):
+        if isinstance(value, bool):
+            raise ValueError(f"{name} {axis} coordinate must be finite")
+        try:
+            coordinate = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                f"{name} {axis} coordinate must be finite"
+            ) from exc
+        if not math.isfinite(coordinate):
+            raise ValueError(f"{name} {axis} coordinate must be finite")
+        coordinates.append(coordinate)
+
+    if len(frame_shape) < 2:
+        raise ValueError("frame_shape must contain positive height and width")
+    height, width = frame_shape[:2]
+    if (
+        isinstance(height, bool)
+        or isinstance(width, bool)
+        or not isinstance(height, int)
+        or not isinstance(width, int)
+        or height <= 0
+        or width <= 0
+    ):
+        raise ValueError("frame_shape must contain positive height and width")
+    point_x, point_y = coordinates
+    if not (0.0 <= point_x < width and 0.0 <= point_y < height):
+        raise ValueError(f"{name} must lie inside the source frame")
+
+    error_x = (point_x - width / 2.0) * (REFERENCE_FRAME_WIDTH / width)
+    error_y = (point_y - height / 2.0) * (REFERENCE_FRAME_HEIGHT / height)
+    if config.invert_x:
+        error_x = -error_x
+    if config.invert_y:
+        error_y = -error_y
+    return error_x, error_y
+
+
 class MakcuAimingController:
     """Publish latest detections to a 1 kHz, button-gated MAKCU loop."""
 
@@ -1807,7 +1857,19 @@ class MakcuAimingController:
         measurement_ns: int | None = None,
         measurement_observed: bool = True,
         velocity_target: Detection | None = None,
+        aim_point: tuple[float, float] | None = None,
+        velocity_point: tuple[float, float] | None = None,
     ) -> None:
+        """Publish one target-presence decision and optional exact aim point.
+
+        ``target`` remains the selected player's safety identity.  An
+        ``aim_point`` is an independently observed source-frame coordinate;
+        when supplied alone it is used for both position and velocity
+        observation channels.  ``velocity_point`` can instead provide a
+        separate raw coordinate from the same source frame.  Existing callers
+        which omit both points retain the body-box/head-ratio path.
+        """
+
         if self._serial is None:
             raise MakcuError("MAKCU serial connection is not open")
         if self._worker_error is not None:
@@ -1827,15 +1889,48 @@ class MakcuAimingController:
             raise ValueError(
                 "a velocity target requires an observed position target"
             )
+        if aim_point is None and velocity_point is not None:
+            raise ValueError("a velocity point requires an aim point")
+        if aim_point is not None and (
+            not measurement_observed or target is None
+        ):
+            raise ValueError(
+                "an aim point requires an observed safety target"
+            )
+        if velocity_target is not None and aim_point is not None:
+            raise ValueError(
+                "velocity_target cannot be combined with explicit aim points"
+            )
         source_ns = published_ns if measurement_ns is None else measurement_ns
         if source_ns < 0:
             raise ValueError("measurement_ns cannot be negative")
-        error_x, error_y = _target_error_pixels(target, frame_shape, self.config)
-        velocity_error = (
-            _target_error_pixels(velocity_target, frame_shape, self.config)
-            if velocity_target is not None
-            else None
-        )
+        if aim_point is not None:
+            error_x, error_y = _explicit_point_error_pixels(
+                aim_point,
+                frame_shape,
+                self.config,
+                name="aim_point",
+            )
+            resolved_velocity_point = (
+                aim_point if velocity_point is None else velocity_point
+            )
+            velocity_error = _explicit_point_error_pixels(
+                resolved_velocity_point,
+                frame_shape,
+                self.config,
+                name="velocity_point",
+            )
+        else:
+            error_x, error_y = _target_error_pixels(
+                target,
+                frame_shape,
+                self.config,
+            )
+            velocity_error = (
+                _target_error_pixels(velocity_target, frame_shape, self.config)
+                if velocity_target is not None
+                else None
+            )
         with self._state_lock:
             if self._calibration_token is not None:
                 raise MakcuError(
@@ -2065,6 +2160,7 @@ class MakcuAimingController:
         frame_shape: tuple[int, int, int],
         active: bool,
         measurement_observed: bool,
+        position_error: tuple[float, float],
         velocity_error: tuple[float, float] | None,
         source_ns: int,
         sample_id: int,
@@ -2083,11 +2179,7 @@ class MakcuAimingController:
             if new_sample:
                 self._calibrated_processed_sample_id = sample_id
                 if measurement_observed and target is not None:
-                    error_x, error_y = _target_error_pixels(
-                        target,
-                        frame_shape,
-                        self.config,
-                    )
+                    error_x, error_y = position_error
                     observation = ScreenErrorObservation(
                         source_ns,
                         error_x,
@@ -2170,6 +2262,28 @@ class MakcuAimingController:
                         or bounded_rate_y != output.rate_y_counts_per_second
                     ),
                     reset_reason=output.reset_reason,
+                    observer_position_sigma_x_pixels=(
+                        output.observer_position_sigma_x_pixels
+                    ),
+                    observer_position_sigma_y_pixels=(
+                        output.observer_position_sigma_y_pixels
+                    ),
+                    observer_velocity_sigma_x_pixels_per_second=(
+                        output.observer_velocity_sigma_x_pixels_per_second
+                    ),
+                    observer_velocity_sigma_y_pixels_per_second=(
+                        output.observer_velocity_sigma_y_pixels_per_second
+                    ),
+                    velocity_feedforward_confidence_x=(
+                        output.velocity_feedforward_confidence_x
+                    ),
+                    velocity_feedforward_confidence_y=(
+                        output.velocity_feedforward_confidence_y
+                    ),
+                    innovation_mahalanobis_squared=(
+                        output.innovation_mahalanobis_squared
+                    ),
+                    innovation_rejected=output.innovation_rejected,
                 )
             self._calibrated_last_output = output
             if observation is not None and output.valid:
@@ -2321,6 +2435,10 @@ class MakcuAimingController:
             measurement_ns = self._latest_measurement_ns
             source_ns = self._latest_source_ns
             measurement_observed = self._latest_measurement_observed
+            position_error = (
+                self._measurement_error_x,
+                self._measurement_error_y,
+            )
             velocity_error = self._latest_velocity_error
             velocity_x = self._latest_velocity_x
             velocity_y = self._latest_velocity_y
@@ -2356,6 +2474,7 @@ class MakcuAimingController:
                 frame_shape=frame_shape,
                 active=active,
                 measurement_observed=measurement_observed,
+                position_error=position_error,
                 velocity_error=velocity_error,
                 source_ns=source_ns,
                 sample_id=sample_id,

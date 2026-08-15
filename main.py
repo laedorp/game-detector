@@ -17,6 +17,498 @@ AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT = 0.120
 AUTOMATIC_MAKCU_DELAY_SECONDS = 0.008
 AUTOMATIC_MAKCU_EMPTY_GRACE_FRAMES = 3
 AUTOMATIC_MAKCU_STALE_AFTER_SECONDS = 0.065
+AUTOMATIC_HEAD_LOCALIZATION_HZ = 60.0
+AUTOMATIC_HEAD_STALE_AFTER_SECONDS = AUTOMATIC_MAKCU_STALE_AFTER_SECONDS
+AUTOMATIC_HEAD_CPU_THREADS = 6
+
+
+def _identity_payload(payload):
+    """Transfer an already-owned prepared tensor into the latest-only worker."""
+
+    return payload
+
+
+@dataclass(frozen=True, slots=True)
+class _TimestampedPreparedHeadInput:
+    prepared: object
+    source_timestamp_ns: int
+
+
+class _PreparedDirectHeadLocalizer:
+    """Adapt the pinned direct-head decoder to ``LatestHeadWorker``."""
+
+    def __init__(self, session) -> None:
+        self._session = session
+
+    def __call__(self, payload, selected_player_box):
+        from detection.head_detector import (
+            PreparedHeadInput,
+            associate_head_to_player,
+            decode_head_output,
+        )
+        from detection.head_worker import HeadObservation
+
+        if not isinstance(payload, _TimestampedPreparedHeadInput):
+            raise TypeError("head worker payload must be timestamped prepared input")
+        prepared = payload.prepared
+        if not isinstance(prepared, PreparedHeadInput):
+            raise TypeError("timestamped head payload must own PreparedHeadInput")
+        output = self._session.infer(prepared.tensor)
+        candidates = decode_head_output(output, prepared.transform)
+        localization = associate_head_to_player(
+            candidates,
+            selected_player_box,
+            source_timestamp_ns=payload.source_timestamp_ns,
+        )
+        if localization is None:
+            return None
+        if localization.source_timestamp_ns != payload.source_timestamp_ns:
+            raise RuntimeError("direct-head localization changed its source timestamp")
+        return HeadObservation(
+            point=localization.point,
+            confidence=localization.confidence,
+            evidence="SunXDS 0.8.0 direct head box",
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class _AutomaticHeadSample:
+    point: tuple[float, float]
+    source_timestamp_ns: int
+    confidence: float
+    evidence: str
+    bridging: bool = False
+
+
+class _AutomaticHeadRuntime:
+    """Own direct-head scheduling, identity epochs, and display freshness.
+
+    The primary player detector remains the safety/identity authority.  This
+    object never turns its box into an aim coordinate and never reprojects an
+    older head through newer box geometry.
+    """
+
+    def __init__(
+        self,
+        worker,
+        *,
+        submission_hz: float = AUTOMATIC_HEAD_LOCALIZATION_HZ,
+        stale_after_seconds: float = AUTOMATIC_HEAD_STALE_AFTER_SECONDS,
+    ) -> None:
+        rate = float(submission_hz)
+        stale = float(stale_after_seconds)
+        if not math.isfinite(rate) or rate <= 0.0:
+            raise ValueError("head submission_hz must be finite and positive")
+        if not math.isfinite(stale) or stale <= 0.0:
+            raise ValueError("head stale_after_seconds must be finite and positive")
+        self.worker = worker
+        self.submission_interval_ns = max(1, round(1_000_000_000 / rate))
+        self.stale_after_ns = max(1, round(stale * 1_000_000_000))
+        self.identity_generation = 0
+        self.body_valid = False
+        self.next_submission_ns: int | None = None
+        self._visible_sample: _AutomaticHeadSample | None = None
+        self._current_player_box: tuple[float, float, float, float] | None = None
+        self._current_player_timestamp_ns: int | None = None
+        self._visible_player_box: tuple[float, float, float, float] | None = None
+        self._tracker_generation: int | None = None
+
+    def start(self) -> None:
+        self.worker.start()
+
+    def advance_identity(self) -> None:
+        """Invalidate every pending/result point and begin a fresh safety epoch."""
+
+        self.identity_generation += 1
+        self.body_valid = False
+        self.next_submission_ns = None
+        self._visible_sample = None
+        self._current_player_box = None
+        self._current_player_timestamp_ns = None
+        self._visible_player_box = None
+        self._tracker_generation = None
+        self.worker.advance_identity(self.identity_generation)
+
+    @staticmethod
+    def _player_boxes_associate(first, second) -> bool:
+        """Conservatively recognize one primary body without moving its point."""
+
+        try:
+            a = tuple(float(value) for value in first)
+            b = tuple(float(value) for value in second)
+        except (TypeError, ValueError):
+            return False
+        if len(a) != 4 or len(b) != 4 or not all(
+            math.isfinite(value) for value in (*a, *b)
+        ):
+            return False
+        aw, ah = a[2] - a[0], a[3] - a[1]
+        bw, bh = b[2] - b[0], b[3] - b[1]
+        if min(aw, ah, bw, bh) <= 0.0:
+            return False
+        area_a, area_b = aw * ah, bw * bh
+        area_ratio = min(area_a, area_b) / max(area_a, area_b)
+        intersection = max(0.0, min(a[2], b[2]) - max(a[0], b[0])) * max(
+            0.0,
+            min(a[3], b[3]) - max(a[1], b[1]),
+        )
+        overlap_of_smaller = intersection / min(area_a, area_b)
+        center_dx = abs((a[0] + a[2]) - (b[0] + b[2])) * 0.5
+        center_dy = abs((a[1] + a[3]) - (b[1] + b[3])) * 0.5
+        return bool(
+            area_ratio >= 0.25
+            and overlap_of_smaller > 0.20
+            and center_dx < max(aw, bw) * 0.80
+            and center_dy < max(ah, bh) * 0.80
+        )
+
+    @staticmethod
+    def _head_point_belongs_to_player(point, player_box) -> bool:
+        """Require a direct point to remain in the current body's head region."""
+
+        try:
+            x, y = (float(value) for value in point)
+            x1, y1, x2, y2 = (float(value) for value in player_box)
+        except (TypeError, ValueError):
+            return False
+        if not all(math.isfinite(value) for value in (x, y, x1, y1, x2, y2)):
+            return False
+        width = x2 - x1
+        height = y2 - y1
+        if width <= 0.0 or height <= 0.0:
+            return False
+        side_margin = width * 0.12
+        top_margin = height * 0.12
+        return bool(
+            x1 - side_margin <= x <= x2 + side_margin
+            and y1 - top_margin <= y <= y1 + height * 0.48
+        )
+
+    @classmethod
+    def _player_boxes_associate_over_interval(
+        cls,
+        submitted_box,
+        current_box,
+        *,
+        elapsed_ns: int,
+    ) -> bool:
+        """Reject implausibly fast box transitions inside one tracker epoch.
+
+        A loose overlap test is intentionally retained for commanded-camera
+        motion.  Source-time displacement adds the missing crossing boundary:
+        a different overlapping player cannot inherit a just-submitted head
+        merely because both boxes share an anatomically plausible point.
+        """
+
+        if not cls._player_boxes_associate(submitted_box, current_box):
+            return False
+        elapsed = int(elapsed_ns)
+        if elapsed < 0:
+            return False
+        first = tuple(float(value) for value in submitted_box)
+        second = tuple(float(value) for value in current_box)
+        first_width = first[2] - first[0]
+        first_height = first[3] - first[1]
+        second_width = second[2] - second[0]
+        second_height = second[3] - second[1]
+        reference_extent = min(
+            max(first_width, second_width),
+            max(first_height, second_height),
+        )
+        center_dx = abs((first[0] + first[2]) - (second[0] + second[2])) * 0.5
+        center_dy = abs((first[1] + first[3]) - (second[1] + second[3])) * 0.5
+        elapsed_seconds = elapsed / 1_000_000_000
+        # Four pixels covers detector quantization on small boxes.  The 12%
+        # extent allowance covers ordinary localization jitter, while the
+        # time term explicitly retains verified 2400 px/s camera motion.
+        maximum_speed = max(2400.0, reference_extent * 12.0)
+        allowed_displacement = (
+            4.0 + reference_extent * 0.12 + maximum_speed * elapsed_seconds
+        )
+        return math.hypot(center_dx, center_dy) <= allowed_displacement
+
+    def accept_body(
+        self,
+        player_box=None,
+        *,
+        track_generation: int | None = None,
+        source_timestamp_ns: int | None = None,
+    ) -> bool:
+        """Accept live primary evidence; return true on identity replacement."""
+
+        replacement = False
+        body_timestamp_ns = (
+            None if source_timestamp_ns is None else int(source_timestamp_ns)
+        )
+        if body_timestamp_ns is not None and body_timestamp_ns < 0:
+            raise ValueError("body source timestamp cannot be negative")
+        if track_generation is not None:
+            if (
+                isinstance(track_generation, bool)
+                or not isinstance(track_generation, int)
+                or track_generation < 0
+            ):
+                raise ValueError("track_generation must be a non-negative integer")
+            if (
+                self.body_valid
+                and self._tracker_generation is not None
+                and track_generation != self._tracker_generation
+            ):
+                self.advance_identity()
+                replacement = True
+        if player_box is not None:
+            candidate = tuple(float(value) for value in player_box)
+            if (
+                self.body_valid
+                and self._current_player_box is not None
+                and (
+                    not self._player_boxes_associate(
+                        self._current_player_box,
+                        candidate,
+                    )
+                    or (
+                        body_timestamp_ns is not None
+                        and self._current_player_timestamp_ns is not None
+                        and not self._player_boxes_associate_over_interval(
+                            self._current_player_box,
+                            candidate,
+                            elapsed_ns=(
+                                body_timestamp_ns
+                                - self._current_player_timestamp_ns
+                            ),
+                        )
+                    )
+                )
+            ):
+                self.advance_identity()
+                replacement = True
+            self._current_player_box = candidate
+            self._current_player_timestamp_ns = body_timestamp_ns
+        if track_generation is not None:
+            self._tracker_generation = track_generation
+        self.body_valid = True
+        return replacement
+
+    def revoke_body(self) -> bool:
+        """Revoke on the first missing/unsafe body sample; return if state changed."""
+
+        if not self.body_valid:
+            return False
+        self.advance_identity()
+        return True
+
+    def submit(self, frame, selected_player, *, source_timestamp_ns: int) -> bool:
+        """Prepare one bounded crop on the caller thread at the 60 Hz gate."""
+
+        if not self.body_valid:
+            return False
+        timestamp = int(source_timestamp_ns)
+        if timestamp < 0:
+            raise ValueError("head source timestamp cannot be negative")
+        deadline = self.next_submission_ns
+        if deadline is not None and timestamp < deadline:
+            return False
+
+        from detection.head_detector import plan_head_crop, prepare_head_input
+
+        transform = plan_head_crop(frame.shape, selected_player.box)
+        prepared = prepare_head_input(frame, transform)
+        payload = _TimestampedPreparedHeadInput(prepared, timestamp)
+        accepted = self.worker.submit(
+            payload,
+            source_timestamp_ns=timestamp,
+            identity_generation=self.identity_generation,
+            selected_player_box=selected_player.box,
+        )
+        if accepted:
+            if deadline is None:
+                self.next_submission_ns = timestamp + self.submission_interval_ns
+            else:
+                elapsed_intervals = (
+                    max(0, timestamp - deadline) // self.submission_interval_ns
+                ) + 1
+                self.next_submission_ns = (
+                    deadline + elapsed_intervals * self.submission_interval_ns
+                )
+        return bool(accepted)
+
+    def take_latest(self, *, now_ns: int) -> _AutomaticHeadSample | None:
+        """Return only a current-identity, still-fresh direct observation."""
+
+        current_ns = int(now_ns)
+        if current_ns < 0:
+            raise ValueError("head poll timestamp cannot be negative")
+        if not self.body_valid:
+            return None
+        result = self.worker.take_latest(self.identity_generation)
+        if result is None:
+            return None
+        current_box = self._current_player_box
+        current_body_timestamp_ns = self._current_player_timestamp_ns
+        association_timestamp_ns = (
+            current_ns
+            if current_body_timestamp_ns is None
+            else current_body_timestamp_ns
+        )
+        if current_box is None or not self._player_boxes_associate_over_interval(
+            result.selected_player_box,
+            current_box,
+            elapsed_ns=association_timestamp_ns - result.source_timestamp_ns,
+        ):
+            # A late result from a replaced primary target invalidates the
+            # whole epoch.  It is never interpreted through the new box.
+            self.advance_identity()
+            return None
+        age_ns = current_ns - result.source_timestamp_ns
+        if age_ns < 0 or age_ns > self.stale_after_ns:
+            self._visible_sample = None
+            return None
+        observation = result.observation
+        if observation is None:
+            leased = self._visible_sample
+            if leased is None:
+                return None
+            leased_age_ns = current_ns - leased.source_timestamp_ns
+            if leased_age_ns < 0 or leased_age_ns > self.stale_after_ns:
+                self._visible_sample = None
+                return None
+            if not self._head_point_belongs_to_player(
+                leased.point,
+                current_box,
+            ):
+                self.advance_identity()
+                return None
+            self._visible_sample = _AutomaticHeadSample(
+                point=leased.point,
+                source_timestamp_ns=leased.source_timestamp_ns,
+                confidence=leased.confidence,
+                evidence=leased.evidence,
+                bridging=True,
+            )
+            return None
+        if not self._head_point_belongs_to_player(
+            observation.point,
+            current_box,
+        ):
+            self.advance_identity()
+            return None
+        sample = _AutomaticHeadSample(
+            point=observation.point,
+            source_timestamp_ns=result.source_timestamp_ns,
+            confidence=observation.confidence,
+            evidence=observation.evidence,
+        )
+        self._visible_sample = sample
+        self._visible_player_box = result.selected_player_box
+        return sample
+
+    def visible_sample(self, *, now_ns: int) -> _AutomaticHeadSample | None:
+        sample = self._visible_sample
+        if sample is None or not self.body_valid:
+            return None
+        if (
+            self._current_player_box is None
+            or self._visible_player_box is None
+            or not self._player_boxes_associate_over_interval(
+                self._visible_player_box,
+                self._current_player_box,
+                elapsed_ns=(
+                    (
+                        int(now_ns)
+                        if self._current_player_timestamp_ns is None
+                        else self._current_player_timestamp_ns
+                    )
+                    - sample.source_timestamp_ns
+                ),
+            )
+        ):
+            self.advance_identity()
+            return None
+        if not self._head_point_belongs_to_player(
+            sample.point,
+            self._current_player_box,
+        ):
+            self.advance_identity()
+            return None
+        age_ns = int(now_ns) - sample.source_timestamp_ns
+        if age_ns < 0 or age_ns > self.stale_after_ns:
+            self._visible_sample = None
+            return None
+        return sample
+
+    def raise_if_failed(self) -> None:
+        self.worker.raise_if_failed()
+
+    @property
+    def status(self):
+        return self.worker.status
+
+    def stop(self) -> bool:
+        return bool(self.worker.stop())
+
+
+def _build_automatic_head_runtime() -> _AutomaticHeadRuntime:
+    """Build the exact pinned CPU direct-head session with no fallback model."""
+
+    import numpy as np
+
+    from detection.head_detector import (
+        HEAD_INPUT_HEIGHT,
+        HEAD_INPUT_WIDTH,
+        HEAD_OUTPUT_ATTRIBUTES,
+        HEAD_OUTPUT_CANDIDATES,
+        verify_pinned_head_model,
+    )
+    from detection.head_worker import (
+        CpuOnnxSession,
+        LatestHeadWorker,
+        OnnxModelContract,
+        OnnxTensorContract,
+    )
+
+    model_path = verify_pinned_head_model()
+    contract = OnnxModelContract(
+        input=OnnxTensorContract(
+            "images",
+            (1, 3, HEAD_INPUT_HEIGHT, HEAD_INPUT_WIDTH),
+        ),
+        output=OnnxTensorContract(
+            "output0",
+            (1, HEAD_OUTPUT_ATTRIBUTES, HEAD_OUTPUT_CANDIDATES),
+        ),
+    )
+    session = CpuOnnxSession(
+        model_path,
+        contract,
+        intra_op_threads=AUTOMATIC_HEAD_CPU_THREADS,
+    )
+    # Pay graph/allocation setup once before any physical activation can arm.
+    session.infer(np.zeros(contract.input.shape, dtype=np.float32))
+    worker = LatestHeadWorker(
+        _PreparedDirectHeadLocalizer(session),
+        payload_copier=_identity_payload,
+    )
+    return _AutomaticHeadRuntime(worker)
+
+
+def _publish_automatic_head_loss_once(
+    controller,
+    frame_shape,
+    *,
+    source_timestamp_ns: int,
+    already_published: bool,
+) -> bool:
+    """Publish at most one immediate target-loss decision in one source frame."""
+
+    if already_published:
+        return True
+    controller.update(
+        None,
+        frame_shape,
+        active=True,
+        measurement_ns=source_timestamp_ns,
+    )
+    return True
 
 
 def _calibration_requested(config: AppConfig) -> bool:
@@ -90,6 +582,7 @@ def _automatic_plant_aware_controller(*, max_step: int):
             # wider robust window and slower acceleration envelope.  Explicit
             # calibration profiles keep the numeric core defaults above.
             velocity_filter_time_constant_seconds=0.018,
+            position_time_constant_seconds=0.022,
             maximum_target_acceleration_pixels_per_second_squared=20_000.0,
             maximum_rate_x_counts_per_second=maximum_rate,
             maximum_rate_y_counts_per_second=maximum_rate,
@@ -101,6 +594,11 @@ def _automatic_plant_aware_controller(*, max_step: int):
             stale_after_seconds=AUTOMATIC_MAKCU_STALE_AFTER_SECONDS,
             maximum_observation_interval_seconds=0.040,
             velocity_median_window=5,
+            feedback_deadzone_pixels=3.0,
+            # A single direct-head point feeds both observation channels.  Do
+            # not turn one-pixel detector quantization into open-loop motion;
+            # the observer still uses landed commands for position ownership.
+            maximum_velocity_feedforward_fraction=0.0,
         ),
     )
 
@@ -1054,6 +1552,40 @@ def _aim_input_telemetry_summary(previous, current, elapsed_seconds: float) -> s
     )
 
 
+def _head_runtime_telemetry_summary(
+    previous,
+    current,
+    elapsed_seconds: float,
+    *,
+    now_ns: int,
+    visible_sample: _AutomaticHeadSample | None,
+) -> str:
+    """Format non-spatial direct-head worker deltas and point freshness."""
+
+    elapsed = max(float(elapsed_seconds), 1e-9)
+
+    def delta(name: str) -> int:
+        return max(0, int(getattr(current, name)) - int(getattr(previous, name)))
+
+    overwrites = delta("pending_overwrites") + delta("result_overwrites")
+    stale = (
+        delta("stale_submissions")
+        + delta("stale_pending_dropped")
+        + delta("stale_results_dropped")
+    )
+    freshness = "none"
+    if visible_sample is not None:
+        age_ms = max(0.0, (int(now_ns) - visible_sample.source_timestamp_ns) / 1e6)
+        bridge = " bridge" if visible_sample.bridging else ""
+        freshness = f"{age_ms:.0f}ms{bridge}"
+    return (
+        f"HEAD completed {delta('jobs_completed') / elapsed:.0f}/s | "
+        f"localized {delta('localized_heads') / elapsed:.0f}/s | "
+        f"no-head {delta('no_head_results') / elapsed:.0f}/s | "
+        f"overwrites {overwrites} | stale {stale} | point age {freshness}"
+    )
+
+
 def _makcu_telemetry_summary(previous, current, elapsed_seconds: float) -> str:
     """Format passive output-loop counters collected since the prior report."""
 
@@ -1485,6 +2017,8 @@ def run(config: AppConfig) -> int:
     aim_input_telemetry: AimInputTelemetry | None = None
     aim_input_report_snapshot: AimInputTelemetrySnapshot | None = None
     aim_input_report_ns: int | None = None
+    head_report_snapshot = None
+    head_report_ns: int | None = None
     aim_sensor: AimActivationSensor | None = None
     target_tracker: TargetTracker | None = None
     calibration_session = None
@@ -1498,6 +2032,7 @@ def run(config: AppConfig) -> int:
     aim_activation_was_active = False
     aim_activation_name = "physical control"
     aim_control_description = "gated output"
+    automatic_head_runtime: _AutomaticHeadRuntime | None = None
     if config.aim:
         aim_input_telemetry = AimInputTelemetry(config.aim_label)
         if not calibration_requested:
@@ -1559,7 +2094,7 @@ def run(config: AppConfig) -> int:
                 )
             if automatic_numeric_controller is not None:
                 aim_control_description = (
-                    "automatic plant-aware control at "
+                    "automatic command-aware observer with direct-head input at "
                     f"{aim_controller.config.output_hz} Hz"
                 )
             elif active_profile is None:
@@ -1626,6 +2161,12 @@ def run(config: AppConfig) -> int:
                     f"startup: {exc}"
                 ) from exc
         aim_runtime_enabled = aim_controller is not None
+        if aim_runtime_enabled and automatic_makcu_requested:
+            # This path is mandatory for automatic no-profile MAKCU.  A missing,
+            # changed, or unloadable head model is a startup failure; it never
+            # falls back to a body-box ratio.
+            automatic_head_runtime = _build_automatic_head_runtime()
+            automatic_head_runtime.start()
         if calibration_requested and not isinstance(
             aim_controller, MakcuAimingController
         ):
@@ -1670,17 +2211,19 @@ def run(config: AppConfig) -> int:
             print(
                 f"Detection-driven aim: enabled | target {config.aim_label} | "
                 f"output {output} | activation {activation} | "
-                "control automatic plant-aware | gains X/Y "
+                "control automatic command-aware observer | gains X/Y "
                 f"{AUTOMATIC_MAKCU_GAIN_X_PIXELS_PER_COUNT:g}/"
                 f"{AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT:g} px/count | "
                 f"delay {AUTOMATIC_MAKCU_DELAY_SECONDS * 1000.0:.2f} ms | "
-                "velocity source raw accepted | "
-                "velocity damping median "
-                f"{automatic_control.velocity_median_window} / "
-                f"{automatic_control.velocity_filter_time_constant_seconds * 1000.0:.0f} "
-                "ms / "
-                f"{automatic_control.maximum_target_acceleration_pixels_per_second_squared:.0f} "
-                "px/s^2 | "
+                "head source pinned SunXDS 0.8.0 direct boxes on "
+                f"CPU ({AUTOMATIC_HEAD_CPU_THREADS} threads) | "
+                f"latest-only {AUTOMATIC_HEAD_LOCALIZATION_HZ:g} Hz | "
+                f"fail closed after {AUTOMATIC_HEAD_STALE_AFTER_SECONDS * 1000.0:.0f} ms | "
+                "primary player box identity/safety only | "
+                "position-only command-aware observer | velocity feed-forward disabled | "
+                "position tau/deadzone "
+                f"{automatic_control.position_time_constant_seconds * 1000.0:.0f} ms/"
+                f"{automatic_control.feedback_deadzone_pixels:.0f} px | "
                 "caps X/Y "
                 f"{automatic_control.maximum_rate_x_counts_per_second:.0f}/"
                 f"{automatic_control.maximum_rate_y_counts_per_second:.0f} counts/s"
@@ -1811,6 +2354,9 @@ def run(config: AppConfig) -> int:
         if aim_input_telemetry is not None:
             aim_input_report_snapshot = aim_input_telemetry.snapshot()
             aim_input_report_ns = pipeline_started_ns
+        if automatic_head_runtime is not None:
+            head_report_snapshot = automatic_head_runtime.status
+            head_report_ns = pipeline_started_ns
         if report_destination is not None:
             from utils.live_report import utc_now
 
@@ -1840,6 +2386,8 @@ def run(config: AppConfig) -> int:
             # 250 ms, so inline HighGUI can service Escape/window close even
             # when there is no paced preview frame to submit.
             if packet is None:
+                if automatic_head_runtime is not None:
+                    automatic_head_runtime.raise_if_failed()
                 if source.error:
                     raise RuntimeError(source.error)
                 if deadline_ns is not None and read_returned_ns >= deadline_ns:
@@ -2088,6 +2636,7 @@ def run(config: AppConfig) -> int:
                 )
                 if aim_input_telemetry is not None:
                     aim_input_telemetry.record_hard_guard(hard_guard_result)
+            direct_head_sample: _AutomaticHeadSample | None = None
             if calibration_session is not None:
                 # Calibration consumes only this frame's configured-confidence,
                 # exact-label, full-pass result.  It deliberately bypasses the
@@ -2150,11 +2699,24 @@ def run(config: AppConfig) -> int:
                 activation_transition = (
                     tracking_activation_active != aim_activation_was_active
                 )
+                automatic_revoked_this_frame = False
                 if activation_transition and target_tracker is not None:
                     # A new physical hold must establish configured-confidence
                     # provenance in this hold; never inherit a weak-only track
                     # maintained while output was inactive.
                     target_tracker.reset()
+                if activation_transition and automatic_head_runtime is not None:
+                    # Both edges are safety epochs.  In-flight results from the
+                    # old hold can never arm the new one, even if inference
+                    # finishes after the button transition.
+                    automatic_head_runtime.advance_identity()
+                    assert isinstance(aim_controller, MakcuAimingController)
+                    automatic_revoked_this_frame = _publish_automatic_head_loss_once(
+                        aim_controller,
+                        packet.image.shape,
+                        source_timestamp_ns=packet.read_started_ns,
+                        already_published=automatic_revoked_this_frame,
+                    )
                 aim_activation_was_active = tracking_activation_active
 
                 selected_aim_target = _update_aim_target(
@@ -2175,46 +2737,207 @@ def run(config: AppConfig) -> int:
                     active = (
                         tracking_activation_active if aim_sensor is not None else True
                     )
-                    aim_controller.update(
-                        selected_aim_target,
-                        packet.image.shape,
-                        active=active,
-                        **(
-                            {
-                                "measurement_ns": packet.read_started_ns,
-                                "measurement_observed": not (
-                                    target_tracker is not None
-                                    and target_tracker.output_is_prediction
-                                ),
-                                **(
-                                    {
-                                        "velocity_target": (
-                                            target_tracker.accepted_measurement
-                                            if target_tracker is not None
-                                            else None
+                    if automatic_head_runtime is not None:
+                        assert isinstance(aim_controller, MakcuAimingController)
+                        assert target_tracker is not None
+                        accepted_player = target_tracker.accepted_measurement
+                        direct_body_safe = bool(
+                            tracking_activation_active
+                            and selected_aim_target is not None
+                        )
+                        if direct_body_safe:
+                            assert selected_aim_target is not None
+                            association_player = (
+                                accepted_player
+                                if accepted_player is not None
+                                else selected_aim_target
+                            )
+                            replacement = automatic_head_runtime.accept_body(
+                                association_player.box,
+                                track_generation=target_tracker.track_generation,
+                                source_timestamp_ns=packet.read_started_ns,
+                            )
+                            if replacement and not automatic_revoked_this_frame:
+                                automatic_revoked_this_frame = (
+                                    _publish_automatic_head_loss_once(
+                                        aim_controller,
+                                        packet.image.shape,
+                                        source_timestamp_ns=packet.read_started_ns,
+                                        already_published=(
+                                            automatic_revoked_this_frame
+                                        ),
+                                    )
+                                )
+                            automatic_head_runtime.raise_if_failed()
+                            generation_before_poll = (
+                                automatic_head_runtime.identity_generation
+                            )
+                            new_head_sample = automatic_head_runtime.take_latest(
+                                now_ns=perf_counter_ns(),
+                            )
+                            if (
+                                automatic_head_runtime.identity_generation
+                                != generation_before_poll
+                            ):
+                                # The completed result belonged geometrically to
+                                # an old player. Revoke its controller lease,
+                                # then seed only the current player's new epoch.
+                                if not automatic_revoked_this_frame:
+                                    automatic_revoked_this_frame = (
+                                        _publish_automatic_head_loss_once(
+                                            aim_controller,
+                                            packet.image.shape,
+                                            source_timestamp_ns=(
+                                                packet.read_started_ns
+                                            ),
+                                            already_published=(
+                                                automatic_revoked_this_frame
+                                            ),
                                         )
-                                    }
-                                    if automatic_makcu_requested
-                                    else {}
-                                ),
-                            }
-                            if isinstance(aim_controller, MakcuAimingController)
-                            else {}
-                        ),
-                    )
+                                    )
+                                automatic_head_runtime.accept_body(
+                                    association_player.box,
+                                    track_generation=target_tracker.track_generation,
+                                    source_timestamp_ns=packet.read_started_ns,
+                                )
+                            if new_head_sample is not None:
+                                # The point and timestamp belong to the same
+                                # source frame.  The current primary player is
+                                # passed only as the live safety identity.
+                                aim_controller.update(
+                                    selected_aim_target,
+                                    packet.image.shape,
+                                    active=True,
+                                    measurement_ns=(
+                                        new_head_sample.source_timestamp_ns
+                                    ),
+                                    measurement_observed=True,
+                                    aim_point=new_head_sample.point,
+                                )
+                            generation_before_display = (
+                                automatic_head_runtime.identity_generation
+                            )
+                            direct_head_sample = (
+                                automatic_head_runtime.visible_sample(
+                                    now_ns=perf_counter_ns(),
+                                )
+                            )
+                            if (
+                                automatic_head_runtime.identity_generation
+                                != generation_before_display
+                            ):
+                                if not automatic_revoked_this_frame:
+                                    automatic_revoked_this_frame = (
+                                        _publish_automatic_head_loss_once(
+                                            aim_controller,
+                                            packet.image.shape,
+                                            source_timestamp_ns=(
+                                                packet.read_started_ns
+                                            ),
+                                            already_published=(
+                                                automatic_revoked_this_frame
+                                            ),
+                                        )
+                                    )
+                                automatic_head_runtime.accept_body(
+                                    association_player.box,
+                                    track_generation=target_tracker.track_generation,
+                                    source_timestamp_ns=packet.read_started_ns,
+                                )
+                            if accepted_player is not None:
+                                # Crop/resize only at the gate, after consuming
+                                # any completed prior result. Latest-only worker
+                                # submission never copies the full source frame.
+                                automatic_head_runtime.submit(
+                                    packet.image,
+                                    accepted_player,
+                                    source_timestamp_ns=packet.read_started_ns,
+                                )
+                        else:
+                            # Unsafe/guarded/expired body selection and inactive
+                            # output revoke immediately. A tracker prediction
+                            # remains bounded by its pre-existing empty-only
+                            # grace and can never create a new head observation.
+                            if (
+                                automatic_head_runtime.revoke_body()
+                                and not automatic_revoked_this_frame
+                            ):
+                                automatic_revoked_this_frame = (
+                                    _publish_automatic_head_loss_once(
+                                        aim_controller,
+                                        packet.image.shape,
+                                        source_timestamp_ns=packet.read_started_ns,
+                                        already_published=(
+                                            automatic_revoked_this_frame
+                                        ),
+                                    )
+                                )
+                            automatic_head_runtime.raise_if_failed()
+                    else:
+                        aim_controller.update(
+                            selected_aim_target,
+                            packet.image.shape,
+                            active=active,
+                            **(
+                                {
+                                    "measurement_ns": packet.read_started_ns,
+                                    "measurement_observed": not (
+                                        target_tracker is not None
+                                        and target_tracker.output_is_prediction
+                                    ),
+                                }
+                                if isinstance(aim_controller, MakcuAimingController)
+                                else {}
+                            ),
+                        )
                     aim_engaged = (
                         aim_controller.activation_pressed
                         if isinstance(aim_controller, MakcuAimingController)
                         else active
                     )
+                status_target = selected_aim_target
+                if automatic_head_runtime is not None and direct_head_sample is None:
+                    status_target = None
                 aim_status = _aim_status(
                     runtime_enabled=aim_runtime_enabled,
                     self_exclusion_ready=self_exclusion_ready,
-                    selected_target=selected_aim_target,
+                    selected_target=status_target,
                     engaged=aim_engaged,
                     activation_name=aim_activation_name,
                     control_description=aim_control_description,
                 )
+                if automatic_head_runtime is not None:
+                    if not tracking_activation_active:
+                        aim_status = (
+                            f"aim ready: hold {aim_activation_name} to run "
+                            "direct-head tracking"
+                        )
+                    elif (
+                        selected_aim_target is not None
+                        and direct_head_sample is None
+                    ):
+                        aim_status = (
+                            "aim blocked: selected player has no fresh direct head box"
+                        )
+                    elif (
+                        direct_head_sample is not None
+                        and direct_head_sample.bridging
+                    ):
+                        remaining_ms = max(
+                            0.0,
+                            (
+                                automatic_head_runtime.stale_after_ns
+                                - (
+                                    perf_counter_ns()
+                                    - direct_head_sample.source_timestamp_ns
+                                )
+                            )
+                            / 1e6,
+                        )
+                        aim_status = (
+                            "aim bridging: direct head missing, holding last direct "
+                            f"point for at most {remaining_ms:.0f} ms"
+                        )
             result_ready_ns = perf_counter_ns()
 
             if prepared.crop_was_clamped and not crop_warning_printed:
@@ -2243,12 +2966,29 @@ def run(config: AppConfig) -> int:
                         last_ignored_detection,
                     )
                 draw_detections(packet.image, detections)
-                if aim_runtime_enabled and selected_aim_target is not None:
+                if automatic_head_runtime is not None:
+                    direct_head_sample = automatic_head_runtime.visible_sample(
+                        now_ns=result_ready_ns,
+                    )
+                    if direct_head_sample is not None:
+                        draw_aim_target(
+                            packet.image,
+                            direct_head_sample.point,
+                            active=aim_engaged,
+                            activation_name=aim_activation_name,
+                            source_label=(
+                                "direct head bridge"
+                                if direct_head_sample.bridging
+                                else "direct head box"
+                            ),
+                        )
+                elif aim_runtime_enabled and selected_aim_target is not None:
                     draw_aim_target(
                         packet.image,
                         head_target_point(selected_aim_target, config.aim_head_ratio),
                         active=aim_engaged,
                         activation_name=aim_activation_name,
+                        source_label="body-box head proxy",
                     )
                 draw_metrics(
                     packet.image,
@@ -2328,6 +3068,21 @@ def run(config: AppConfig) -> int:
                     )
                     aim_input_report_snapshot = current_aim_input
                     aim_input_report_ns = result_ready_ns
+                if (
+                    automatic_head_runtime is not None
+                    and head_report_snapshot is not None
+                    and head_report_ns is not None
+                ):
+                    current_head_status = automatic_head_runtime.status
+                    summary += " | " + _head_runtime_telemetry_summary(
+                        head_report_snapshot,
+                        current_head_status,
+                        (result_ready_ns - head_report_ns) / 1_000_000_000,
+                        now_ns=result_ready_ns,
+                        visible_sample=direct_head_sample,
+                    )
+                    head_report_snapshot = current_head_status
+                    head_report_ns = result_ready_ns
                 if (
                     isinstance(aim_controller, MakcuAimingController)
                     and makcu_report_snapshot is not None
@@ -2424,11 +3179,29 @@ def run(config: AppConfig) -> int:
                 except Exception as exc:  # noqa: BLE001 - still stop physical output
                     record_cleanup_failure("calibration evidence publication", exc)
 
+        # Stop physical output before waiting for any auxiliary CPU worker.
+        # This makes pipeline exit an immediate movement revocation even if a
+        # head inference takes its full bounded join interval to return.
         if aim_controller is not None:
             try:
                 aim_controller.stop()
-            except Exception as exc:  # noqa: BLE001 - aggregate bounded cleanup failures
+            except Exception as exc:  # noqa: BLE001 - aggregate cleanup failures
                 record_cleanup_failure("aim output shutdown", exc)
+        if automatic_head_runtime is not None:
+            try:
+                head_worker_stopped = automatic_head_runtime.stop()
+            except Exception as exc:  # noqa: BLE001 - continue physical shutdown
+                record_cleanup_failure("direct-head worker shutdown", exc)
+            else:
+                if not head_worker_stopped:
+                    record_cleanup_failure(
+                        "direct-head worker shutdown",
+                        "the CPU localization worker did not stop within its bounded timeout",
+                    )
+                try:
+                    automatic_head_runtime.raise_if_failed()
+                except Exception as exc:  # noqa: BLE001 - report after bounded stop
+                    record_cleanup_failure("direct-head worker", exc)
         if aim_sensor is not None:
             try:
                 aim_sensor.stop()

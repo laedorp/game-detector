@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 import math
 import os
@@ -794,6 +794,384 @@ class MakcuAimingTests(unittest.TestCase):
             controller._output_thread = None
             controller.stop()
 
+    def test_calibrated_explicit_aim_point_never_falls_back_to_body_box(self) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(velocity_median_window=1),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(
+                head_ratio=0.0,
+                invert_x=True,
+                invert_y=True,
+                output_hz=1000,
+            ),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        # The safety identity's historical box aim point is far down-right.
+        # The face landmark is centered, so any nonzero observation would be a
+        # body-box fallback rather than the explicitly published evidence.
+        safety_target = Detection(
+            0,
+            "player",
+            0.95,
+            (1050.0, 600.0, 1250.0, 1000.0),
+        )
+        measurement_ns = 51_500_000_000
+        try:
+            controller.update(
+                safety_target,
+                (720, 1280, 3),
+                measurement_ns=measurement_ns,
+                aim_point=(640.0, 360.0),
+            )
+            controller._output_tick(0.001, now_ns=measurement_ns)
+
+            observation = calibrated._last_observation
+            assert observation is not None
+            self.assertEqual(observation.error_x_pixels, 0.0)
+            self.assertEqual(observation.error_y_pixels, 0.0)
+            # One exact point feeds both channels, selecting the command-aware
+            # paired observer without deriving anything from the body box.
+            self.assertEqual(observation.velocity_error_x_pixels, 0.0)
+            self.assertEqual(observation.velocity_error_y_pixels, 0.0)
+            self.assertIs(controller._latest_target, safety_target)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_calibrated_explicit_position_and_velocity_points_share_mapping(self) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(velocity_median_window=1),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(invert_x=True, invert_y=True, output_hz=1000),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        safety_target = Detection(0, "player", 0.95, (50.0, 50.0, 90.0, 300.0))
+        measurement_ns = 51_600_000_000
+        try:
+            controller.update(
+                safety_target,
+                (720, 1280, 3),
+                measurement_ns=measurement_ns,
+                aim_point=(600.0, 340.0),
+                velocity_point=(800.0, 400.0),
+            )
+            controller._output_tick(0.001, now_ns=measurement_ns)
+
+            observation = calibrated._last_observation
+            assert observation is not None
+            self.assertEqual(observation.error_x_pixels, 60.0)
+            self.assertEqual(observation.error_y_pixels, 30.0)
+            self.assertEqual(observation.velocity_error_x_pixels, -240.0)
+            self.assertEqual(observation.velocity_error_y_pixels, -60.0)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_explicit_points_fail_closed_before_mutating_publication(self) -> None:
+        controller = self.controller()
+        controller.start(output_loop=False)
+        target = Detection(0, "player", 0.9, (950.0, 540.0, 970.0, 640.0))
+        controller.update(
+            target,
+            (1080, 1920, 3),
+            measurement_ns=51_700_000_000,
+            aim_point=(960.0, 540.0),
+        )
+        original_sample_id = controller._latest_sample_id
+        original_source_ns = controller._latest_source_ns
+        original_error = (
+            controller._measurement_error_x,
+            controller._measurement_error_y,
+        )
+
+        invalid_points = (
+            ([960.0, 540.0], TypeError, "tuple"),
+            ((math.nan, 540.0), ValueError, "finite"),
+            ((960.0, math.inf), ValueError, "finite"),
+            ((True, 540.0), ValueError, "finite"),
+            ((-0.01, 540.0), ValueError, "inside"),
+            ((1920.0, 540.0), ValueError, "inside"),
+            ((960.0, 1080.0), ValueError, "inside"),
+        )
+        for point, exception, message in invalid_points:
+            with (
+                self.subTest(point=point),
+                self.assertRaisesRegex(exception, message),
+            ):
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=51_800_000_000,
+                    aim_point=point,  # type: ignore[arg-type]
+                )
+
+        self.assertEqual(controller._latest_sample_id, original_sample_id)
+        self.assertEqual(controller._latest_source_ns, original_source_ns)
+        self.assertEqual(
+            (controller._measurement_error_x, controller._measurement_error_y),
+            original_error,
+        )
+
+        with self.assertRaisesRegex(ValueError, "requires an aim point"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=51_800_000_000,
+                velocity_point=(960.0, 540.0),
+            )
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=51_800_000_000,
+                velocity_target=target,
+                aim_point=(960.0, 540.0),
+            )
+        with self.assertRaisesRegex(ValueError, "inside"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=51_800_000_000,
+                aim_point=(960.0, 540.0),
+                velocity_point=(1920.0, 540.0),
+            )
+
+    def test_explicit_point_timestamps_reject_late_frames_and_same_time_motion(
+        self,
+    ) -> None:
+        controller = self.controller(MakcuAimConfig(head_ratio=0.0))
+        controller.start(output_loop=False)
+        first_target = Detection(0, "player", 0.9, (100.0, 100.0, 200.0, 600.0))
+        current_target = Detection(
+            0,
+            "player",
+            0.9,
+            (1500.0, 100.0, 1700.0, 600.0),
+        )
+        late_target = Detection(0, "player", 0.9, (300.0, 100.0, 500.0, 600.0))
+        first_ns = 51_850_000_000
+        current_ns = first_ns + 100_000_000
+        controller.update(
+            first_target,
+            (1080, 1920, 3),
+            measurement_ns=first_ns,
+            aim_point=(960.0, 540.0),
+        )
+        controller.update(
+            current_target,
+            (1080, 1920, 3),
+            measurement_ns=current_ns,
+            aim_point=(1060.0, 540.0),
+        )
+        self.assertEqual(controller._latest_velocity_x, 1000.0)
+
+        with self.assertRaisesRegex(ValueError, "must not move backwards"):
+            controller.update(
+                late_target,
+                (1080, 1920, 3),
+                measurement_ns=current_ns - 1,
+                aim_point=(980.0, 540.0),
+            )
+        self.assertIs(controller._latest_target, current_target)
+        self.assertEqual(controller._measurement_error_x, 100.0)
+
+        # A conflicting localization for the same source frame is accepted as
+        # the current evidence but cannot imply infinite/undefined velocity.
+        controller.update(
+            current_target,
+            (1080, 1920, 3),
+            measurement_ns=current_ns,
+            aim_point=(1080.0, 540.0),
+        )
+        self.assertEqual(controller._latest_velocity_x, 0.0)
+        self.assertEqual(controller._latest_velocity_y, 0.0)
+        self.assertEqual(controller._measurement_error_x, 120.0)
+
+    def test_unobserved_publication_preserves_last_exact_point_without_observation(
+        self,
+    ) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(velocity_median_window=1),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(output_hz=1000),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        first_target = Detection(0, "player", 0.95, (100.0, 100.0, 200.0, 500.0))
+        current_target = Detection(
+            0,
+            "player",
+            0.95,
+            (1500.0, 400.0, 1800.0, 1000.0),
+        )
+        source_ns = 51_900_000_000
+        try:
+            controller.update(
+                first_target,
+                (1080, 1920, 3),
+                measurement_ns=source_ns,
+                aim_point=(1000.0, 500.0),
+            )
+            controller._output_tick(0.001, now_ns=source_ns)
+            exact_observation = calibrated._last_observation
+            exact_error = (
+                controller._measurement_error_x,
+                controller._measurement_error_y,
+            )
+
+            # A current primary box can refresh safety presence at the exact
+            # head frame's timestamp, but it is not a new head observation.
+            controller.update(
+                current_target,
+                (1080, 1920, 3),
+                measurement_ns=source_ns,
+                measurement_observed=False,
+            )
+            controller._output_tick(0.001, now_ns=source_ns + 1_000_000)
+
+            self.assertIs(calibrated._last_observation, exact_observation)
+            self.assertEqual(
+                (controller._measurement_error_x, controller._measurement_error_y),
+                exact_error,
+            )
+            self.assertIs(controller._latest_target, current_target)
+            with self.assertRaisesRegex(
+                ValueError,
+                "requires an observed safety target",
+            ):
+                controller.update(
+                    current_target,
+                    (1080, 1920, 3),
+                    measurement_ns=source_ns,
+                    measurement_observed=False,
+                    aim_point=(1700.0, 500.0),
+                )
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_explicit_head_loss_revokes_a_blocked_calibrated_commit(self) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(velocity_median_window=1),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(max_step=320, output_hz=1000),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        safety_target = Detection(
+            0,
+            "player",
+            0.95,
+            (1200.0, 400.0, 1500.0, 1000.0),
+        )
+        source_ns = 52_000_000_000
+        controller.update(
+            safety_target,
+            (1080, 1920, 3),
+            measurement_ns=source_ns,
+            aim_point=(1200.0, 540.0),
+        )
+
+        entered = threading.Event()
+        release_step = threading.Event()
+        output_errors: list[BaseException] = []
+
+        def blocked_step(*_args, **_kwargs) -> CalibratedControlOutput:
+            entered.set()
+            if not release_step.wait(1.0):
+                raise AssertionError("timed out waiting to revoke the head")
+            return CalibratedControlOutput(
+                timestamp_ns=source_ns,
+                rate_x_counts_per_second=1000.0,
+                rate_y_counts_per_second=0.0,
+                target_velocity_x_pixels_per_second=0.0,
+                target_velocity_y_pixels_per_second=0.0,
+                projected_error_x_pixels=240.0,
+                projected_error_y_pixels=0.0,
+                valid=True,
+            )
+
+        def output_tick() -> None:
+            try:
+                controller._output_tick(0.001, now_ns=source_ns)
+            except BaseException as exc:  # noqa: BLE001 - assert thread outcome
+                output_errors.append(exc)
+
+        movement_before = self._movement_writes(active)
+        try:
+            with mock.patch.object(calibrated, "step", side_effect=blocked_step):
+                worker = threading.Thread(target=output_tick)
+                worker.start()
+                self.assertTrue(entered.wait(1.0))
+
+                controller.update(
+                    None,
+                    (1080, 1920, 3),
+                    measurement_ns=source_ns + 1_000_000,
+                    measurement_observed=True,
+                )
+                self.assertFalse(controller._measurement_target_present)
+                self.assertIsNone(controller._latest_target)
+                release_step.set()
+                worker.join(1.0)
+                self.assertFalse(worker.is_alive())
+
+            self.assertEqual(output_errors, [])
+            self.assertEqual(self._movement_writes(active), movement_before)
+            self.assertFalse(calibrated.ready)
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+        finally:
+            release_step.set()
+            controller._output_thread = None
+            controller.stop()
+
     def test_calibrated_control_honors_visible_max_step_and_vertical_cap(self) -> None:
         calibrated = MakcuCalibratedController(
             CalibratedPlant(0.10, 0.10, 0.0),
@@ -822,15 +1200,35 @@ class MakcuAimingTests(unittest.TestCase):
         controller._output_thread = live_worker
         target = Detection(0, "player", 0.95, (1050.0, 628.0, 1070.0, 728.0))
         base_ns = 52_000_000_000
+        original_step = calibrated.step
+
+        def diagnostic_step(*args, **kwargs) -> CalibratedControlOutput:
+            return replace(
+                original_step(*args, **kwargs),
+                observer_position_sigma_x_pixels=1.25,
+                observer_position_sigma_y_pixels=2.50,
+                observer_velocity_sigma_x_pixels_per_second=125.0,
+                observer_velocity_sigma_y_pixels_per_second=250.0,
+                velocity_feedforward_confidence_x=0.75,
+                velocity_feedforward_confidence_y=0.50,
+                innovation_mahalanobis_squared=3.25,
+                innovation_rejected=True,
+            )
+
         try:
             active.responses.extend(bytes((0b00010,)))
-            for timestamp_ns in (base_ns, base_ns + 8_000_000):
-                controller.update(
-                    target,
-                    (1080, 1920, 3),
-                    measurement_ns=timestamp_ns,
-                )
-                controller._output_tick(0.001, now_ns=timestamp_ns)
+            with mock.patch.object(
+                calibrated,
+                "step",
+                side_effect=diagnostic_step,
+            ):
+                for timestamp_ns in (base_ns, base_ns + 8_000_000):
+                    controller.update(
+                        target,
+                        (1080, 1920, 3),
+                        measurement_ns=timestamp_ns,
+                    )
+                    controller._output_tick(0.001, now_ns=timestamp_ns)
             movement = self._movement_writes(active)
             self.assertEqual(len(movement), 1)
             delta_x, delta_y = (
@@ -851,6 +1249,20 @@ class MakcuAimingTests(unittest.TestCase):
             )
             self.assertTrue(output.saturated_x)
             self.assertTrue(output.saturated_y)
+            self.assertEqual(output.observer_position_sigma_x_pixels, 1.25)
+            self.assertEqual(output.observer_position_sigma_y_pixels, 2.50)
+            self.assertEqual(
+                output.observer_velocity_sigma_x_pixels_per_second,
+                125.0,
+            )
+            self.assertEqual(
+                output.observer_velocity_sigma_y_pixels_per_second,
+                250.0,
+            )
+            self.assertEqual(output.velocity_feedforward_confidence_x, 0.75)
+            self.assertEqual(output.velocity_feedforward_confidence_y, 0.50)
+            self.assertEqual(output.innovation_mahalanobis_squared, 3.25)
+            self.assertTrue(output.innovation_rejected)
             telemetry = controller.telemetry_snapshot()
             self.assertEqual(telemetry.control_samples, 1)
             self.assertEqual(telemetry.saturated_x_samples, 1)

@@ -52,6 +52,14 @@ metadata identifies a CC BY 4.0 license. Their required attribution and data
 quality limitations are retained next to each model in
 `models/fort_player*_openvino_model/ATTRIBUTION.md`.
 
+The optional second-stage head localizer is a derived ONNX export of SunOne's
+public SunXDS 0.8.0 player/head checkpoint. The upstream repository is MIT;
+the checkpoint and derived graph embed Ultralytics AGPL-3.0 model metadata, so
+ProAim distributes the graph under the compatible AGPL terms used by this
+project. Exact upstream provenance, hashes, export versions, and limitations
+are retained in `models/sunxds_head_onnx/ATTRIBUTION.md`. ProAim bundles and
+loads only the inspected ONNX graph, not the upstream PyTorch pickle.
+
 The exported YOLO model artifacts were produced with Ultralytics tooling and
 are distributed in this AGPL-3.0-or-later project. Each generic YOLO IR and
 ONNX bundle directory retains the matching export `metadata.yaml`, including

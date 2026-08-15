@@ -38,6 +38,7 @@ HIGH_END_MODEL_DIR = PROJECT_ROOT / "models" / "yolo11l_openvino_model"
 HIGH_END_ONNX_DIR = PROJECT_ROOT / "models" / "yolo11l_onnx"
 PLAYER_MODEL_DIR = PROJECT_ROOT / "models" / "fort_player_openvino_model"
 PLAYER_INT8_MODEL_DIR = PROJECT_ROOT / "models" / "fort_player_416_int8_openvino_model"
+HEAD_MODEL_DIR = PROJECT_ROOT / "models" / "sunxds_head_onnx"
 # ONNX copies of every bundled model.  OpenVINO cannot drive AMD or NVIDIA
 # GPUs, so a build without these cannot run on that hardware at all.
 ONNX_MODEL_DIRS = {
@@ -126,6 +127,8 @@ required_files = (
     PLAYER_INT8_MODEL_DIR / "fort_player_416_int8.bin",
     PLAYER_INT8_MODEL_DIR / "metadata.yaml",
     PLAYER_INT8_MODEL_DIR / "ATTRIBUTION.md",
+    HEAD_MODEL_DIR / "sunxds_0.8.0.onnx",
+    HEAD_MODEL_DIR / "ATTRIBUTION.md",
 ) + tuple(
     PROJECT_ROOT / directory / filename
     for directory, filename in ONNX_MODEL_DIRS.items()
@@ -200,6 +203,8 @@ datas = [
         str(PLAYER_INT8_MODEL_DIR / "ATTRIBUTION.md"),
         "models/fort_player_416_int8_openvino_model",
     ),
+    (str(HEAD_MODEL_DIR / "sunxds_0.8.0.onnx"), "models/sunxds_head_onnx"),
+    (str(HEAD_MODEL_DIR / "ATTRIBUTION.md"), "models/sunxds_head_onnx"),
 ]
 
 def _find_python_license():

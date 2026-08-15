@@ -717,6 +717,7 @@ class TargetTracker:
         self._telemetry_output_present = False
         self._output_is_prediction = False
         self._accepted_measurement: Detection | None = None
+        self._track_generation = 0
 
     def reset(self) -> None:
         self._reset_tracking_state()
@@ -758,6 +759,12 @@ class TargetTracker:
         """
 
         return self._accepted_measurement
+
+    @property
+    def track_generation(self) -> int:
+        """Monotonic identity epoch for each newly established logical track."""
+
+        return self._track_generation
 
     def telemetry_snapshot(self) -> TargetTrackerTelemetrySnapshot:
         """Return aggregate tracker diagnostics without changing tracker state."""
@@ -962,6 +969,7 @@ class TargetTracker:
         )
 
     def _start_track(self, detection: Detection, measurement_ns: int) -> Detection:
+        self._track_generation += 1
         self._smoothed_box = detection.xyxy
         self._last_observed_box = detection.xyxy
         self._box_velocity = (0.0, 0.0, 0.0, 0.0)

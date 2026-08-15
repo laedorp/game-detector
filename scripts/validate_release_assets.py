@@ -33,6 +33,17 @@ BALANCED_INPUT_SHAPE = (1, 3, 416, 416)
 HIGH_END_INPUT_SHAPE = (1, 3, 640, 640)
 FORT_SOURCE_URL = "https://universe.roboflow.com/aviles-joseph/fort-cuh-mji4f"
 MODEL_MANIFEST = Path("models/RELEASE-MANIFEST.sha256")
+HEAD_MODEL_ONNX = Path("models/sunxds_head_onnx/sunxds_0.8.0.onnx")
+HEAD_MODEL_ATTRIBUTION = Path("models/sunxds_head_onnx/ATTRIBUTION.md")
+HEAD_MODEL_INPUT_SHAPE = (1, 3, 320, 320)
+HEAD_MODEL_OUTPUT_SHAPE = (1, 6, 2100)
+HEAD_MODEL_ATTRIBUTION_MARKERS = (
+    "SunXDS 0.8.0",
+    "ec17c7d89ea2c940b20081d27da633f4c7491655",
+    "de8a0cf0d3911751c65193b7b487f830fd3c6cbb53866e23bf8b8be7c33b4baf",
+    "93264ec61b86b8459ef64c85a31ab3da294327ee1f95337076e57d8af24bb192",
+    "AGPL-3.0",
+)
 
 COCO80_LABELS = (
     "person",
@@ -349,6 +360,9 @@ def _validate_model_manifest(
         expected_paths.update(
             str(record["path"]) for record in contract["artifacts"].values()
         )
+    expected_paths.update(
+        (HEAD_MODEL_ONNX.as_posix(), HEAD_MODEL_ATTRIBUTION.as_posix())
+    )
     missing = sorted(expected_paths - seen)
     if missing:
         errors.append("SHA-256 manifest is missing release artifact(s): " + ", ".join(missing))
@@ -534,7 +548,70 @@ def _all_model_files_ready(
                     return False
             except OSError:
                 return False
+    for relative_path in (HEAD_MODEL_ONNX, HEAD_MODEL_ATTRIBUTION):
+        path = root / relative_path
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
     return True
+
+
+def _validate_head_model(root: Path, core: Any, errors: list[str]) -> str | None:
+    """Validate the exact second-stage player/head graph contract."""
+
+    attribution = _read_text(
+        root / HEAD_MODEL_ATTRIBUTION,
+        "SunXDS head model attribution",
+        errors,
+    )
+    if attribution is not None:
+        folded = attribution.casefold()
+        missing = [
+            marker
+            for marker in HEAD_MODEL_ATTRIBUTION_MARKERS
+            if marker.casefold() not in folded
+        ]
+        if missing:
+            errors.append(
+                "SunXDS head model attribution is missing required marker(s): "
+                + ", ".join(repr(marker) for marker in missing)
+            )
+    path = root / HEAD_MODEL_ONNX
+    if not _regular_nonempty_file(path, "SunXDS head model ONNX", errors):
+        return None
+    try:
+        model = core.read_model(model=str(path))
+        inputs = tuple(model.inputs)
+        outputs = tuple(model.outputs)
+    except Exception as exc:
+        errors.append(f"OpenVINO could not inspect SunXDS head ONNX: {exc}")
+        return None
+    if len(inputs) != 1 or len(outputs) != 1:
+        errors.append(
+            "SunXDS head ONNX must expose exactly one input and one output"
+        )
+        return None
+    try:
+        input_shape = _port_shape(inputs[0])
+        output_shape = _port_shape(outputs[0])
+    except ValueError as exc:
+        errors.append(f"cannot inspect SunXDS head ONNX ports: {exc}")
+        return None
+    if input_shape != HEAD_MODEL_INPUT_SHAPE:
+        errors.append(
+            f"SunXDS head ONNX input is {input_shape}; expected "
+            f"{HEAD_MODEL_INPUT_SHAPE}"
+        )
+    if output_shape != HEAD_MODEL_OUTPUT_SHAPE:
+        errors.append(
+            f"SunXDS head ONNX output is {output_shape}; expected "
+            f"{HEAD_MODEL_OUTPUT_SHAPE}"
+        )
+    if input_shape != HEAD_MODEL_INPUT_SHAPE or output_shape != HEAD_MODEL_OUTPUT_SHAPE:
+        return None
+    return f"SunXDS head localizer: input {input_shape}; ONNX output {output_shape}"
 
 
 def _validate_model_ports(
@@ -697,6 +774,9 @@ def validate_release_assets(
                         f"IR output {ir[1]} ({ir[2]}); ONNX output {onnx[1]} ({onnx[2]})"
                         f"{detail_note}"
                     )
+            head_summary = _validate_head_model(root, core, errors)
+            if head_summary is not None:
+                summaries.append(head_summary)
     else:
         # Run the common checks to produce path-specific diagnostics.  A core
         # is intentionally unnecessary when an IR pair is not present yet.
@@ -710,6 +790,28 @@ def validate_release_assets(
             if asset.onnx_relative is not None:
                 _regular_nonempty_file(
                     root / asset.onnx_relative, f"{asset.display_name} ONNX", errors
+                )
+        _regular_nonempty_file(
+            root / HEAD_MODEL_ONNX,
+            "SunXDS head model ONNX",
+            errors,
+        )
+        attribution = _read_text(
+            root / HEAD_MODEL_ATTRIBUTION,
+            "SunXDS head model attribution",
+            errors,
+        )
+        if attribution is not None:
+            folded = attribution.casefold()
+            missing = [
+                marker
+                for marker in HEAD_MODEL_ATTRIBUTION_MARKERS
+                if marker.casefold() not in folded
+            ]
+            if missing:
+                errors.append(
+                    "SunXDS head model attribution is missing required marker(s): "
+                    + ", ".join(repr(marker) for marker in missing)
                 )
 
     if errors:

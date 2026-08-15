@@ -554,7 +554,9 @@ class QtLauncherTests(unittest.TestCase):
             QMessageBox.StandardButton.No,
         )
         self.assertIn("Normal Start works without", question.call_args.args[2])
-        self.assertIn("automatic plant-aware", question.call_args.args[2])
+        self.assertIn(
+            "automatic direct-head command-aware", question.call_args.args[2]
+        )
         self.assertIn("never activated automatically", question.call_args.args[2])
         self.assertIn("KEEP Right Mouse RELEASED", question.call_args.args[2])
         self.assertIn("Release confirmation is automatic", question.call_args.args[2])
@@ -576,7 +578,7 @@ class QtLauncherTests(unittest.TestCase):
             window.aim_makcu_calibration_help.text(),
         )
         self.assertIn(
-            "automatic plant-aware",
+            "automatic direct-head command-aware",
             window.aim_makcu_calibration_help.text(),
         )
         self.assertIn(
@@ -923,7 +925,7 @@ class QtLauncherTests(unittest.TestCase):
         self.assertFalse(window.activate_makcu_calibration_button.isEnabled())
         self.assertTrue(window.aim_makcu_vertical_rate_ratio.isEnabled())
         self.assertIn(
-            "Measured plant-aware profile",
+            "Measured calibrated profile",
             window.aim_makcu_control_mode_note.text(),
         )
 
@@ -1485,6 +1487,7 @@ class QtLauncherTests(unittest.TestCase):
                 aim_makcu_prediction_lead_seconds="0.047",
                 aim_makcu_derivative_damping_seconds="0.013",
                 aim_makcu_vertical_rate_ratio="0.63",
+                aim_head_ratio="0.08",
             )
         )
 
@@ -1497,8 +1500,19 @@ class QtLauncherTests(unittest.TestCase):
         self.assertFalse(window.aim_makcu_prediction_lead_seconds.isEnabled())
         self.assertFalse(window.aim_makcu_derivative_damping_seconds.isEnabled())
         self.assertFalse(window.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertFalse(window.aim_point.isEnabled())
+        self.assertEqual(window.aim_point.currentData(), "0.08")
+        self.assertIn("pinned direct head detector", window.aim_point.toolTip())
         self.assertIn(
-            "Automatic plant-aware control",
+            "Automatic direct-head command-aware control",
+            window.aim_makcu_control_mode_note.text(),
+        )
+        self.assertIn(
+            "pinned direct head detector supplies the anatomical aim point",
+            window.aim_makcu_control_mode_note.text(),
+        )
+        self.assertIn(
+            "saved body-box Aim point ratio is ignored",
             window.aim_makcu_control_mode_note.text(),
         )
         self.assertIn("Max step", window.aim_makcu_control_mode_note.text())
@@ -1526,6 +1540,7 @@ class QtLauncherTests(unittest.TestCase):
         self.assertEqual(collected.aim_makcu_prediction_lead_seconds, "0.061")
         self.assertEqual(collected.aim_makcu_derivative_damping_seconds, "0.015")
         self.assertEqual(collected.aim_makcu_vertical_rate_ratio, "0.7")
+        self.assertEqual(collected.aim_head_ratio, "0.08")
 
         restored = self.window(collected)
         self.assertEqual(restored.collect().aim_makcu_strength, "0.91")
@@ -1533,9 +1548,11 @@ class QtLauncherTests(unittest.TestCase):
         self.assertAlmostEqual(restored.aim_makcu_prediction_lead_seconds.value(), 0.061)
         self.assertAlmostEqual(restored.aim_makcu_derivative_damping_seconds.value(), 0.015)
         self.assertAlmostEqual(restored.aim_makcu_vertical_rate_ratio.value(), 0.70)
+        self.assertEqual(restored.aim_point.currentData(), "0.08")
         self.assertFalse(restored.aim_makcu_prediction_lead_seconds.isEnabled())
         self.assertFalse(restored.aim_makcu_derivative_damping_seconds.isEnabled())
         self.assertFalse(restored.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertFalse(restored.aim_point.isEnabled())
 
         restored.aim.setChecked(False)
         self.assertFalse(restored.aim_makcu_vertical_rate_ratio.isEnabled())
@@ -1546,17 +1563,25 @@ class QtLauncherTests(unittest.TestCase):
                 aim=True,
                 aim_makcu_active_profile="/private/profile.json",
                 aim_makcu_vertical_rate_ratio="0.63",
+                aim_head_ratio="0.16",
             )
         )
 
         self.assertTrue(window.aim_makcu_max_step.isEnabled())
         self.assertTrue(window.aim_makcu_vertical_rate_ratio.isEnabled())
+        self.assertTrue(window.aim_point.isEnabled())
+        self.assertEqual(window.aim_point.currentData(), "0.16")
+        self.assertEqual(window.collect().aim_head_ratio, "0.16")
         self.assertFalse(window.aim_makcu_strength.isEnabled())
         self.assertFalse(window.aim_makcu_smoothing.isEnabled())
         self.assertFalse(window.aim_makcu_prediction_lead_seconds.isEnabled())
         self.assertFalse(window.aim_makcu_derivative_damping_seconds.isEnabled())
         self.assertIn(
-            "Measured plant-aware profile",
+            "Measured calibrated profile",
+            window.aim_makcu_control_mode_note.text(),
+        )
+        self.assertIn(
+            "Aim point uses the saved body-box ratio",
             window.aim_makcu_control_mode_note.text(),
         )
         self.assertIn(

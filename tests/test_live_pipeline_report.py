@@ -474,6 +474,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         raw_target = Detection(0, "player", 0.90, (20, 2, 28, 22))
         _FakeDetector.detection_batches = [[raw_target], []]
         tracker_options: list[dict[str, object]] = []
+        cleanup_order: list[str] = []
 
         def recording_tracker(**options):
             tracker_options.append(options)
@@ -485,7 +486,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             def __init__(self, config, *, calibrated_controller=None) -> None:
                 self.config = config
                 self.calibrated_controller = calibrated_controller
-                self.activation_pressed = False
+                self.activation_pressed = True
                 self.started = False
                 self.stopped = False
                 self.updates: list[
@@ -509,6 +510,8 @@ class LivePipelineIntegrationTests(unittest.TestCase):
                 active=True,
                 **kwargs,
             ) -> None:
+                if self.stopped:
+                    raise AssertionError("aim controller stopped before frame update")
                 self.updates.append(
                     (target, frame_shape, active, dict(kwargs))
                 )
@@ -518,6 +521,22 @@ class LivePipelineIntegrationTests(unittest.TestCase):
 
             def stop(self) -> None:
                 self.stopped = True
+                cleanup_order.append("aim")
+
+        direct_sample = SimpleNamespace(
+            point=(24.0, 5.0),
+            source_timestamp_ns=source.base_ns,
+            confidence=0.9,
+            evidence="direct head box",
+            bridging=False,
+        )
+        head_runtime = mock.Mock()
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.return_value = False
+        head_runtime.take_latest.side_effect = [direct_sample, None]
+        head_runtime.visible_sample.return_value = direct_sample
+        head_runtime.stop.side_effect = lambda: cleanup_order.append("head") or True
 
         config = self._config(
             report_path,
@@ -541,6 +560,10 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
             mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
             mock.patch("aiming.TargetTracker", side_effect=recording_tracker),
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
         ):
             result = run(config)
 
@@ -571,24 +594,93 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             numeric.config.maximum_observation_interval_seconds,
             0.040,
         )
+        self.assertEqual(numeric.config.position_time_constant_seconds, 0.022)
+        self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
+        self.assertEqual(numeric.config.maximum_velocity_feedforward_fraction, 0.0)
         self.assertEqual(len(controller.updates), 2)
         first_target, _shape, _active, first_keywords = controller.updates[0]
-        self.assertIs(first_target, raw_target)
-        self.assertIs(first_keywords["velocity_target"], raw_target)
-        self.assertTrue(first_keywords["measurement_observed"])
-        predicted_target, _shape, _active, predicted_keywords = (
-            controller.updates[1]
+        self.assertIsNone(first_target)
+        self.assertNotIn("aim_point", first_keywords)
+        direct_target, _shape, _active, direct_keywords = controller.updates[1]
+        self.assertIs(direct_target, raw_target)
+        self.assertEqual(direct_keywords["aim_point"], direct_sample.point)
+        self.assertEqual(
+            direct_keywords["measurement_ns"],
+            direct_sample.source_timestamp_ns,
         )
-        self.assertIsNotNone(predicted_target)
-        self.assertIsNone(predicted_keywords["velocity_target"])
-        self.assertFalse(predicted_keywords["measurement_observed"])
+        self.assertNotIn("velocity_target", direct_keywords)
+        self.assertTrue(direct_keywords["measurement_observed"])
+        head_runtime.submit.assert_called_once()
+        self.assertEqual(cleanup_order, ["aim", "head"])
         startup = output.getvalue()
-        self.assertIn("control automatic plant-aware", startup)
-        self.assertIn("velocity source raw accepted", startup)
-        self.assertIn(
-            "velocity damping median 5 / 18 ms / 20000 px/s^2",
-            startup,
+        self.assertIn("control automatic command-aware observer", startup)
+        self.assertIn("head source pinned SunXDS 0.8.0 direct boxes", startup)
+        self.assertIn("velocity feed-forward disabled", startup)
+
+    def test_capture_starvation_surfaces_automatic_head_worker_failure(self) -> None:
+        report_path = self.root / "head-worker-starvation.json"
+        source = _FakeSource(static=True)
+
+        class RecordingMakcuController:
+            instances: list["RecordingMakcuController"] = []
+
+            def __init__(self, config, *, calibrated_controller=None) -> None:
+                self.config = config
+                self.calibrated_controller = calibrated_controller
+                self.activation_pressed = False
+                self.started = False
+                self.stopped = False
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                self.started = True
+
+            def stop(self) -> None:
+                self.stopped = True
+
+            def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
+                return MakcuTelemetrySnapshot()
+
+        head_runtime = mock.Mock()
+        head_runtime.status = SimpleNamespace()
+        head_runtime.stop.return_value = True
+        head_runtime.raise_if_failed.side_effect = RuntimeError(
+            "synthetic starved head failure"
         )
+        config = self._config(
+            report_path,
+            "--max-seconds",
+            "0.1",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "makcu",
+            "--aim-makcu-port",
+            "/dev/serial/by-id/test-makcu",
+        )
+
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            self.assertRaisesRegex(RuntimeError, "synthetic starved head failure"),
+        ):
+            run(config)
+
+        self.assertEqual(source.read_calls, 1)
+        # One call comes from the packet=None branch and the second from the
+        # bounded cleanup audit.  Without starvation polling this would be one.
+        self.assertEqual(head_runtime.raise_if_failed.call_count, 2)
+        head_runtime.stop.assert_called_once_with()
+        controller = RecordingMakcuController.instances[0]
+        self.assertTrue(controller.started)
+        self.assertTrue(controller.stopped)
 
     def test_detail_pass_runs_same_model_twice_and_reports_actual_geometry(self) -> None:
         report_path = self.root / "detail.json"

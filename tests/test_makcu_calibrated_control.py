@@ -263,10 +263,23 @@ class _SmoothedFeedbackRunResult:
     emitted_counts: tuple[tuple[int, int, int], ...]
 
 
+@dataclass(frozen=True, slots=True)
+class _DirectPointRunResult:
+    moving_rms_pixels: float
+    moving_p95_pixels: float
+    reversal_rms_pixels: float
+    maximum_reversal_error_pixels: float
+    stationary_rms_pixels: float
+    stationary_p95_pixels: float
+    steady_abs_counts_per_second: float
+    maximum_requested_axis_rate: float
+
+
 def _run_tracked_jitter_plant(
     controller: MakcuCalibratedController,
     *,
     raw_velocity_channel: bool = False,
+    physical_gain_scale: float = 1.0,
 ) -> _TrackedJitterRunResult:
     """Exercise the real target filter and numeric controller under box jitter."""
 
@@ -301,8 +314,8 @@ def _run_tracked_jitter_plant(
         while delayed_index < len(delayed) and delayed[delayed_index][0] <= now_ns:
             _impact_ns, delta_x, delta_y = delayed[delayed_index]
             delayed_index += 1
-            error_x -= 0.125 * delta_x
-            error_y -= 0.120 * delta_y
+            error_x -= 0.125 * physical_gain_scale * delta_x
+            error_y -= 0.120 * physical_gain_scale * delta_y
 
         observation = None
         if tick % 8 == 0:
@@ -511,6 +524,133 @@ def _percentile_95(values: list[float]) -> float:
     return ordered[math.ceil(len(ordered) * 0.95) - 1]
 
 
+def _run_direct_point_plant(
+    *,
+    position_time_constant_seconds: float,
+    feedback_deadzone_pixels: float,
+    noise_amplitude_pixels: float,
+    physical_gain_scale: float = 1.0,
+) -> _DirectPointRunResult:
+    """Exercise the automatic one-point measurement path with no velocity FF."""
+
+    controller = MakcuCalibratedController(
+        CalibratedPlant(0.125, 0.120, 0.008),
+        CalibratedControlConfig(
+            position_time_constant_seconds=position_time_constant_seconds,
+            velocity_filter_time_constant_seconds=0.018,
+            maximum_target_speed_pixels_per_second=3000.0,
+            maximum_target_acceleration_pixels_per_second_squared=20_000.0,
+            maximum_rate_x_counts_per_second=19_200.0,
+            maximum_rate_y_counts_per_second=19_200.0,
+            stale_after_seconds=0.065,
+            maximum_observation_interval_seconds=0.040,
+            maximum_error_jump_pixels=180.0,
+            feedback_deadzone_pixels=feedback_deadzone_pixels,
+            wrong_way_guard_pixels=2.0,
+            velocity_median_window=5,
+            maximum_velocity_feedforward_fraction=0.0,
+        ),
+    )
+    error_x = 70.0
+    error_y = -35.0
+    fractional_x = 0.0
+    fractional_y = 0.0
+    delayed: list[tuple[int, int, int]] = []
+    delayed_index = 0
+    observation_index = 0
+    next_observation_ms = 0
+    observation_intervals_ms = (8, 8, 7, 9, 8, 7, 9)
+    radial_errors: list[float] = []
+    requested_rates: list[tuple[float, float]] = []
+
+    for tick in range(4000):
+        now_ns = tick * NS_PER_MS
+        if 300 <= tick < 1500:
+            velocity_x, velocity_y = 575.0, -287.5
+        elif 2000 <= tick < 3200:
+            velocity_x, velocity_y = -575.0, 345.0
+        else:
+            velocity_x, velocity_y = 0.0, 0.0
+        error_x += velocity_x * 0.001
+        error_y += velocity_y * 0.001
+
+        while delayed_index < len(delayed) and delayed[delayed_index][0] <= tick:
+            _impact_ms, delta_x, delta_y = delayed[delayed_index]
+            delayed_index += 1
+            error_x -= 0.125 * physical_gain_scale * delta_x
+            error_y -= 0.120 * physical_gain_scale * delta_y
+
+        observation = None
+        if tick >= next_observation_ms:
+            noise_x = noise_amplitude_pixels * (
+                0.70 * math.sin(observation_index * 1.91)
+                + 0.30 * math.sin(observation_index * 0.47 + 0.3)
+            )
+            noise_y = noise_amplitude_pixels * (
+                0.72 * math.sin(observation_index * 1.57 + 0.2)
+                + 0.28 * math.sin(observation_index * 0.39)
+            )
+            measured_x = error_x + noise_x
+            measured_y = error_y + noise_y
+            # The direct head detector intentionally supplies this same exact
+            # point to the paired position and observer channels.
+            observation = ScreenErrorObservation(
+                now_ns,
+                measured_x,
+                measured_y,
+                velocity_error_x_pixels=measured_x,
+                velocity_error_y_pixels=measured_y,
+            )
+            next_observation_ms += observation_intervals_ms[
+                observation_index % len(observation_intervals_ms)
+            ]
+            observation_index += 1
+
+        output = controller.step(
+            now_ns,
+            engaged=True,
+            observation=observation,
+        )
+        requested_rates.append(
+            (
+                output.rate_x_counts_per_second,
+                output.rate_y_counts_per_second,
+            )
+        )
+        fractional_x += output.rate_x_counts_per_second * 0.001
+        fractional_y += output.rate_y_counts_per_second * 0.001
+        delta_x = math.trunc(fractional_x)
+        delta_y = math.trunc(fractional_y)
+        fractional_x -= delta_x
+        fractional_y -= delta_y
+        if delta_x or delta_y:
+            command = EmittedMouseCommand(now_ns, delta_x, delta_y)
+            controller.preflight_emitted(command)
+            controller.record_emitted(command)
+            delayed.append((tick + 8, delta_x, delta_y))
+        radial_errors.append(math.hypot(error_x, error_y))
+
+    moving_errors = radial_errors[400:1450]
+    reversal_errors = radial_errors[2000:2300]
+    stationary_errors = radial_errors[3400:4000]
+    stationary_rates = requested_rates[3400:4000]
+    return _DirectPointRunResult(
+        moving_rms_pixels=_rms(moving_errors),
+        moving_p95_pixels=_percentile_95(moving_errors),
+        reversal_rms_pixels=_rms(reversal_errors),
+        maximum_reversal_error_pixels=max(reversal_errors),
+        stationary_rms_pixels=_rms(stationary_errors),
+        stationary_p95_pixels=_percentile_95(stationary_errors),
+        steady_abs_counts_per_second=sum(
+            abs(rate_x) + abs(rate_y) for rate_x, rate_y in stationary_rates
+        )
+        / 600.0,
+        maximum_requested_axis_rate=max(
+            max(abs(rate_x), abs(rate_y)) for rate_x, rate_y in requested_rates
+        ),
+    )
+
+
 class CalibratedControlUnitTests(unittest.TestCase):
     def test_velocity_error_pair_is_both_or_neither_and_finite(self) -> None:
         for values in ((1.0, None), (None, 1.0)):
@@ -540,6 +680,12 @@ class CalibratedControlUnitTests(unittest.TestCase):
             config.maximum_rate_y_counts_per_second,
             config.maximum_rate_x_counts_per_second,
         )
+        self.assertEqual(config.maximum_velocity_feedforward_fraction, 1.0)
+        for invalid in (-0.01, 1.01, math.nan):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                CalibratedControlConfig(
+                    maximum_velocity_feedforward_fraction=invalid,
+                )
         self.assertEqual(config.maximum_rate_y_counts_per_second, 19_200.0)
 
     def test_automatic_empty_only_bridge_remains_valid_with_processing_age(self) -> None:
@@ -764,7 +910,9 @@ class CalibratedControlUnitTests(unittest.TestCase):
         self.assertEqual(changed.reset_reason, "velocity-channel-change")
         self.assertFalse(controller.ready)
 
-    def test_paired_linear_velocity_survives_at_zero_position_error(self) -> None:
+    def test_paired_observer_uses_one_state_for_linear_position_and_velocity(
+        self,
+    ) -> None:
         controller = MakcuCalibratedController(
             CalibratedPlant(0.10, 0.20, 0.0),
             _test_config(
@@ -773,15 +921,15 @@ class CalibratedControlUnitTests(unittest.TestCase):
                 velocity_median_window=5,
             ),
         )
-        for index in range(5):
+        for index in range(50):
             timestamp_ns = index * 10 * NS_PER_MS
             output = controller.step(
                 timestamp_ns,
                 engaged=True,
                 observation=ScreenErrorObservation(
                     timestamp_ns,
-                    0.0,
-                    0.0,
+                    index * 8.0,
+                    index * -3.0,
                     velocity_error_x_pixels=index * 8.0,
                     velocity_error_y_pixels=index * -3.0,
                 ),
@@ -798,12 +946,19 @@ class CalibratedControlUnitTests(unittest.TestCase):
             -300.0,
             delta=0.1,
         )
-        self.assertAlmostEqual(output.projected_error_x_pixels, 0.0, delta=0.01)
-        self.assertAlmostEqual(output.projected_error_y_pixels, 0.0, delta=0.01)
-        self.assertGreater(output.rate_x_counts_per_second, 7_990.0)
-        self.assertLess(output.rate_y_counts_per_second, -1_490.0)
+        # Position and velocity are projections of the same raw-point state,
+        # not the old smoothed-position plus independent OLS derivative split.
+        self.assertAlmostEqual(output.projected_error_x_pixels, 392.0, delta=0.01)
+        self.assertAlmostEqual(output.projected_error_y_pixels, -147.0, delta=0.01)
+        self.assertGreater(output.observer_position_sigma_x_pixels, 0.0)
+        self.assertGreater(
+            output.observer_velocity_sigma_x_pixels_per_second,
+            0.0,
+        )
+        self.assertGreater(output.velocity_feedforward_confidence_x, 0.99)
+        self.assertGreater(output.velocity_feedforward_confidence_y, 0.99)
 
-    def test_paired_trailing_fit_attenuates_circular_frame_noise(self) -> None:
+    def test_paired_observer_attenuates_circular_frame_noise(self) -> None:
         config = _test_config(
             velocity_filter_time_constant_seconds=0.0001,
             maximum_target_speed_pixels_per_second=10_000.0,
@@ -857,14 +1012,447 @@ class CalibratedControlUnitTests(unittest.TestCase):
                 )
 
         # Independent adjacent-frame medians follow this closed orbit as a
-        # persistent 1,768 px/s rotating vector. One shared trailing X/Y fit
-        # sees the repeated displacement and attenuates it by more than 80%.
+        # persistent 1,768 px/s rotating vector. The covariance-aware paired
+        # observer sees the bounded repeated displacement and attenuates it by
+        # more than 80% without a five-frame OLS derivative.
         self.assertGreater(min(legacy_speeds), 1_760.0)
         self.assertLess(max(paired_speeds), 251.0)
         self.assertLess(
             sum(paired_speeds) / len(paired_speeds),
             (sum(legacy_speeds) / len(legacy_speeds)) * 0.20,
         )
+
+    def test_paired_observer_suppresses_one_model_pixel_staircases(self) -> None:
+        q = 1920.0 / 416.0
+        plant = CalibratedPlant(0.125, 0.120, 0.008)
+        config = _test_config(
+            maximum_target_acceleration_pixels_per_second_squared=20_000.0,
+            maximum_rate_x_counts_per_second=19_200.0,
+            maximum_rate_y_counts_per_second=19_200.0,
+            stale_after_seconds=0.065,
+        )
+
+        def run(
+            points: tuple[tuple[float, float], ...],
+            *,
+            samples: int,
+        ) -> list[CalibratedControlOutput]:
+            controller = MakcuCalibratedController(plant, config)
+            outputs: list[CalibratedControlOutput] = []
+            for index in range(samples):
+                timestamp_ns = round(index * NS_PER_SECOND / 126.0)
+                raw_x, raw_y = points[index % len(points)]
+                outputs.append(
+                    controller.step(
+                        timestamp_ns,
+                        engaged=True,
+                        observation=ScreenErrorObservation(
+                            timestamp_ns,
+                            0.0,
+                            0.0,
+                            velocity_error_x_pixels=raw_x,
+                            velocity_error_y_pixels=raw_y,
+                        ),
+                    )
+                )
+            return outputs
+
+        # Exact logged false-motion reproduction: the tracked position stays
+        # centered while the raw box edge walks one 416-model-pixel quantum on
+        # every accepted 126 Hz sample. The old paired OLS reported 581.39 px/s
+        # and requested about 5,271 counts/s indefinitely.
+        monotonic = MakcuCalibratedController(plant, config)
+        monotonic_outputs: list[CalibratedControlOutput] = []
+        for index in range(192):
+            timestamp_ns = round(index * NS_PER_SECOND / 126.0)
+            monotonic_outputs.append(
+                monotonic.step(
+                    timestamp_ns,
+                    engaged=True,
+                    observation=ScreenErrorObservation(
+                        timestamp_ns,
+                        0.0,
+                        0.0,
+                        velocity_error_x_pixels=index * q,
+                        velocity_error_y_pixels=0.0,
+                    ),
+                )
+            )
+        monotonic_tail = monotonic_outputs[-64:]
+        self.assertGreater(
+            monotonic_tail[-1].target_velocity_x_pixels_per_second,
+            575.0,
+        )
+        self.assertLess(
+            monotonic_tail[-1].target_velocity_x_pixels_per_second,
+            590.0,
+        )
+        self.assertGreater(
+            monotonic_tail[-1].observer_velocity_sigma_x_pixels_per_second,
+            100.0,
+        )
+        self.assertEqual(monotonic_tail[-1].velocity_feedforward_confidence_x, 0.0)
+        self.assertLess(
+            max(abs(output.rate_x_counts_per_second) for output in monotonic_tail),
+            1.0,
+        )
+
+        # Also bind the smaller four-sample q-by-q loop. It never earns
+        # velocity feed-forward confidence and remains under ten percent of
+        # the measured 4,412 counts/s rotating OLS failure.
+        tiny_square = ((0.0, 0.0), (q, 0.0), (q, q), (0.0, q))
+        tiny_outputs = run(tiny_square, samples=400)[-200:]
+        tiny_rms_rate = math.sqrt(
+            sum(
+                output.rate_x_counts_per_second**2
+                + output.rate_y_counts_per_second**2
+                for output in tiny_outputs
+            )
+            / len(tiny_outputs)
+        )
+        self.assertLess(tiny_rms_rate, 4_412.0 * 0.10)
+        self.assertEqual(
+            max(output.velocity_feedforward_confidence_x for output in tiny_outputs),
+            0.0,
+        )
+        self.assertEqual(
+            max(output.velocity_feedforward_confidence_y for output in tiny_outputs),
+            0.0,
+        )
+
+        # One-q axis steps around an eight-model-pixel square were the full
+        # live orbit reproduction. Radial raw/tracker disagreement prevents an
+        # alternating quiet-looking axis from reopening that loop.
+        perimeter: list[tuple[float, float]] = []
+        perimeter.extend((index * q, -4.0 * q) for index in range(-4, 5))
+        perimeter.extend((4.0 * q, index * q) for index in range(-3, 5))
+        perimeter.extend((index * q, 4.0 * q) for index in range(3, -5, -1))
+        perimeter.extend((-4.0 * q, index * q) for index in range(3, -4, -1))
+        perimeter_outputs = run(tuple(perimeter), samples=800)[-400:]
+        self.assertLess(
+            max(
+                math.hypot(
+                    output.rate_x_counts_per_second,
+                    output.rate_y_counts_per_second,
+                )
+                for output in perimeter_outputs
+            ),
+            1.0,
+        )
+
+    def test_same_channel_quantization_is_bounded_to_position_feedback(self) -> None:
+        """Bind the direct-head limitation when no independent anchor exists."""
+
+        q = 1920.0 / 416.0
+        config = _test_config(
+            position_time_constant_seconds=0.022,
+            maximum_target_acceleration_pixels_per_second_squared=20_000.0,
+            maximum_rate_x_counts_per_second=19_200.0,
+            maximum_rate_y_counts_per_second=19_200.0,
+            stale_after_seconds=0.065,
+            feedback_deadzone_pixels=3.0,
+            maximum_velocity_feedforward_fraction=0.0,
+        )
+        plant = CalibratedPlant(0.125, 0.120, 0.008)
+
+        def run(
+            points: tuple[tuple[float, float], ...],
+            samples: int,
+        ) -> list[CalibratedControlOutput]:
+            controller = MakcuCalibratedController(plant, config)
+            outputs: list[CalibratedControlOutput] = []
+            for index in range(samples):
+                timestamp_ns = round(index * NS_PER_SECOND / 126.0)
+                point_x, point_y = points[index % len(points)]
+                outputs.append(
+                    controller.step(
+                        timestamp_ns,
+                        engaged=True,
+                        observation=ScreenErrorObservation(
+                            timestamp_ns,
+                            point_x,
+                            point_y,
+                            velocity_error_x_pixels=point_x,
+                            velocity_error_y_pixels=point_y,
+                        ),
+                    )
+                )
+            return outputs
+
+        # With identical channels this sample stream is observationally equal
+        # to a real 581 px/s target. FF=0 removes the false 4,651 counts/s
+        # derivative term, but no numeric observer can also reject its growing
+        # position error without external evidence that the point is false.
+        monotonic_points = tuple((index * q, 0.0) for index in range(192))
+        monotonic = run(monotonic_points, len(monotonic_points))
+        monotonic_tail = monotonic[-64:]
+        self.assertEqual(
+            max(
+                output.velocity_feedforward_confidence_x
+                for output in monotonic_tail
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            min(output.rate_x_counts_per_second for output in monotonic_tail),
+            19_200.0,
+        )
+        self.assertEqual(
+            max(output.rate_x_counts_per_second for output in monotonic_tail),
+            19_200.0,
+        )
+
+        perimeter: list[tuple[float, float]] = []
+        perimeter.extend((index * q, -4.0 * q) for index in range(-4, 5))
+        perimeter.extend((4.0 * q, index * q) for index in range(-3, 5))
+        perimeter.extend((index * q, 4.0 * q) for index in range(3, -5, -1))
+        perimeter.extend((-4.0 * q, index * q) for index in range(3, -4, -1))
+        perimeter_tail = run(tuple(perimeter), 800)[-400:]
+        perimeter_rms_rate = math.sqrt(
+            sum(
+                output.rate_x_counts_per_second**2
+                + output.rate_y_counts_per_second**2
+                for output in perimeter_tail
+            )
+            / len(perimeter_tail)
+        )
+        self.assertEqual(
+            max(
+                output.velocity_feedforward_confidence_x
+                for output in perimeter_tail
+            ),
+            0.0,
+        )
+        self.assertEqual(
+            max(
+                output.velocity_feedforward_confidence_y
+                for output in perimeter_tail
+            ),
+            0.0,
+        )
+        # This upper bound protects the configured feedback-only envelope. It
+        # deliberately does not claim the same-channel orbit is distinguishable.
+        self.assertLess(perimeter_rms_rate, 9_700.0)
+        self.assertLess(
+            max(
+                math.hypot(
+                    output.rate_x_counts_per_second,
+                    output.rate_y_counts_per_second,
+                )
+                for output in perimeter_tail
+            ),
+            11_100.0,
+        )
+
+    def test_paired_observer_tracks_variable_dt_motion_and_reversal(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.125, 0.120, 0.008),
+            _test_config(
+                maximum_target_acceleration_pixels_per_second_squared=20_000.0,
+                maximum_rate_x_counts_per_second=19_200.0,
+                maximum_rate_y_counts_per_second=19_200.0,
+                stale_after_seconds=0.065,
+            ),
+        )
+        intervals_ms = (7, 9, 8, 8, 7, 9)
+        timestamp_ns = 0
+        position_x = 0.0
+        outputs: list[CalibratedControlOutput] = []
+        for index in range(240):
+            if index:
+                interval_ms = intervals_ms[index % len(intervals_ms)]
+                timestamp_ns += interval_ms * NS_PER_MS
+                velocity = 575.0 if index < 120 else -575.0
+                position_x += velocity * interval_ms / 1000.0
+            outputs.append(
+                controller.step(
+                    timestamp_ns,
+                    engaged=True,
+                    observation=ScreenErrorObservation(
+                        timestamp_ns,
+                        position_x,
+                        0.0,
+                        velocity_error_x_pixels=position_x,
+                        velocity_error_y_pixels=0.0,
+                    ),
+                )
+            )
+
+        self.assertLess(
+            max(
+                abs(output.target_velocity_x_pixels_per_second - 575.0)
+                for output in outputs[80:120]
+            ),
+            0.1,
+        )
+        first_negative = next(
+            index
+            for index, output in enumerate(outputs[120:])
+            if output.target_velocity_x_pixels_per_second < 0.0
+        )
+        self.assertLessEqual(first_negative, 3)
+        self.assertLess(
+            max(
+                abs(output.target_velocity_x_pixels_per_second + 575.0)
+                for output in outputs[-40:]
+            ),
+            0.1,
+        )
+        self.assertGreater(outputs[-1].velocity_feedforward_confidence_x, 0.99)
+        self.assertLess(
+            outputs[-1].observer_velocity_sigma_x_pixels_per_second,
+            200.0,
+        )
+
+    def test_paired_observer_gates_outlier_and_reacquires_fail_closed(self) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            _test_config(stale_after_seconds=0.065),
+        )
+
+        def observe(index: int, position: float) -> CalibratedControlOutput:
+            timestamp_ns = index * 8 * NS_PER_MS
+            return controller.step(
+                timestamp_ns,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    timestamp_ns,
+                    position,
+                    0.0,
+                    velocity_error_x_pixels=position,
+                    velocity_error_y_pixels=0.0,
+                ),
+            )
+
+        observe(0, 0.0)
+        observe(1, 0.0)
+        accepted = observe(2, 0.0)
+        rejected = observe(3, 1_000.0)
+        self.assertTrue(rejected.valid)
+        self.assertTrue(rejected.innovation_rejected)
+        self.assertGreater(rejected.innovation_mahalanobis_squared, 16.0)
+        self.assertAlmostEqual(rejected.projected_error_x_pixels, 0.0, delta=0.01)
+        bridged = controller.step(25 * NS_PER_MS, engaged=True)
+        self.assertTrue(bridged.innovation_rejected)
+        self.assertEqual(
+            bridged.innovation_mahalanobis_squared,
+            rejected.innovation_mahalanobis_squared,
+        )
+        recovered = observe(4, 0.0)
+        self.assertTrue(recovered.valid)
+        self.assertFalse(recovered.innovation_rejected)
+        self.assertAlmostEqual(
+            recovered.target_velocity_x_pixels_per_second,
+            accepted.target_velocity_x_pixels_per_second,
+            delta=0.01,
+        )
+
+        observe(5, 1_000.0)
+        observe(6, 1_000.0)
+        reacquired = observe(7, 1_000.0)
+        self.assertFalse(reacquired.valid)
+        self.assertEqual(reacquired.reset_reason, "innovation-reacquired")
+        self.assertFalse(controller.ready)
+
+    def test_paired_release_and_loss_clear_observer_and_require_confirmation(
+        self,
+    ) -> None:
+        for action, reason in (
+            ({"engaged": False}, "released"),
+            ({"engaged": True, "target_lost": True}, "target-lost"),
+        ):
+            with self.subTest(reason=reason):
+                controller = MakcuCalibratedController(
+                    CalibratedPlant(0.10, 0.10, 0.0),
+                    _test_config(stale_after_seconds=0.065),
+                )
+                for index in range(2):
+                    timestamp_ns = index * 8 * NS_PER_MS
+                    controller.step(
+                        timestamp_ns,
+                        engaged=True,
+                        observation=ScreenErrorObservation(
+                            timestamp_ns,
+                            10.0,
+                            0.0,
+                            velocity_error_x_pixels=10.0,
+                            velocity_error_y_pixels=0.0,
+                        ),
+                    )
+                stopped = controller.step(16 * NS_PER_MS, **action)
+                self.assertFalse(stopped.valid)
+                self.assertEqual(stopped.reset_reason, reason)
+                self.assertEqual(
+                    stopped.observer_velocity_sigma_x_pixels_per_second,
+                    0.0,
+                )
+                first = controller.step(
+                    24 * NS_PER_MS,
+                    engaged=True,
+                    observation=ScreenErrorObservation(
+                        24 * NS_PER_MS,
+                        10.0,
+                        0.0,
+                        velocity_error_x_pixels=10.0,
+                        velocity_error_y_pixels=0.0,
+                    ),
+                )
+                self.assertFalse(first.valid)
+                self.assertEqual(first.reset_reason, "awaiting-confirmation")
+                second = controller.step(
+                    32 * NS_PER_MS,
+                    engaged=True,
+                    observation=ScreenErrorObservation(
+                        32 * NS_PER_MS,
+                        10.0,
+                        0.0,
+                        velocity_error_x_pixels=10.0,
+                        velocity_error_y_pixels=0.0,
+                    ),
+                )
+                self.assertTrue(second.valid)
+
+    def test_velocity_feedforward_cap_does_not_change_legacy_callers(self) -> None:
+        controllers = (
+            MakcuCalibratedController(
+                CalibratedPlant(0.10, 0.20, 0.012),
+                _test_config(
+                    maximum_velocity_feedforward_fraction=fraction,
+                    velocity_filter_time_constant_seconds=0.0001,
+                    maximum_target_acceleration_pixels_per_second_squared=1e9,
+                    velocity_median_window=1,
+                ),
+            )
+            for fraction in (0.0, 1.0)
+        )
+        outputs: list[list[CalibratedControlOutput]] = []
+        for controller in controllers:
+            outputs.append(
+                [
+                    controller.step(
+                        100 * NS_PER_MS,
+                        engaged=True,
+                        observation=ScreenErrorObservation(
+                            100 * NS_PER_MS,
+                            10.0,
+                            -4.0,
+                        ),
+                    ),
+                    controller.step(
+                        120 * NS_PER_MS,
+                        engaged=True,
+                        observation=ScreenErrorObservation(
+                            120 * NS_PER_MS,
+                            16.0,
+                            -8.0,
+                        ),
+                        emitted_commands=(
+                            EmittedMouseCommand(105 * NS_PER_MS, 20, -10),
+                        ),
+                    ),
+                ]
+            )
+        self.assertEqual(outputs[0], outputs[1])
 
     def test_successful_recorded_write_reduces_projected_error_exactly_once(self) -> None:
         def established_controller() -> tuple[
@@ -1199,48 +1787,228 @@ class CalibratedControlUnitTests(unittest.TestCase):
 
 
 class CalibratedControlPlantTests(unittest.TestCase):
-    def test_automatic_raw_velocity_improves_real_tracker_closed_loop(self) -> None:
+    def test_direct_point_automatic_tuning_bounds_noise_motion_and_gain_error(
+        self,
+    ) -> None:
+        candidates = tuple(
+            (time_constant, deadzone)
+            for time_constant in (0.022, 0.035, 0.045, 0.060)
+            for deadzone in (2.5, 3.0)
+        )
+        nominal = {
+            (time_constant, deadzone, noise): _run_direct_point_plant(
+                position_time_constant_seconds=time_constant,
+                feedback_deadzone_pixels=deadzone,
+                noise_amplitude_pixels=noise,
+            )
+            for time_constant, deadzone in candidates
+            for noise in (0.4, 0.7, 1.0)
+        }
+        mismatched = {
+            (time_constant, deadzone, scale): _run_direct_point_plant(
+                position_time_constant_seconds=time_constant,
+                feedback_deadzone_pixels=deadzone,
+                noise_amplitude_pixels=1.0,
+                physical_gain_scale=scale,
+            )
+            for time_constant, deadzone in candidates
+            for scale in (0.80, 1.20)
+        }
+
+        # With FF intentionally disabled, constant-motion lag is dominated by
+        # the position time constant. The 22 ms candidate extends the requested
+        # 35/45/60 ms sweep and wins at each tested deadzone.
+        for deadzone in (2.5, 3.0):
+            moving_rms = [
+                nominal[(time_constant, deadzone, 1.0)].moving_rms_pixels
+                for time_constant in (0.022, 0.035, 0.045, 0.060)
+            ]
+            self.assertLess(moving_rms[0], moving_rms[1] * 0.65)
+            self.assertLess(moving_rms[1], moving_rms[2] * 0.80)
+            self.assertLess(moving_rms[2], moving_rms[3] * 0.80)
+
+        chosen_nominal = [
+            nominal[(0.022, 3.0, noise)] for noise in (0.4, 0.7, 1.0)
+        ]
+        chosen_mismatch = [
+            mismatched[(0.022, 3.0, scale)] for scale in (0.80, 1.20)
+        ]
+        self.assertLess(
+            max(result.moving_rms_pixels for result in chosen_nominal),
+            13.6,
+        )
+        self.assertLess(
+            max(result.moving_p95_pixels for result in chosen_nominal),
+            13.9,
+        )
+        self.assertLess(
+            max(result.reversal_rms_pixels for result in chosen_nominal),
+            15.0,
+        )
+        self.assertLess(
+            max(result.stationary_rms_pixels for result in chosen_nominal),
+            3.1,
+        )
+        self.assertLess(
+            max(
+                result.steady_abs_counts_per_second
+                for result in chosen_nominal
+            ),
+            2.0,
+        )
+
+        # A physical gain 20% below the nominal calibration is the limiting
+        # pursuit case. It remains bounded without FF or a stationary orbit.
+        self.assertLess(
+            max(result.moving_rms_pixels for result in chosen_mismatch),
+            17.0,
+        )
+        self.assertLess(
+            max(result.moving_p95_pixels for result in chosen_mismatch),
+            17.3,
+        )
+        self.assertLess(
+            max(result.reversal_rms_pixels for result in chosen_mismatch),
+            18.4,
+        )
+        self.assertLess(
+            max(
+                result.maximum_reversal_error_pixels
+                for result in chosen_mismatch
+            ),
+            22.6,
+        )
+        self.assertLess(
+            max(result.stationary_rms_pixels for result in chosen_mismatch),
+            2.9,
+        )
+        self.assertLess(
+            max(
+                result.steady_abs_counts_per_second
+                for result in chosen_mismatch
+            ),
+            1.5,
+        )
+        self.assertLessEqual(
+            max(
+                result.maximum_requested_axis_rate
+                for result in chosen_nominal + chosen_mismatch
+            ),
+            19_200.0,
+        )
+
+    def test_automatic_factory_uses_direct_point_feedback_only_tuning(self) -> None:
         from main import _automatic_plant_aware_controller
 
-        smoothed_only_controller = _automatic_plant_aware_controller(max_step=320)
-        raw_controller = _automatic_plant_aware_controller(max_step=320)
+        controller = _automatic_plant_aware_controller(max_step=320)
         self.assertEqual(
-            raw_controller.config.velocity_filter_time_constant_seconds,
+            controller.config.velocity_filter_time_constant_seconds,
             0.018,
         )
-        self.assertEqual(raw_controller.config.velocity_median_window, 5)
+        self.assertEqual(controller.config.velocity_median_window, 5)
         self.assertEqual(
-            raw_controller.config.maximum_target_acceleration_pixels_per_second_squared,
+            controller.config.maximum_target_acceleration_pixels_per_second_squared,
             20_000.0,
         )
-        smoothed_only = _run_tracked_jitter_plant(smoothed_only_controller)
-        paired_raw = _run_tracked_jitter_plant(
-            raw_controller,
-            raw_velocity_channel=True,
+        self.assertEqual(controller.config.position_time_constant_seconds, 0.022)
+        self.assertEqual(controller.config.feedback_deadzone_pixels, 3.0)
+        self.assertEqual(controller.config.maximum_velocity_feedforward_fraction, 0.0)
+
+        output = None
+        q = 1920.0 / 416.0
+        for index in range(24):
+            timestamp_ns = round(index * NS_PER_SECOND / 126.0)
+            point_x = index * q
+            output = controller.step(
+                timestamp_ns,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    timestamp_ns,
+                    point_x,
+                    0.0,
+                    velocity_error_x_pixels=point_x,
+                    velocity_error_y_pixels=0.0,
+                ),
+            )
+        assert output is not None
+        self.assertTrue(output.valid)
+        self.assertGreater(output.target_velocity_x_pixels_per_second, 575.0)
+        self.assertEqual(output.velocity_feedforward_confidence_x, 0.0)
+        self.assertGreater(output.rate_x_counts_per_second, 0.0)
+
+    def test_direct_point_feedback_only_tuning_rejects_subpixel_noise(self) -> None:
+        results = [
+            _run_direct_point_plant(
+                position_time_constant_seconds=0.022,
+                feedback_deadzone_pixels=3.0,
+                noise_amplitude_pixels=noise,
+            )
+            for noise in (0.4, 0.7, 1.0)
+        ]
+        self.assertLess(
+            max(result.stationary_rms_pixels for result in results),
+            3.1,
+        )
+        self.assertLess(
+            max(result.steady_abs_counts_per_second for result in results),
+            2.0,
         )
 
-        smoothed_stationary = list(smoothed_only.radial_errors[3300:])
-        raw_stationary = list(paired_raw.radial_errors[3300:])
-        smoothed_moving = list(smoothed_only.radial_errors[300:3200])
-        raw_moving = list(paired_raw.radial_errors[300:3200])
-        smoothed_reversal = list(smoothed_only.radial_errors[2000:2300])
-        raw_reversal = list(paired_raw.radial_errors[2000:2300])
-
-        # Same physical plant, integer writes, 8 ms observations, the real
-        # TargetTracker filter, and its representative 2--15 px raw residuals.
-        # The raw channel must buy quieter stationary output without creating
-        # the tracking/reversal lag that additional velocity damping caused.
-        self.assertLess(
-            paired_raw.steady_abs_counts_per_second,
-            smoothed_only.steady_abs_counts_per_second * 0.70,
+    def test_bounded_automatic_feedforward_handles_twenty_percent_gain_error(
+        self,
+    ) -> None:
+        config = CalibratedControlConfig(
+            position_time_constant_seconds=0.060,
+            velocity_filter_time_constant_seconds=0.018,
+            maximum_target_speed_pixels_per_second=3000.0,
+            maximum_target_acceleration_pixels_per_second_squared=20_000.0,
+            maximum_rate_x_counts_per_second=19_200.0,
+            maximum_rate_y_counts_per_second=19_200.0,
+            stale_after_seconds=0.065,
+            maximum_observation_interval_seconds=0.040,
+            velocity_median_window=5,
+            maximum_velocity_feedforward_fraction=0.95,
         )
-        self.assertLess(_rms(raw_stationary), _rms(smoothed_stationary) * 0.95)
-        self.assertLess(_rms(raw_moving), _rms(smoothed_moving))
-        self.assertLess(_rms(raw_reversal), _rms(smoothed_reversal))
-        self.assertLess(max(raw_reversal), max(smoothed_reversal))
+        results = [
+            _run_tracked_jitter_plant(
+                MakcuCalibratedController(
+                    CalibratedPlant(0.125, 0.120, 0.008),
+                    config,
+                ),
+                raw_velocity_channel=True,
+                physical_gain_scale=scale,
+            )
+            for scale in (0.80, 1.20)
+        ]
+
+        moving_rms = [
+            _rms(list(result.radial_errors[300:3200])) for result in results
+        ]
+        moving_p95 = [
+            _percentile_95(list(result.radial_errors[300:3200]))
+            for result in results
+        ]
+        reversal_rms = [
+            _rms(list(result.radial_errors[2000:2300])) for result in results
+        ]
+        stationary_rms = [
+            _rms(list(result.radial_errors[3300:])) for result in results
+        ]
+
+        # A 0.95 cap was the best candidate at or below 0.95 in the
+        # deterministic +/-20% sweep: lower caps accumulated pursuit error,
+        # while this setting retains sub-8 px moving RMS without instability.
+        self.assertLess(max(moving_rms), 7.5)
+        self.assertLess(max(moving_p95), 18.0)
+        self.assertLess(max(reversal_rms), 17.0)
+        self.assertLess(max(stationary_rms), 2.6)
         self.assertLess(
-            paired_raw.maximum_requested_axis_rate,
-            smoothed_only.maximum_requested_axis_rate,
+            max(result.steady_abs_counts_per_second for result in results),
+            750.0,
+        )
+        self.assertLessEqual(
+            max(result.maximum_requested_axis_rate for result in results),
+            19_200.0,
         )
 
     def test_raw_velocity_channel_breaks_smoothed_feedback_limit_cycle(self) -> None:
@@ -1272,65 +2040,6 @@ class CalibratedControlPlantTests(unittest.TestCase):
         self.assertLess(_rms(paired_steady_error), 1.0)
         self.assertLess(max(paired_steady_speed), 0.01)
         self.assertEqual(paired_counts, 0)
-
-    def test_automatic_velocity_damping_rejects_live_scale_box_jitter(self) -> None:
-        from main import _automatic_plant_aware_controller
-
-        automatic = _run_tracked_jitter_plant(
-            _automatic_plant_aware_controller(max_step=320),
-            raw_velocity_channel=True,
-        )
-        short_filter = _run_tracked_jitter_plant(
-            MakcuCalibratedController(
-                CalibratedPlant(0.125, 0.120, 0.008),
-                CalibratedControlConfig(
-                    maximum_rate_x_counts_per_second=19_200.0,
-                    maximum_rate_y_counts_per_second=19_200.0,
-                ),
-            ),
-        )
-
-        # The final 700 ms are a stationary target. Do not turn small box
-        # geometry changes into a near-continuous stream of opposing counts.
-        self.assertLess(
-            automatic.steady_abs_counts_per_second,
-            short_filter.steady_abs_counts_per_second * 0.45,
-        )
-        self.assertLess(automatic.steady_abs_counts_per_second, 850.0)
-        automatic_stationary = automatic.radial_errors[3300:]
-        short_filter_stationary = short_filter.radial_errors[3300:]
-        self.assertLess(
-            _rms(list(automatic_stationary)),
-            _rms(list(short_filter_stationary)),
-        )
-        self.assertLess(_rms(list(automatic_stationary)), 4.0)
-
-        # Damping still has to pursue both high-speed directions rather than
-        # buying quiet output by falling materially behind the moving target.
-        automatic_moving = automatic.radial_errors[300:3200]
-        short_filter_moving = short_filter.radial_errors[300:3200]
-        self.assertLess(
-            _rms(list(automatic_moving)),
-            _rms(list(short_filter_moving)) * 1.15,
-        )
-        self.assertLess(_rms(list(automatic_moving)), 10.0)
-
-        # Aggregate pursuit metrics can hide a sluggish response immediately
-        # after the target reverses. Keep the first 300 ms of the second
-        # pursuit bounded as well as the longer moving interval above.
-        automatic_reversal = automatic.radial_errors[2000:2300]
-        short_filter_reversal = short_filter.radial_errors[2000:2300]
-        self.assertLess(
-            _rms(list(automatic_reversal)),
-            _rms(list(short_filter_reversal)) * 1.30,
-        )
-        self.assertLess(_rms(list(automatic_reversal)), 18.0)
-        self.assertLess(max(automatic_reversal), 35.0)
-        self.assertLess(
-            automatic.maximum_requested_axis_rate,
-            short_filter.maximum_requested_axis_rate * 0.90,
-        )
-        self.assertLessEqual(automatic.maximum_requested_axis_rate, 19_200.0)
 
     def test_automatic_seed_tracks_through_duplicate_box_mode_noise(self) -> None:
         """Exercise tracker arbitration and delayed control as one closed loop."""

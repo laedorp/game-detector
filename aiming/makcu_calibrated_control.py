@@ -36,6 +36,33 @@ __all__ = (
 
 _NS_PER_SECOND = 1_000_000_000
 
+# The paired raw-point path is deliberately a small, dependency-free Kalman
+# observer.  These values describe detector uncertainty, rather than tuning a
+# differentiator.  The 2.5-pixel floor grows by a conservative fraction of the
+# measured raw-versus-track residual on each sample, covering the observed
+# 6--11 px player-box excursions without hiding two coordinates which genuinely
+# agree.  Acceleration noise is derived from the existing bounded target-
+# acceleration setting below.
+_PAIRED_MEASUREMENT_SIGMA_PIXELS = 2.5
+_PAIRED_TRACK_RESIDUAL_VARIANCE_FRACTION = 0.10
+_PAIRED_INITIAL_VELOCITY_SIGMA_PIXELS_PER_SECOND = 1500.0
+_PAIRED_MINIMUM_ACCELERATION_SIGMA_PIXELS_PER_SECOND_SQUARED = 1000.0
+_PAIRED_MAXIMUM_ACCELERATION_SIGMA_PIXELS_PER_SECOND_SQUARED = 8000.0
+_PAIRED_ACCELERATION_SIGMA_FRACTION = 0.40
+_PAIRED_PLANT_GAIN_UNCERTAINTY_FRACTION = 0.20
+_PAIRED_INNOVATION_GATE_MAHALANOBIS_SQUARED = 16.0
+_PAIRED_REJECTIONS_BEFORE_RESEED = 3
+_PAIRED_FEEDBACK_ENTER_SIGMAS = 1.25
+_PAIRED_FEEDBACK_EXIT_SIGMAS = 2.0
+_PAIRED_HELD_FEEDBACK_FRACTION = 0.75
+_PAIRED_FEEDFORWARD_FULL_VELOCITY_SIGMA = 200.0
+_PAIRED_FEEDFORWARD_ZERO_VELOCITY_SIGMA = 600.0
+_PAIRED_FEEDFORWARD_ZERO_SIGNAL_TO_NOISE = 0.5
+_PAIRED_FEEDFORWARD_FULL_SIGNAL_TO_NOISE = 2.0
+_PAIRED_FULL_POSITION_CHANNEL_AGREEMENT_PIXELS = 8.0
+_PAIRED_ZERO_POSITION_CHANNEL_AGREEMENT_PIXELS = 16.0
+_MAXIMUM_OBSERVER_DIAGNOSTIC = 1_000_000.0
+
 
 def _finite(value: object, name: str) -> float:
     if isinstance(value, bool):
@@ -112,6 +139,7 @@ class CalibratedControlConfig:
     feedback_deadzone_pixels: float = 0.50
     wrong_way_guard_pixels: float = 2.0
     velocity_median_window: int = 3
+    maximum_velocity_feedforward_fraction: float = 1.0
     maximum_command_history: int = 4096
 
     def __post_init__(self) -> None:
@@ -132,6 +160,19 @@ class CalibratedControlConfig:
             if value < 0.0:
                 raise ValueError(f"{name} cannot be negative")
             object.__setattr__(self, name, value)
+        feedforward_fraction = _finite(
+            self.maximum_velocity_feedforward_fraction,
+            "maximum_velocity_feedforward_fraction",
+        )
+        if not 0.0 <= feedforward_fraction <= 1.0:
+            raise ValueError(
+                "maximum_velocity_feedforward_fraction must be between zero and one"
+            )
+        object.__setattr__(
+            self,
+            "maximum_velocity_feedforward_fraction",
+            feedforward_fraction,
+        )
         if (
             isinstance(self.velocity_median_window, bool)
             or not isinstance(self.velocity_median_window, int)
@@ -156,13 +197,14 @@ class CalibratedControlConfig:
 class ScreenErrorObservation:
     """One observed X/Y error in the calibration profile's pixel space.
 
-    ``error_*`` is the position-control observation and may therefore be a
-    tracker-smoothed point.  The optional ``velocity_error_*`` pair supplies
-    the accepted raw point from that same target and source timestamp.  A raw
-    velocity channel keeps the exact command ledger in the same measurement
-    domain as the plant calibration instead of differentiating a downstream
-    smoothing filter.  Omitting both optional fields preserves the historical
-    single-channel estimator exactly.
+    ``error_*`` is the historical position-control observation and may be a
+    tracker-smoothed point.  Supplying the optional ``velocity_error_*`` pair
+    selects the automatic raw-point observer: that accepted detector point is
+    the single measurement used to estimate both image position and target
+    velocity.  Exact landed commands are its known control input.  This avoids
+    differentiating a separately smoothed coordinate or letting two estimators
+    disagree.  Omitting both optional fields preserves the historical
+    single-channel controller exactly.
     """
 
     timestamp_ns: int
@@ -243,6 +285,14 @@ class CalibratedControlOutput:
     saturated_x: bool = False
     saturated_y: bool = False
     reset_reason: str | None = None
+    observer_position_sigma_x_pixels: float = 0.0
+    observer_position_sigma_y_pixels: float = 0.0
+    observer_velocity_sigma_x_pixels_per_second: float = 0.0
+    observer_velocity_sigma_y_pixels_per_second: float = 0.0
+    velocity_feedforward_confidence_x: float = 0.0
+    velocity_feedforward_confidence_y: float = 0.0
+    innovation_mahalanobis_squared: float = 0.0
+    innovation_rejected: bool = False
 
 
 class MakcuCalibratedController:
@@ -282,14 +332,22 @@ class MakcuCalibratedController:
         window = self.config.velocity_median_window
         self._raw_velocity_x: deque[float] = deque(maxlen=window)
         self._raw_velocity_y: deque[float] = deque(maxlen=window)
-        # The paired raw channel estimates one 2-D trajectory over shared
-        # timestamps. Keep two samples even when the legacy median window is
-        # one so an adjacent secant remains defined.
-        self._paired_velocity_history: deque[tuple[int, float, float]] = deque(
-            maxlen=max(2, window)
-        )
+        # One block-diagonal four-state observer: [position X, position Y,
+        # velocity X, velocity Y]. Each independent image axis stores the
+        # symmetric 2x2 covariance as (position variance, cross covariance,
+        # velocity variance). The observer is used only when the paired raw
+        # point is present; legacy/no-raw callers retain the original path.
         self._paired_position_x = 0.0
         self._paired_position_y = 0.0
+        self._paired_covariance_x = (0.0, 0.0, 0.0)
+        self._paired_covariance_y = (0.0, 0.0, 0.0)
+        self._paired_feedback_hold_x = False
+        self._paired_feedback_hold_y = False
+        self._paired_measurement_agreement_x = 1.0
+        self._paired_measurement_agreement_y = 1.0
+        self._paired_rejection_count = 0
+        self._last_innovation_rejected = False
+        self._last_innovation_mahalanobis_squared = 0.0
 
     @property
     def ready(self) -> bool:
@@ -428,35 +486,117 @@ class MakcuCalibratedController:
             horizon_ns,
         )
         horizon_seconds = (horizon_ns - latest.timestamp_ns) / _NS_PER_SECOND
-        projected_x = (
-            latest.error_x_pixels
-            + self._velocity_x * horizon_seconds
-            - self.plant.gain_x_pixels_per_count * pending_x
-        )
-        projected_y = (
-            latest.error_y_pixels
-            + self._velocity_y * horizon_seconds
-            - self.plant.gain_y_pixels_per_count * pending_y
-        )
+        paired_observer = latest.velocity_error_x_pixels is not None
+        if paired_observer:
+            projected_x, projected_velocity_x, projected_covariance_x = (
+                self._paired_predict_axis(
+                    self._paired_position_x,
+                    self._velocity_x,
+                    self._paired_covariance_x,
+                    horizon_seconds,
+                    self.plant.gain_x_pixels_per_count * pending_x,
+                )
+            )
+            projected_y, projected_velocity_y, projected_covariance_y = (
+                self._paired_predict_axis(
+                    self._paired_position_y,
+                    self._velocity_y,
+                    self._paired_covariance_y,
+                    horizon_seconds,
+                    self.plant.gain_y_pixels_per_count * pending_y,
+                )
+            )
+            position_sigma_x = math.sqrt(projected_covariance_x[0])
+            position_sigma_y = math.sqrt(projected_covariance_y[0])
+            velocity_sigma_x = math.sqrt(projected_covariance_x[2])
+            velocity_sigma_y = math.sqrt(projected_covariance_y[2])
+            feedforward_confidence_x = self._paired_velocity_confidence(
+                projected_velocity_x,
+                velocity_sigma_x,
+            ) * self._paired_measurement_agreement_x
+            feedforward_confidence_y = self._paired_velocity_confidence(
+                projected_velocity_y,
+                velocity_sigma_y,
+            ) * self._paired_measurement_agreement_y
+            self._paired_feedback_hold_x = self._paired_feedback_hold(
+                self._paired_feedback_hold_x,
+                projected_x,
+                position_sigma_x,
+            )
+            self._paired_feedback_hold_y = self._paired_feedback_hold(
+                self._paired_feedback_hold_y,
+                projected_y,
+                position_sigma_y,
+            )
+        else:
+            projected_velocity_x = self._velocity_x
+            projected_velocity_y = self._velocity_y
+            projected_x = (
+                latest.error_x_pixels
+                + projected_velocity_x * horizon_seconds
+                - self.plant.gain_x_pixels_per_count * pending_x
+            )
+            projected_y = (
+                latest.error_y_pixels
+                + projected_velocity_y * horizon_seconds
+                - self.plant.gain_y_pixels_per_count * pending_y
+            )
+            position_sigma_x = 0.0
+            position_sigma_y = 0.0
+            velocity_sigma_x = 0.0
+            velocity_sigma_y = 0.0
+            feedforward_confidence_x = 1.0
+            feedforward_confidence_y = 1.0
         if not all(
             math.isfinite(value)
-            for value in (projected_x, projected_y, self._velocity_x, self._velocity_y)
+            for value in (
+                projected_x,
+                projected_y,
+                projected_velocity_x,
+                projected_velocity_y,
+                position_sigma_x,
+                position_sigma_y,
+                velocity_sigma_x,
+                velocity_sigma_y,
+                feedforward_confidence_x,
+                feedforward_confidence_y,
+            )
         ):
             self._reset_tracking()
             return self._zero(current_ns, "non-finite-control-state")
 
-        rate_x, saturated_x = self._axis_rate(
-            projected_x,
-            self._velocity_x,
-            self.plant.gain_x_pixels_per_count,
-            self.config.maximum_rate_x_counts_per_second,
-        )
-        rate_y, saturated_y = self._axis_rate(
-            projected_y,
-            self._velocity_y,
-            self.plant.gain_y_pixels_per_count,
-            self.config.maximum_rate_y_counts_per_second,
-        )
+        if paired_observer:
+            rate_x, saturated_x = self._paired_axis_rate(
+                projected_x,
+                projected_velocity_x,
+                self.plant.gain_x_pixels_per_count,
+                self.config.maximum_rate_x_counts_per_second,
+                feedforward_confidence_x,
+                feedback_held=self._paired_feedback_hold_x,
+                position_confidence=self._paired_measurement_agreement_x,
+            )
+            rate_y, saturated_y = self._paired_axis_rate(
+                projected_y,
+                projected_velocity_y,
+                self.plant.gain_y_pixels_per_count,
+                self.config.maximum_rate_y_counts_per_second,
+                feedforward_confidence_y,
+                feedback_held=self._paired_feedback_hold_y,
+                position_confidence=self._paired_measurement_agreement_y,
+            )
+        else:
+            rate_x, saturated_x = self._axis_rate(
+                projected_x,
+                projected_velocity_x,
+                self.plant.gain_x_pixels_per_count,
+                self.config.maximum_rate_x_counts_per_second,
+            )
+            rate_y, saturated_y = self._axis_rate(
+                projected_y,
+                projected_velocity_y,
+                self.plant.gain_y_pixels_per_count,
+                self.config.maximum_rate_y_counts_per_second,
+            )
         if not math.isfinite(rate_x) or not math.isfinite(rate_y):
             self._reset_tracking()
             return self._zero(current_ns, "non-finite-control-output")
@@ -464,13 +604,31 @@ class MakcuCalibratedController:
             timestamp_ns=current_ns,
             rate_x_counts_per_second=rate_x,
             rate_y_counts_per_second=rate_y,
-            target_velocity_x_pixels_per_second=self._velocity_x,
-            target_velocity_y_pixels_per_second=self._velocity_y,
+            target_velocity_x_pixels_per_second=projected_velocity_x,
+            target_velocity_y_pixels_per_second=projected_velocity_y,
             projected_error_x_pixels=projected_x,
             projected_error_y_pixels=projected_y,
             valid=True,
             saturated_x=saturated_x,
             saturated_y=saturated_y,
+            observer_position_sigma_x_pixels=self._bounded_diagnostic(
+                position_sigma_x
+            ),
+            observer_position_sigma_y_pixels=self._bounded_diagnostic(
+                position_sigma_y
+            ),
+            observer_velocity_sigma_x_pixels_per_second=(
+                self._bounded_diagnostic(velocity_sigma_x)
+            ),
+            observer_velocity_sigma_y_pixels_per_second=(
+                self._bounded_diagnostic(velocity_sigma_y)
+            ),
+            velocity_feedforward_confidence_x=feedforward_confidence_x,
+            velocity_feedforward_confidence_y=feedforward_confidence_y,
+            innovation_mahalanobis_squared=self._bounded_diagnostic(
+                self._last_innovation_mahalanobis_squared
+            ),
+            innovation_rejected=self._last_innovation_rejected,
         )
 
     def _reset_tracking(self) -> None:
@@ -480,9 +638,17 @@ class MakcuCalibratedController:
         self._velocity_y = 0.0
         self._raw_velocity_x.clear()
         self._raw_velocity_y.clear()
-        self._paired_velocity_history.clear()
         self._paired_position_x = 0.0
         self._paired_position_y = 0.0
+        self._paired_covariance_x = (0.0, 0.0, 0.0)
+        self._paired_covariance_y = (0.0, 0.0, 0.0)
+        self._paired_feedback_hold_x = False
+        self._paired_feedback_hold_y = False
+        self._paired_measurement_agreement_x = 1.0
+        self._paired_measurement_agreement_y = 1.0
+        self._paired_rejection_count = 0
+        self._last_innovation_rejected = False
+        self._last_innovation_mahalanobis_squared = 0.0
 
     def _zero(self, now_ns: int, reason: str) -> CalibratedControlOutput:
         return CalibratedControlOutput(
@@ -495,6 +661,22 @@ class MakcuCalibratedController:
             projected_error_y_pixels=0.0,
             valid=False,
             reset_reason=reason,
+            observer_position_sigma_x_pixels=self._bounded_diagnostic(
+                math.sqrt(self._paired_covariance_x[0])
+            ),
+            observer_position_sigma_y_pixels=self._bounded_diagnostic(
+                math.sqrt(self._paired_covariance_y[0])
+            ),
+            observer_velocity_sigma_x_pixels_per_second=(
+                self._bounded_diagnostic(math.sqrt(self._paired_covariance_x[2]))
+            ),
+            observer_velocity_sigma_y_pixels_per_second=(
+                self._bounded_diagnostic(math.sqrt(self._paired_covariance_y[2]))
+            ),
+            innovation_mahalanobis_squared=self._bounded_diagnostic(
+                self._last_innovation_mahalanobis_squared
+            ),
+            innovation_rejected=self._last_innovation_rejected,
         )
 
     def _ingest_commands(
@@ -558,42 +740,27 @@ class MakcuCalibratedController:
             self._seed_observation(observation)
             return "velocity-channel-change"
 
+        if paired_velocity:
+            return self._accept_paired_observation(
+                observation,
+                previous,
+                elapsed,
+            )
+
+        self._last_innovation_rejected = False
+        self._last_innovation_mahalanobis_squared = 0.0
         count_x, count_y = self._counts_landing_between(
             previous.timestamp_ns,
             observation.timestamp_ns,
         )
-        velocity_error_x = (
-            observation.velocity_error_x_pixels
-            if paired_velocity
-            else observation.error_x_pixels
-        )
-        velocity_error_y = (
-            observation.velocity_error_y_pixels
-            if paired_velocity
-            else observation.error_y_pixels
-        )
-        previous_velocity_error_x = (
-            previous.velocity_error_x_pixels
-            if previous_paired_velocity
-            else previous.error_x_pixels
-        )
-        previous_velocity_error_y = (
-            previous.velocity_error_y_pixels
-            if previous_paired_velocity
-            else previous.error_y_pixels
-        )
-        assert velocity_error_x is not None
-        assert velocity_error_y is not None
-        assert previous_velocity_error_x is not None
-        assert previous_velocity_error_y is not None
         target_delta_x = (
-            velocity_error_x
-            - previous_velocity_error_x
+            observation.error_x_pixels
+            - previous.error_x_pixels
             + self.plant.gain_x_pixels_per_count * count_x
         )
         target_delta_y = (
-            velocity_error_y
-            - previous_velocity_error_y
+            observation.error_y_pixels
+            - previous.error_y_pixels
             + self.plant.gain_y_pixels_per_count * count_y
         )
         jump = self.config.maximum_error_jump_pixels
@@ -602,26 +769,14 @@ class MakcuCalibratedController:
             return "error-jump"
 
         speed_limit = self.config.maximum_target_speed_pixels_per_second
-        if paired_velocity:
-            self._paired_position_x += target_delta_x
-            self._paired_position_y += target_delta_y
-            self._paired_velocity_history.append(
-                (
-                    observation.timestamp_ns,
-                    self._paired_position_x,
-                    self._paired_position_y,
-                )
-            )
-            robust_x, robust_y = self._paired_velocity_regression(speed_limit)
-        else:
-            # Preserve the original independent adjacent-frame estimator for
-            # every existing caller which has no separate raw point channel.
-            raw_x = min(max(target_delta_x / elapsed, -speed_limit), speed_limit)
-            raw_y = min(max(target_delta_y / elapsed, -speed_limit), speed_limit)
-            self._raw_velocity_x.append(raw_x)
-            self._raw_velocity_y.append(raw_y)
-            robust_x = float(statistics.median(self._raw_velocity_x))
-            robust_y = float(statistics.median(self._raw_velocity_y))
+        # Preserve the original independent adjacent-frame estimator for
+        # every existing caller which has no separate raw point channel.
+        raw_x = min(max(target_delta_x / elapsed, -speed_limit), speed_limit)
+        raw_y = min(max(target_delta_y / elapsed, -speed_limit), speed_limit)
+        self._raw_velocity_x.append(raw_x)
+        self._raw_velocity_y.append(raw_y)
+        robust_x = float(statistics.median(self._raw_velocity_x))
+        robust_y = float(statistics.median(self._raw_velocity_y))
         alpha = 1.0 - math.exp(
             -elapsed / self.config.velocity_filter_time_constant_seconds
         )
@@ -648,88 +803,394 @@ class MakcuCalibratedController:
         self._prune_commands(observation.timestamp_ns)
         return None
 
+    def _accept_paired_observation(
+        self,
+        observation: ScreenErrorObservation,
+        previous: ScreenErrorObservation,
+        elapsed: float,
+    ) -> str | None:
+        """Update the one raw-point position/velocity observer.
+
+        The state transition includes every command which became visible
+        between the two image timestamps.  Thus the Kalman innovation is
+        target/detector motion, rather than a derivative contaminated by the
+        controller's own delayed movement.
+        """
+
+        measured_x = observation.velocity_error_x_pixels
+        measured_y = observation.velocity_error_y_pixels
+        assert measured_x is not None
+        assert measured_y is not None
+        # The downstream tracker point is not differentiated and never owns a
+        # second control state. It is only an independent plausibility signal:
+        # a one-model-pixel box-edge staircase which moves the raw point while
+        # the tracked position stays fixed must not earn feed-forward trust.
+        measurement_agreement = self._paired_channel_agreement(
+            measured_x,
+            measured_y,
+            observation.error_x_pixels,
+            observation.error_y_pixels,
+        )
+        self._paired_measurement_agreement_x = measurement_agreement
+        self._paired_measurement_agreement_y = measurement_agreement
+        disagreement_x = measured_x - observation.error_x_pixels
+        disagreement_y = measured_y - observation.error_y_pixels
+        count_x, count_y = self._counts_landing_between(
+            previous.timestamp_ns,
+            observation.timestamp_ns,
+        )
+        predicted_x, predicted_velocity_x, predicted_covariance_x = (
+            self._paired_predict_axis(
+                self._paired_position_x,
+                self._velocity_x,
+                self._paired_covariance_x,
+                elapsed,
+                self.plant.gain_x_pixels_per_count * count_x,
+            )
+        )
+        predicted_y, predicted_velocity_y, predicted_covariance_y = (
+            self._paired_predict_axis(
+                self._paired_position_y,
+                self._velocity_y,
+                self._paired_covariance_y,
+                elapsed,
+                self.plant.gain_y_pixels_per_count * count_y,
+            )
+        )
+        # The accepted raw box and tracker point are correlated, so the latter
+        # is not fused as a second measurement.  Their residual is still a
+        # useful per-frame noise estimate: grow R instead of giving a visibly
+        # quantized box edge the same trust as two agreeing coordinates.
+        base_measurement_variance = _PAIRED_MEASUREMENT_SIGMA_PIXELS**2
+        measurement_variance_x = (
+            base_measurement_variance
+            + _PAIRED_TRACK_RESIDUAL_VARIANCE_FRACTION
+            * disagreement_x
+            * disagreement_x
+        )
+        measurement_variance_y = (
+            base_measurement_variance
+            + _PAIRED_TRACK_RESIDUAL_VARIANCE_FRACTION
+            * disagreement_y
+            * disagreement_y
+        )
+        innovation_x = measured_x - predicted_x
+        innovation_y = measured_y - predicted_y
+        innovation_variance_x = predicted_covariance_x[0] + measurement_variance_x
+        innovation_variance_y = predicted_covariance_y[0] + measurement_variance_y
+        mahalanobis_squared = (
+            innovation_x * innovation_x / innovation_variance_x
+            + innovation_y * innovation_y / innovation_variance_y
+        )
+        if not math.isfinite(mahalanobis_squared):
+            self._reset_tracking()
+            return "non-finite-observer"
+        self._last_innovation_mahalanobis_squared = self._bounded_diagnostic(
+            mahalanobis_squared
+        )
+        if mahalanobis_squared > _PAIRED_INNOVATION_GATE_MAHALANOBIS_SQUARED:
+            self._last_innovation_rejected = True
+            self._paired_rejection_count += 1
+            if self._paired_rejection_count >= _PAIRED_REJECTIONS_BEFORE_RESEED:
+                self._seed_observation(observation)
+                return "innovation-reacquired"
+            # Keep the last accepted timestamp and command ledger. The next
+            # accepted update will predict across the entire interval exactly
+            # once. Meanwhile the existing state may bridge only its ordinary
+            # freshness lease.
+            return None
+
+        self._last_innovation_rejected = False
+        self._paired_position_x, self._velocity_x, self._paired_covariance_x = (
+            self._paired_update_axis(
+                predicted_x,
+                predicted_velocity_x,
+                predicted_covariance_x,
+                measured_x,
+                measurement_variance_x,
+            )
+        )
+        self._paired_position_y, self._velocity_y, self._paired_covariance_y = (
+            self._paired_update_axis(
+                predicted_y,
+                predicted_velocity_y,
+                predicted_covariance_y,
+                measured_y,
+                measurement_variance_y,
+            )
+        )
+        speed_limit = self.config.maximum_target_speed_pixels_per_second
+        self._velocity_x = min(max(self._velocity_x, -speed_limit), speed_limit)
+        self._velocity_y = min(max(self._velocity_y, -speed_limit), speed_limit)
+        self._paired_rejection_count = 0
+        self._last_observation = observation
+        self._ready = True
+        self._prune_commands(observation.timestamp_ns)
+        return None
+
     def _seed_observation(self, observation: ScreenErrorObservation) -> None:
         self._reset_tracking()
         self._last_observation = observation
         if observation.velocity_error_x_pixels is not None:
-            self._paired_velocity_history.append(
-                (observation.timestamp_ns, 0.0, 0.0)
+            assert observation.velocity_error_y_pixels is not None
+            self._paired_position_x = observation.velocity_error_x_pixels
+            self._paired_position_y = observation.velocity_error_y_pixels
+            measurement_agreement = self._paired_channel_agreement(
+                observation.velocity_error_x_pixels,
+                observation.velocity_error_y_pixels,
+                observation.error_x_pixels,
+                observation.error_y_pixels,
             )
+            self._paired_measurement_agreement_x = measurement_agreement
+            self._paired_measurement_agreement_y = measurement_agreement
+            measurement_variance = _PAIRED_MEASUREMENT_SIGMA_PIXELS**2
+            initial_velocity_sigma = min(
+                self.config.maximum_target_speed_pixels_per_second,
+                _PAIRED_INITIAL_VELOCITY_SIGMA_PIXELS_PER_SECOND,
+            )
+            initial_covariance = (
+                measurement_variance,
+                0.0,
+                initial_velocity_sigma * initial_velocity_sigma,
+            )
+            self._paired_covariance_x = initial_covariance
+            self._paired_covariance_y = initial_covariance
         self._prune_commands(observation.timestamp_ns)
 
-    def _paired_velocity_regression(
+    def _paired_predict_axis(
         self,
-        speed_limit: float,
-    ) -> tuple[float, float]:
-        """Fit one coherent X/Y velocity to shared raw-point timestamps.
+        position: float,
+        velocity: float,
+        covariance: tuple[float, float, float],
+        elapsed: float,
+        landed_command_pixels: float,
+    ) -> tuple[float, float, tuple[float, float, float]]:
+        """Predict one axis with landed mouse motion as a known input."""
 
-        Ordinary least squares over reconstructed target displacement rejects
-        adjacent-frame derivative noise without selecting X from one frame and
-        Y from another.  A shared two-dimensional explained-variance gate
-        suppresses fits dominated by curved/rotating point noise while giving
-        a sufficiently linear trajectory its full slope.  A steady physical
-        motion therefore keeps its feed-forward even when position error is
-        zero.
-        """
-
-        history = tuple(self._paired_velocity_history)
-        if len(history) < 2:
-            return 0.0, 0.0
-        origin_ns = history[0][0]
-        times = [
-            (timestamp_ns - origin_ns) / _NS_PER_SECOND
-            for timestamp_ns, _x, _y in history
-        ]
-        mean_time = sum(times) / len(times)
-        mean_x = sum(item[1] for item in history) / len(history)
-        mean_y = sum(item[2] for item in history) / len(history)
-        denominator = sum((value - mean_time) ** 2 for value in times)
-        if denominator <= 0.0:
-            return 0.0, 0.0
-        slope_x = sum(
-            (time_value - mean_time) * (item[1] - mean_x)
-            for time_value, item in zip(times, history)
-        ) / denominator
-        slope_y = sum(
-            (time_value - mean_time) * (item[2] - mean_y)
-            for time_value, item in zip(times, history)
-        ) / denominator
-
-        total_variation = sum(
-            (item[1] - mean_x) ** 2 + (item[2] - mean_y) ** 2
-            for item in history
+        predicted_position = position + velocity * elapsed - landed_command_pixels
+        position_variance, cross_covariance, velocity_variance = covariance
+        acceleration_sigma = min(
+            max(
+                self.config.maximum_target_acceleration_pixels_per_second_squared
+                * _PAIRED_ACCELERATION_SIGMA_FRACTION,
+                _PAIRED_MINIMUM_ACCELERATION_SIGMA_PIXELS_PER_SECOND_SQUARED,
+            ),
+            _PAIRED_MAXIMUM_ACCELERATION_SIGMA_PIXELS_PER_SECOND_SQUARED,
         )
-        if total_variation <= 1e-12:
-            return 0.0, 0.0
-        residual_variation = sum(
-            (
-                item[1]
-                - (mean_x + slope_x * (time_value - mean_time))
-            )
-            ** 2
-            + (
-                item[2]
-                - (mean_y + slope_y * (time_value - mean_time))
-            )
-            ** 2
-            for time_value, item in zip(times, history)
+        acceleration_variance = acceleration_sigma * acceleration_sigma
+        elapsed_squared = elapsed * elapsed
+        process_position_variance = (
+            0.25 * elapsed_squared * elapsed_squared * acceleration_variance
         )
-        explained_fraction = min(
-            max(1.0 - residual_variation / total_variation, 0.0),
+        process_cross_covariance = (
+            0.5 * elapsed_squared * elapsed * acceleration_variance
+        )
+        process_velocity_variance = elapsed_squared * acceleration_variance
+        # The raw count is exact, while a no-profile pixel/count seed can be
+        # imperfect. Represent a bounded 20% gain mismatch as control-input
+        # uncertainty so a large command does not make the observer falsely
+        # overconfident in its projected pixel position.
+        input_sigma = (
+            abs(landed_command_pixels)
+            * _PAIRED_PLANT_GAIN_UNCERTAINTY_FRACTION
+        )
+        predicted_position_variance = (
+            position_variance
+            + 2.0 * elapsed * cross_covariance
+            + elapsed_squared * velocity_variance
+            + process_position_variance
+            + input_sigma * input_sigma
+        )
+        predicted_cross_covariance = (
+            cross_covariance
+            + elapsed * velocity_variance
+            + process_cross_covariance
+        )
+        predicted_velocity_variance = (
+            velocity_variance + process_velocity_variance
+        )
+        predicted_covariance = self._bounded_covariance(
+            predicted_position_variance,
+            predicted_cross_covariance,
+            predicted_velocity_variance,
+        )
+        return predicted_position, velocity, predicted_covariance
+
+    @staticmethod
+    def _paired_update_axis(
+        predicted_position: float,
+        predicted_velocity: float,
+        predicted_covariance: tuple[float, float, float],
+        measurement: float,
+        measurement_variance: float,
+    ) -> tuple[float, float, tuple[float, float, float]]:
+        """Apply one scalar position measurement to one Kalman axis."""
+
+        position_variance, cross_covariance, velocity_variance = (
+            predicted_covariance
+        )
+        innovation_variance = position_variance + measurement_variance
+        position_gain = position_variance / innovation_variance
+        velocity_gain = cross_covariance / innovation_variance
+        innovation = measurement - predicted_position
+        updated_position = predicted_position + position_gain * innovation
+        updated_velocity = predicted_velocity + velocity_gain * innovation
+        updated_position_variance = (
+            position_variance - position_gain * position_variance
+        )
+        updated_cross_covariance = (
+            cross_covariance - position_gain * cross_covariance
+        )
+        updated_velocity_variance = (
+            velocity_variance - velocity_gain * cross_covariance
+        )
+        covariance = MakcuCalibratedController._bounded_covariance(
+            updated_position_variance,
+            updated_cross_covariance,
+            updated_velocity_variance,
+        )
+        return updated_position, updated_velocity, covariance
+
+    @staticmethod
+    def _bounded_covariance(
+        position_variance: float,
+        cross_covariance: float,
+        velocity_variance: float,
+    ) -> tuple[float, float, float]:
+        """Keep the tiny covariance finite, symmetric, and positive semidefinite."""
+
+        minimum_variance = 1e-12
+        position_variance = max(position_variance, minimum_variance)
+        velocity_variance = max(velocity_variance, minimum_variance)
+        maximum_cross = math.sqrt(position_variance * velocity_variance)
+        cross_covariance = min(
+            max(cross_covariance, -maximum_cross),
+            maximum_cross,
+        )
+        return position_variance, cross_covariance, velocity_variance
+
+    def _paired_velocity_confidence(
+        self,
+        velocity: float,
+        velocity_sigma: float,
+    ) -> float:
+        """Return covariance- and signal-limited velocity feed-forward weight."""
+
+        covariance_confidence = min(
+            max(
+                (
+                    _PAIRED_FEEDFORWARD_ZERO_VELOCITY_SIGMA
+                    - velocity_sigma
+                )
+                / (
+                    _PAIRED_FEEDFORWARD_ZERO_VELOCITY_SIGMA
+                    - _PAIRED_FEEDFORWARD_FULL_VELOCITY_SIGMA
+                ),
+                0.0,
+            ),
             1.0,
         )
-        # R² itself is not a suitable gain: multiplying a real noisy pursuit
-        # by (for example) 0.75 creates avoidable lag.  Below 0.15 the samples
-        # do not establish one velocity vector; above 0.50 the slope is kept
-        # whole.  The bounded transition prevents a hard chatter threshold.
-        coherence = min(max((explained_fraction - 0.15) / 0.35, 0.0), 1.0)
-        slope_x *= coherence
-        slope_y *= coherence
-
-        return (
-            min(max(slope_x, -speed_limit), speed_limit),
-            min(max(slope_y, -speed_limit), speed_limit),
+        signal_to_noise = abs(velocity) / max(velocity_sigma, 1e-9)
+        signal_confidence = min(
+            max(
+                (
+                    signal_to_noise
+                    - _PAIRED_FEEDFORWARD_ZERO_SIGNAL_TO_NOISE
+                )
+                / (
+                    _PAIRED_FEEDFORWARD_FULL_SIGNAL_TO_NOISE
+                    - _PAIRED_FEEDFORWARD_ZERO_SIGNAL_TO_NOISE
+                ),
+                0.0,
+            ),
+            1.0,
         )
+        return (
+            self.config.maximum_velocity_feedforward_fraction
+            * covariance_confidence
+            * signal_confidence
+        )
+
+    @staticmethod
+    def _paired_channel_agreement(
+        raw_x: float,
+        raw_y: float,
+        tracked_x: float,
+        tracked_y: float,
+    ) -> float:
+        # Treat X/Y as one detector point.  Independent axis confidence lets a
+        # quantized point walk around a square while alternately trusting the
+        # quiet-looking axis; radial agreement closes that rotating loophole.
+        disagreement = math.hypot(raw_x - tracked_x, raw_y - tracked_y)
+        return min(
+            max(
+                (
+                    _PAIRED_ZERO_POSITION_CHANNEL_AGREEMENT_PIXELS
+                    - disagreement
+                )
+                / (
+                    _PAIRED_ZERO_POSITION_CHANNEL_AGREEMENT_PIXELS
+                    - _PAIRED_FULL_POSITION_CHANNEL_AGREEMENT_PIXELS
+                ),
+                0.0,
+            ),
+            1.0,
+        )
+
+    def _paired_feedback_hold(
+        self,
+        held: bool,
+        projected_error: float,
+        position_sigma: float,
+    ) -> bool:
+        """Apply a covariance-sized Schmitt band to positional feedback."""
+
+        enter_threshold = max(
+            self.config.feedback_deadzone_pixels,
+            _PAIRED_FEEDBACK_ENTER_SIGMAS * position_sigma,
+        )
+        exit_threshold = max(
+            self.config.feedback_deadzone_pixels,
+            _PAIRED_FEEDBACK_EXIT_SIGMAS * position_sigma,
+        )
+        if held:
+            return abs(projected_error) <= exit_threshold
+        return abs(projected_error) <= enter_threshold
+
+    def _paired_axis_rate(
+        self,
+        projected_error: float,
+        velocity: float,
+        gain: float,
+        limit: float,
+        feedforward_confidence: float,
+        *,
+        feedback_held: bool,
+        position_confidence: float,
+    ) -> tuple[float, bool]:
+        feedback = 0.0
+        if abs(projected_error) > self.config.feedback_deadzone_pixels:
+            feedback_fraction = (
+                _PAIRED_HELD_FEEDBACK_FRACTION if feedback_held else 1.0
+            )
+            feedback = position_confidence * feedback_fraction * projected_error / (
+                gain * self.config.position_time_constant_seconds
+            )
+        feed_forward = feedforward_confidence * velocity / gain
+        requested = feedback + feed_forward
+        if (
+            abs(projected_error) > self.config.wrong_way_guard_pixels
+            and requested * projected_error < 0.0
+        ):
+            requested = feedback
+        bounded = min(max(requested, -limit), limit)
+        return bounded, bounded != requested
+
+    @staticmethod
+    def _bounded_diagnostic(value: float) -> float:
+        if not math.isfinite(value) or value <= 0.0:
+            return 0.0
+        return min(value, _MAXIMUM_OBSERVER_DIAGNOSTIC)
 
     @staticmethod
     def _filtered_velocity(

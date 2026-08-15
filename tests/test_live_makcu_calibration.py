@@ -546,6 +546,7 @@ class _FakeMakcuController:
         self.started = False
         self.stopped = False
         self.normal_updates = 0
+        self.normal_update_arguments: list[tuple[object, ...]] = []
         self.normal_update_keywords: list[dict[str, object]] = []
         self.__class__.instances.append(self)
 
@@ -566,6 +567,7 @@ class _FakeMakcuController:
 
     def update(self, *_arguments, **_keywords) -> None:
         self.normal_updates += 1
+        self.normal_update_arguments.append(tuple(_arguments))
         self.normal_update_keywords.append(dict(_keywords))
         if self.reject_updates:
             raise AssertionError("normal MAKCU update ran during calibration")
@@ -1022,20 +1024,29 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         ):
             run(config)
 
-    def test_absent_profile_selects_automatic_plant_aware_controller(self) -> None:
-        result, output = self._run(self.base_config)
+    def test_absent_profile_selects_direct_head_command_aware_controller(self) -> None:
+        head_runtime = mock.Mock()
+        head_runtime.status = SimpleNamespace()
+        head_runtime.revoke_body.return_value = False
+        head_runtime.visible_sample.return_value = None
+        head_runtime.stop.return_value = True
+        _FakeDetector.detections = []
+        with mock.patch(
+            "main._build_automatic_head_runtime",
+            return_value=head_runtime,
+        ) as build_head_runtime:
+            result, output = self._run(self.base_config)
 
         self.assertEqual(result, 0)
+        build_head_runtime.assert_called_once_with()
+        head_runtime.start.assert_called_once_with()
+        head_runtime.stop.assert_called_once_with()
         controller = _FakeMakcuController.instances[0]
         numeric = controller.calibrated_controller
         self.assertIsNotNone(numeric)
         self.assertIsNone(controller.expected_identity_token)
         self.assertEqual(controller.config.vertical_rate_ratio, 1.0)
-        self.assertEqual(controller.normal_updates, 1)
-        self.assertIn(
-            "velocity_target",
-            controller.normal_update_keywords[0],
-        )
+        self.assertEqual(controller.normal_updates, 0)
         self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.125)
         self.assertEqual(numeric.plant.gain_y_pixels_per_count, 0.120)
         self.assertEqual(numeric.plant.delay_seconds, 0.008)
@@ -1061,17 +1072,77 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             numeric.config.maximum_rate_y_counts_per_second,
             12_000.0,
         )
-        self.assertIn("control automatic plant-aware", output)
+        self.assertEqual(
+            numeric.config.maximum_velocity_feedforward_fraction,
+            0.0,
+        )
+        self.assertEqual(numeric.config.position_time_constant_seconds, 0.022)
+        self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
+        self.assertIn("control automatic command-aware observer", output)
         self.assertIn("gains X/Y 0.125/0.12 px/count", output)
         self.assertIn("delay 8.00 ms", output)
-        self.assertIn("velocity source raw accepted", output)
-        self.assertIn(
-            "velocity damping median 5 / 18 ms / 20000 px/s^2",
-            output,
-        )
+        self.assertIn("head source pinned SunXDS 0.8.0 direct boxes on CPU", output)
+        self.assertIn("position-only command-aware observer", output)
+        self.assertIn("velocity feed-forward disabled", output)
+        self.assertIn("position tau/deadzone 22 ms/3 px", output)
         self.assertIn("caps X/Y 12000/12000 counts/s", output)
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)
+
+    def test_automatic_mode_publishes_only_direct_head_point_after_player_safety(self) -> None:
+        player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
+        _FakeDetector.detections = [player]
+        sample = SimpleNamespace(
+            point=(915.0, 238.0),
+            source_timestamp_ns=123,
+            confidence=0.88,
+            evidence="direct head box",
+            bridging=False,
+        )
+        head_runtime = mock.Mock()
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.return_value = False
+        head_runtime.take_latest.return_value = sample
+        head_runtime.visible_sample.return_value = sample
+        head_runtime.stop.return_value = True
+
+        with (
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            mock.patch.object(
+                _FakeMakcuController,
+                "activation_pressed",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ),
+        ):
+            result, _output = self._run(self.base_config)
+
+        self.assertEqual(result, 0)
+        controller = _FakeMakcuController.instances[0]
+        self.assertEqual(controller.normal_updates, 2)
+        self.assertIsNone(controller.normal_update_arguments[0][0])
+        self.assertNotIn("aim_point", controller.normal_update_keywords[0])
+        self.assertIsNotNone(controller.normal_update_arguments[1][0])
+        self.assertEqual(
+            controller.normal_update_keywords[1]["aim_point"],
+            sample.point,
+        )
+        self.assertEqual(
+            controller.normal_update_keywords[1]["measurement_ns"],
+            sample.source_timestamp_ns,
+        )
+        self.assertNotIn("velocity_target", controller.normal_update_keywords[1])
+        head_runtime.submit.assert_called_once()
+        submitted_player = head_runtime.submit.call_args.args[1]
+        self.assertEqual(submitted_player, player)
+        self.assertEqual(
+            head_runtime.accept_body.call_args.kwargs["track_generation"],
+            1,
+        )
 
 
 if __name__ == "__main__":

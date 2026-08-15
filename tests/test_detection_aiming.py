@@ -1052,6 +1052,62 @@ class AimingControllerTests(unittest.TestCase):
         self.assertIs(tracker.accepted_measurement, moved)
         self.assertNotEqual(tracked.xyxy, moved.xyxy)
 
+    def test_track_generation_is_stable_through_measurement_and_prediction(self) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
+        first = Detection(0, "person", 0.9, (700, 250, 900, 850))
+        moved = Detection(0, "person", 0.9, (720, 250, 920, 850))
+        base_ns = 5_900_000_000
+
+        self.assertEqual(tracker.track_generation, 0)
+        tracker.update((first,), (1080, 1920, 3), measurement_ns=base_ns)
+        self.assertEqual(tracker.track_generation, 1)
+        tracker.update(
+            (moved,),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 8_000_000,
+        )
+        self.assertEqual(tracker.track_generation, 1)
+        tracker.update(
+            (),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 16_000_000,
+        )
+        self.assertTrue(tracker.output_is_prediction)
+        self.assertEqual(tracker.track_generation, 1)
+
+    def test_track_generation_increments_on_reacquisition_and_reset_new_track(self) -> None:
+        tracker = TargetTracker(
+            label="person",
+            lost_grace_frames=1,
+            reacquire_confirmations=2,
+        )
+        first = Detection(0, "person", 0.9, (200, 250, 400, 850))
+        replacement = Detection(0, "person", 0.9, (1300, 250, 1500, 850))
+        base_ns = 6_000_000_000
+        tracker.update((first,), (1080, 1920, 3), measurement_ns=base_ns)
+
+        tracker.update(
+            (replacement,),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 8_000_000,
+        )
+        self.assertEqual(tracker.track_generation, 1)
+        tracker.update(
+            (replacement,),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 16_000_000,
+        )
+        self.assertEqual(tracker.track_generation, 2)
+
+        tracker.reset()
+        self.assertEqual(tracker.track_generation, 2)
+        tracker.update(
+            (first,),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 24_000_000,
+        )
+        self.assertEqual(tracker.track_generation, 3)
+
     def test_prediction_grace_does_not_replace_an_incompatible_detection(self) -> None:
         tracker = TargetTracker(label="person", lost_grace_frames=3)
         original = Detection(0, "person", 0.8, (200, 300, 400, 900))

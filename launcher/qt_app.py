@@ -947,6 +947,11 @@ class LauncherWindow(QMainWindow):
         self.aim_point = QComboBox()
         for label, value in AIM_POINT_OPTIONS:
             self.aim_point.addItem(label, value)
+        self.aim_point.setToolTip(
+            "Automatic mode ignores this saved body-box ratio because the pinned "
+            "direct head detector supplies the anatomical aim point. An active "
+            "measured response profile uses the ratio."
+        )
         self.aim_invert_x = QCheckBox("Invert X")
         self.aim_invert_y = QCheckBox("Invert Y")
         self.aim_makcu_port = QLineEdit()
@@ -967,8 +972,9 @@ class LauncherWindow(QMainWindow):
             "Optional advanced response calibration…"
         )
         self.calibrate_makcu_button.setToolTip(
-            "Normal Start works without calibration by using automatic plant-aware "
-            "MAKCU control. Run this only to measure an optional mode-specific profile."
+            "Normal Start works without calibration by using automatic direct-head "
+            "command-aware MAKCU control. Run this only to measure an optional "
+            "mode-specific profile."
         )
         self.calibrate_makcu_button.clicked.connect(self.start_makcu_calibration)
         self.activate_makcu_calibration_button = QPushButton(
@@ -993,8 +999,8 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_strength.setRange(5, 250)
         self.aim_makcu_strength.setSingleStep(1)
         self.aim_makcu_strength.setToolTip(
-            "Stored for compatibility. Plant-aware automatic and measured-profile "
-            "control do not use this value."
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control do not use this value."
         )
         self.aim_makcu_strength_value = _label("0.50", "subtitle")
         self.aim_makcu_strength.valueChanged.connect(self._sync_strength_label)
@@ -1002,15 +1008,15 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_smoothing.setRange(10, 100)
         self.aim_makcu_smoothing.setSingleStep(1)
         self.aim_makcu_smoothing.setToolTip(
-            "Stored for compatibility. Plant-aware automatic and measured-profile "
-            "control do not use this value."
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control do not use this value."
         )
         self.aim_makcu_smoothing_value = _label("0.78", "subtitle")
         self.aim_makcu_smoothing.valueChanged.connect(self._sync_smoothing_label)
         self.aim_makcu_max_step = QLineEdit()
         self.aim_makcu_max_step.setToolTip(
-            "Sets the active plant-aware mouse-rate envelope. Automatic control "
-            "uses the same envelope for X and Y."
+            "Sets the active MAKCU mouse-rate envelope. Automatic direct-head "
+            "command-aware control uses the same envelope for X and Y."
         )
         self.aim_makcu_prediction_lead_seconds = QDoubleSpinBox()
         self.aim_makcu_prediction_lead_seconds.setRange(0.0, 0.25)
@@ -1018,8 +1024,9 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_prediction_lead_seconds.setSingleStep(0.001)
         self.aim_makcu_prediction_lead_seconds.setSuffix(" s")
         self.aim_makcu_prediction_lead_seconds.setToolTip(
-            "Stored for compatibility. Plant-aware automatic and measured-profile "
-            "control estimate target motion directly and do not use this value."
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control estimate target motion directly and do not "
+            "use this value."
         )
         self.aim_makcu_derivative_damping_seconds = QDoubleSpinBox()
         self.aim_makcu_derivative_damping_seconds.setRange(0.0, 0.25)
@@ -1027,8 +1034,9 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_derivative_damping_seconds.setSingleStep(0.001)
         self.aim_makcu_derivative_damping_seconds.setSuffix(" s")
         self.aim_makcu_derivative_damping_seconds.setToolTip(
-            "Stored for compatibility. Plant-aware automatic and measured-profile "
-            "control estimate target motion directly and do not use this value."
+            "Stored for compatibility. Automatic direct-head command-aware and "
+            "measured-profile control estimate target motion directly and do not "
+            "use this value."
         )
         self.aim_makcu_vertical_rate_ratio = QDoubleSpinBox()
         self.aim_makcu_vertical_rate_ratio.setRange(0.10, 1.00)
@@ -1037,7 +1045,8 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_vertical_rate_ratio.setSuffix(" ×")
         self.aim_makcu_vertical_rate_ratio.setToolTip(
             "Caps vertical mouse rate only when an active measured response profile "
-            "is selected. Automatic plant-aware control uses an equal X/Y envelope."
+            "is selected. Automatic direct-head command-aware control uses an equal "
+            "X/Y envelope."
         )
         self.aim_makcu_verification_status = _label("", "subtitle")
         self.aim_makcu_verification_status.setWordWrap(True)
@@ -1117,9 +1126,9 @@ class LauncherWindow(QMainWindow):
         layout.addWidget(self.aim_makcu_verification_status)
         self.aim_makcu_calibration_help = _label(
             "Normal Start does not require a response calibration profile. When no "
-            "profile is active, ProAim uses automatic plant-aware MAKCU control. "
-            "Advanced response calibration is optional and creates a profile for one "
-            "exact aim mode only after you review and activate it.",
+            "profile is active, ProAim uses automatic direct-head command-aware MAKCU "
+            "control. Advanced response calibration is optional and creates a profile "
+            "for one exact aim mode only after you review and activate it.",
             "subtitle",
         )
         self.aim_makcu_calibration_help.setWordWrap(True)
@@ -2271,6 +2280,7 @@ class LauncherWindow(QMainWindow):
         aim_enabled = self.aim.isChecked()
         calibration_busy = self._calibration_running()
         enabled = aim_enabled and not calibration_busy
+        active_profile = bool(self.settings.aim_makcu_active_profile.strip())
         if aim_enabled:
             # Detection output must never run without the third-person guard.
             # Keep the relationship visible in the UI instead of silently
@@ -2279,7 +2289,6 @@ class LauncherWindow(QMainWindow):
         self.ignore_self.setEnabled(not aim_enabled and not calibration_busy)
         for widget in (
             self.aim_label,
-            self.aim_point,
             self.aim_invert_x,
             self.aim_invert_y,
             self.aim_makcu_port,
@@ -2290,10 +2299,13 @@ class LauncherWindow(QMainWindow):
             self.aim_makcu_max_step,
         ):
             widget.setEnabled(enabled)
-        # The normal MAKCU path is plant-aware with or without a measured
-        # profile. These legacy shaping values remain loaded and collected for
-        # settings compatibility, but neither plant-aware controller consumes
-        # them. Do not present them as live tracking controls.
+        # Automatic mode receives an anatomical point from the pinned direct
+        # head detector, so its saved body-box ratio is deliberately not a live
+        # control. Measured profiles retain the established body-box path.
+        self.aim_point.setEnabled(enabled and active_profile)
+        # These legacy shaping values remain loaded and collected for settings
+        # compatibility, but neither command-aware automatic nor measured-profile
+        # control consumes them. Do not present them as live tracking controls.
         for widget in (
             self.aim_makcu_strength,
             self.aim_makcu_strength_value,
@@ -2303,19 +2315,21 @@ class LauncherWindow(QMainWindow):
             self.aim_makcu_derivative_damping_seconds,
         ):
             widget.setEnabled(False)
-        active_profile = bool(self.settings.aim_makcu_active_profile.strip())
         self.aim_makcu_vertical_rate_ratio.setEnabled(enabled and active_profile)
         if active_profile:
             self.aim_makcu_control_mode_note.setText(
-                "Measured plant-aware profile: Max step and Vertical cap set the "
-                "rate envelope. Strength, Smoothing, Prediction lead, and Damping "
-                "are stored compatibility values and do not affect profile control."
+                "Measured calibrated profile: Aim point uses the saved body-box "
+                "ratio; Max step and Vertical cap set the rate envelope. Strength, "
+                "Smoothing, Prediction lead, and Damping are stored compatibility "
+                "values and do not affect profile control."
             )
         else:
             self.aim_makcu_control_mode_note.setText(
-                "Automatic plant-aware control: Max step sets the equal X/Y rate "
-                "envelope. Strength, Smoothing, Prediction lead, Damping, and "
-                "Vertical cap are stored but do not affect normal tracking."
+                "Automatic direct-head command-aware control: the pinned direct head "
+                "detector supplies the anatomical aim point, so the saved body-box Aim "
+                "point ratio is ignored. Max step sets the equal X/Y rate envelope. "
+                "Strength, Smoothing, Prediction lead, Damping, and Vertical cap are "
+                "stored but do not affect normal tracking."
             )
         verify_busy = (
             self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive()
@@ -2446,9 +2460,9 @@ class LauncherWindow(QMainWindow):
                 "Optional advanced response calibration — ready",
                 "Optional — not started",
                 "Normal Start already works without calibration by using automatic "
-                "plant-aware control. Only continue if you intentionally want a "
-                "mode-specific response profile. Before calibration, show at least "
-                "one fully visible stationary player in the game; "
+                "direct-head command-aware control. Only continue if you intentionally "
+                "want a mode-specific response profile. Before calibration, show at "
+                "least one fully visible stationary player in the game; "
                 "ProAim will use the player nearest the center. "
                 f"{context_setup} Keep {button} Mouse released, then click Optional "
                 "advanced response calibration.",
@@ -2821,8 +2835,8 @@ class LauncherWindow(QMainWindow):
             self,
             "Optional advanced calibration will move the pointer",
             "Normal Start works without this calibration by using automatic "
-            "plant-aware MAKCU control. Continue only if you intentionally want an "
-            "advanced mode-specific response profile.\n\n"
+            "direct-head command-aware MAKCU control. Continue only if you "
+            "intentionally want an advanced mode-specific response profile.\n\n"
             "Calibration sends only a short, bounded sequence of horizontal and "
             "vertical mouse movements through MAKCU. Nothing is activated "
             "automatically.\n\n"

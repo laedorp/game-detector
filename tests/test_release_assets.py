@@ -10,6 +10,10 @@ from scripts.validate_release_assets import (
     BALANCED_INPUT_SHAPE,
     COCO80_LABELS,
     EXPECTED_INPUT_SHAPE,
+    HEAD_MODEL_ATTRIBUTION,
+    HEAD_MODEL_ATTRIBUTION_MARKERS,
+    HEAD_MODEL_ONNX,
+    HEAD_MODEL_OUTPUT_SHAPE,
     PLAYER_ATTRIBUTION_MARKERS,
     PLAYER_LABELS,
     RELEASE_MODELS,
@@ -72,6 +76,10 @@ class FakeCore:
             or FakeModel(
                 input_shape=BALANCED_INPUT_SHAPE,
                 output_shapes=((1, 300, 6),),
+            ),
+            "sunxds_0.8.0.xml": FakeModel(
+                input_shape=EXPECTED_INPUT_SHAPE,
+                output_shapes=(HEAD_MODEL_OUTPUT_SHAPE,),
             ),
         }
         self.calls: list[tuple[Path, Path]] = []
@@ -181,6 +189,13 @@ class ReleaseAssetValidationTests(unittest.TestCase):
             "precision: INT8\nmethod: NNCF\noutput_xml_sha256: fixture\n",
             encoding="utf-8",
         )
+        head_dir = self.root / HEAD_MODEL_ONNX.parent
+        head_dir.mkdir(parents=True)
+        (self.root / HEAD_MODEL_ONNX).write_bytes(b"head onnx weights")
+        (self.root / HEAD_MODEL_ATTRIBUTION).write_text(
+            "\n".join(HEAD_MODEL_ATTRIBUTION_MARKERS) + "\n",
+            encoding="utf-8",
+        )
         self._write_default_contract()
         self._write_model_manifest()
 
@@ -246,6 +261,7 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         manifest_paths.update(
             Path(record["path"]) for record in contract["artifacts"].values()
         )
+        manifest_paths.update((HEAD_MODEL_ONNX, HEAD_MODEL_ATTRIBUTION))
         lines = []
         for relative in sorted(manifest_paths, key=lambda value: value.as_posix()):
             digest = hashlib.sha256((self.root / relative).read_bytes()).hexdigest()
@@ -267,7 +283,7 @@ class ReleaseAssetValidationTests(unittest.TestCase):
 
         summaries = validate_release_assets(self.root, core_factory=lambda: core)
 
-        self.assertEqual(len(summaries), 6)
+        self.assertEqual(len(summaries), 7)
         # The two player detectors are end-to-end; the COCO pair in this fixture
         # uses the traditional layout, while the high-end YOLO11l bundle keeps
         # the dynamic end-to-end path exercised.
@@ -286,7 +302,10 @@ class ReleaseAssetValidationTests(unittest.TestCase):
         for text in coco_summaries:
             self.assertIn("traditional [1,84,N]", text)
         self.assertIn("traditional [1,84,N]", high_end_summaries[0])
-        self.assertEqual(len(core.calls), 11)
+        self.assertTrue(
+            any("SunXDS head localizer" in summary for summary in summaries)
+        )
+        self.assertEqual(len(core.calls), 12)
         for model_path, weights_path in core.calls:
             self.assertTrue(model_path.is_absolute())
             if model_path.suffix == ".xml":
@@ -308,7 +327,12 @@ class ReleaseAssetValidationTests(unittest.TestCase):
 
         summaries = validate_release_assets(self.root, core_factory=lambda: core)
 
-        self.assertTrue(all("end-to-end [1,N,6]" in item for item in summaries))
+        detector_summaries = [
+            item for item in summaries if not item.startswith("SunXDS head localizer")
+        ]
+        self.assertTrue(
+            all("end-to-end [1,N,6]" in item for item in detector_summaries)
+        )
 
     def test_pointer_selects_a_new_rectangular_model_without_validator_edits(self) -> None:
         release = self.root / "models" / "release-defaults" / ("a" * 64)
