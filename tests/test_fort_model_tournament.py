@@ -380,8 +380,8 @@ def _fixture(
         for head in ("end2end", "traditional"):
             candidate, report = slots[(scale, head)]
             plan["models"][scale][head] = {
-                "candidate_dir": str(candidate.relative_to(root)),
-                "validation_report": str(report.relative_to(root)),
+                "candidate_dir": candidate.relative_to(root).as_posix(),
+                "validation_report": report.relative_to(root).as_posix(),
             }
     path = root / "tournament-plan.json"
     path.write_bytes(tournament_module._canonical_bytes(plan))

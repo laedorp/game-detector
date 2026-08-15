@@ -270,6 +270,7 @@ def validate_declared_requirements(
 ) -> list[dict[str, Any]]:
     """Prove the target-active source/build/runtime requirements are in the lock."""
 
+    project_root = project_root.expanduser().resolve()
     marker_environment = _marker_environment(profile)
     visited: set[Path] = set()
     active: dict[str, dict[str, Any]] = {}

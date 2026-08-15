@@ -109,12 +109,12 @@ class ReleaseDefaultModelSmokeTests(unittest.TestCase):
             self.assertEqual(command[command.index("--name") + 1], "release-default")
             self.assertEqual(command[command.index("--inference-size") + 1], "384x640")
             self.assertEqual(
-                Path(command[command.index("--model") + 1]),
-                bundle / "_internal" / "models" / "player" / "default.onnx",
+                Path(command[command.index("--model") + 1]).resolve(),
+                (bundle / "_internal" / "models" / "player" / "default.onnx").resolve(),
             )
             self.assertEqual(
-                Path(command[command.index("--labels") + 1]),
-                bundle / "_internal" / "models" / "player.txt",
+                Path(command[command.index("--labels") + 1]).resolve(),
+                (bundle / "_internal" / "models" / "player.txt").resolve(),
             )
             self.assertEqual(json.loads(output.read_text(encoding="utf-8")), benchmark)
 

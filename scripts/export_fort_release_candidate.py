@@ -477,7 +477,6 @@ def _validate_initial_training_contract(
     if training.get("cache") != "none" or arguments.get("cache") is not False:
         raise CandidateExportError("release training must use the exact no-cache dataset contract")
     expected_argument_values = {
-        "data": str(data),
         "epochs": planned_epochs,
         "patience": training.get("patience"),
         "batch": training.get("batch"),
@@ -491,13 +490,22 @@ def _validate_initial_training_contract(
         "single_cls": False,
         "save": True,
         "save_period": 1,
-        "project": str(run_dir.parent),
         "name": run_dir.name,
         "exist_ok": True,
     }
-    differing = sorted(
+    differing = [
         key for key, expected in expected_argument_values.items() if arguments.get(key) != expected
-    )
+    ]
+    for key, expected in (("data", data), ("project", run_dir.parent)):
+        try:
+            matches = _recorded_path(
+                arguments.get(key), f"initial training argument {key}"
+            ) == expected.resolve()
+        except CandidateExportError:
+            matches = False
+        if not matches:
+            differing.append(key)
+    differing.sort()
     if differing:
         raise CandidateExportError(
             f"initial training arguments are inconsistent with the run contract: {differing}"

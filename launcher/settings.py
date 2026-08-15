@@ -603,6 +603,7 @@ class LauncherSettings:
         except ValueError as exc:
             raise SettingsError(str(exc)) from exc
         backend = _backend_name(self.backend)
+        device = _device_name(self.device)
         if backend == "onnxruntime":
             # An ONNX graph is a single self-contained file, so there is no
             # separate weights file to keep beside it.
@@ -635,9 +636,9 @@ class LauncherSettings:
             "--labels",
             str(labels),
             "--device",
-            _device_name(self.device),
+            device,
             "--backend",
-            _backend_name(self.backend),
+            backend,
             "--inference-size",
             format_inference_size(inference_size_value),
             "--confidence",
@@ -651,6 +652,12 @@ class LauncherSettings:
                 "model output format",
             ),
         ]
+        if backend == "onnxruntime" and _requires_full_gpu_provider(device):
+            # Explicit accelerator choices must fail closed.  ONNX Runtime can
+            # otherwise assign unsupported graph nodes to CPU or retry a failed
+            # provider with a CPU-only session while the launcher still appears
+            # to be running the selected GPU.
+            args.append("--require-full-provider")
 
         crop = self.crop_size.strip()
         detail_crop = self.detail_crop_size.strip()
@@ -1076,6 +1083,24 @@ def _device_name(value: str) -> str:
         "CPUEXECUTIONPROVIDER": "CPU",
         "OPENVINOEXECUTIONPROVIDER": "OPENVINO",
     }.get(parsed, parsed)
+
+
+def _requires_full_gpu_provider(device: str) -> bool:
+    """Return whether an explicit ONNX device promises GPU-only inference."""
+
+    if device in {
+        "GPU",
+        "AMD",
+        "NVIDIA",
+        "CUDA",
+        "TENSORRT",
+        "ROCM",
+        "MIGRAPHX",
+        "DIRECTML",
+        "DML",
+    }:
+        return True
+    return device.startswith(("DIRECTML:", "DML:"))
 
 
 def _backend_name(value: str) -> str:

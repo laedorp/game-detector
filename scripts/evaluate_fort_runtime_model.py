@@ -1133,9 +1133,9 @@ def _assert_inputs_unchanged(
 def _write_metrics_file(path: Path, record: Mapping[str, Any]) -> None:
     """Create and durably flush the only member of a staged evidence directory."""
 
-    with path.open("x", encoding="utf-8") as destination:
-        json.dump(record, destination, indent=2, sort_keys=True)
-        destination.write("\n")
+    payload = (json.dumps(record, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    with path.open("xb") as destination:
+        destination.write(payload)
         destination.flush()
         os.fsync(destination.fileno())
 

@@ -93,7 +93,10 @@ class StrictFortEvaluationTests(unittest.TestCase):
             f"{self.dataset.resolve() / 'images' / 'test' / 'test-only.jpg'}\n",
         )
         yaml_text = (output / "fort_cuh_strict_eval.yaml").read_text(encoding="utf-8")
-        self.assertIn(str(output.resolve() / "strict_valid.txt"), yaml_text)
+        self.assertIn(
+            f"val: {json.dumps(str(output.resolve() / 'strict_valid.txt'))}",
+            yaml_text,
+        )
         self.assertIn("0: player", yaml_text)
         with self.assertRaisesRegex(StrictEvaluationError, "refusing to overwrite"):
             write_strict_evaluation(self.dataset, output)

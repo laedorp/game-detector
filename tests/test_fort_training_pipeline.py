@@ -674,7 +674,9 @@ class FortTrainingScriptTests(unittest.TestCase):
         )
         self.assertEqual(state.completed_epoch, 1)
         options = resume_training_arguments(resume, state)
-        self.assertEqual(options["resume"], str(weights / "last.pt"))
+        self.assertEqual(
+            Path(options["resume"]).resolve(), (weights / "last.pt").resolve()
+        )
         self.assertNotIn("data", options)
         self.assertNotIn("project", options)
 

@@ -374,20 +374,31 @@ class CudaTrainingHandoffTests(unittest.TestCase):
         self.assertEqual(training_arguments["save_period"], 1)
 
     def test_larger_candidate_uses_conservative_fixed_batch_on_eight_gb(self) -> None:
-        _report, command = handoff.prepare_handoff(
-            model_size="s",
-            run_name="unit_cuda5060_s_fresh",
-            device_index=0,
-            torch_module=_FakeTorch(),
-            version_getter=_versions,
-            power_probe=lambda: True,
-            dataset_verifier=lambda: {},
-        )
-        self.assertEqual(command[command.index("--batch") + 1], "4")
-        self.assertEqual(
-            command[command.index("--weights") + 1],
-            str(handoff.PROJECT_ROOT / "yolo26s.pt"),
-        )
+        with tempfile.TemporaryDirectory() as temporary:
+            project_root = Path(temporary)
+            weights = project_root / "yolo26s.pt"
+            weights.write_bytes(b"fake yolo26s unit-test checkpoint")
+            original_contract = handoff.MODEL_CONTRACTS["s"]
+            fake_contract = handoff.ModelContract(
+                filename=original_contract.filename,
+                sha256=handoff._sha256_file(weights),
+                default_run_name=original_contract.default_run_name,
+                training_batch=original_contract.training_batch,
+            )
+            with mock.patch.object(
+                handoff, "PROJECT_ROOT", project_root
+            ), mock.patch.dict(handoff.MODEL_CONTRACTS, {"s": fake_contract}):
+                _report, command = handoff.prepare_handoff(
+                    model_size="s",
+                    run_name="unit_cuda5060_s_fresh",
+                    device_index=0,
+                    torch_module=_FakeTorch(),
+                    version_getter=_versions,
+                    power_probe=lambda: True,
+                    dataset_verifier=lambda: {},
+                )
+            self.assertEqual(command[command.index("--batch") + 1], "4")
+            self.assertEqual(command[command.index("--weights") + 1], str(weights))
 
     def test_production_preflight_uses_isolated_probe_without_importing_torch(self) -> None:
         gpu = handoff.verify_cuda_device(_FakeTorch(), 0)
