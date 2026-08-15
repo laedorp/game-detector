@@ -12,6 +12,7 @@ from detection.head_worker import HeadObservation, HeadWorkerResult
 from detection.types import Detection
 from main import (
     AUTOMATIC_HEAD_CPU_THREADS,
+    AUTOMATIC_HEAD_LOCALIZATION_HZ,
     _AutomaticHeadRuntime,
     _PreparedDirectHeadLocalizer,
     _TimestampedPreparedHeadInput,
@@ -167,8 +168,143 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
                 self.assertGreaterEqual(len(worker.submissions), 599)
                 self.assertLessEqual(len(worker.submissions), 601)
 
+    def test_default_submission_gate_preserves_120_hz_phase_at_130_fps(self) -> None:
+        self.assertEqual(AUTOMATIC_HEAD_LOCALIZATION_HZ, 120.0)
+        worker = _FakeWorker()
+        runtime = _AutomaticHeadRuntime(worker)
+        runtime.accept_body(self.player.box)
+        with (
+            mock.patch(
+                "detection.head_detector.plan_head_crop",
+                return_value=object(),
+            ),
+            mock.patch(
+                "detection.head_detector.prepare_head_input",
+                return_value=object(),
+            ),
+        ):
+            for index in range(1300):
+                runtime.submit(
+                    self.frame,
+                    self.player,
+                    source_timestamp_ns=round(index * 1_000_000_000 / 130.0),
+                )
+
+        self.assertGreaterEqual(len(worker.submissions), 1199)
+        self.assertLessEqual(len(worker.submissions), 1201)
+
+    def test_two_primary_misses_cannot_recursively_submit_predicted_crop(self) -> None:
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=4,
+            source_timestamp_ns=100_000_000,
+        )
+        with (
+            mock.patch(
+                "detection.head_detector.plan_head_crop",
+                return_value=object(),
+            ),
+            mock.patch(
+                "detection.head_detector.prepare_head_input",
+                return_value=object(),
+            ),
+        ):
+            # The first miss is unknowable until primary inference completes,
+            # so this one job is authorized by the immediately prior physical
+            # primary sample.
+            self.assertTrue(
+                self.runtime.submit(
+                    self.frame,
+                    source_timestamp_ns=120_000_000,
+                )
+            )
+            self.runtime.accept_body(
+                self.player.box,
+                corroboration_box=None,
+                track_generation=4,
+                source_timestamp_ns=120_000_000,
+            )
+            self.assertFalse(self.runtime.early_submission_authorized)
+            self.assertFalse(
+                self.runtime.submit(
+                    self.frame,
+                    source_timestamp_ns=140_000_000,
+                )
+            )
+
+            # A second predicted frame cannot make prediction recursive.
+            self.runtime.accept_body(
+                self.player.box,
+                corroboration_box=None,
+                track_generation=4,
+                source_timestamp_ns=140_000_000,
+            )
+            self.assertFalse(
+                self.runtime.submit(
+                    self.frame,
+                    source_timestamp_ns=160_000_000,
+                )
+            )
+
+        self.assertEqual(len(self.worker.submissions), 1)
+        self.assertTrue(
+            self.runtime.consume_motion_corroboration_revocation()
+        )
+
+    def test_first_miss_head_result_cannot_publish_on_later_observed_frame(self) -> None:
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=6,
+            source_timestamp_ns=100_000_000,
+        )
+        with (
+            mock.patch(
+                "detection.head_detector.plan_head_crop",
+                return_value=object(),
+            ),
+            mock.patch(
+                "detection.head_detector.prepare_head_input",
+                return_value=object(),
+            ),
+        ):
+            self.assertTrue(
+                self.runtime.submit(
+                    self.frame,
+                    source_timestamp_ns=108_000_000,
+                )
+            )
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=None,
+            track_generation=6,
+            source_timestamp_ns=108_000_000,
+        )
+        self.runtime.consume_motion_corroboration_revocation()
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=6,
+            source_timestamp_ns=116_000_000,
+        )
+        self.worker.result = _result(
+            source_ns=108_000_000,
+            point=(200.0, 150.0),
+        )
+
+        self.assertIsNone(self.runtime.take_latest(now_ns=118_000_000))
+        self.assertIsNone(self.runtime.visible_sample(now_ns=118_000_000))
+        self.assertTrue(
+            self.runtime.consume_motion_corroboration_revocation()
+        )
+
     def test_direct_absolute_point_and_original_timestamp_are_preserved(self) -> None:
-        self.runtime.accept_body(self.player.box)
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            source_timestamp_ns=100_000_000,
+        )
         self.worker.result = _result(source_ns=100_000_000)
 
         sample = self.runtime.take_latest(now_ns=120_000_000)
@@ -178,6 +314,210 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertEqual(sample.source_timestamp_ns, 100_000_000)
         # This is intentionally unrelated to the body-box ratio proxy.
         self.assertNotEqual(sample.point, (200.0, 172.0))
+
+    def test_same_source_current_body_center_is_independent_corroboration(
+        self,
+    ) -> None:
+        previous = self.player.box
+        current = (110.0, 100.0, 310.0, 700.0)
+        self.runtime.accept_body(
+            previous,
+            corroboration_box=previous,
+            track_generation=5,
+            source_timestamp_ns=92_000_000,
+        )
+        with (
+            mock.patch(
+                "detection.head_detector.plan_head_crop",
+                return_value=object(),
+            ),
+            mock.patch(
+                "detection.head_detector.prepare_head_input",
+                return_value=object(),
+            ),
+        ):
+            self.assertTrue(
+                self.runtime.submit(
+                    self.frame,
+                    source_timestamp_ns=100_000_000,
+                )
+            )
+        self.runtime.accept_body(
+            current,
+            corroboration_box=current,
+            track_generation=5,
+            source_timestamp_ns=100_000_000,
+        )
+        self.worker.result = _result(
+            source_ns=100_000_000,
+            point=(205.0, 150.0),
+            selected_player_box=previous,
+        )
+
+        sample = self.runtime.take_latest(now_ns=108_000_000)
+
+        assert sample is not None
+        self.assertEqual(sample.point, (205.0, 150.0))
+        # The previous crop box center was (200, 400); it must never masquerade
+        # as same-source motion evidence for the current image.
+        self.assertEqual(sample.corroboration_point, (210.0, 400.0))
+
+    def test_wrong_timestamp_or_predicted_body_never_corroborates_head(self) -> None:
+        cases = (
+            (101_000_000, self.player.box),
+            (100_000_000, None),
+        )
+        for body_timestamp_ns, corroboration_box in cases:
+            with self.subTest(
+                body_timestamp_ns=body_timestamp_ns,
+                corroboration=corroboration_box is not None,
+            ):
+                worker = _FakeWorker()
+                runtime = _AutomaticHeadRuntime(worker, submission_hz=60.0)
+                runtime.accept_body(
+                    self.player.box,
+                    corroboration_box=corroboration_box,
+                    track_generation=1,
+                    source_timestamp_ns=body_timestamp_ns,
+                )
+                worker.result = _result(
+                    source_ns=100_000_000,
+                    point=(200.0, 150.0),
+                )
+
+                self.assertIsNone(runtime.take_latest(now_ns=110_000_000))
+                self.assertTrue(
+                    runtime.consume_motion_corroboration_revocation()
+                )
+
+    def test_primary_miss_can_bridge_position_but_withdraws_corroboration(
+        self,
+    ) -> None:
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=2,
+            source_timestamp_ns=100_000_000,
+        )
+        self.worker.result = _result(
+            source_ns=100_000_000,
+            point=(200.0, 150.0),
+        )
+        observed = self.runtime.take_latest(now_ns=102_000_000)
+        assert observed is not None
+        self.assertEqual(observed.corroboration_point, (200.0, 400.0))
+
+        # A tracker prediction may retain the bounded direct-head lease but is
+        # not an accepted primary measurement and therefore cannot grant FF.
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=None,
+            track_generation=2,
+            source_timestamp_ns=108_000_000,
+        )
+        self.worker.result = _result(source_ns=108_000_000, point=None)
+        self.assertIsNone(self.runtime.take_latest(now_ns=110_000_000))
+        bridged = self.runtime.visible_sample(now_ns=110_000_000)
+
+        assert bridged is not None
+        self.assertTrue(bridged.bridging)
+        self.assertEqual(bridged.point, observed.point)
+        self.assertIsNone(bridged.corroboration_point)
+
+    def test_body_reacquisition_cannot_relabel_old_head_bridge_as_observed(
+        self,
+    ) -> None:
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=2,
+            source_timestamp_ns=100_000_000,
+        )
+        self.worker.result = _result(
+            source_ns=100_000_000,
+            point=(200.0, 150.0),
+        )
+        observed = self.runtime.take_latest(now_ns=102_000_000)
+        assert observed is not None
+        self.assertFalse(observed.bridging)
+        self.assertEqual(observed.corroboration_point, (200.0, 400.0))
+
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=None,
+            track_generation=2,
+            source_timestamp_ns=108_000_000,
+        )
+        predicted = self.runtime.visible_sample(now_ns=110_000_000)
+        assert predicted is not None
+        self.assertTrue(predicted.bridging)
+        self.assertIsNone(predicted.corroboration_point)
+        self.assertTrue(
+            self.runtime.consume_motion_corroboration_revocation()
+        )
+
+        # The primary body is physical again, but no newer direct-head result
+        # exists. Status must continue to report the old point as a bridge and
+        # cannot resurrect its source-100 corroboration record.
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=2,
+            source_timestamp_ns=116_000_000,
+        )
+        body_only_reacquired = self.runtime.visible_sample(now_ns=118_000_000)
+        assert body_only_reacquired is not None
+        self.assertTrue(body_only_reacquired.bridging)
+        self.assertIsNone(body_only_reacquired.corroboration_point)
+        self.assertEqual(
+            body_only_reacquired.source_timestamp_ns,
+            observed.source_timestamp_ns,
+        )
+
+    def test_early_crop_uses_previous_box_time_for_fast_identity_validation(
+        self,
+    ) -> None:
+        first = (800.0, 200.0, 1000.0, 800.0)
+        current = (920.0, 200.0, 1120.0, 800.0)
+        self.runtime.accept_body(
+            first,
+            corroboration_box=first,
+            track_generation=9,
+            source_timestamp_ns=100_000_000,
+        )
+        with (
+            mock.patch(
+                "detection.head_detector.plan_head_crop",
+                return_value=object(),
+            ),
+            mock.patch(
+                "detection.head_detector.prepare_head_input",
+                return_value=object(),
+            ),
+        ):
+            self.assertTrue(
+                self.runtime.submit(
+                    self.frame,
+                    source_timestamp_ns=150_000_000,
+                )
+            )
+        self.runtime.accept_body(
+            current,
+            corroboration_box=current,
+            track_generation=9,
+            source_timestamp_ns=150_000_000,
+        )
+        self.worker.result = _result(
+            source_ns=150_000_000,
+            point=(1000.0, 260.0),
+            selected_player_box=first,
+        )
+
+        sample = self.runtime.take_latest(now_ns=150_000_000)
+
+        assert sample is not None
+        self.assertEqual(sample.point, (1000.0, 260.0))
+        self.assertEqual(sample.corroboration_point, (1020.0, 500.0))
 
     def test_stale_or_missing_head_never_becomes_visible(self) -> None:
         self.runtime.accept_body(self.player.box)
@@ -190,10 +530,19 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertIsNone(self.runtime.visible_sample(now_ns=210_000_000))
 
     def test_explicit_no_head_truthfully_bridges_only_existing_fresh_lease(self) -> None:
-        self.runtime.accept_body(self.player.box)
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            source_timestamp_ns=100_000_000,
+        )
         self.worker.result = _result(source_ns=100_000_000)
         original = self.runtime.take_latest(now_ns=110_000_000)
         assert original is not None
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            source_timestamp_ns=120_000_000,
+        )
         self.worker.result = _result(source_ns=120_000_000, point=None)
 
         self.assertIsNone(self.runtime.take_latest(now_ns=125_000_000))
@@ -205,10 +554,17 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
             bridged.source_timestamp_ns,
             original.source_timestamp_ns,
         )
+        self.assertTrue(
+            self.runtime.consume_motion_corroboration_revocation()
+        )
         self.assertIsNone(self.runtime.visible_sample(now_ns=165_000_001))
 
     def test_identity_advance_and_body_loss_clear_point_and_pending_result(self) -> None:
-        self.runtime.accept_body(self.player.box)
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            source_timestamp_ns=100_000_000,
+        )
         self.worker.result = _result(source_ns=100_000_000)
         self.assertIsNotNone(self.runtime.take_latest(now_ns=110_000_000))
 
@@ -330,7 +686,12 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
     def test_crossing_target_revokes_existing_visible_head_lease(self) -> None:
         first = (800.0, 200.0, 1000.0, 800.0)
         crossing = (950.0, 200.0, 1150.0, 800.0)
-        self.runtime.accept_body(first, track_generation=1)
+        self.runtime.accept_body(
+            first,
+            corroboration_box=first,
+            track_generation=1,
+            source_timestamp_ns=100_000_000,
+        )
         self.worker.result = _result(
             source_ns=100_000_000,
             point=(900.0, 260.0),
@@ -350,6 +711,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         moved_120_pixels = (920.0, 200.0, 1120.0, 800.0)
         self.runtime.accept_body(
             first,
+            corroboration_box=first,
             track_generation=7,
             source_timestamp_ns=100_000_000,
         )
@@ -362,6 +724,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertFalse(
             self.runtime.accept_body(
                 moved_120_pixels,
+                corroboration_box=moved_120_pixels,
                 track_generation=7,
                 source_timestamp_ns=150_000_000,
             )
@@ -371,8 +734,54 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertEqual(sample.point, (940.0, 260.0))
         self.assertEqual(self.runtime.identity_generation, 0)
 
+    def test_stationary_head_is_not_reprojected_by_oscillating_primary_boxes(
+        self,
+    ) -> None:
+        base = self.player.box
+        self.runtime.accept_body(
+            base,
+            corroboration_box=base,
+            track_generation=3,
+            source_timestamp_ns=100_000_000,
+        )
+        self.worker.result = _result(
+            source_ns=100_000_000,
+            point=(200.0, 150.0),
+            selected_player_box=base,
+        )
+        self.assertIsNotNone(self.runtime.take_latest(now_ns=100_000_000))
+
+        points: list[tuple[float, float]] = []
+        for index, offset in enumerate((4.0, -4.0, 3.5, -3.5, 4.0, -4.0), 1):
+            oscillating_box = (
+                base[0] + offset,
+                base[1] - offset,
+                base[2] + offset,
+                base[3] - offset,
+            )
+            self.assertFalse(
+                self.runtime.accept_body(
+                    oscillating_box,
+                    track_generation=3,
+                    source_timestamp_ns=100_000_000 + index * 8_000_000,
+                )
+            )
+            sample = self.runtime.visible_sample(
+                now_ns=100_000_000 + index * 8_000_000
+            )
+            assert sample is not None
+            points.append(sample.point)
+
+        # The direct head remains exactly fixed, hence far below the 3 px
+        # controller deadband and incapable of producing an orbit command.
+        self.assertEqual(points, [(200.0, 150.0)] * len(points))
+
     def test_nearby_tracker_prediction_retains_bounded_direct_head_lease(self) -> None:
-        self.runtime.accept_body(self.player.box)
+        self.runtime.accept_body(
+            self.player.box,
+            corroboration_box=self.player.box,
+            source_timestamp_ns=100_000_000,
+        )
         self.worker.result = _result(source_ns=100_000_000)
         original = self.runtime.take_latest(now_ns=110_000_000)
         assert original is not None
@@ -383,6 +792,8 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         retained = self.runtime.visible_sample(now_ns=130_000_000)
         assert retained is not None
         self.assertEqual(retained.point, original.point)
+        self.assertTrue(retained.bridging)
+        self.assertIsNone(retained.corroboration_point)
 
     def test_controller_loss_publication_is_idempotent_within_one_frame(self) -> None:
         controller = mock.Mock()

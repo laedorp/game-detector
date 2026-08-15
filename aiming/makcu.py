@@ -400,6 +400,7 @@ class MakcuTelemetrySnapshot:
     saturated_x_samples: int = 0
     saturated_y_samples: int = 0
     pursuit_resets: int = 0
+    motion_corroboration_confidence: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -830,6 +831,7 @@ class MakcuAimingController:
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
         self._latest_velocity_error: tuple[float, float] | None = None
+        self._latest_motion_corroboration_error: tuple[float, float] | None = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -884,6 +886,7 @@ class MakcuAimingController:
         self._telemetry_saturated_x_samples = 0
         self._telemetry_saturated_y_samples = 0
         self._telemetry_pursuit_resets = 0
+        self._telemetry_motion_corroboration_confidence = 0.0
         self.connected_port: str | None = None
         self._identity_token: str | None = None
 
@@ -957,6 +960,9 @@ class MakcuAimingController:
                 saturated_x_samples=self._telemetry_saturated_x_samples,
                 saturated_y_samples=self._telemetry_saturated_y_samples,
                 pursuit_resets=self._telemetry_pursuit_resets,
+                motion_corroboration_confidence=(
+                    self._telemetry_motion_corroboration_confidence
+                ),
             )
 
     def calibration_snapshot(self) -> MakcuCalibrationSnapshot:
@@ -995,6 +1001,7 @@ class MakcuAimingController:
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
         self._latest_velocity_error = None
+        self._latest_motion_corroboration_error = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -1376,6 +1383,7 @@ class MakcuAimingController:
             self._telemetry_saturated_x_samples = 0
             self._telemetry_saturated_y_samples = 0
             self._telemetry_pursuit_resets = 0
+            self._telemetry_motion_corroboration_confidence = 0.0
 
     def _record_pursuit_reset(self, *, reset_x: bool = True, reset_y: bool = True) -> None:
         """Count an actual accumulator clear, never a repeated empty tick."""
@@ -1399,6 +1407,7 @@ class MakcuAimingController:
         correction_y: float,
         limit_x: float,
         limit_y: float,
+        motion_corroboration_confidence: float = 0.0,
     ) -> None:
         """Aggregate one new authorized detector sample without device I/O."""
 
@@ -1414,6 +1423,10 @@ class MakcuAimingController:
             self._telemetry_pursuit_abs_y += abs(pursuit_y)
             self._telemetry_saturated_x_samples += int(abs(correction_x) >= limit_x)
             self._telemetry_saturated_y_samples += int(abs(correction_y) >= limit_y)
+            self._telemetry_motion_corroboration_confidence += min(
+                max(float(motion_corroboration_confidence), 0.0),
+                1.0,
+            )
 
     def _require_serial(self) -> None:
         if self._serial_factory is not None:
@@ -1574,6 +1587,7 @@ class MakcuAimingController:
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
         self._latest_velocity_error = None
+        self._latest_motion_corroboration_error = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -1859,6 +1873,7 @@ class MakcuAimingController:
         velocity_target: Detection | None = None,
         aim_point: tuple[float, float] | None = None,
         velocity_point: tuple[float, float] | None = None,
+        motion_corroboration_point: tuple[float, float] | None = None,
     ) -> None:
         """Publish one target-presence decision and optional exact aim point.
 
@@ -1866,8 +1881,11 @@ class MakcuAimingController:
         ``aim_point`` is an independently observed source-frame coordinate;
         when supplied alone it is used for both position and velocity
         observation channels.  ``velocity_point`` can instead provide a
-        separate raw coordinate from the same source frame.  Existing callers
-        which omit both points retain the body-box/head-ratio path.
+        separate raw coordinate from the same source frame.
+        ``motion_corroboration_point`` is optional independent evidence from
+        that exact same source frame; it can authorize bounded feed-forward
+        but can never move the requested aim coordinate. Existing callers
+        which omit these points retain the body-box/head-ratio path.
         """
 
         if self._serial is None:
@@ -1891,6 +1909,10 @@ class MakcuAimingController:
             )
         if aim_point is None and velocity_point is not None:
             raise ValueError("a velocity point requires an aim point")
+        if aim_point is None and motion_corroboration_point is not None:
+            raise ValueError(
+                "a motion corroboration point requires an aim point"
+            )
         if aim_point is not None and (
             not measurement_observed or target is None
         ):
@@ -1920,6 +1942,16 @@ class MakcuAimingController:
                 self.config,
                 name="velocity_point",
             )
+            motion_corroboration_error = (
+                _explicit_point_error_pixels(
+                    motion_corroboration_point,
+                    frame_shape,
+                    self.config,
+                    name="motion_corroboration_point",
+                )
+                if motion_corroboration_point is not None
+                else None
+            )
         else:
             error_x, error_y = _target_error_pixels(
                 target,
@@ -1931,6 +1963,7 @@ class MakcuAimingController:
                 if velocity_target is not None
                 else None
             )
+            motion_corroboration_error = None
         with self._state_lock:
             if self._calibration_token is not None:
                 raise MakcuError(
@@ -2001,6 +2034,9 @@ class MakcuAimingController:
             self._latest_source_ns = source_ns
             self._latest_measurement_observed = measurement_observed
             self._latest_velocity_error = velocity_error
+            self._latest_motion_corroboration_error = (
+                motion_corroboration_error
+            )
             if measurement_observed:
                 self._latest_measurement_ns = source_ns
                 self._measurement_target_present = target is not None
@@ -2011,6 +2047,37 @@ class MakcuAimingController:
             self._latest_sample_id += 1
         if self._output_thread is None:
             self._output_tick(1.0 / REFERENCE_CONTROL_HZ)
+
+    def revoke_motion_corroboration(self) -> None:
+        """Synchronously withdraw automatic feed-forward evidence only.
+
+        The accepted direct-head position/velocity lease and landed-command
+        ledger remain intact. This operation is enabled only for a calibrated
+        controller whose profile explicitly requires independent motion
+        corroboration, so explicit user profiles keep their existing sample
+        semantics.
+        """
+
+        controller = self._calibrated_controller
+        if (
+            controller is None
+            or not controller.config.require_motion_corroboration_for_feedforward
+        ):
+            return
+        # Lock order is calibrated -> state everywhere these domains meet.
+        # Owning the calibrated lock means any already-authorized serial write
+        # has completed before this method returns. Marking the current sample
+        # processed prevents a queued pre-revoke snapshot from replaying its
+        # old corroboration after the numeric state is cleared.
+        with self._calibrated_lock:
+            controller.revoke_motion_corroboration()
+            # A sub-count remainder may contain the old feed-forward term; it
+            # must not leak into the next otherwise position-only command.
+            self._fractional_x = 0.0
+            self._fractional_y = 0.0
+            with self._state_lock:
+                self._latest_motion_corroboration_error = None
+                self._calibrated_processed_sample_id = self._latest_sample_id
 
     def _run_output_loop(self) -> None:
         period_ns = max(1, round(1_000_000_000 / self.config.output_hz))
@@ -2162,6 +2229,7 @@ class MakcuAimingController:
         measurement_observed: bool,
         position_error: tuple[float, float],
         velocity_error: tuple[float, float] | None,
+        motion_corroboration_error: tuple[float, float] | None,
         source_ns: int,
         sample_id: int,
         generation: int,
@@ -2192,6 +2260,16 @@ class MakcuAimingController:
                         velocity_error_y_pixels=(
                             velocity_error[1]
                             if velocity_error is not None
+                            else None
+                        ),
+                        corroboration_error_x_pixels=(
+                            motion_corroboration_error[0]
+                            if motion_corroboration_error is not None
+                            else None
+                        ),
+                        corroboration_error_y_pixels=(
+                            motion_corroboration_error[1]
+                            if motion_corroboration_error is not None
                             else None
                         ),
                     )
@@ -2284,6 +2362,9 @@ class MakcuAimingController:
                         output.innovation_mahalanobis_squared
                     ),
                     innovation_rejected=output.innovation_rejected,
+                    motion_corroboration_confidence=(
+                        output.motion_corroboration_confidence
+                    ),
                 )
             self._calibrated_last_output = output
             if observation is not None and output.valid:
@@ -2295,15 +2376,18 @@ class MakcuAimingController:
                     observation.error_x_pixels,
                     observation.error_y_pixels,
                     output.target_velocity_x_pixels_per_second
+                    * output.velocity_feedforward_confidence_x
                     / controller.plant.gain_x_pixels_per_count
                     / REFERENCE_CONTROL_HZ,
                     output.target_velocity_y_pixels_per_second
+                    * output.velocity_feedforward_confidence_y
                     / controller.plant.gain_y_pixels_per_count
                     / REFERENCE_CONTROL_HZ,
                     bounded_rate_x / REFERENCE_CONTROL_HZ,
                     bounded_rate_y / REFERENCE_CONTROL_HZ,
                     rate_limit_x / REFERENCE_CONTROL_HZ,
                     rate_limit_y / REFERENCE_CONTROL_HZ,
+                    output.motion_corroboration_confidence,
                 )
             if not output.valid:
                 self._fractional_x = 0.0
@@ -2440,6 +2524,9 @@ class MakcuAimingController:
                 self._measurement_error_y,
             )
             velocity_error = self._latest_velocity_error
+            motion_corroboration_error = (
+                self._latest_motion_corroboration_error
+            )
             velocity_x = self._latest_velocity_x
             velocity_y = self._latest_velocity_y
             sample_id = self._latest_sample_id
@@ -2476,6 +2563,7 @@ class MakcuAimingController:
                 measurement_observed=measurement_observed,
                 position_error=position_error,
                 velocity_error=velocity_error,
+                motion_corroboration_error=motion_corroboration_error,
                 source_ns=source_ns,
                 sample_id=sample_id,
                 generation=generation,
@@ -2906,6 +2994,7 @@ class MakcuAimingController:
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
         self._latest_velocity_error = None
+        self._latest_motion_corroboration_error = None
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0

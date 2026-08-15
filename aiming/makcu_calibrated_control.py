@@ -61,6 +61,25 @@ _PAIRED_FEEDFORWARD_ZERO_SIGNAL_TO_NOISE = 0.5
 _PAIRED_FEEDFORWARD_FULL_SIGNAL_TO_NOISE = 2.0
 _PAIRED_FULL_POSITION_CHANNEL_AGREEMENT_PIXELS = 8.0
 _PAIRED_ZERO_POSITION_CHANNEL_AGREEMENT_PIXELS = 16.0
+_CORROBORATION_MEASUREMENT_SIGMA_PIXELS = 6.0
+_CORROBORATION_INNOVATION_GATE_MAHALANOBIS_SQUARED = 25.0
+_CORROBORATION_ZERO_DIRECTION_COSINE = 0.55
+_CORROBORATION_FULL_DIRECTION_COSINE = 0.90
+_CORROBORATION_ZERO_SPEED_RATIO = 0.30
+_CORROBORATION_FULL_SPEED_RATIO = 0.70
+_CORROBORATION_ZERO_SIGNAL_TO_NOISE = 0.50
+_CORROBORATION_FULL_SIGNAL_TO_NOISE = 1.75
+_CORROBORATION_MINIMUM_DIRECTION_COSINE = 0.90
+_CORROBORATION_ZERO_DIRECTION_PERSISTENCE_SECONDS = 0.016
+_CORROBORATION_FULL_DIRECTION_PERSISTENCE_SECONDS = 0.050
+_CORROBORATION_RISE_TIME_CONSTANT_SECONDS = 0.050
+_CORROBORATION_FALL_TIME_CONSTANT_SECONDS = 0.010
+# Positional lead is a short, closed-loop horizon rather than an open-loop
+# velocity command. Once independent evidence has reached half confidence it
+# may use that bounded horizon fully; explicit feed-forward remains scaled by
+# the unmodified, slower confidence. This preserves prompt pursuit without
+# weakening the exact-zero revoke boundary.
+_CORROBORATION_FULL_MOTION_PROJECTION_CONFIDENCE = 0.50
 _MAXIMUM_OBSERVER_DIAGNOSTIC = 1_000_000.0
 
 
@@ -140,6 +159,7 @@ class CalibratedControlConfig:
     wrong_way_guard_pixels: float = 2.0
     velocity_median_window: int = 3
     maximum_velocity_feedforward_fraction: float = 1.0
+    require_motion_corroboration_for_feedforward: bool = False
     maximum_command_history: int = 4096
 
     def __post_init__(self) -> None:
@@ -173,6 +193,10 @@ class CalibratedControlConfig:
             "maximum_velocity_feedforward_fraction",
             feedforward_fraction,
         )
+        if not isinstance(self.require_motion_corroboration_for_feedforward, bool):
+            raise TypeError(
+                "require_motion_corroboration_for_feedforward must be bool"
+            )
         if (
             isinstance(self.velocity_median_window, bool)
             or not isinstance(self.velocity_median_window, int)
@@ -201,10 +225,12 @@ class ScreenErrorObservation:
     tracker-smoothed point.  Supplying the optional ``velocity_error_*`` pair
     selects the automatic raw-point observer: that accepted detector point is
     the single measurement used to estimate both image position and target
-    velocity.  Exact landed commands are its known control input.  This avoids
-    differentiating a separately smoothed coordinate or letting two estimators
-    disagree.  Omitting both optional fields preserves the historical
-    single-channel controller exactly.
+    velocity.  Exact landed commands are its known control input.  An optional
+    ``corroboration_error_*`` pair is an independent object's point from the
+    same source frame (for example, the primary detector's player-box center).
+    Its separate observer can authorize coherent translation feed-forward, but
+    can never move or replace the raw aim coordinate.  Omitting the optional
+    fields preserves the historical single-channel controller exactly.
     """
 
     timestamp_ns: int
@@ -212,6 +238,8 @@ class ScreenErrorObservation:
     error_y_pixels: float
     velocity_error_x_pixels: float | None = None
     velocity_error_y_pixels: float | None = None
+    corroboration_error_x_pixels: float | None = None
+    corroboration_error_y_pixels: float | None = None
 
     def __post_init__(self) -> None:
         _timestamp(self.timestamp_ns, "observation timestamp")
@@ -248,6 +276,35 @@ class ScreenErrorObservation:
                 _finite(
                     self.velocity_error_y_pixels,
                     "observation velocity Y error",
+                ),
+            )
+        corroboration = (
+            self.corroboration_error_x_pixels is not None,
+            self.corroboration_error_y_pixels is not None,
+        )
+        if corroboration[0] != corroboration[1]:
+            raise ValueError(
+                "corroboration X/Y errors must either both be supplied or both be omitted"
+            )
+        if corroboration[0] and not paired[0]:
+            raise ValueError(
+                "corroboration errors require the paired velocity error channel"
+            )
+        if corroboration[0]:
+            object.__setattr__(
+                self,
+                "corroboration_error_x_pixels",
+                _finite(
+                    self.corroboration_error_x_pixels,
+                    "observation corroboration X error",
+                ),
+            )
+            object.__setattr__(
+                self,
+                "corroboration_error_y_pixels",
+                _finite(
+                    self.corroboration_error_y_pixels,
+                    "observation corroboration Y error",
                 ),
             )
 
@@ -293,6 +350,7 @@ class CalibratedControlOutput:
     velocity_feedforward_confidence_y: float = 0.0
     innovation_mahalanobis_squared: float = 0.0
     innovation_rejected: bool = False
+    motion_corroboration_confidence: float = 0.0
 
 
 class MakcuCalibratedController:
@@ -348,6 +406,21 @@ class MakcuCalibratedController:
         self._paired_rejection_count = 0
         self._last_innovation_rejected = False
         self._last_innovation_mahalanobis_squared = 0.0
+        # Optional independent motion evidence is intentionally a second
+        # observer, not another measurement fused into the direct aim point.
+        # The primary/body detector may corroborate translation, but its box
+        # geometry can never pull the requested coordinate away from the head.
+        self._corroboration_position_x = 0.0
+        self._corroboration_position_y = 0.0
+        self._corroboration_velocity_x = 0.0
+        self._corroboration_velocity_y = 0.0
+        self._corroboration_covariance_x = (0.0, 0.0, 0.0)
+        self._corroboration_covariance_y = (0.0, 0.0, 0.0)
+        self._motion_corroboration_confidence = 0.0
+        self._corroboration_direction_anchor_x = 0.0
+        self._corroboration_direction_anchor_y = 0.0
+        self._corroboration_direction_persistence_seconds = 0.0
+        self._corroboration_reseed_required = False
 
     @property
     def ready(self) -> bool:
@@ -363,6 +436,31 @@ class MakcuCalibratedController:
         if clear_command_history:
             self._commands.clear()
             self._last_command_ns = -1
+
+    def revoke_motion_corroboration(self) -> None:
+        """Withdraw feed-forward permission without discarding head position.
+
+        This is the narrow bridge operation for an explicit no-head result or
+        a current primary-player prediction.  The accepted direct-head state,
+        its freshness lease, landed-command ledger, and readiness remain
+        untouched.  A later corroboration channel must seed its independent
+        observer once before it can begin earning motion confidence again.
+
+        Like :meth:`step` and :meth:`record_emitted`, this numeric method is not
+        internally synchronized; the runtime owner must serialize calls.
+        """
+
+        self._corroboration_position_x = 0.0
+        self._corroboration_position_y = 0.0
+        self._corroboration_velocity_x = 0.0
+        self._corroboration_velocity_y = 0.0
+        self._corroboration_covariance_x = (0.0, 0.0, 0.0)
+        self._corroboration_covariance_y = (0.0, 0.0, 0.0)
+        self._motion_corroboration_confidence = 0.0
+        self._corroboration_direction_anchor_x = 0.0
+        self._corroboration_direction_anchor_y = 0.0
+        self._corroboration_direction_persistence_seconds = 0.0
+        self._corroboration_reseed_required = True
 
     def record_emitted(self, command: EmittedMouseCommand) -> None:
         """Record one successful physical write exactly once.
@@ -518,6 +616,41 @@ class MakcuCalibratedController:
                 projected_velocity_y,
                 velocity_sigma_y,
             ) * self._paired_measurement_agreement_y
+            if self.config.require_motion_corroboration_for_feedforward:
+                feedforward_confidence_x *= self._motion_corroboration_confidence
+                feedforward_confidence_y *= self._motion_corroboration_confidence
+
+                # A velocity estimate is predictive motion whether it enters
+                # as the explicit feed-forward term or as ``v * horizon`` in
+                # positional feedback.  Independent corroboration therefore
+                # gates both paths.  With no evidence (including immediately
+                # after an explicit revoke), bridge only the last accepted
+                # absolute head position minus commands which will have
+                # landed; never let retained velocity drive an open-loop P
+                # command.  Default/explicit profiles retain their historical
+                # full paired projection because they do not enable this
+                # automatic-only requirement.
+                static_projected_x = (
+                    self._paired_position_x
+                    - self.plant.gain_x_pixels_per_count * pending_x
+                )
+                static_projected_y = (
+                    self._paired_position_y
+                    - self.plant.gain_y_pixels_per_count * pending_y
+                )
+                motion_projection_confidence = min(
+                    self._motion_corroboration_confidence
+                    / _CORROBORATION_FULL_MOTION_PROJECTION_CONFIDENCE,
+                    1.0,
+                )
+                projected_x = static_projected_x + (
+                    motion_projection_confidence
+                    * (projected_x - static_projected_x)
+                )
+                projected_y = static_projected_y + (
+                    motion_projection_confidence
+                    * (projected_y - static_projected_y)
+                )
             self._paired_feedback_hold_x = self._paired_feedback_hold(
                 self._paired_feedback_hold_x,
                 projected_x,
@@ -629,6 +762,9 @@ class MakcuCalibratedController:
                 self._last_innovation_mahalanobis_squared
             ),
             innovation_rejected=self._last_innovation_rejected,
+            motion_corroboration_confidence=(
+                self._motion_corroboration_confidence
+            ),
         )
 
     def _reset_tracking(self) -> None:
@@ -649,6 +785,17 @@ class MakcuCalibratedController:
         self._paired_rejection_count = 0
         self._last_innovation_rejected = False
         self._last_innovation_mahalanobis_squared = 0.0
+        self._corroboration_position_x = 0.0
+        self._corroboration_position_y = 0.0
+        self._corroboration_velocity_x = 0.0
+        self._corroboration_velocity_y = 0.0
+        self._corroboration_covariance_x = (0.0, 0.0, 0.0)
+        self._corroboration_covariance_y = (0.0, 0.0, 0.0)
+        self._motion_corroboration_confidence = 0.0
+        self._corroboration_direction_anchor_x = 0.0
+        self._corroboration_direction_anchor_y = 0.0
+        self._corroboration_direction_persistence_seconds = 0.0
+        self._corroboration_reseed_required = False
 
     def _zero(self, now_ns: int, reason: str) -> CalibratedControlOutput:
         return CalibratedControlOutput(
@@ -677,6 +824,9 @@ class MakcuCalibratedController:
                 self._last_innovation_mahalanobis_squared
             ),
             innovation_rejected=self._last_innovation_rejected,
+            motion_corroboration_confidence=(
+                self._motion_corroboration_confidence
+            ),
         )
 
     def _ingest_commands(
@@ -739,6 +889,14 @@ class MakcuCalibratedController:
             # fresh velocity estimate without manufacturing a jump here.
             self._seed_observation(observation)
             return "velocity-channel-change"
+
+        corroborated = observation.corroboration_error_x_pixels is not None
+        previous_corroborated = (
+            previous.corroboration_error_x_pixels is not None
+        )
+        if corroborated != previous_corroborated:
+            self._seed_observation(observation)
+            return "corroboration-channel-change"
 
         if paired_velocity:
             return self._accept_paired_observation(
@@ -891,6 +1049,11 @@ class MakcuCalibratedController:
         if mahalanobis_squared > _PAIRED_INNOVATION_GATE_MAHALANOBIS_SQUARED:
             self._last_innovation_rejected = True
             self._paired_rejection_count += 1
+            # A rejected head coordinate cannot renew independent permission
+            # for open-loop motion.  Position may retain its ordinary short
+            # bridge, but predictive feed-forward fails closed immediately.
+            self._motion_corroboration_confidence = 0.0
+            self._corroboration_direction_persistence_seconds = 0.0
             if self._paired_rejection_count >= _PAIRED_REJECTIONS_BEFORE_RESEED:
                 self._seed_observation(observation)
                 return "innovation-reacquired"
@@ -922,6 +1085,12 @@ class MakcuCalibratedController:
         speed_limit = self.config.maximum_target_speed_pixels_per_second
         self._velocity_x = min(max(self._velocity_x, -speed_limit), speed_limit)
         self._velocity_y = min(max(self._velocity_y, -speed_limit), speed_limit)
+        self._update_motion_corroboration(
+            observation,
+            elapsed=elapsed,
+            landed_x_pixels=self.plant.gain_x_pixels_per_count * count_x,
+            landed_y_pixels=self.plant.gain_y_pixels_per_count * count_y,
+        )
         self._paired_rejection_count = 0
         self._last_observation = observation
         self._ready = True
@@ -955,7 +1124,267 @@ class MakcuCalibratedController:
             )
             self._paired_covariance_x = initial_covariance
             self._paired_covariance_y = initial_covariance
+            if observation.corroboration_error_x_pixels is not None:
+                assert observation.corroboration_error_y_pixels is not None
+                self._corroboration_position_x = (
+                    observation.corroboration_error_x_pixels
+                )
+                self._corroboration_position_y = (
+                    observation.corroboration_error_y_pixels
+                )
+                corroboration_variance = (
+                    _CORROBORATION_MEASUREMENT_SIGMA_PIXELS**2
+                )
+                corroboration_covariance = (
+                    corroboration_variance,
+                    0.0,
+                    initial_velocity_sigma * initial_velocity_sigma,
+                )
+                self._corroboration_covariance_x = corroboration_covariance
+                self._corroboration_covariance_y = corroboration_covariance
         self._prune_commands(observation.timestamp_ns)
+
+    def _update_motion_corroboration(
+        self,
+        observation: ScreenErrorObservation,
+        *,
+        elapsed: float,
+        landed_x_pixels: float,
+        landed_y_pixels: float,
+    ) -> None:
+        """Update independent translation evidence without moving the aim point."""
+
+        measured_x = observation.corroboration_error_x_pixels
+        measured_y = observation.corroboration_error_y_pixels
+        if measured_x is None or measured_y is None:
+            self._motion_corroboration_confidence = 0.0
+            return
+        if self._corroboration_reseed_required:
+            self._seed_corroboration(measured_x, measured_y)
+            self._motion_corroboration_confidence = 0.0
+            return
+
+        predicted_x, predicted_velocity_x, predicted_covariance_x = (
+            self._paired_predict_axis(
+                self._corroboration_position_x,
+                self._corroboration_velocity_x,
+                self._corroboration_covariance_x,
+                elapsed,
+                landed_x_pixels,
+            )
+        )
+        predicted_y, predicted_velocity_y, predicted_covariance_y = (
+            self._paired_predict_axis(
+                self._corroboration_position_y,
+                self._corroboration_velocity_y,
+                self._corroboration_covariance_y,
+                elapsed,
+                landed_y_pixels,
+            )
+        )
+        measurement_variance = _CORROBORATION_MEASUREMENT_SIGMA_PIXELS**2
+        innovation_x = measured_x - predicted_x
+        innovation_y = measured_y - predicted_y
+        mahalanobis_squared = (
+            innovation_x
+            * innovation_x
+            / (predicted_covariance_x[0] + measurement_variance)
+            + innovation_y
+            * innovation_y
+            / (predicted_covariance_y[0] + measurement_variance)
+        )
+        if (
+            not math.isfinite(mahalanobis_squared)
+            or mahalanobis_squared
+            > _CORROBORATION_INNOVATION_GATE_MAHALANOBIS_SQUARED
+        ):
+            # A body-box excursion is never allowed to invalidate an otherwise
+            # sound direct-head sample.  It merely withdraws permission for
+            # predictive feed-forward and reseeds its own independent state.
+            self._seed_corroboration(measured_x, measured_y)
+            self._motion_corroboration_confidence = 0.0
+            return
+
+        (
+            self._corroboration_position_x,
+            self._corroboration_velocity_x,
+            self._corroboration_covariance_x,
+        ) = self._paired_update_axis(
+            predicted_x,
+            predicted_velocity_x,
+            predicted_covariance_x,
+            measured_x,
+            measurement_variance,
+        )
+        (
+            self._corroboration_position_y,
+            self._corroboration_velocity_y,
+            self._corroboration_covariance_y,
+        ) = self._paired_update_axis(
+            predicted_y,
+            predicted_velocity_y,
+            predicted_covariance_y,
+            measured_y,
+            measurement_variance,
+        )
+        speed_limit = self.config.maximum_target_speed_pixels_per_second
+        self._corroboration_velocity_x = min(
+            max(self._corroboration_velocity_x, -speed_limit),
+            speed_limit,
+        )
+        self._corroboration_velocity_y = min(
+            max(self._corroboration_velocity_y, -speed_limit),
+            speed_limit,
+        )
+        raw_confidence = self._motion_corroboration(
+            self._velocity_x,
+            self._velocity_y,
+            math.sqrt(self._paired_covariance_x[2]),
+            math.sqrt(self._paired_covariance_y[2]),
+            self._corroboration_velocity_x,
+            self._corroboration_velocity_y,
+            math.sqrt(self._corroboration_covariance_x[2]),
+            math.sqrt(self._corroboration_covariance_y[2]),
+        )
+        raw_confidence *= self._direction_persistence_confidence(
+            self._velocity_x,
+            self._velocity_y,
+            self._corroboration_velocity_x,
+            self._corroboration_velocity_y,
+            elapsed,
+            evidence_present=raw_confidence > 0.0,
+        )
+        time_constant = (
+            _CORROBORATION_RISE_TIME_CONSTANT_SECONDS
+            if raw_confidence > self._motion_corroboration_confidence
+            else _CORROBORATION_FALL_TIME_CONSTANT_SECONDS
+        )
+        alpha = 1.0 - math.exp(-elapsed / time_constant)
+        self._motion_corroboration_confidence += alpha * (
+            raw_confidence - self._motion_corroboration_confidence
+        )
+
+    def _seed_corroboration(self, measured_x: float, measured_y: float) -> None:
+        self._corroboration_position_x = measured_x
+        self._corroboration_position_y = measured_y
+        self._corroboration_velocity_x = 0.0
+        self._corroboration_velocity_y = 0.0
+        measurement_variance = _CORROBORATION_MEASUREMENT_SIGMA_PIXELS**2
+        initial_velocity_sigma = min(
+            self.config.maximum_target_speed_pixels_per_second,
+            _PAIRED_INITIAL_VELOCITY_SIGMA_PIXELS_PER_SECOND,
+        )
+        covariance = (
+            measurement_variance,
+            0.0,
+            initial_velocity_sigma * initial_velocity_sigma,
+        )
+        self._corroboration_covariance_x = covariance
+        self._corroboration_covariance_y = covariance
+        self._corroboration_direction_anchor_x = 0.0
+        self._corroboration_direction_anchor_y = 0.0
+        self._corroboration_direction_persistence_seconds = 0.0
+        self._corroboration_reseed_required = False
+
+    def _direction_persistence_confidence(
+        self,
+        direct_x: float,
+        direct_y: float,
+        reference_x: float,
+        reference_y: float,
+        elapsed: float,
+        *,
+        evidence_present: bool,
+    ) -> float:
+        """Require one stable translation direction, rejecting curved orbits."""
+
+        if not evidence_present:
+            self._corroboration_direction_persistence_seconds = 0.0
+            return 0.0
+        common_x = direct_x + reference_x
+        common_y = direct_y + reference_y
+        magnitude = math.hypot(common_x, common_y)
+        if magnitude <= 1e-9:
+            self._corroboration_direction_persistence_seconds = 0.0
+            return 0.0
+        direction_x = common_x / magnitude
+        direction_y = common_y / magnitude
+        anchor_magnitude = math.hypot(
+            self._corroboration_direction_anchor_x,
+            self._corroboration_direction_anchor_y,
+        )
+        if anchor_magnitude <= 1e-9:
+            self._corroboration_direction_anchor_x = direction_x
+            self._corroboration_direction_anchor_y = direction_y
+            self._corroboration_direction_persistence_seconds = 0.0
+            return 0.0
+        alignment = (
+            direction_x * self._corroboration_direction_anchor_x
+            + direction_y * self._corroboration_direction_anchor_y
+        )
+        if alignment < _CORROBORATION_MINIMUM_DIRECTION_COSINE:
+            self._corroboration_direction_anchor_x = direction_x
+            self._corroboration_direction_anchor_y = direction_y
+            self._corroboration_direction_persistence_seconds = 0.0
+            return 0.0
+        self._corroboration_direction_persistence_seconds += elapsed
+        return self._ramp(
+            self._corroboration_direction_persistence_seconds,
+            _CORROBORATION_ZERO_DIRECTION_PERSISTENCE_SECONDS,
+            _CORROBORATION_FULL_DIRECTION_PERSISTENCE_SECONDS,
+        )
+
+    @staticmethod
+    def _ramp(value: float, zero: float, full: float) -> float:
+        return min(max((value - zero) / (full - zero), 0.0), 1.0)
+
+    @classmethod
+    def _motion_corroboration(
+        cls,
+        direct_x: float,
+        direct_y: float,
+        direct_sigma_x: float,
+        direct_sigma_y: float,
+        reference_x: float,
+        reference_y: float,
+        reference_sigma_x: float,
+        reference_sigma_y: float,
+    ) -> float:
+        """Score vector direction, magnitude, and statistical significance."""
+
+        direct_speed = math.hypot(direct_x, direct_y)
+        reference_speed = math.hypot(reference_x, reference_y)
+        if direct_speed <= 1e-9 or reference_speed <= 1e-9:
+            return 0.0
+        direction_cosine = (
+            direct_x * reference_x + direct_y * reference_y
+        ) / (direct_speed * reference_speed)
+        direction_confidence = cls._ramp(
+            direction_cosine,
+            _CORROBORATION_ZERO_DIRECTION_COSINE,
+            _CORROBORATION_FULL_DIRECTION_COSINE,
+        )
+        speed_ratio = min(direct_speed, reference_speed) / max(
+            direct_speed,
+            reference_speed,
+        )
+        speed_confidence = cls._ramp(
+            speed_ratio,
+            _CORROBORATION_ZERO_SPEED_RATIO,
+            _CORROBORATION_FULL_SPEED_RATIO,
+        )
+        direct_sigma = math.hypot(direct_sigma_x, direct_sigma_y)
+        reference_sigma = math.hypot(reference_sigma_x, reference_sigma_y)
+        signal_to_noise = min(
+            direct_speed / max(direct_sigma, 1e-9),
+            reference_speed / max(reference_sigma, 1e-9),
+        )
+        signal_confidence = cls._ramp(
+            signal_to_noise,
+            _CORROBORATION_ZERO_SIGNAL_TO_NOISE,
+            _CORROBORATION_FULL_SIGNAL_TO_NOISE,
+        )
+        return direction_confidence * speed_confidence * signal_confidence
 
     def _paired_predict_axis(
         self,

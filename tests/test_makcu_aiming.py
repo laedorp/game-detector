@@ -878,6 +878,7 @@ class MakcuAimingTests(unittest.TestCase):
                 measurement_ns=measurement_ns,
                 aim_point=(600.0, 340.0),
                 velocity_point=(800.0, 400.0),
+                motion_corroboration_point=(700.0, 300.0),
             )
             controller._output_tick(0.001, now_ns=measurement_ns)
 
@@ -887,9 +888,165 @@ class MakcuAimingTests(unittest.TestCase):
             self.assertEqual(observation.error_y_pixels, 30.0)
             self.assertEqual(observation.velocity_error_x_pixels, -240.0)
             self.assertEqual(observation.velocity_error_y_pixels, -60.0)
+            self.assertEqual(observation.corroboration_error_x_pixels, -90.0)
+            self.assertEqual(observation.corroboration_error_y_pixels, 90.0)
+
+            controller.update(
+                safety_target,
+                (720, 1280, 3),
+                measurement_ns=measurement_ns + 8_000_000,
+                aim_point=(600.0, 340.0),
+                velocity_point=(800.0, 400.0),
+            )
+            controller._output_tick(
+                0.008,
+                now_ns=measurement_ns + 8_000_000,
+            )
+            next_observation = calibrated._last_observation
+            assert next_observation is not None
+            self.assertIsNone(next_observation.corroboration_error_x_pixels)
+            self.assertIsNone(next_observation.corroboration_error_y_pixels)
+
+            controller.update(
+                None,
+                (720, 1280, 3),
+                measurement_ns=measurement_ns + 16_000_000,
+            )
+            self.assertIsNone(controller._latest_motion_corroboration_error)
         finally:
             controller._output_thread = None
             controller.stop()
+
+    def test_corroboration_revoke_cannot_replay_or_leak_prior_feedforward(
+        self,
+    ) -> None:
+        from main import _automatic_plant_aware_controller
+
+        calibrated = _automatic_plant_aware_controller(max_step=200)
+        controller = MakcuAimingController(
+            MakcuAimConfig(
+                max_step=200,
+                output_hz=1000,
+                vertical_rate_ratio=1.0,
+            ),
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        active = self.factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        live_worker = mock.Mock()
+        live_worker.is_alive.return_value = True
+        controller._output_thread = live_worker
+        safety_target = Detection(
+            0,
+            "player",
+            0.95,
+            (850.0, 200.0, 1070.0, 800.0),
+        )
+        base_ns = 51_650_000_000
+        try:
+            for index in range(40):
+                timestamp_ns = base_ns + index * 8_000_000
+                # The final accepted head point is exactly centered while its
+                # retained observer velocity is still about 575 px/s. After
+                # corroboration loss, that velocity must not sneak through
+                # the projected P term as an implicit feed-forward command.
+                point_x = 960.0 + (index - 39) * 4.6
+                controller.update(
+                    safety_target,
+                    (1080, 1920, 3),
+                    measurement_ns=timestamp_ns,
+                    aim_point=(point_x, 540.0),
+                    motion_corroboration_point=(point_x + 100.0, 740.0),
+                )
+                # Zero elapsed prevents the test harness from moving the fake
+                # screen while still exercising each real numeric decision.
+                controller._output_tick(0.0, now_ns=timestamp_ns)
+
+            before = controller.calibrated_control_output
+            assert before is not None
+            self.assertTrue(before.valid)
+            self.assertGreater(before.velocity_feedforward_confidence_x, 0.90)
+
+            # Queue a newer corroborated sample but revoke it before the 1 kHz
+            # owner consumes it. The wrapper must mark that exact sample
+            # processed rather than replaying stale permission after unlock.
+            queued_ns = base_ns + 313_000_000
+            controller.update(
+                safety_target,
+                (1080, 1920, 3),
+                measurement_ns=queued_ns,
+                aim_point=(960.575, 540.0),
+                motion_corroboration_point=(1060.575, 740.0),
+            )
+            self.assertNotEqual(
+                controller._calibrated_processed_sample_id,
+                controller._latest_sample_id,
+            )
+            controller._fractional_x = 0.75
+            controller._fractional_y = -0.75
+
+            controller.revoke_motion_corroboration()
+
+            self.assertIsNone(controller._latest_motion_corroboration_error)
+            self.assertEqual(
+                controller._calibrated_processed_sample_id,
+                controller._latest_sample_id,
+            )
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+            movement_before = self._movement_writes(active)
+            controller._output_tick(0.001, now_ns=queued_ns)
+            after = controller.calibrated_control_output
+            assert after is not None
+            self.assertTrue(after.valid)
+            self.assertTrue(calibrated.ready)
+            self.assertGreater(
+                after.target_velocity_x_pixels_per_second,
+                570.0,
+            )
+            self.assertEqual(after.motion_corroboration_confidence, 0.0)
+            self.assertEqual(after.velocity_feedforward_confidence_x, 0.0)
+            self.assertEqual(after.velocity_feedforward_confidence_y, 0.0)
+            self.assertEqual(after.rate_x_counts_per_second, 0.0)
+            self.assertEqual(self._movement_writes(active), movement_before)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_corroboration_revoke_is_noop_for_explicit_profile(self) -> None:
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.10, 0.10, 0.0),
+            CalibratedControlConfig(
+                velocity_median_window=1,
+                require_motion_corroboration_for_feedforward=False,
+            ),
+        )
+        controller = MakcuAimingController(
+            calibrated_controller=calibrated,
+            serial_factory=self.factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller._latest_motion_corroboration_error = (1.0, 2.0)
+        controller._fractional_x = 0.5
+        with mock.patch.object(
+            calibrated,
+            "revoke_motion_corroboration",
+        ) as revoke:
+            controller.revoke_motion_corroboration()
+
+        revoke.assert_not_called()
+        self.assertEqual(
+            controller._latest_motion_corroboration_error,
+            (1.0, 2.0),
+        )
+        self.assertEqual(controller._fractional_x, 0.5)
 
     def test_explicit_points_fail_closed_before_mutating_publication(self) -> None:
         controller = self.controller()
@@ -943,6 +1100,13 @@ class MakcuAimingTests(unittest.TestCase):
                 measurement_ns=51_800_000_000,
                 velocity_point=(960.0, 540.0),
             )
+        with self.assertRaisesRegex(ValueError, "requires an aim point"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=51_800_000_000,
+                motion_corroboration_point=(960.0, 540.0),
+            )
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             controller.update(
                 target,
@@ -958,6 +1122,23 @@ class MakcuAimingTests(unittest.TestCase):
                 measurement_ns=51_800_000_000,
                 aim_point=(960.0, 540.0),
                 velocity_point=(1920.0, 540.0),
+            )
+        with self.assertRaisesRegex(ValueError, "inside"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=51_800_000_000,
+                aim_point=(960.0, 540.0),
+                motion_corroboration_point=(1920.0, 540.0),
+            )
+        with self.assertRaisesRegex(ValueError, "aim point requires"):
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=51_800_000_000,
+                measurement_observed=False,
+                aim_point=(960.0, 540.0),
+                motion_corroboration_point=(960.0, 540.0),
             )
 
     def test_explicit_point_timestamps_reject_late_frames_and_same_time_motion(
@@ -1209,8 +1390,11 @@ class MakcuAimingTests(unittest.TestCase):
                 observer_position_sigma_y_pixels=2.50,
                 observer_velocity_sigma_x_pixels_per_second=125.0,
                 observer_velocity_sigma_y_pixels_per_second=250.0,
+                target_velocity_x_pixels_per_second=600.0,
+                target_velocity_y_pixels_per_second=-400.0,
                 velocity_feedforward_confidence_x=0.75,
                 velocity_feedforward_confidence_y=0.50,
+                motion_corroboration_confidence=0.625,
                 innovation_mahalanobis_squared=3.25,
                 innovation_rejected=True,
             )
@@ -1261,12 +1445,19 @@ class MakcuAimingTests(unittest.TestCase):
             )
             self.assertEqual(output.velocity_feedforward_confidence_x, 0.75)
             self.assertEqual(output.velocity_feedforward_confidence_y, 0.50)
+            self.assertEqual(output.motion_corroboration_confidence, 0.625)
             self.assertEqual(output.innovation_mahalanobis_squared, 3.25)
             self.assertTrue(output.innovation_rejected)
             telemetry = controller.telemetry_snapshot()
             self.assertEqual(telemetry.control_samples, 1)
             self.assertEqual(telemetry.saturated_x_samples, 1)
             self.assertEqual(telemetry.saturated_y_samples, 1)
+            self.assertAlmostEqual(telemetry.pursuit_x, 75.0)
+            self.assertAlmostEqual(telemetry.pursuit_y, -100.0 / 3.0)
+            self.assertEqual(
+                telemetry.motion_corroboration_confidence,
+                0.625,
+            )
         finally:
             controller._output_thread = None
             controller.stop()

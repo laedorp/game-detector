@@ -24,6 +24,7 @@ from capture.base import CaptureStats, FramePacket
 from config import parse_args
 from detection.types import Detection
 from main import (
+    _AutomaticHeadRuntime,
     _build_calibration_runtime_binding,
     _calibrated_controller_from_active_profile,
     _calibration_model_sha256,
@@ -548,6 +549,7 @@ class _FakeMakcuController:
         self.normal_updates = 0
         self.normal_update_arguments: list[tuple[object, ...]] = []
         self.normal_update_keywords: list[dict[str, object]] = []
+        self.corroboration_revocations = 0
         self.__class__.instances.append(self)
 
     @property
@@ -571,6 +573,9 @@ class _FakeMakcuController:
         self.normal_update_keywords.append(dict(_keywords))
         if self.reject_updates:
             raise AssertionError("normal MAKCU update ran during calibration")
+
+    def revoke_motion_corroboration(self) -> None:
+        self.corroboration_revocations += 1
 
     def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
         return MakcuTelemetrySnapshot()
@@ -1074,7 +1079,10 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(
             numeric.config.maximum_velocity_feedforward_fraction,
-            0.0,
+            0.95,
+        )
+        self.assertTrue(
+            numeric.config.require_motion_corroboration_for_feedforward
         )
         self.assertEqual(numeric.config.position_time_constant_seconds, 0.022)
         self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
@@ -1082,12 +1090,138 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("gains X/Y 0.125/0.12 px/count", output)
         self.assertIn("delay 8.00 ms", output)
         self.assertIn("head source pinned SunXDS 0.8.0 direct boxes on CPU", output)
-        self.assertIn("position-only command-aware observer", output)
-        self.assertIn("velocity feed-forward disabled", output)
+        self.assertIn(
+            "direct-head prediction gated by same-frame player motion",
+            output,
+        )
         self.assertIn("position tau/deadzone 22 ms/3 px", output)
         self.assertIn("caps X/Y 12000/12000 counts/s", output)
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)
+
+    def test_stable_head_job_starts_before_primary_inference(self) -> None:
+        events: list[str] = []
+        original_infer = _FakeDetector.infer
+
+        def ordered_primary_infer(detector, tensor):
+            events.append("primary")
+            return original_infer(detector, tensor)
+
+        head_runtime = mock.Mock()
+        head_runtime.status = SimpleNamespace()
+        head_runtime.early_submission_authorized = True
+        head_runtime.identity_generation = 7
+        head_runtime.submit.side_effect = lambda *_args, **_kwargs: (
+            events.append("head") or True
+        )
+        head_runtime.revoke_body.return_value = True
+        head_runtime.visible_sample.return_value = None
+        head_runtime.stop.return_value = True
+        _FakeDetector.detections = []
+
+        with (
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            mock.patch.object(
+                _FakeDetector,
+                "infer",
+                new=ordered_primary_infer,
+            ),
+        ):
+            result, _output = self._run(self.base_config)
+
+        self.assertEqual(result, 0)
+        self.assertGreaterEqual(len(events), 2)
+        self.assertEqual(events[:2], ["head", "primary"])
+
+    def test_two_live_primary_misses_do_not_submit_from_prediction(self) -> None:
+        player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
+        batches = iter(([player], [], []))
+
+        class TimestampedSource(_FakeSource):
+            def __init__(self) -> None:
+                super().__init__()
+                self.base_ns = perf_counter_ns() - 100_000_000
+
+            def read(self, timeout=None):
+                del timeout
+                self.read_calls += 1
+                index = self.read_calls - 1
+                started_ns = self.base_ns + index * 10_000_000
+                return FramePacket(
+                    image=np.zeros((1080, 1920, 3), dtype=np.uint8),
+                    sequence=index,
+                    read_started_ns=started_ns,
+                    read_completed_ns=started_ns + 100_000,
+                )
+
+        class RecordingHeadWorker:
+            def __init__(self) -> None:
+                self.submissions: list[dict[str, object]] = []
+                self.status = SimpleNamespace()
+
+            def start(self) -> None:
+                return None
+
+            def submit(self, _payload, **metadata) -> bool:
+                self.submissions.append(dict(metadata))
+                return True
+
+            def advance_identity(self, _generation: int) -> bool:
+                return True
+
+            def take_latest(self, _generation: int):
+                return None
+
+            def raise_if_failed(self) -> None:
+                return None
+
+            def stop(self) -> bool:
+                return True
+
+        source = TimestampedSource()
+        worker = RecordingHeadWorker()
+        head_runtime = _AutomaticHeadRuntime(worker)
+        config = replace(self.base_config, max_frames=3)
+
+        def sequenced_postprocess(_detector, _raw, **_arguments):
+            return list(next(batches))
+
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("aiming.MakcuAimingController", _FakeMakcuController),
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            mock.patch.object(
+                _FakeDetector,
+                "postprocess",
+                new=sequenced_postprocess,
+            ),
+            mock.patch.object(
+                _FakeMakcuController,
+                "activation_pressed",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        # Frame one seeds after its accepted primary. Frame two may start one
+        # overlapped job from frame one's physical evidence. Once frame two is
+        # a prediction, frame three cannot recursively submit its predicted box.
+        self.assertEqual(len(worker.submissions), 2)
+        self.assertEqual(
+            [item["source_timestamp_ns"] for item in worker.submissions],
+            [source.base_ns, source.base_ns + 10_000_000],
+        )
+        controller = _FakeMakcuController.instances[0]
+        self.assertEqual(controller.corroboration_revocations, 2)
 
     def test_automatic_mode_publishes_only_direct_head_point_after_player_safety(self) -> None:
         player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
@@ -1098,6 +1232,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             confidence=0.88,
             evidence="direct head box",
             bridging=False,
+            corroboration_point=(900.0, 450.0),
         )
         head_runtime = mock.Mock()
         head_runtime.status = SimpleNamespace()

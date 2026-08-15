@@ -131,6 +131,7 @@ class AimingControllerTests(unittest.TestCase):
             pursuit_abs_y=10.0,
             saturated_x_samples=1,
             pursuit_resets=2,
+            motion_corroboration_confidence=2.0,
         )
         current = MakcuTelemetrySnapshot(
             output_ticks=1100,
@@ -150,6 +151,7 @@ class AimingControllerTests(unittest.TestCase):
             pursuit_abs_y=60.0,
             saturated_x_samples=6,
             pursuit_resets=5,
+            motion_corroboration_confidence=32.0,
         )
 
         summary = _makcu_telemetry_summary(previous, current, 1.0)
@@ -165,6 +167,7 @@ class AimingControllerTests(unittest.TestCase):
         self.assertIn("CTRL samples 50/s", summary)
         self.assertIn("error abs X/Y 10.0/5.0px", summary)
         self.assertIn("pursuit X/Y 120/60 cps", summary)
+        self.assertIn("motion corroboration 60%", summary)
         self.assertIn("saturation X/Y 10/0%", summary)
         self.assertIn("pursuit resets 3", summary)
 

@@ -529,6 +529,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             confidence=0.9,
             evidence="direct head box",
             bridging=False,
+            corroboration_point=(24.0, 12.0),
         )
         head_runtime = mock.Mock()
         head_runtime.status = SimpleNamespace()
@@ -596,7 +597,10 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         )
         self.assertEqual(numeric.config.position_time_constant_seconds, 0.022)
         self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
-        self.assertEqual(numeric.config.maximum_velocity_feedforward_fraction, 0.0)
+        self.assertEqual(numeric.config.maximum_velocity_feedforward_fraction, 0.95)
+        self.assertTrue(
+            numeric.config.require_motion_corroboration_for_feedforward
+        )
         self.assertEqual(len(controller.updates), 2)
         first_target, _shape, _active, first_keywords = controller.updates[0]
         self.assertIsNone(first_target)
@@ -610,12 +614,20 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         )
         self.assertNotIn("velocity_target", direct_keywords)
         self.assertTrue(direct_keywords["measurement_observed"])
+        self.assertEqual(
+            direct_keywords["motion_corroboration_point"],
+            direct_sample.corroboration_point,
+        )
         head_runtime.submit.assert_called_once()
         self.assertEqual(cleanup_order, ["aim", "head"])
         startup = output.getvalue()
         self.assertIn("control automatic command-aware observer", startup)
         self.assertIn("head source pinned SunXDS 0.8.0 direct boxes", startup)
-        self.assertIn("velocity feed-forward disabled", startup)
+        self.assertIn(
+            "direct-head prediction gated by same-frame player motion",
+            startup,
+        )
+        self.assertIn("latest-only 120 Hz", startup)
 
     def test_capture_starvation_surfaces_automatic_head_worker_failure(self) -> None:
         report_path = self.root / "head-worker-starvation.json"

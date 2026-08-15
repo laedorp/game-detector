@@ -651,6 +651,149 @@ def _run_direct_point_plant(
     )
 
 
+def _run_aged_corroborated_direct_point_plant(
+    *,
+    observation_hz: float,
+    processing_age_ms: int,
+    feedforward_fraction: float,
+    physical_gain_scale: float,
+    body_noise_amplitude_pixels: float = 8.0,
+) -> _DirectPointRunResult:
+    """Close the plant around 60/120 Hz source-dated head/body evidence."""
+
+    controller = MakcuCalibratedController(
+        CalibratedPlant(0.125, 0.120, 0.008),
+        CalibratedControlConfig(
+            position_time_constant_seconds=0.022,
+            velocity_filter_time_constant_seconds=0.018,
+            maximum_target_speed_pixels_per_second=3000.0,
+            maximum_target_acceleration_pixels_per_second_squared=20_000.0,
+            maximum_rate_x_counts_per_second=19_200.0,
+            maximum_rate_y_counts_per_second=19_200.0,
+            stale_after_seconds=0.065,
+            maximum_observation_interval_seconds=0.040,
+            maximum_error_jump_pixels=180.0,
+            feedback_deadzone_pixels=3.0,
+            wrong_way_guard_pixels=2.0,
+            velocity_median_window=5,
+            maximum_velocity_feedforward_fraction=feedforward_fraction,
+            require_motion_corroboration_for_feedforward=True,
+        ),
+    )
+    error_x = 70.0
+    error_y = -35.0
+    fractional_x = 0.0
+    fractional_y = 0.0
+    delayed: list[tuple[int, int, int]] = []
+    delayed_index = 0
+    queued_observations: list[tuple[int, ScreenErrorObservation]] = []
+    observation_index = 0
+    next_source_ms = 0.0
+    radial_errors: list[float] = []
+    requested_rates: list[tuple[float, float]] = []
+
+    for tick in range(4500):
+        if 400 <= tick < 1600:
+            velocity_x, velocity_y = 575.0, -287.5
+        elif 2200 <= tick < 3400:
+            velocity_x, velocity_y = -575.0, 345.0
+        else:
+            velocity_x, velocity_y = 0.0, 0.0
+        error_x += velocity_x * 0.001
+        error_y += velocity_y * 0.001
+
+        while delayed_index < len(delayed) and delayed[delayed_index][0] <= tick:
+            _impact_ms, delta_x, delta_y = delayed[delayed_index]
+            delayed_index += 1
+            error_x -= 0.125 * physical_gain_scale * delta_x
+            error_y -= 0.120 * physical_gain_scale * delta_y
+
+        while tick + 1e-9 >= next_source_ms:
+            head_noise_x = (
+                0.70 * math.sin(observation_index * 1.91)
+                + 0.30 * math.sin(observation_index * 0.47 + 0.3)
+            )
+            head_noise_y = (
+                0.72 * math.sin(observation_index * 1.57 + 0.2)
+                + 0.28 * math.sin(observation_index * 0.39)
+            )
+            body_noise_x = body_noise_amplitude_pixels * (
+                0.70 * math.sin(observation_index * 1.31 + 0.4)
+                + 0.30 * math.sin(observation_index * 0.29)
+            )
+            body_noise_y = body_noise_amplitude_pixels * (
+                0.72 * math.sin(observation_index * 1.73 + 0.7)
+                + 0.28 * math.sin(observation_index * 0.37)
+            )
+            source_ms = round(next_source_ms)
+            measured_x = error_x + head_noise_x
+            measured_y = error_y + head_noise_y
+            queued_observations.append(
+                (
+                    source_ms + processing_age_ms,
+                    ScreenErrorObservation(
+                        source_ms * NS_PER_MS,
+                        measured_x,
+                        measured_y,
+                        velocity_error_x_pixels=measured_x,
+                        velocity_error_y_pixels=measured_y,
+                        corroboration_error_x_pixels=(
+                            error_x + 100.0 + body_noise_x
+                        ),
+                        corroboration_error_y_pixels=(
+                            error_y + 200.0 + body_noise_y
+                        ),
+                    ),
+                )
+            )
+            observation_index += 1
+            next_source_ms += 1000.0 / observation_hz
+
+        observation = None
+        if queued_observations and queued_observations[0][0] <= tick:
+            _arrival_ms, observation = queued_observations.pop(0)
+        output = controller.step(
+            tick * NS_PER_MS,
+            engaged=True,
+            observation=observation,
+        )
+        requested_rates.append(
+            (output.rate_x_counts_per_second, output.rate_y_counts_per_second)
+        )
+        fractional_x += output.rate_x_counts_per_second * 0.001
+        fractional_y += output.rate_y_counts_per_second * 0.001
+        delta_x = math.trunc(fractional_x)
+        delta_y = math.trunc(fractional_y)
+        fractional_x -= delta_x
+        fractional_y -= delta_y
+        if delta_x or delta_y:
+            command = EmittedMouseCommand(tick * NS_PER_MS, delta_x, delta_y)
+            controller.preflight_emitted(command)
+            controller.record_emitted(command)
+            delayed.append((tick + 8, delta_x, delta_y))
+        radial_errors.append(math.hypot(error_x, error_y))
+
+    moving_errors = radial_errors[600:1500] + radial_errors[2400:3300]
+    reversal_errors = radial_errors[2200:2500]
+    stationary_errors = radial_errors[3700:4500]
+    stationary_rates = requested_rates[3700:4500]
+    return _DirectPointRunResult(
+        moving_rms_pixels=_rms(moving_errors),
+        moving_p95_pixels=_percentile_95(moving_errors),
+        reversal_rms_pixels=_rms(reversal_errors),
+        maximum_reversal_error_pixels=max(reversal_errors),
+        stationary_rms_pixels=_rms(stationary_errors),
+        stationary_p95_pixels=_percentile_95(stationary_errors),
+        steady_abs_counts_per_second=sum(
+            abs(rate_x) + abs(rate_y) for rate_x, rate_y in stationary_rates
+        )
+        / len(stationary_rates),
+        maximum_requested_axis_rate=max(
+            max(abs(rate_x), abs(rate_y)) for rate_x, rate_y in requested_rates
+        ),
+    )
+
+
 class CalibratedControlUnitTests(unittest.TestCase):
     def test_velocity_error_pair_is_both_or_neither_and_finite(self) -> None:
         for values in ((1.0, None), (None, 1.0)):
@@ -674,6 +817,34 @@ class CalibratedControlUnitTests(unittest.TestCase):
                 velocity_error_y_pixels=0.0,
             )
 
+        with self.assertRaisesRegex(ValueError, "corroboration X/Y"):
+            ScreenErrorObservation(
+                0,
+                0.0,
+                0.0,
+                velocity_error_x_pixels=0.0,
+                velocity_error_y_pixels=0.0,
+                corroboration_error_x_pixels=1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "require the paired"):
+            ScreenErrorObservation(
+                0,
+                0.0,
+                0.0,
+                corroboration_error_x_pixels=1.0,
+                corroboration_error_y_pixels=1.0,
+            )
+        with self.assertRaisesRegex(ValueError, "corroboration X error"):
+            ScreenErrorObservation(
+                0,
+                0.0,
+                0.0,
+                velocity_error_x_pixels=0.0,
+                velocity_error_y_pixels=0.0,
+                corroboration_error_x_pixels=math.inf,
+                corroboration_error_y_pixels=0.0,
+            )
+
     def test_default_calibrated_envelope_has_no_hidden_vertical_ratio(self) -> None:
         config = CalibratedControlConfig()
         self.assertEqual(
@@ -686,7 +857,338 @@ class CalibratedControlUnitTests(unittest.TestCase):
                 CalibratedControlConfig(
                     maximum_velocity_feedforward_fraction=invalid,
                 )
+        with self.assertRaises(TypeError):
+            CalibratedControlConfig(
+                require_motion_corroboration_for_feedforward=1,  # type: ignore[arg-type]
+            )
         self.assertEqual(config.maximum_rate_y_counts_per_second, 19_200.0)
+
+    def test_independent_motion_corroboration_never_moves_direct_aim_point(
+        self,
+    ) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.125, 0.120, 0.008),
+            _test_config(
+                maximum_velocity_feedforward_fraction=0.95,
+                require_motion_corroboration_for_feedforward=True,
+            ),
+        )
+        for index in range(12):
+            timestamp_ns = index * 8 * NS_PER_MS
+            output = controller.step(
+                timestamp_ns,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    timestamp_ns,
+                    10.0,
+                    -5.0,
+                    velocity_error_x_pixels=10.0,
+                    velocity_error_y_pixels=-5.0,
+                    # An arbitrary body-center offset is valid because this
+                    # channel is evidence only, never a second aim coordinate.
+                    corroboration_error_x_pixels=510.0,
+                    corroboration_error_y_pixels=395.0,
+                ),
+            )
+        self.assertTrue(output.valid)
+        self.assertAlmostEqual(output.projected_error_x_pixels, 10.0, delta=0.01)
+        self.assertAlmostEqual(output.projected_error_y_pixels, -5.0, delta=0.01)
+        self.assertEqual(output.motion_corroboration_confidence, 0.0)
+        self.assertEqual(output.velocity_feedforward_confidence_x, 0.0)
+        self.assertEqual(output.velocity_feedforward_confidence_y, 0.0)
+
+    def test_feedforward_requires_persistent_independently_corroborated_motion(
+        self,
+    ) -> None:
+        def run(
+            hz: float,
+            point_at: object,
+            body_at: object,
+            *,
+            samples: int = 180,
+        ) -> list[CalibratedControlOutput]:
+            controller = MakcuCalibratedController(
+                CalibratedPlant(0.125, 0.120, 0.008),
+                _test_config(
+                    maximum_target_acceleration_pixels_per_second_squared=(
+                        20_000.0
+                    ),
+                    maximum_rate_x_counts_per_second=19_200.0,
+                    maximum_rate_y_counts_per_second=19_200.0,
+                    stale_after_seconds=0.065,
+                    maximum_velocity_feedforward_fraction=0.95,
+                    require_motion_corroboration_for_feedforward=True,
+                ),
+            )
+            outputs: list[CalibratedControlOutput] = []
+            for index in range(samples):
+                timestamp_ns = round(index * NS_PER_SECOND / hz)
+                point_x, point_y = point_at(index, hz)  # type: ignore[operator]
+                body_x, body_y = body_at(index, hz)  # type: ignore[operator]
+                outputs.append(
+                    controller.step(
+                        timestamp_ns,
+                        engaged=True,
+                        observation=ScreenErrorObservation(
+                            timestamp_ns,
+                            point_x,
+                            point_y,
+                            velocity_error_x_pixels=point_x,
+                            velocity_error_y_pixels=point_y,
+                            corroboration_error_x_pixels=body_x,
+                            corroboration_error_y_pixels=body_y,
+                        ),
+                    )
+                )
+            return outputs
+
+        for hz in (60.0, 120.0):
+            with self.subTest(hz=hz, motion="linear"):
+                linear = run(
+                    hz,
+                    lambda index, rate: (index * 575.0 / rate, 0.0),
+                    lambda index, rate: (100.0 + index * 575.0 / rate, 200.0),
+                )
+                self.assertGreater(
+                    min(
+                        output.motion_corroboration_confidence
+                        for output in linear[-30:]
+                    ),
+                    0.99,
+                )
+                self.assertGreater(
+                    min(
+                        output.velocity_feedforward_confidence_x
+                        for output in linear[-30:]
+                    ),
+                    0.94,
+                )
+
+            with self.subTest(hz=hz, motion="opposed"):
+                opposed = run(
+                    hz,
+                    lambda index, rate: (index * 575.0 / rate, 0.0),
+                    lambda index, rate: (100.0 - index * 575.0 / rate, 200.0),
+                )
+                self.assertEqual(
+                    max(
+                        output.velocity_feedforward_confidence_x
+                        for output in opposed[-60:]
+                    ),
+                    0.0,
+                )
+
+            with self.subTest(hz=hz, motion="correlated-circle"):
+                circle = tuple(
+                    (
+                        8.0 * math.cos(index * math.pi / 8.0),
+                        8.0 * math.sin(index * math.pi / 8.0),
+                    )
+                    for index in range(16)
+                )
+                circular = run(
+                    hz,
+                    lambda index, _rate: circle[index % len(circle)],
+                    lambda index, _rate: (
+                        circle[index % len(circle)][0] + 100.0,
+                        circle[index % len(circle)][1] + 200.0,
+                    ),
+                    samples=480,
+                )
+                self.assertLess(
+                    max(
+                        output.motion_corroboration_confidence
+                        for output in circular[-240:]
+                    ),
+                    0.002,
+                )
+                self.assertLess(
+                    max(
+                        output.velocity_feedforward_confidence_x
+                        for output in circular[-240:]
+                    ),
+                    0.001,
+                )
+
+    def test_rejected_direct_head_immediately_revokes_corroborated_feedforward(
+        self,
+    ) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.125, 0.120, 0.008),
+            _test_config(
+                maximum_target_acceleration_pixels_per_second_squared=(
+                    20_000.0
+                ),
+                stale_after_seconds=0.065,
+                maximum_velocity_feedforward_fraction=0.95,
+                require_motion_corroboration_for_feedforward=True,
+            ),
+        )
+        for index in range(40):
+            timestamp_ns = index * 8 * NS_PER_MS
+            point_x = index * 4.6
+            accepted = controller.step(
+                timestamp_ns,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    timestamp_ns,
+                    point_x,
+                    0.0,
+                    velocity_error_x_pixels=point_x,
+                    velocity_error_y_pixels=0.0,
+                    corroboration_error_x_pixels=point_x + 100.0,
+                    corroboration_error_y_pixels=200.0,
+                ),
+            )
+        self.assertGreater(accepted.velocity_feedforward_confidence_x, 0.90)
+
+        timestamp_ns = 40 * 8 * NS_PER_MS
+        rejected = controller.step(
+            timestamp_ns,
+            engaged=True,
+            observation=ScreenErrorObservation(
+                timestamp_ns,
+                1_000.0,
+                0.0,
+                velocity_error_x_pixels=1_000.0,
+                velocity_error_y_pixels=0.0,
+                corroboration_error_x_pixels=40 * 4.6 + 100.0,
+                corroboration_error_y_pixels=200.0,
+            ),
+        )
+        self.assertTrue(rejected.valid)
+        self.assertTrue(rejected.innovation_rejected)
+        self.assertEqual(rejected.motion_corroboration_confidence, 0.0)
+        self.assertEqual(rejected.velocity_feedforward_confidence_x, 0.0)
+
+    def test_explicit_corroboration_revoke_preserves_position_lease_and_reseeds(
+        self,
+    ) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.125, 0.120, 0.008),
+            _test_config(
+                position_time_constant_seconds=0.022,
+                maximum_target_acceleration_pixels_per_second_squared=(
+                    20_000.0
+                ),
+                stale_after_seconds=0.065,
+                maximum_observation_interval_seconds=0.065,
+                feedback_deadzone_pixels=3.0,
+                maximum_velocity_feedforward_fraction=0.95,
+                require_motion_corroboration_for_feedforward=True,
+            ),
+        )
+
+        def observe(index: int) -> CalibratedControlOutput:
+            timestamp_ns = index * 8 * NS_PER_MS
+            # End the accepted run exactly centered while velocity remains
+            # about 575 px/s. This catches the subtle bypass where retained
+            # velocity entered projected positional feedback even with the
+            # explicit feed-forward confidence already at zero.
+            point_x = (index - 40) * 4.6
+            return controller.step(
+                timestamp_ns,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    timestamp_ns,
+                    point_x,
+                    0.0,
+                    velocity_error_x_pixels=point_x,
+                    velocity_error_y_pixels=0.0,
+                    corroboration_error_x_pixels=point_x + 100.0,
+                    corroboration_error_y_pixels=200.0,
+                ),
+            )
+
+        for index in range(41):
+            before_revoke = observe(index)
+        self.assertTrue(controller.ready)
+        self.assertGreater(before_revoke.velocity_feedforward_confidence_x, 0.90)
+        self.assertGreater(
+            before_revoke.target_velocity_x_pixels_per_second,
+            570.0,
+        )
+
+        controller.revoke_motion_corroboration()
+        controller.revoke_motion_corroboration()  # Explicitly idempotent.
+        # The last direct-head point is exactly centered while its retained
+        # observer velocity is about 575 px/s. Across the entire valid lease,
+        # neither processing age nor the calibrated 8 ms delay may leak that
+        # uncorroborated velocity through projected positional feedback.
+        for age_ms in (1, 8, 32, 60):
+            bridged = controller.step(
+                (320 + age_ms) * NS_PER_MS,
+                engaged=True,
+            )
+            with self.subTest(age_ms=age_ms):
+                self.assertTrue(controller.ready)
+                self.assertTrue(bridged.valid)
+                self.assertIsNone(bridged.reset_reason)
+                self.assertGreater(
+                    bridged.target_velocity_x_pixels_per_second,
+                    570.0,
+                )
+                self.assertEqual(bridged.motion_corroboration_confidence, 0.0)
+                self.assertEqual(bridged.velocity_feedforward_confidence_x, 0.0)
+                self.assertAlmostEqual(
+                    bridged.projected_error_x_pixels,
+                    0.0,
+                    delta=1e-6,
+                )
+                self.assertEqual(bridged.rate_x_counts_per_second, 0.0)
+
+        # The first returning body point seeds only its independent observer;
+        # it cannot immediately restore held confidence. Direct-head position
+        # remains valid throughout rather than requiring a new two-frame lease.
+        first_return = observe(48)
+        self.assertTrue(first_return.valid)
+        self.assertTrue(controller.ready)
+        self.assertEqual(first_return.motion_corroboration_confidence, 0.0)
+        self.assertEqual(first_return.velocity_feedforward_confidence_x, 0.0)
+
+        for index in range(49, 79):
+            reacquired = observe(index)
+        self.assertGreater(reacquired.motion_corroboration_confidence, 0.90)
+        self.assertGreater(reacquired.velocity_feedforward_confidence_x, 0.85)
+
+    def test_profiles_without_corroboration_requirement_keep_velocity_projection(
+        self,
+    ) -> None:
+        controller = MakcuCalibratedController(
+            CalibratedPlant(0.125, 0.120, 0.008),
+            _test_config(
+                position_time_constant_seconds=0.022,
+                maximum_target_acceleration_pixels_per_second_squared=(
+                    20_000.0
+                ),
+                stale_after_seconds=0.065,
+                maximum_velocity_feedforward_fraction=0.95,
+                require_motion_corroboration_for_feedforward=False,
+            ),
+        )
+        for index in range(41):
+            timestamp_ns = index * 8 * NS_PER_MS
+            point_x = (index - 40) * 4.6
+            output = controller.step(
+                timestamp_ns,
+                engaged=True,
+                observation=ScreenErrorObservation(
+                    timestamp_ns,
+                    point_x,
+                    0.0,
+                    velocity_error_x_pixels=point_x,
+                    velocity_error_y_pixels=0.0,
+                ),
+            )
+        self.assertTrue(output.valid)
+        self.assertAlmostEqual(output.projected_error_x_pixels, 4.6, delta=0.2)
+
+        bridged = controller.step(352 * NS_PER_MS, engaged=True)
+        self.assertTrue(bridged.valid)
+        self.assertGreater(bridged.target_velocity_x_pixels_per_second, 570.0)
+        self.assertGreater(bridged.projected_error_x_pixels, 22.0)
+        self.assertGreater(bridged.velocity_feedforward_confidence_x, 0.0)
+        self.assertGreater(bridged.rate_x_counts_per_second, 0.0)
 
     def test_automatic_empty_only_bridge_remains_valid_with_processing_age(self) -> None:
         from main import _automatic_plant_aware_controller
@@ -1897,7 +2399,7 @@ class CalibratedControlPlantTests(unittest.TestCase):
             19_200.0,
         )
 
-    def test_automatic_factory_uses_direct_point_feedback_only_tuning(self) -> None:
+    def test_automatic_factory_requires_independent_motion_corroboration(self) -> None:
         from main import _automatic_plant_aware_controller
 
         controller = _automatic_plant_aware_controller(max_step=320)
@@ -1912,7 +2414,10 @@ class CalibratedControlPlantTests(unittest.TestCase):
         )
         self.assertEqual(controller.config.position_time_constant_seconds, 0.022)
         self.assertEqual(controller.config.feedback_deadzone_pixels, 3.0)
-        self.assertEqual(controller.config.maximum_velocity_feedforward_fraction, 0.0)
+        self.assertEqual(controller.config.maximum_velocity_feedforward_fraction, 0.95)
+        self.assertTrue(
+            controller.config.require_motion_corroboration_for_feedforward
+        )
 
         output = None
         q = 1920.0 / 416.0
@@ -1933,6 +2438,9 @@ class CalibratedControlPlantTests(unittest.TestCase):
         assert output is not None
         self.assertTrue(output.valid)
         self.assertGreater(output.target_velocity_x_pixels_per_second, 575.0)
+        # A coherent direct point alone is insufficient.  The automatic
+        # factory grants feed-forward only when a same-source primary body
+        # measurement independently corroborates that translation.
         self.assertEqual(output.velocity_feedforward_confidence_x, 0.0)
         self.assertGreater(output.rate_x_counts_per_second, 0.0)
 
@@ -1953,6 +2461,66 @@ class CalibratedControlPlantTests(unittest.TestCase):
             max(result.steady_abs_counts_per_second for result in results),
             2.0,
         )
+
+    def test_corroborated_feedforward_removes_60_120_hz_processing_lag(
+        self,
+    ) -> None:
+        cases = (
+            (60.0, 20),
+            (120.0, 12),
+        )
+        for observation_hz, processing_age_ms in cases:
+            for physical_gain_scale in (0.80, 1.20):
+                with self.subTest(
+                    observation_hz=observation_hz,
+                    processing_age_ms=processing_age_ms,
+                    physical_gain_scale=physical_gain_scale,
+                ):
+                    feedback_only = _run_aged_corroborated_direct_point_plant(
+                        observation_hz=observation_hz,
+                        processing_age_ms=processing_age_ms,
+                        feedforward_fraction=0.0,
+                        physical_gain_scale=physical_gain_scale,
+                    )
+                    corroborated = _run_aged_corroborated_direct_point_plant(
+                        observation_hz=observation_hz,
+                        processing_age_ms=processing_age_ms,
+                        feedforward_fraction=0.95,
+                        physical_gain_scale=physical_gain_scale,
+                    )
+                    # This uses source timestamps and real arrival age.  A
+                    # separately observed body center confirms translation;
+                    # the direct head remains the only position coordinate.
+                    self.assertLess(
+                        corroborated.moving_rms_pixels,
+                        feedback_only.moving_rms_pixels * 0.70,
+                    )
+                    self.assertLess(
+                        corroborated.moving_p95_pixels,
+                        feedback_only.moving_p95_pixels * 0.72,
+                    )
+                    self.assertLess(
+                        corroborated.reversal_rms_pixels,
+                        feedback_only.reversal_rms_pixels,
+                    )
+                    self.assertLessEqual(
+                        corroborated.stationary_rms_pixels,
+                        feedback_only.stationary_rms_pixels + 0.15,
+                    )
+                    # With motion evidence gone, the automatic profile now
+                    # freezes at the last absolute point rather than using
+                    # residual observer velocity to creep inside its 3 px
+                    # deadzone. Detector noise and integer count landing may
+                    # therefore leave a bounded sub-3.5 px static residual.
+                    self.assertLess(corroborated.stationary_rms_pixels, 3.5)
+                    self.assertLess(
+                        corroborated.steady_abs_counts_per_second,
+                        4.0,
+                    )
+                    self.assertLessEqual(
+                        corroborated.maximum_requested_axis_rate,
+                        19_200.0,
+                    )
 
     def test_bounded_automatic_feedforward_handles_twenty_percent_gain_error(
         self,
