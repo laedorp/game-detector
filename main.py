@@ -746,14 +746,13 @@ def _automatic_plant_aware_controller(*, max_step: int):
             AUTOMATIC_MAKCU_DELAY_SECONDS,
         ),
         CalibratedControlConfig(
-            # Normal detection boxes carry several pixels of frame-to-frame
-            # geometry noise even after target tracking.  A short derivative
-            # filter turns that noise into thousands of feed-forward counts
-            # per second.  The automatic (uncalibrated) path therefore uses a
-            # wider robust window and slower acceleration envelope.  Explicit
-            # calibration profiles keep the numeric core defaults above.
+            # Direct-head observations have a bounded 3 px feedback deadzone,
+            # covariance hold, and independently corroborated velocity path.
+            # A 12 ms position response removes the measured moving-target lag
+            # left by the former 22 ms response without weakening any velocity
+            # or physical-output gate. Explicit profiles keep their defaults.
             velocity_filter_time_constant_seconds=0.018,
-            position_time_constant_seconds=0.022,
+            position_time_constant_seconds=0.012,
             maximum_target_acceleration_pixels_per_second_squared=20_000.0,
             maximum_rate_x_counts_per_second=maximum_rate,
             maximum_rate_y_counts_per_second=maximum_rate,
@@ -2415,6 +2414,8 @@ def run(config: AppConfig) -> int:
             # therefore cannot move during this startup boundary.
             pass
         elif config.aim_output == "makcu":
+            from detection.head_detector import DEFAULT_HEAD_CONFIDENCE
+
             assert automatic_numeric_controller is not None
             assert automatic_head_runtime is not None
             head_provider = automatic_head_runtime.provider
@@ -2437,7 +2438,8 @@ def run(config: AppConfig) -> int:
                 f"delay {AUTOMATIC_MAKCU_DELAY_SECONDS * 1000.0:.2f} ms | "
                 "head source pinned SunXDS 0.8.0 direct boxes on "
                 f"{head_provider} GPU-only "
-                "(CPU fallback disabled) | "
+                "(CPU fallback disabled) | direct-head confidence "
+                f">= {DEFAULT_HEAD_CONFIDENCE:g} | "
                 f"latest-only {AUTOMATIC_HEAD_LOCALIZATION_HZ:g} Hz | "
                 f"fail closed after {AUTOMATIC_HEAD_STALE_AFTER_SECONDS * 1000.0:.0f} ms | "
                 "primary player box identity/safety only | "

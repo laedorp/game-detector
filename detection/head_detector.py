@@ -46,7 +46,11 @@ PLAYER_CLASS_ID = 0
 HEAD_CLASS_ID = 1
 HEAD_CLASS_NAMES = ("player", "head")
 
-DEFAULT_HEAD_CONFIDENCE = 0.30
+# Exact-model replay selected 0.25 as the conservative threshold that improved
+# direct-head recall while keeping every accepted center inside its annotation.
+# The next lower candidate (0.20) crossed a crowded sample's annotation edge,
+# so 0.25 remains the bounded default pending representative live evidence.
+DEFAULT_HEAD_CONFIDENCE = 0.25
 DEFAULT_NMS_IOU = 0.45
 DEFAULT_CROP_SCALE = 2.00
 DEFAULT_MIN_CROP_SIDE = 64

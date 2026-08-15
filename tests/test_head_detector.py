@@ -10,6 +10,7 @@ import numpy as np
 
 from detection.base import OutputDecodeError
 from detection.head_detector import (
+    DEFAULT_HEAD_CONFIDENCE,
     HEAD_CLASS_ID,
     HEAD_OUTPUT_CANDIDATES,
     MAX_HEAD_DETECTIONS,
@@ -218,6 +219,23 @@ class HeadDecoderTests(unittest.TestCase):
         self.assertTrue(np.allclose(decoded[0].box, (180, 80, 220, 120)))
         self.assertTrue(np.allclose(decoded[1].box, (120, 70, 320, 350)))
 
+    def test_default_threshold_is_selected_safe_recall_floor(self) -> None:
+        self.assertEqual(DEFAULT_HEAD_CONFIDENCE, 0.25)
+        output = model_output(((80, 30, 120, 70), 0.01, 0.27))
+
+        decoded = decode_head_output(output, self.transform)
+
+        self.assertEqual(len(decoded), 1)
+        self.assertEqual(decoded[0].class_id, HEAD_CLASS_ID)
+        self.assertAlmostEqual(decoded[0].confidence, 0.27, places=6)
+        self.assertEqual(
+            decode_head_output(
+                model_output(((80, 30, 120, 70), 0.01, 0.24)),
+                self.transform,
+            ),
+            [],
+        )
+
     def test_nms_is_class_aware_and_suppresses_only_duplicate_heads(self) -> None:
         output = model_output(
             ((80, 30, 120, 70), 0.92, 0.02),
@@ -235,7 +253,7 @@ class HeadDecoderTests(unittest.TestCase):
 
     def test_low_nonfinite_impossible_and_out_of_crop_rows_are_skipped(self) -> None:
         output = model_output(
-            ((10, 10, 30, 30), 0.01, 0.29),
+            ((10, 10, 30, 30), 0.01, 0.24),
             ((30, 30, 50, 50), 0.01, 0.90),
             ((60, 60, 60, 80), 0.01, 0.95),
             ((-40, 10, -20, 30), 0.01, 0.95),

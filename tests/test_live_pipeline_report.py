@@ -602,7 +602,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             numeric.config.maximum_observation_interval_seconds,
             0.040,
         )
-        self.assertEqual(numeric.config.position_time_constant_seconds, 0.022)
+        self.assertEqual(numeric.config.position_time_constant_seconds, 0.012)
         self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
         self.assertEqual(numeric.config.maximum_velocity_feedforward_fraction, 0.95)
         self.assertTrue(
@@ -634,6 +634,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             "MIGraphXExecutionProvider GPU-only (CPU fallback disabled)",
             startup,
         )
+        self.assertIn("direct-head confidence >= 0.25", startup)
         self.assertIn(
             "direct-head prediction gated by same-frame player motion",
             startup,

@@ -658,13 +658,14 @@ def _run_aged_corroborated_direct_point_plant(
     feedforward_fraction: float,
     physical_gain_scale: float,
     body_noise_amplitude_pixels: float = 8.0,
+    position_time_constant_seconds: float = 0.022,
 ) -> _DirectPointRunResult:
     """Close the plant around 60/120 Hz source-dated head/body evidence."""
 
     controller = MakcuCalibratedController(
         CalibratedPlant(0.125, 0.120, 0.008),
         CalibratedControlConfig(
-            position_time_constant_seconds=0.022,
+            position_time_constant_seconds=position_time_constant_seconds,
             velocity_filter_time_constant_seconds=0.018,
             maximum_target_speed_pixels_per_second=3000.0,
             maximum_target_acceleration_pixels_per_second_squared=20_000.0,
@@ -2412,7 +2413,7 @@ class CalibratedControlPlantTests(unittest.TestCase):
             controller.config.maximum_target_acceleration_pixels_per_second_squared,
             20_000.0,
         )
-        self.assertEqual(controller.config.position_time_constant_seconds, 0.022)
+        self.assertEqual(controller.config.position_time_constant_seconds, 0.012)
         self.assertEqual(controller.config.feedback_deadzone_pixels, 3.0)
         self.assertEqual(controller.config.maximum_velocity_feedforward_fraction, 0.95)
         self.assertTrue(
@@ -2521,6 +2522,53 @@ class CalibratedControlPlantTests(unittest.TestCase):
                         corroborated.maximum_requested_axis_rate,
                         19_200.0,
                     )
+
+    def test_direct_head_twelve_ms_position_response_cuts_live_cadence_lag(
+        self,
+    ) -> None:
+        for physical_gain_scale in (0.80, 1.0, 1.20):
+            with self.subTest(physical_gain_scale=physical_gain_scale):
+                former = _run_aged_corroborated_direct_point_plant(
+                    observation_hz=45.0,
+                    processing_age_ms=29,
+                    feedforward_fraction=0.95,
+                    physical_gain_scale=physical_gain_scale,
+                    position_time_constant_seconds=0.022,
+                )
+                faster = _run_aged_corroborated_direct_point_plant(
+                    observation_hz=45.0,
+                    processing_age_ms=29,
+                    feedforward_fraction=0.95,
+                    physical_gain_scale=physical_gain_scale,
+                    position_time_constant_seconds=0.012,
+                )
+
+                # These are the measured controller-ingestion cadence and
+                # median direct-point age from the 14:32 run. Faster position
+                # feedback materially reduces pursuit and reversal error even
+                # across the existing +/-20% uncalibrated plant envelope.
+                self.assertLess(
+                    faster.moving_rms_pixels,
+                    former.moving_rms_pixels * 0.60,
+                )
+                self.assertLess(
+                    faster.moving_p95_pixels,
+                    former.moving_p95_pixels * 0.70,
+                )
+                self.assertLess(
+                    faster.reversal_rms_pixels,
+                    former.reversal_rms_pixels * 0.86,
+                )
+                self.assertLessEqual(
+                    faster.stationary_rms_pixels,
+                    former.stationary_rms_pixels + 0.15,
+                )
+                self.assertLess(faster.stationary_rms_pixels, 3.5)
+                self.assertLess(faster.steady_abs_counts_per_second, 6.0)
+                self.assertLessEqual(
+                    faster.maximum_requested_axis_rate,
+                    19_200.0,
+                )
 
     def test_bounded_automatic_feedforward_handles_twenty_percent_gain_error(
         self,

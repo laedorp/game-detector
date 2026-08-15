@@ -1121,7 +1121,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertTrue(
             numeric.config.require_motion_corroboration_for_feedforward
         )
-        self.assertEqual(numeric.config.position_time_constant_seconds, 0.022)
+        self.assertEqual(numeric.config.position_time_constant_seconds, 0.012)
         self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
         self.assertIn(
             "Loading direct-head model on MIGraphXExecutionProvider GPU-only; "
@@ -1138,11 +1138,12 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             output,
         )
         self.assertIn("CPU fallback disabled", output)
+        self.assertIn("direct-head confidence >= 0.25", output)
         self.assertIn(
             "direct-head prediction gated by same-frame player motion",
             output,
         )
-        self.assertIn("position tau/deadzone 22 ms/3 px", output)
+        self.assertIn("position tau/deadzone 12 ms/3 px", output)
         self.assertIn("caps X/Y 12000/12000 counts/s", output)
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)
