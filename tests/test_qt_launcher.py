@@ -554,14 +554,160 @@ class QtLauncherTests(unittest.TestCase):
             QMessageBox.StandardButton.No,
         )
         self.assertIn("never activated automatically", question.call_args.args[2])
-        self.assertIn(
-            "press Right once, then fully release it",
-            question.call_args.args[2],
-        )
+        self.assertIn("KEEP Right Mouse RELEASED", question.call_args.args[2])
+        self.assertIn("Release confirmation is automatic", question.call_args.args[2])
+        self.assertNotIn("press Right once", question.call_args.args[2])
         private_path.assert_not_called()
         start.assert_not_called()
         self.assertIsNone(window.calibration_process)
         self.assertEqual(window.settings.aim_makcu_active_profile, "")
+
+    def test_calibration_guide_makes_each_physical_action_visible(self) -> None:
+        window = self.window(self.calibration_settings())
+
+        self.assertIn("Before calibration", window.aim_makcu_calibration_step.text())
+        self.assertIn("Keep Right Mouse released", window.aim_makcu_calibration_instruction.text())
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Exclusive mode armed. Keep activation released; "
+            "after Release confirmed, press and continuously hold it.\n"
+        )
+        self.assertIn("MAKCU armed", window.aim_makcu_calibration_step.text())
+        self.assertIn("Keep Right Mouse fully released", window.aim_makcu_calibration_instruction.text())
+        self.assertEqual(window.aim_makcu_calibration_progress.value(), 2)
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Waiting for a fresh MAKCU activation report; "
+            "movement is disarmed.\n"
+        )
+        self.assertIn("fresh button report", window.aim_makcu_calibration_step.text())
+        self.assertIn("Tap Right Mouse once", window.aim_makcu_calibration_instruction.text())
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Release confirmed and target ready. Press and "
+            "continuously hold activation.\n"
+        )
+        self.assertIn("READY TO HOLD", window.aim_makcu_calibration_step.text())
+        self.assertIn("stable target is ready", window.aim_makcu_calibration_instruction.text())
+        self.assertEqual(window.aim_makcu_calibration_progress.value(), 3)
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration target: target wait: no exact player detection\n"
+        )
+        self.assertIn("Waiting for a safe target", window.aim_makcu_calibration_step.text())
+        self.assertIn("Keep Right Mouse released", window.aim_makcu_calibration_instruction.text())
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration target: target ready: center-nearest of 2 exact detections\n"
+        )
+        self.assertIn("READY TO HOLD", window.aim_makcu_calibration_step.text())
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Hold detected. Keep holding while the selected "
+            "aim mode settles. No movement is authorized yet.\n"
+        )
+        self.assertIn("settling the aim view", window.aim_makcu_calibration_step.text())
+        self.assertIn("300 ms", window.aim_makcu_calibration_instruction.text())
+        self.assertIn(
+            "No movement is authorized",
+            window.aim_makcu_calibration_instruction.text(),
+        )
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Keep holding activation; waiting for one safe exact "
+            "target (target wait: no exact player detection). No movement is "
+            "authorized yet.\n"
+        )
+        self.assertIn("waiting for a safe target", window.aim_makcu_calibration_step.text())
+        self.assertIn("No movement is authorized", window.aim_makcu_calibration_instruction.text())
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Hold still while the stationary baseline settles.\n"
+        )
+        self.assertIn("Measuring response", window.aim_makcu_calibration_step.text())
+        self.assertIn("Keep Right Mouse held", window.aim_makcu_calibration_instruction.text())
+        self.assertEqual(window.aim_makcu_calibration_progress.value(), 4)
+
+    def test_calibration_summary_parses_readiness_between_state_and_button(self) -> None:
+        window = self.window(self.calibration_settings())
+
+        window._handle_calibration_output_line(
+            "FPS 160 | CAL wait_hold | target wait: self-avatar safety is not "
+            "ready | raw button released | counts 0/2400\n"
+        )
+        self.assertIn("Waiting for a safe target", window.aim_makcu_calibration_step.text())
+        window._handle_calibration_output_line(
+            "FPS 160 | CAL wait_hold | target ready: center-nearest of 2 exact "
+            "detections | raw button released | counts 0/2400\n"
+        )
+        self.assertIn("READY TO HOLD", window.aim_makcu_calibration_step.text())
+
+    def test_known_release_without_post_entry_frame_prompts_one_tap(self) -> None:
+        window = self.window(self.calibration_settings())
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Waiting for a post-entry framed MAKCU button "
+            "report; movement is disarmed.\n"
+        )
+
+        self.assertIn("fresh button report", window.aim_makcu_calibration_step.text())
+        self.assertIn("Tap Right Mouse once", window.aim_makcu_calibration_instruction.text())
+
+    def test_release_confirmed_waiting_message_beats_keep_released_parser(self) -> None:
+        window = self.window(self.calibration_settings())
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Release confirmed. Keep activation released; "
+            "waiting for a safe target (no exact target observation was available).\n"
+        )
+
+        self.assertTrue(window._calibration_release_confirmed)
+        self.assertIn("Waiting for a safe target", window.aim_makcu_calibration_step.text())
+        self.assertNotIn("MAKCU armed", window.aim_makcu_calibration_step.text())
+
+    def test_target_ready_updates_do_not_override_post_hold_settle(self) -> None:
+        window = self.window(self.calibration_settings())
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Release confirmed and target ready. Press and "
+            "continuously hold activation.\n"
+        )
+        window._handle_calibration_output_line(
+            "MAKCU calibration: Hold detected. Keep holding while the selected "
+            "aim mode settles. No movement is authorized yet.\n"
+        )
+
+        window._handle_calibration_output_line(
+            "MAKCU calibration target: target ready: center-nearest of 2 exact "
+            "detections\n"
+        )
+        self.assertIn("settling the aim view", window.aim_makcu_calibration_step.text())
+        window._handle_calibration_output_line(
+            "FPS 160 | CAL wait_hold | target ready: center-nearest of 2 exact "
+            "detections | raw button pressed | counts 0/2400\n"
+        )
+        self.assertIn("settling the aim view", window.aim_makcu_calibration_step.text())
+        self.assertNotIn("READY TO HOLD", window.aim_makcu_calibration_step.text())
+
+    def test_calibration_runtime_failure_stays_actionable_after_child_exit(self) -> None:
+        window = self.window(self.calibration_settings())
+        process = FakeProcess(returncode=2)
+        window.calibration_process = process  # type: ignore[assignment]
+        window._calibration_evidence_path = Path("/private/aborted.json")
+        window._calibration_launch_arguments = tuple(
+            window.collect().detector_arguments()
+        )
+        window._calibration_context = "ads"
+
+        window._handle_calibration_output_line(
+            "\x1b[31mMAKCU calibration: fresh activation lacked a safe target: "
+            "no exact target observation was available\x1b[0m\n"
+        )
+        with mock.patch("launcher.qt_app.QMessageBox.warning"):
+            window._finish_calibration_process(process, 2)  # type: ignore[arg-type]
+
+        self.assertIn("nothing was activated", window.aim_makcu_calibration_step.text())
+        self.assertIn("fully visible stationary player box", window.aim_makcu_calibration_instruction.text())
+        self.assertIn("safe target", window.aim_makcu_calibration_status.text())
 
     def test_calibration_context_is_explicit_noneditable_and_collected(self) -> None:
         window = self.window(self.calibration_settings())
@@ -618,6 +764,8 @@ class QtLauncherTests(unittest.TestCase):
             self.assertIsNone(window.process)
             self.assertFalse(window.start_button.isEnabled())
             self.assertTrue(window.stop_button.isEnabled())
+            self.assertIn("Starting the GPU model", window.aim_makcu_calibration_step.text())
+            self.assertIn("30–40 seconds", window.aim_makcu_calibration_instruction.text())
 
         window.calibration_process = None
 

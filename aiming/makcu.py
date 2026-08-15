@@ -1614,10 +1614,11 @@ class MakcuAimingController:
                     if is_pressed:
                         self._calibration_post_entry_press_seen = True
                     if not is_pressed:
-                        if (
-                            self._calibration_post_entry_press_seen
-                            and self._calibration_release_started_ns is None
-                        ):
+                        if self._calibration_release_started_ns is None:
+                            # A framed post-entry zero is already direct board
+                            # evidence that the activation button is released.
+                            # Do not require an artificial press/release cycle
+                            # before a released user can arm calibration.
                             self._calibration_release_started_ns = event_ns
                             self._calibration_release_started_report_sequence = (
                                 self._activation_framed_report_sequence

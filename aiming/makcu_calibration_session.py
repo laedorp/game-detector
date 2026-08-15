@@ -356,6 +356,8 @@ class CalibrationSessionConfig:
     stationary_span_seconds: float = 0.040
     stationary_range_pixels: float = 3.0
     stationary_speed_pixels_per_second: float = 20.0
+    post_hold_settle_seconds: float = 0.300
+    target_acquire_timeout_seconds: float = 2.0
     initial_settle_timeout_seconds: float = 1.5
     response_delay_seconds: float = 0.110
     response_settle_timeout_seconds: float = 0.75
@@ -387,6 +389,8 @@ class CalibrationSessionConfig:
             "stationary_span_seconds",
             "stationary_range_pixels",
             "stationary_speed_pixels_per_second",
+            "post_hold_settle_seconds",
+            "target_acquire_timeout_seconds",
             "initial_settle_timeout_seconds",
             "response_delay_seconds",
             "response_settle_timeout_seconds",
@@ -570,11 +574,14 @@ class MakcuCalibrationSession:
         self.config = config or CalibrationSessionConfig()
         self.started_ns = _timestamp(started_ns, "started_ns")
         self.state = CalibrationSessionState.WAIT_RELEASE
-        self.message = "Release the activation button to arm calibration."
+        self.message = "Keep the activation button released while calibration starts."
         self.result: CalibrationSessionResult | None = None
         self._token: object | None = None
         self._release_started_ns: int | None = None
         self._hold_deadline_ns = 0
+        self._hold_settle_deadline_ns = 0
+        self._target_deadline_ns = 0
+        self._hold_started_ns: int | None = None
         self._arm_deadline_ns = 0
         self._held_ns: int | None = None
         self._last_now_ns: int | None = None
@@ -711,9 +718,8 @@ class MakcuCalibrationSession:
                         f"could not enter exclusive calibration: {exc}",
                     )
                 self.message = (
-                    "Exclusive mode armed. Press activation once, fully release "
-                    "it, keep it released until Release confirmed, then press "
-                    "and hold."
+                    "Exclusive mode armed. Keep activation released; after "
+                    "Release confirmed, press and continuously hold it."
                 )
                 self._arm_deadline_ns = now + round(
                     self.config.arm_timeout_seconds * 1_000_000_000
@@ -738,12 +744,6 @@ class MakcuCalibrationSession:
                 dwell_ns = round(
                     self.config.release_dwell_seconds * 1_000_000_000
                 )
-                if not activation_snapshot.post_entry_press_seen:
-                    self.message = (
-                        "Press activation once, then fully release it and keep it "
-                        "released until Release confirmed."
-                    )
-                    return self.status()
                 if not activation_snapshot.known:
                     self.message = (
                         "Waiting for a fresh MAKCU activation report; movement is "
@@ -778,15 +778,15 @@ class MakcuCalibrationSession:
                                 "activation."
                             )
                             self._hold_deadline_ns = now + 15_000_000_000
-                            return self._begin_held_calibration(now, observation)
+                            return self._begin_post_hold_settle(now)
                         self.message = (
                             "Release was too brief. Fully release activation and "
                             "wait for Release confirmed before pressing again."
                         )
                     else:
                         self.message = (
-                            "Post-entry press received. Now fully release activation "
-                            "and keep it released until Release confirmed."
+                            "Activation is pressed. Fully release it and keep it "
+                            "released until Release confirmed."
                         )
                     return self.status()
                 release_ns = activation_snapshot.release_started_ns
@@ -799,8 +799,9 @@ class MakcuCalibrationSession:
                 if activation_snapshot.captured_ns - release_ns >= dwell_ns:
                     self._accepted_release_started_ns = release_ns
                     self.state = CalibrationSessionState.WAIT_HOLD
-                    self.message = (
-                        "Release confirmed. Press and continuously hold activation."
+                    self.message = self._released_target_readiness_message(
+                        observation,
+                        now,
                     )
                     self._hold_deadline_ns = now + 15_000_000_000
                 else:
@@ -814,8 +815,9 @@ class MakcuCalibrationSession:
                 dwell_ns = round(self.config.release_dwell_seconds * 1_000_000_000)
                 if now - self._release_started_ns >= dwell_ns:
                     self.state = CalibrationSessionState.WAIT_HOLD
-                    self.message = (
-                        "Release confirmed. Press and continuously hold activation."
+                    self.message = self._released_target_readiness_message(
+                        observation,
+                        now,
                     )
                     self._hold_deadline_ns = now + 15_000_000_000
             else:
@@ -823,8 +825,39 @@ class MakcuCalibrationSession:
             return self.status()
 
         if self.state is CalibrationSessionState.WAIT_HOLD:
-            if now > self._hold_deadline_ns:
+            if self._hold_started_ns is None and now > self._hold_deadline_ns:
                 return self._abort(now, "fresh post-entry activation timed out")
+            if self._hold_started_ns is not None:
+                if not activation_known or not activation_pressed:
+                    return self._abort(
+                        now,
+                        "physical activation was released or became unknown during "
+                        "post-hold settling or safe-target acquisition",
+                    )
+                if (
+                    activation_snapshot is not None
+                    and activation_snapshot.transition_sequence
+                    != self._accepted_hold_transition_sequence
+                ):
+                    return self._abort(
+                        now,
+                        "physical activation changed during post-hold settling or "
+                        "safe-target acquisition",
+                    )
+                if now < self._hold_settle_deadline_ns:
+                    self.message = (
+                        "Hold detected. Keep holding while the selected aim mode "
+                        "settles. No movement is authorized yet."
+                    )
+                    return self.status()
+                if now > self._target_deadline_ns:
+                    reason = self._observation_rejection(observation, now)
+                    detail = reason or "no continuously safe exact target was available"
+                    return self._abort(
+                        now,
+                        f"safe target was not ready before the hold deadline: {detail}",
+                    )
+                return self._begin_held_calibration(now, observation)
             if not activation_known:
                 if activation_snapshot is not None:
                     return self._abort(
@@ -833,6 +866,10 @@ class MakcuCalibrationSession:
                     )
                 return self.status()
             if not activation_pressed:
+                self.message = self._released_target_readiness_message(
+                    observation,
+                    now,
+                )
                 return self.status()
             if activation_snapshot is not None:
                 release_ns = activation_snapshot.completed_release_started_ns
@@ -855,7 +892,7 @@ class MakcuCalibrationSession:
                 self._accepted_hold_transition_sequence = (
                     activation_snapshot.completed_press_transition_sequence
                 )
-            return self._begin_held_calibration(now, observation)
+            return self._begin_post_hold_settle(now)
 
         if not activation_known or not activation_pressed:
             return self._abort(now, "physical activation was released or became unknown")
@@ -1070,10 +1107,11 @@ class MakcuCalibrationSession:
 
         reason = self._observation_rejection(observation, now_ns)
         if reason is not None:
-            return self._abort(
-                now_ns,
-                f"fresh activation lacked a safe target: {reason}",
+            self.message = (
+                "Keep holding activation; waiting for one safe exact target "
+                f"({reason}). No movement is authorized yet."
             )
+            return self.status()
         assert observation is not None
         try:
             assert self._token is not None
@@ -1104,6 +1142,40 @@ class MakcuCalibrationSession:
         self._record_fit_observation(observation)
         self._stable.append(observation)
         return self.status()
+
+    def _begin_post_hold_settle(self, now_ns: int) -> CalibrationSessionStatus:
+        """Latch the fresh hold but ignore pre-transition video without a lease."""
+
+        self._hold_started_ns = now_ns
+        self._hold_settle_deadline_ns = now_ns + round(
+            self.config.post_hold_settle_seconds * 1_000_000_000
+        )
+        self._target_deadline_ns = self._hold_settle_deadline_ns + round(
+            self.config.target_acquire_timeout_seconds * 1_000_000_000
+        )
+        self.message = (
+            "Hold detected. Keep holding while the selected aim mode settles. "
+            "No movement is authorized yet."
+        )
+        return self.status()
+
+    def _released_target_readiness_message(
+        self,
+        observation: CalibrationObservation | None,
+        now_ns: int,
+    ) -> str:
+        """Describe target readiness without authorizing a calibration lease."""
+
+        reason = self._observation_rejection(observation, now_ns)
+        if reason is None:
+            return (
+                "Release confirmed and target ready. Press and continuously hold "
+                "activation."
+            )
+        return (
+            "Release confirmed. Keep activation released; waiting for a safe target "
+            f"({reason})."
+        )
 
     def abort(self, reason: str, *, now_ns: int) -> CalibrationSessionStatus:
         """Idempotently stop an unfinished session without corrective movement."""

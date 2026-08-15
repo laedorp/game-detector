@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QRadioButton,
     QScrollArea,
@@ -448,6 +449,7 @@ class LauncherWindow(QMainWindow):
     """Main window: sidebar, section stack, and a persistent run bar."""
 
     log_line = Signal(str)
+    calibration_output_line = Signal(str)
     makcu_verification_done = Signal(bool, str, str, str)
     makcu_verification_progress = Signal(str)
     makcu_monitor_done = Signal()
@@ -488,6 +490,12 @@ class LauncherWindow(QMainWindow):
         self._calibration_evidence_path: Path | None = None
         self._calibration_launch_arguments: tuple[str, ...] | None = None
         self._calibration_context: str | None = None
+        self._calibration_last_runtime_failure = ""
+        self._calibration_guide_stage = "ready"
+        self._calibration_release_confirmed = False
+        self._calibration_target_ready = False
+        self._calibration_raw_button = "unknown"
+        self._calibration_settling_view = False
         self._pending_calibration_evidence: CalibrationSessionEvidence | None = None
         self._pending_calibration_path: Path | None = None
         self._makcu_verify_thread: threading.Thread | None = None
@@ -546,6 +554,7 @@ class LauncherWindow(QMainWindow):
         self._poll.start(400)
 
         self.log_line.connect(self._append_log)
+        self.calibration_output_line.connect(self._handle_calibration_output_line)
         self.makcu_verification_done.connect(self._apply_makcu_verification_result)
         self.makcu_verification_progress.connect(self._apply_makcu_verification_progress)
         self.makcu_monitor_done.connect(self._finish_makcu_monitor)
@@ -1091,6 +1100,22 @@ class LauncherWindow(QMainWindow):
         )
         self.aim_makcu_calibration_status.setWordWrap(True)
         layout.addWidget(self.aim_makcu_calibration_status)
+        self.aim_makcu_calibration_step = _label(
+            "Calibration guide — ready",
+            "title",
+        )
+        self.aim_makcu_calibration_step.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_calibration_step)
+        self.aim_makcu_calibration_progress = QProgressBar()
+        self.aim_makcu_calibration_progress.setRange(0, 4)
+        self.aim_makcu_calibration_progress.setValue(0)
+        self.aim_makcu_calibration_progress.setTextVisible(True)
+        self.aim_makcu_calibration_progress.setFormat("Not started")
+        layout.addWidget(self.aim_makcu_calibration_progress)
+        self.aim_makcu_calibration_instruction = _label("")
+        self.aim_makcu_calibration_instruction.setWordWrap(True)
+        layout.addWidget(self.aim_makcu_calibration_instruction)
+        self._set_calibration_guide("ready")
         note = _label(
             "Verification is read-only. It watches for a press and release from the selected "
             "MAKCU mouse button and never moves or clicks during the check.",
@@ -2204,6 +2229,12 @@ class LauncherWindow(QMainWindow):
             self._makcu_verified_port = ""
             self._makcu_verified_button = ""
         self._refresh_makcu_verification_status()
+        if (
+            hasattr(self, "aim_makcu_calibration_instruction")
+            and not self._calibration_running()
+            and self._pending_calibration_evidence is None
+        ):
+            self._set_calibration_guide("ready")
         self._update_calibration_controls()
 
     def _update_aim_state(self) -> None:
@@ -2310,7 +2341,10 @@ class LauncherWindow(QMainWindow):
                 "staged; calibrate this mode before activation."
             )
             self._set_status("Calibration context changed; run calibration again.", "warn")
+            self._set_calibration_guide("ready")
             return
+        if not self._calibration_running() and self._pending_calibration_evidence is None:
+            self._set_calibration_guide("ready")
         self._update_calibration_controls()
 
     def _clear_staged_calibration(self) -> None:
@@ -2332,6 +2366,322 @@ class LauncherWindow(QMainWindow):
         if self._precision_running():
             return "Stop controller precision before MAKCU calibration."
         return None
+
+    def _set_calibration_guide(self, stage: str, detail: str = "") -> None:
+        """Show the next physical action without making the log a requirement.
+
+        Calibration startup can spend tens of seconds compiling a GPU model.
+        A click made during that interval is deliberately not accepted by the
+        fresh-input safety latch, so the persistent panel must distinguish
+        loading from the moment the controller is actually ready.
+        """
+
+        if not hasattr(self, "aim_makcu_calibration_instruction"):
+            return
+        button = MAKCU_BUTTON_LABELS[self._selected_makcu_button()]
+        context = self.aim_makcu_context.currentText() or "selected aim mode"
+        context_mode = self._selected_calibration_context()
+        if context_mode == "ads":
+            context_setup = (
+                f"{context} is selected; the final {button} Mouse hold should enter "
+                "and maintain ADS."
+            )
+        else:
+            context_setup = f"Keep the game in {context} during the final hold."
+        descriptions = {
+            "ready": (
+                0,
+                "Before calibration — set up a stationary target",
+                "Ready",
+                "In the game, show at least one fully visible stationary player and "
+                "ProAim will use the player nearest the center. "
+                f"{context_setup} Keep {button} Mouse released, then click Calibrate "
+                "response.",
+            ),
+            "loading": (
+                1,
+                "Step 1 of 4 — Starting the GPU model",
+                "Step 1 / 4",
+                f"Keep {button} Mouse fully released and do not move the mouse. "
+                "GPU model startup can take 30–40 seconds. This guide will advance "
+                "automatically when MAKCU is armed.",
+            ),
+            "release_wait": (
+                2,
+                "Step 2 of 4 — MAKCU armed; keep the button released",
+                "Step 2 / 4",
+                f"Keep {button} Mouse fully released. Release confirmation is "
+                "automatic; wait until this panel advances. Do not press and hold yet.",
+            ),
+            "input_unknown": (
+                2,
+                "Step 2 of 4 — MAKCU needs a fresh button report",
+                "Step 2 / 4",
+                f"MAKCU still reports an unknown state. Tap {button} Mouse once, "
+                "release it immediately, then keep it released. Do not hold it yet.",
+            ),
+            "hold": (
+                3,
+                "Step 3 of 4 — READY TO HOLD",
+                "Step 3 / 4",
+                "A stable target is ready in the preview. Press and continuously "
+                f"hold {button} Mouse. Keep "
+                "holding it and do not move the mouse until calibration completes.",
+            ),
+            "target_before_hold": (
+                3,
+                "Step 3 of 4 — Waiting for a safe target",
+                "Step 3 / 4",
+                f"Keep {button} Mouse released. Put a fully visible stationary player "
+                "in the preview; ProAim will choose the one nearest the center and "
+                "change this guide to READY TO HOLD automatically.",
+            ),
+            "target_while_held": (
+                3,
+                "Step 3 of 4 — Hold detected; waiting for a safe target",
+                "Step 3 / 4",
+                f"Keep {button} Mouse held and put a fully visible stationary player "
+                "in the preview. No movement is authorized until a safe target is ready.",
+            ),
+            "settling_view": (
+                3,
+                "Step 3 of 4 — Hold detected; settling the aim view",
+                "Step 3 / 4",
+                f"Keep {button} Mouse held continuously and do not move the mouse. "
+                "ProAim is waiting 300 ms for the aim-mode/FOV transition to settle. "
+                "No movement is authorized during this wait.",
+            ),
+            "measuring": (
+                4,
+                "Step 4 of 4 — Measuring response",
+                "Step 4 / 4",
+                f"Keep {button} Mouse held continuously. Keep the same player still "
+                "and fully visible, and do not move the mouse. The bounded pointer "
+                "movements are automatic.",
+            ),
+            "complete": (
+                4,
+                "Calibration measured — review and activate",
+                "Measurement complete",
+                "The measurement passed strict checks but is not active yet. Click "
+                "Review and activate to use it for detection.",
+            ),
+            "active": (
+                4,
+                "Calibration active",
+                "Profile active",
+                "The measured response profile is selected. Start detection to use "
+                "the calibrated controller.",
+            ),
+            "failed": (
+                0,
+                "Calibration stopped safely — nothing was activated",
+                "Stopped — retry",
+                detail
+                or "Correct the condition shown below, then click Calibrate response "
+                "to try again.",
+            ),
+        }
+        if stage not in descriptions:
+            raise ValueError(f"unknown calibration guide stage: {stage}")
+        value, heading, progress, instruction = descriptions[stage]
+        self._calibration_guide_stage = stage
+        self.aim_makcu_calibration_step.setText(heading)
+        self.aim_makcu_calibration_progress.setValue(value)
+        self.aim_makcu_calibration_progress.setFormat(progress)
+        self.aim_makcu_calibration_instruction.setText(instruction)
+
+    @staticmethod
+    def _calibration_failure_help(message: str) -> str:
+        """Translate a fail-closed runtime reason into one actionable retry."""
+
+        lowered = message.casefold()
+        if "no exact target observation" in lowered or "safe target" in lowered:
+            return (
+                "No movement was sent because a safe target was not available at "
+                "the hold step. Retry with a fully visible stationary player box; "
+                "ProAim will choose the one nearest the center. Wait for READY TO "
+                "HOLD before pressing and holding the activation button."
+            )
+        if "timed out" in lowered:
+            return (
+                "The current step timed out without moving the pointer. Retry and "
+                "follow the large release / READY TO HOLD prompts as they appear."
+            )
+        if "released" in lowered or "unknown" in lowered:
+            return (
+                "MAKCU lost the continuous hold, so movement stopped safely. Retry "
+                "and keep the activation button held from READY TO HOLD until completion."
+            )
+        return f"Calibration stopped safely: {message} Retry after correcting this condition."
+
+    def _handle_calibration_output_line(self, text: str) -> None:
+        """Append one child line and advance the visible calibration guide."""
+
+        self._append_log(text)
+        # Strip terminal colors before interpreting the bounded status line.
+        plain = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", text).strip()
+        prefix = "MAKCU calibration:"
+        if plain.startswith(prefix):
+            message = plain[len(prefix) :].strip()
+        elif plain.startswith("MAKCU calibration target:"):
+            readiness = plain[len("MAKCU calibration target:") :].strip()
+            self._calibration_target_ready = readiness.casefold().startswith(
+                "target ready"
+            )
+            if self._calibration_release_confirmed and not self._calibration_settling_view:
+                if self._calibration_target_ready:
+                    if self._calibration_raw_button == "pressed":
+                        self._set_calibration_guide("target_while_held")
+                    else:
+                        self._set_calibration_guide("hold")
+                        self._set_status(
+                            "READY TO HOLD: target ready; press and hold activation.",
+                            "warn",
+                        )
+                else:
+                    self._set_calibration_guide(
+                        "target_while_held"
+                        if self._calibration_raw_button == "pressed"
+                        else "target_before_hold"
+                    )
+            return
+        elif plain.startswith("Error: MAKCU calibration aborted:"):
+            message = plain.split(":", 2)[-1].strip()
+        elif "| CAL " in plain:
+            state_match = re.search(
+                r"\| CAL ([a-z_]+) \| "
+                r"(?:(target (?:ready|wait)[^|]*) \| )?"
+                r"raw button (pressed|released|unknown)\b",
+                plain,
+            )
+            if state_match is None:
+                return
+            state, readiness, raw_button = state_match.groups()
+            self._calibration_raw_button = raw_button
+            if readiness is not None:
+                self._calibration_target_ready = readiness.casefold().startswith(
+                    "target ready"
+                )
+            if state == "wait_release":
+                self._calibration_release_confirmed = False
+                self._calibration_settling_view = False
+                self._set_calibration_guide(
+                    "input_unknown" if raw_button == "unknown" else "release_wait"
+                )
+            elif state == "wait_hold":
+                self._calibration_release_confirmed = True
+                if raw_button == "pressed" and self._calibration_settling_view:
+                    self._set_calibration_guide("settling_view")
+                elif raw_button == "pressed":
+                    self._set_calibration_guide("target_while_held")
+                elif not self._calibration_target_ready:
+                    self._set_calibration_guide(
+                        "target_before_hold"
+                    )
+                else:
+                    self._set_calibration_guide("hold")
+            elif state in {"baseline_settle", "pulse", "response_settle"}:
+                self._calibration_release_confirmed = True
+                self._calibration_settling_view = False
+                self._set_calibration_guide("measuring")
+            return
+        else:
+            return
+        lowered = message.casefold()
+        if (
+            "waiting for a fresh makcu activation report" in lowered
+            or "waiting for a post-entry framed makcu button report" in lowered
+        ):
+            self._calibration_settling_view = False
+            self._set_calibration_guide("input_unknown")
+            self._set_status(
+                "MAKCU input is unknown—tap the activation button once, then release.",
+                "warn",
+            )
+        elif lowered.startswith("release confirmed"):
+            self._calibration_release_confirmed = True
+            self._calibration_settling_view = False
+            self._calibration_target_ready = "target ready" in lowered
+            if self._calibration_target_ready:
+                self._set_calibration_guide("hold")
+                self._set_status(
+                    "READY TO HOLD: target ready; press and hold activation.",
+                    "warn",
+                )
+            else:
+                self._set_calibration_guide("target_before_hold")
+                self._set_status(
+                    "Release confirmed—waiting for a safe target before the hold.",
+                    "warn",
+                )
+        elif (
+            "exclusive mode armed" in lowered
+            or "keep the activation button released while calibration starts" in lowered
+            or "keep activation released" in lowered
+            or "keep activation fully released" in lowered
+            or "activation is pressed" in lowered
+        ):
+            self._set_calibration_guide("release_wait")
+            self._set_status(
+                "MAKCU armed—keep the activation button fully released.",
+                "warn",
+            )
+        elif (
+            "hold detected" in lowered
+            and "selected aim mode settles" in lowered
+        ):
+            self._calibration_release_confirmed = True
+            self._calibration_raw_button = "pressed"
+            self._calibration_settling_view = True
+            self._set_calibration_guide("settling_view")
+            self._set_status(
+                "Hold detected—settling the aim view safely; no movement yet.",
+                "warn",
+            )
+        elif "keep holding activation; waiting for one safe exact target" in lowered:
+            self._calibration_release_confirmed = True
+            self._calibration_target_ready = False
+            self._calibration_raw_button = "pressed"
+            self._calibration_settling_view = False
+            self._set_calibration_guide("target_while_held")
+            self._set_status(
+                "Hold detected—waiting safely for a visible target; no movement yet.",
+                "warn",
+            )
+        elif (
+            "hold still" in lowered
+            or "running bounded" in lowered
+            or "pulse response to settle" in lowered
+        ):
+            self._calibration_settling_view = False
+            self._set_calibration_guide("measuring")
+            self._set_status(
+                "Measuring—keep holding and do not move the mouse or target.",
+                "warn",
+            )
+        elif "calibration fit passed" in lowered:
+            self._set_calibration_guide("complete")
+        elif any(
+            marker in lowered
+            for marker in (
+                "timed out",
+                "lacked a safe target",
+                "no exact target",
+                "became unknown",
+                "was released",
+                "rejected the evidence",
+                "exceeded",
+                "could not",
+                "invalid calibration",
+                "changed discontinuously",
+            )
+        ):
+            self._calibration_last_runtime_failure = message
+            self._set_calibration_guide(
+                "failed",
+                self._calibration_failure_help(message),
+            )
 
     def start_makcu_calibration(self) -> None:
         busy_message = self._calibration_busy_message()
@@ -2407,19 +2757,30 @@ class LauncherWindow(QMainWindow):
 
         button_name = MAKCU_BUTTON_LABELS[self._selected_makcu_button()]
         context_label = self.aim_makcu_context.currentText()
+        context_hold_instruction = (
+            f"The final {button_name} Mouse hold must enter and maintain ADS."
+            if calibration_context == "ads"
+            else "Keep the game in hip-fire mode during the final hold."
+        )
         answer = QMessageBox.question(
             self,
             "MAKCU calibration will move the pointer",
-            "Calibration sends a short, bounded sequence of horizontal and "
-            "vertical mouse movements through MAKCU. Use one stationary, fully "
-            "visible target; keep game sensitivity, FOV, and aim mode unchanged; "
-            "and do not move the mouse.\n\n"
-            f"Selected aim mode: {context_label}. Keep that exact mode active for "
-            "the entire calibration.\n\n"
-            f"After calibration starts, press {button_name} once, then fully "
-            "release it and keep it released until the preview says Release "
-            "confirmed. Then press and continuously hold it when asked. "
-            "Releasing it after that, pressing Stop, or pressing Esc aborts.\n\n"
+            "Calibration sends only a short, bounded sequence of horizontal and "
+            "vertical mouse movements through MAKCU. Nothing is activated "
+            "automatically.\n\n"
+            "1. Show at least one stationary, fully visible player. ProAim uses "
+            "the player nearest the center. Do not move the mouse, target, or camera.\n"
+            f"2. Selected mode: {context_label}. {context_hold_instruction} After "
+            f"clicking Yes, KEEP {button_name} Mouse RELEASED while the GPU model "
+            "loads. This can take 30–40 seconds.\n"
+            "3. Release confirmation is automatic. If the guide specifically says "
+            f"MAKCU input is unknown, tap {button_name} once and release it; otherwise "
+            "do not click yet.\n"
+            "4. When the guide says READY TO HOLD, press and continuously hold "
+            f"{button_name} until complete. If a target is not ready, ProAim waits "
+            "without moving.\n\n"
+            "The guide advances automatically. Releasing during measurement, "
+            "pressing Stop, or pressing Esc aborts safely.\n\n"
             "Passing evidence is staged for review and is never activated automatically. "
             "Continue?",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -2453,14 +2814,22 @@ class LauncherWindow(QMainWindow):
         self._calibration_launch_arguments = launch_arguments
         self._calibration_context = calibration_context
         self._calibration_stop_requested = False
+        self._calibration_last_runtime_failure = ""
+        self._calibration_release_confirmed = False
+        self._calibration_target_ready = False
+        self._calibration_raw_button = "unknown"
+        self._calibration_settling_view = False
         self.log.clear()
         self._append_log("Started bounded MAKCU response calibration.")
+        self._set_calibration_guide("loading")
         self.aim_makcu_calibration_status.setText(
-            "Calibration running. First press and release the activation button, "
-            "wait for Release confirmed, then press and hold as instructed. "
-            "Press Stop/Esc to abort."
+            "Calibration is starting. Follow the numbered guide below; it changes "
+            "automatically. Press Stop/Esc to abort."
         )
-        self._set_status("MAKCU calibration running.", "warn")
+        self._set_status(
+            "Step 1/4: loading—keep the activation button released and wait.",
+            "warn",
+        )
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self._start_calibration_reader(process)
@@ -2474,7 +2843,7 @@ class LauncherWindow(QMainWindow):
         def pump() -> None:
             assert process.stdout is not None
             for line in process.stdout:
-                self.log_line.emit(line)
+                self.calibration_output_line.emit(line)
 
         self._calibration_reader = threading.Thread(
             target=pump,
@@ -2514,10 +2883,16 @@ class LauncherWindow(QMainWindow):
         if stopped:
             failure = "MAKCU calibration was stopped; no profile was staged."
         elif return_code != 0:
-            failure = (
-                f"MAKCU calibration exited with code {return_code}; "
-                "no profile was staged."
-            )
+            if self._calibration_last_runtime_failure:
+                failure = (
+                    "Calibration stopped safely: "
+                    f"{self._calibration_last_runtime_failure}. No profile was staged."
+                )
+            else:
+                failure = (
+                    f"MAKCU calibration exited with code {return_code}; "
+                    "no profile was staged."
+                )
         elif evidence_path is None:
             failure = "Calibration ended without a bound evidence destination."
         else:
@@ -2535,9 +2910,11 @@ class LauncherWindow(QMainWindow):
                 or evidence.binding.context_name != calibration_context
                 or evidence.binding.aim_mode != calibration_context
             ):
+                reason = str(
+                    getattr(evidence, "reason", "strict validation did not pass")
+                )
                 failure = (
-                    "Calibration evidence did not record a complete, clean success; "
-                    "no profile was staged."
+                    f"Calibration stopped safely: {reason}. No profile was staged."
                 )
                 evidence = None
 
@@ -2545,6 +2922,10 @@ class LauncherWindow(QMainWindow):
             self._clear_staged_calibration()
             message = failure or "Calibration produced no usable evidence."
             self.aim_makcu_calibration_status.setText(message)
+            self._set_calibration_guide(
+                "failed",
+                self._calibration_failure_help(message),
+            )
             self._set_status(message, "error" if not stopped else "warn")
             if not stopped and not self._closing:
                 QMessageBox.warning(self, "MAKCU calibration not staged", message)
@@ -2557,6 +2938,7 @@ class LauncherWindow(QMainWindow):
                 "Evidence passed strict validation and refit. Review is required "
                 "before activation; it is not active yet."
             )
+            self._set_calibration_guide("complete")
             self._set_status(
                 "MAKCU calibration passed and is staged for review only.",
                 "ok",
@@ -2581,6 +2963,11 @@ class LauncherWindow(QMainWindow):
         if process is None or process.poll() is not None or self._calibration_stop_requested:
             return
         self._calibration_stop_requested = True
+        self._set_calibration_guide(
+            "failed",
+            "Stopping safely. No calibration profile will be activated; wait for "
+            "shutdown, then click Calibrate response to retry.",
+        )
         self._set_status("Stopping MAKCU calibration…", "warn")
         self.stop_button.setEnabled(False)
         request_stop(process)
@@ -2764,6 +3151,7 @@ class LauncherWindow(QMainWindow):
             "Measured response profile activated. Runtime will revalidate its exact "
             "binding before using it."
         )
+        self._set_calibration_guide("active")
         self._set_status("MAKCU calibration profile activated.", "ok")
         QMessageBox.information(
             self,

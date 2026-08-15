@@ -1618,10 +1618,20 @@ class MakcuAimingTests(unittest.TestCase):
                 observation=self._calibration_observation(decision_ns),
             )
             raw = controller.raw_activation_snapshot
-            self.assertEqual(status.state, CalibrationSessionState.BASELINE_SETTLE)
+            self.assertEqual(status.state, CalibrationSessionState.WAIT_HOLD)
+            self.assertIn("aim mode settles", status.message)
             self.assertTrue(raw.pressed)
             self.assertEqual(raw.completed_release_started_ns, release_ns)
             self.assertEqual(raw.completed_press_ns, press_ns)
+            self.assertEqual(controller.calibration_snapshot().emitted_events, ())
+            self.assertEqual(self._movement_writes(active), ())
+
+            decision_ns += 300_000_000
+            status = session.update_from_controller(
+                decision_ns,
+                observation=self._calibration_observation(decision_ns),
+            )
+            self.assertEqual(status.state, CalibrationSessionState.BASELINE_SETTLE)
             self.assertEqual(controller.calibration_snapshot().emitted_events, ())
             self.assertEqual(self._movement_writes(active), ())
         finally:
@@ -1677,7 +1687,7 @@ class MakcuAimingTests(unittest.TestCase):
             controller._output_thread = None
             controller.stop()
 
-    def test_calibration_silent_released_entry_requires_press_release_hold(self) -> None:
+    def test_calibration_fresh_released_report_arms_without_priming_press(self) -> None:
         from tests.test_makcu_calibration_session import _binding
 
         controller = self.controller(MakcuAimConfig(output_hz=1000))
@@ -1703,8 +1713,9 @@ class MakcuAimingTests(unittest.TestCase):
             )
             entered_ns = controller.raw_activation_snapshot.calibration_entered_ns
 
-            # An event-driven board is silent while an already-released button
-            # remains released. Cached pre-entry zero must not start the dwell.
+            # An event-driven board can be silent while an already-released
+            # button remains released. Cached pre-entry zero must not start the
+            # dwell, because calibration has not yet received fresh evidence.
             decision_ns = entered_ns + 500_000_000
             status = session.update_from_controller(
                 decision_ns,
@@ -1712,15 +1723,14 @@ class MakcuAimingTests(unittest.TestCase):
             )
             raw = controller.raw_activation_snapshot
             self.assertEqual(status.state, CalibrationSessionState.WAIT_RELEASE)
-            self.assertIn("press activation once", status.message.lower())
+            self.assertIn("post-entry framed", status.message.lower())
             self.assertFalse(raw.post_entry_press_seen)
             self.assertIsNone(raw.release_started_ns)
             self.assertEqual(self._movement_writes(active), ())
 
-            initial_press_ns = entered_ns + 501_000_000
-            release_ns = entered_ns + 502_000_000
-            self._queue_button_event(active, 0b00010)
-            controller._output_tick(0.0, now_ns=initial_press_ns)
+            # One fresh framed zero is direct physical release proof. No
+            # artificial press/release cycle is required before the real hold.
+            release_ns = entered_ns + 501_000_000
             self._queue_button_event(active, 0)
             controller._output_tick(0.0, now_ns=release_ns)
 
@@ -1735,12 +1745,23 @@ class MakcuAimingTests(unittest.TestCase):
                 )
             self.assertEqual(status.state, CalibrationSessionState.WAIT_HOLD)
             self.assertIn("release confirmed", status.message.lower())
+            self.assertFalse(controller.raw_activation_snapshot.post_entry_press_seen)
             self.assertEqual(self._movement_writes(active), ())
 
             final_press_ns = decision_ns + 1_000_000
             self._queue_button_event(active, 0b00010)
             controller._output_tick(0.0, now_ns=final_press_ns)
             decision_ns = final_press_ns + 1_000_000
+            status = session.update_from_controller(
+                decision_ns,
+                observation=None,
+            )
+            self.assertEqual(status.state, CalibrationSessionState.WAIT_HOLD)
+            self.assertIn("aim mode settles", status.message)
+            self.assertEqual(controller.calibration_snapshot().emitted_events, ())
+            self.assertEqual(self._movement_writes(active), ())
+
+            decision_ns += 300_000_000
             status = session.update_from_controller(
                 decision_ns,
                 observation=self._calibration_observation(decision_ns),
@@ -1811,7 +1832,7 @@ class MakcuAimingTests(unittest.TestCase):
                         status.state,
                         CalibrationSessionState.WAIT_RELEASE,
                     )
-                    self.assertIn("press activation once", status.message.lower())
+                    self.assertIn("post-entry framed", status.message.lower())
                     self.assertFalse(raw.post_entry_press_seen)
                     self.assertEqual(
                         raw.framed_report_sequence,

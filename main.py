@@ -502,6 +502,166 @@ def _build_calibration_runtime_binding(
     )
 
 
+def _calibration_observation_target_and_readiness(
+    detections,
+    frame_shape: tuple[int, ...],
+    *,
+    aim_label: str,
+    head_ratio: float,
+    configured_confidence: float,
+    invert_x: bool,
+    invert_y: bool,
+    self_exclusion_safe: bool,
+    measurement_ns: int,
+    safe_roi_margin_ratio: float | None = None,
+    maximum_reference_error: float | None = None,
+):
+    """Select one raw exact-label target and explain its readiness."""
+
+    from aiming import head_target_point
+    from aiming.makcu_calibration_session import (
+        CalibrationObservation,
+        target_within_safe_roi,
+    )
+
+    if not self_exclusion_safe:
+        return None, None, "target wait: self-avatar safety is not ready"
+    if len(frame_shape) < 2:
+        return None, None, "target wait: capture dimensions are unavailable"
+    height, width = frame_shape[:2]
+    if width <= 0 or height <= 0:
+        return None, None, "target wait: capture dimensions are invalid"
+    threshold = float(configured_confidence)
+    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+        raise ValueError("Calibration confidence must be finite and in [0,1]")
+    normalized_label = aim_label.strip().casefold()
+    exact_label_count = 0
+    eligible: list[
+        tuple[object, float, float, float, float, float, float, float]
+    ] = []
+    for detection in detections:
+        if detection.class_name.strip().casefold() != normalized_label:
+            continue
+        exact_label_count += 1
+        try:
+            confidence = float(detection.confidence)
+            left, top, right, bottom = (float(value) for value in detection.box)
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(confidence) or confidence < threshold:
+            continue
+        if not all(math.isfinite(value) for value in (left, top, right, bottom)):
+            continue
+        if not (0.0 <= left < right <= width and 0.0 <= top < bottom <= height):
+            continue
+        target_x, target_y = head_target_point(detection, head_ratio)
+        if not math.isfinite(target_x) or not math.isfinite(target_y):
+            continue
+        eligible.append(
+            (
+                detection,
+                confidence,
+                left,
+                top,
+                right,
+                bottom,
+                target_x,
+                target_y,
+            )
+        )
+    if not eligible:
+        if exact_label_count:
+            readiness = (
+                "target wait: no valid exact "
+                f"{aim_label} detection at confidence >= {threshold:g}"
+            )
+        else:
+            readiness = f"target wait: no exact {aim_label} detection"
+        return None, None, readiness
+
+    center_x = width / 2.0
+    center_y = height / 2.0
+
+    def target_key(candidate):
+        (
+            detection,
+            confidence,
+            left,
+            top,
+            right,
+            bottom,
+            target_x,
+            target_y,
+        ) = candidate
+        reference_x = (target_x - center_x) * (1920.0 / width)
+        reference_y = (target_y - center_y) * (1080.0 / height)
+        # Distance is the intent signal. The remaining fields make equal-distance
+        # selection stable even if the detector returns boxes in another order.
+        return (
+            reference_x * reference_x + reference_y * reference_y,
+            -confidence,
+            left,
+            top,
+            right,
+            bottom,
+            int(detection.class_id),
+        )
+
+    (
+        target,
+        confidence,
+        left,
+        top,
+        right,
+        bottom,
+        target_x,
+        target_y,
+    ) = min(eligible, key=target_key)
+    reference_x = (target_x - width / 2.0) * (1920.0 / width)
+    reference_y = (target_y - height / 2.0) * (1080.0 / height)
+    if invert_x:
+        reference_x = -reference_x
+    if invert_y:
+        reference_y = -reference_y
+    observation = CalibrationObservation(
+        measurement_ns=measurement_ns,
+        error_x=reference_x,
+        error_y=reference_y,
+        confidence=confidence,
+        exact_label=True,
+        # Deterministic arbitration turns all safe, eligible full-pass boxes
+        # into one authorized candidate. The session still independently
+        # enforces central ROI and frame-to-frame box continuity.
+        unique_candidates=1,
+        self_safe=True,
+        is_prediction=False,
+        target_identity="selected-exact-target",
+        normalized_bbox=(
+            left / width,
+            top / height,
+            right / width,
+            bottom / height,
+        ),
+    )
+    if safe_roi_margin_ratio is not None and not target_within_safe_roi(
+        observation.normalized_bbox,
+        safe_roi_margin_ratio,
+    ):
+        readiness = "target wait: keep the complete target inside the central guide"
+    elif maximum_reference_error is not None and max(
+        abs(observation.error_x),
+        abs(observation.error_y),
+    ) > float(maximum_reference_error):
+        readiness = "target wait: move the target aim point closer to the crosshair"
+    else:
+        readiness = (
+            "target ready"
+            if len(eligible) == 1
+            else f"target ready: center-nearest of {len(eligible)} exact detections"
+        )
+    return observation, target, readiness
+
+
 def _calibration_observation_and_target(
     detections,
     frame_shape: tuple[int, ...],
@@ -513,64 +673,23 @@ def _calibration_observation_and_target(
     invert_y: bool,
     self_exclusion_safe: bool,
     measurement_ns: int,
+    safe_roi_margin_ratio: float | None = None,
+    maximum_reference_error: float | None = None,
 ):
-    """Return one raw, strong, exact-label target in 1920x1080 coordinates."""
+    """Return the deterministically authorized raw calibration target."""
 
-    from aiming import head_target_point
-    from aiming.makcu_calibration_session import CalibrationObservation
-
-    if not self_exclusion_safe:
-        return None, None
-    if len(frame_shape) < 2:
-        return None, None
-    height, width = frame_shape[:2]
-    if width <= 0 or height <= 0:
-        return None, None
-    threshold = float(configured_confidence)
-    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
-        raise ValueError("Calibration confidence must be finite and in [0,1]")
-    normalized_label = aim_label.strip().casefold()
-    candidates = tuple(
-        detection
-        for detection in detections
-        if detection.class_name.strip().casefold() == normalized_label
-        and math.isfinite(float(detection.confidence))
-        and float(detection.confidence) >= threshold
-    )
-    if len(candidates) != 1:
-        return None, None
-    target = candidates[0]
-    try:
-        left, top, right, bottom = (float(value) for value in target.box)
-    except (TypeError, ValueError):
-        return None, None
-    if not all(math.isfinite(value) for value in (left, top, right, bottom)):
-        return None, None
-    if not (0.0 <= left < right <= width and 0.0 <= top < bottom <= height):
-        return None, None
-    target_x, target_y = head_target_point(target, head_ratio)
-    reference_x = (target_x - width / 2.0) * (1920.0 / width)
-    reference_y = (target_y - height / 2.0) * (1080.0 / height)
-    if invert_x:
-        reference_x = -reference_x
-    if invert_y:
-        reference_y = -reference_y
-    observation = CalibrationObservation(
+    observation, target, _readiness = _calibration_observation_target_and_readiness(
+        detections,
+        frame_shape,
+        aim_label=aim_label,
+        head_ratio=head_ratio,
+        configured_confidence=configured_confidence,
+        invert_x=invert_x,
+        invert_y=invert_y,
+        self_exclusion_safe=self_exclusion_safe,
         measurement_ns=measurement_ns,
-        error_x=reference_x,
-        error_y=reference_y,
-        confidence=float(target.confidence),
-        exact_label=True,
-        unique_candidates=1,
-        self_safe=True,
-        is_prediction=False,
-        target_identity="unique-exact-target",
-        normalized_bbox=(
-            left / width,
-            top / height,
-            right / width,
-            bottom / height,
-        ),
+        safe_roi_margin_ratio=safe_roi_margin_ratio,
+        maximum_reference_error=maximum_reference_error,
     )
     return observation, target
 
@@ -1319,6 +1438,8 @@ def run(config: AppConfig) -> int:
     calibration_status = None
     calibration_evidence_written = False
     calibration_last_log: tuple[object, str] | None = None
+    calibration_target_readiness = "target wait: awaiting detector frame"
+    calibration_last_target_readiness: str | None = None
     active_profile_bound = False
     aim_runtime_enabled = False
     aim_activation_was_active = False
@@ -1454,7 +1575,8 @@ def run(config: AppConfig) -> int:
             assert isinstance(aim_controller, MakcuAimingController)
             print(
                 f"MAKCU calibration: enabled | target {config.aim_label} | "
-                f"activation {aim_activation_name} | exact full-pass detections | "
+                f"activation {aim_activation_name} | exact full-pass detections "
+                f">= configured confidence {config.confidence:g} | "
                 "bounded exclusive pulses | no automatic profile activation"
             )
         elif config.aim_output == "makcu" and active_profile is not None:
@@ -1555,9 +1677,13 @@ def run(config: AppConfig) -> int:
             preview_window.start()
 
         if calibration_requested:
-            from aiming.makcu_calibration_session import MakcuCalibrationSession
+            from aiming.makcu_calibration_session import (
+                CalibrationSessionConfig,
+                MakcuCalibrationSession,
+            )
 
             assert isinstance(aim_controller, MakcuAimingController)
+            assert aim_configured_confidence is not None
             assert model_artifact_snapshot is not None
             assert labels_artifact_snapshot is not None
             binding = _build_calibration_runtime_binding(
@@ -1572,6 +1698,9 @@ def run(config: AppConfig) -> int:
             calibration_session = MakcuCalibrationSession(
                 aim_controller,
                 binding,
+                config=CalibrationSessionConfig(
+                    minimum_confidence=aim_configured_confidence,
+                ),
                 started_ns=calibration_started_ns,
             )
             calibration_status = calibration_session.status()
@@ -1882,22 +2011,30 @@ def run(config: AppConfig) -> int:
                 assert isinstance(aim_controller, MakcuAimingController)
                 assert aim_configured_confidence is not None
                 assert config.aim_label is not None
-                calibration_observation, selected_aim_target = (
-                    _calibration_observation_and_target(
-                        aim_detections,
-                        packet.image.shape,
-                        aim_label=config.aim_label,
-                        head_ratio=config.aim_head_ratio,
-                        configured_confidence=max(
-                            aim_configured_confidence,
-                            calibration_session.config.minimum_confidence,
-                        ),
-                        invert_x=config.aim_invert_x,
-                        invert_y=config.aim_invert_y,
-                        self_exclusion_safe=self_exclusion_ready,
-                        measurement_ns=packet.read_started_ns,
-                    )
+                (
+                    calibration_observation,
+                    selected_aim_target,
+                    calibration_target_readiness,
+                ) = _calibration_observation_target_and_readiness(
+                    aim_detections,
+                    packet.image.shape,
+                    aim_label=config.aim_label,
+                    head_ratio=config.aim_head_ratio,
+                    configured_confidence=aim_configured_confidence,
+                    invert_x=config.aim_invert_x,
+                    invert_y=config.aim_invert_y,
+                    self_exclusion_safe=self_exclusion_ready,
+                    measurement_ns=packet.read_started_ns,
+                    safe_roi_margin_ratio=(
+                        calibration_session.config.safe_roi_margin_ratio
+                    ),
+                    maximum_reference_error=(
+                        calibration_session.config.maximum_reference_error
+                    ),
                 )
+                if calibration_target_readiness != calibration_last_target_readiness:
+                    print(f"MAKCU calibration target: {calibration_target_readiness}")
+                    calibration_last_target_readiness = calibration_target_readiness
                 calibration_status = calibration_session.update_from_controller(
                     perf_counter_ns(),
                     observation=calibration_observation,
@@ -1913,7 +2050,7 @@ def run(config: AppConfig) -> int:
                     calibration_last_log = current_calibration_log
                 aim_status = (
                     f"calibration {calibration_status.state.value}: "
-                    f"{calibration_status.message}"
+                    f"{calibration_status.message} | {calibration_target_readiness}"
                 )
             else:
                 if active_profile is not None and not active_profile_bound:
@@ -2117,6 +2254,7 @@ def run(config: AppConfig) -> int:
                     ) if raw_known else "unknown"
                     summary += (
                         f" | CAL {calibration_status.state.value} | "
+                        f"{calibration_target_readiness} | "
                         f"raw button {raw_button_state} | "
                         f"counts {calibration_status.emitted_abs_counts}/2400 | "
                         "qualifying X +/- "

@@ -28,6 +28,7 @@ from main import (
     _calibrated_controller_from_active_profile,
     _calibration_model_sha256,
     _calibration_observation_and_target,
+    _calibration_observation_target_and_readiness,
     run,
 )
 from utils.live_report import snapshot_artifact
@@ -100,12 +101,11 @@ class CalibrationInputHelperTests(unittest.TestCase):
         self.assertFalse(observation.is_prediction)
         self.assertEqual(observation.unique_candidates, 1)
 
-    def test_unsafe_weak_ambiguous_or_out_of_frame_inputs_are_not_observations(self) -> None:
+    def test_unsafe_weak_or_out_of_frame_inputs_are_not_observations(self) -> None:
         valid = Detection(0, "player", 0.85, (760.0, 300.0, 1160.0, 900.0))
         cases = (
             ([valid], False),
             ([replace(valid, confidence=0.69)], True),
-            ([valid, replace(valid, xyxy=(500.0, 300.0, 700.0, 900.0))], True),
             ([replace(valid, xyxy=(-1.0, 300.0, 1160.0, 900.0))], True),
             ([replace(valid, class_name="person")], True),
         )
@@ -125,6 +125,149 @@ class CalibrationInputHelperTests(unittest.TestCase):
                     ),
                     (None, None),
                 )
+
+    def test_configured_detector_confidence_has_no_hidden_calibration_floor(self) -> None:
+        accepted = Detection(0, "player", 0.26, (760.0, 300.0, 1160.0, 900.0))
+
+        observation, selected, readiness = (
+            _calibration_observation_target_and_readiness(
+                [accepted],
+                (1080, 1920, 3),
+                aim_label="player",
+                head_ratio=0.12,
+                configured_confidence=0.25,
+                invert_x=False,
+                invert_y=False,
+                self_exclusion_safe=True,
+                measurement_ns=123,
+            )
+        )
+
+        self.assertIs(selected, accepted)
+        self.assertIsNotNone(observation)
+        self.assertEqual(readiness, "target ready")
+
+        observation, selected, readiness = (
+            _calibration_observation_target_and_readiness(
+                [replace(accepted, confidence=0.24)],
+                (1080, 1920, 3),
+                aim_label="player",
+                head_ratio=0.12,
+                configured_confidence=0.25,
+                invert_x=False,
+                invert_y=False,
+                self_exclusion_safe=True,
+                measurement_ns=124,
+            )
+        )
+        self.assertIsNone(observation)
+        self.assertIsNone(selected)
+        self.assertEqual(
+            readiness,
+            "target wait: no valid exact player detection at confidence >= 0.25",
+        )
+
+    def test_multiple_targets_select_center_nearest_deterministically(self) -> None:
+        left = Detection(0, "player", 0.95, (300.0, 250.0, 500.0, 850.0))
+        nearest = Detection(0, "player", 0.30, (860.0, 250.0, 1060.0, 850.0))
+        right = Detection(0, "player", 0.99, (1400.0, 250.0, 1600.0, 850.0))
+
+        selections = []
+        for detections in ([left, nearest, right], [right, nearest, left]):
+            observation, selected, readiness = (
+                _calibration_observation_target_and_readiness(
+                    detections,
+                    (1080, 1920, 3),
+                    aim_label="player",
+                    head_ratio=0.12,
+                    configured_confidence=0.25,
+                    invert_x=False,
+                    invert_y=False,
+                    self_exclusion_safe=True,
+                    measurement_ns=123,
+                )
+            )
+            selections.append(selected)
+            assert observation is not None
+            self.assertEqual(observation.unique_candidates, 1)
+            self.assertEqual(
+                readiness,
+                "target ready: center-nearest of 3 exact detections",
+            )
+
+        self.assertEqual(selections, [nearest, nearest])
+
+    def test_equal_distance_tie_is_stable_and_invalid_boxes_are_ignored(self) -> None:
+        left = Detection(0, "player", 0.80, (700.0, 300.0, 800.0, 900.0))
+        right = Detection(0, "player", 0.80, (1120.0, 300.0, 1220.0, 900.0))
+        invalid = Detection(0, "player", 0.99, (-10.0, 300.0, 20.0, 900.0))
+
+        selected = []
+        for detections in ([right, invalid, left], [left, invalid, right]):
+            _observation, target, _readiness = (
+                _calibration_observation_target_and_readiness(
+                    detections,
+                    (1080, 1920, 3),
+                    aim_label="player",
+                    head_ratio=0.12,
+                    configured_confidence=0.25,
+                    invert_x=False,
+                    invert_y=False,
+                    self_exclusion_safe=True,
+                    measurement_ns=123,
+                )
+            )
+            selected.append(target)
+
+        self.assertEqual(selected, [left, left])
+
+    def test_readiness_explains_central_safety_rejections(self) -> None:
+        outside_roi = Detection(0, "player", 0.90, (10.0, 300.0, 310.0, 900.0))
+        _observation, _target, readiness = (
+            _calibration_observation_target_and_readiness(
+                [outside_roi],
+                (1080, 1920, 3),
+                aim_label="player",
+                head_ratio=0.12,
+                configured_confidence=0.25,
+                invert_x=False,
+                invert_y=False,
+                self_exclusion_safe=True,
+                measurement_ns=123,
+                safe_roi_margin_ratio=0.08,
+                maximum_reference_error=360.0,
+            )
+        )
+        self.assertEqual(
+            readiness,
+            "target wait: keep the complete target inside the central guide",
+        )
+
+        outside_error = Detection(
+            0,
+            "player",
+            0.90,
+            (1250.0, 300.0, 1450.0, 900.0),
+        )
+        _observation, _target, readiness = (
+            _calibration_observation_target_and_readiness(
+                [outside_error],
+                (1080, 1920, 3),
+                aim_label="player",
+                head_ratio=0.12,
+                configured_confidence=0.25,
+                invert_x=False,
+                invert_y=False,
+                self_exclusion_safe=True,
+                measurement_ns=123,
+                safe_roi_margin_ratio=0.08,
+                maximum_reference_error=360.0,
+            )
+        )
+        self.assertEqual(
+            readiness,
+            "target wait: move the target aim point closer to the crosshair",
+        )
 
     def test_axis_inversion_uses_the_same_logical_error_as_normal_control(self) -> None:
         target = Detection(0, "player", 0.90, (960.0, 540.0, 1160.0, 1040.0))
@@ -299,6 +442,8 @@ class CalibrationInputHelperTests(unittest.TestCase):
 
 
 class _FakeDetector:
+    detections: list[Detection] = []
+
     def __init__(self, **arguments) -> None:
         size = arguments["inference_size"]
         height, width = (size, size) if isinstance(size, int) else size
@@ -320,7 +465,7 @@ class _FakeDetector:
         return np.zeros((1, 0, 6), dtype=np.float32)
 
     def postprocess(self, _raw, **_arguments):
-        return []
+        return list(self.detections)
 
 
 class _FakeSource:
@@ -437,11 +582,11 @@ class _FakeCalibrationSession:
     terminal_on_update = True
     instances: list["_FakeCalibrationSession"] = []
 
-    def __init__(self, controller, binding, *, started_ns: int) -> None:
+    def __init__(self, controller, binding, *, config, started_ns: int) -> None:
         self.controller = controller
         self.binding = binding
         self.started_ns = started_ns
-        self.config = SimpleNamespace(minimum_confidence=0.70)
+        self.config = config
         self.terminal = False
         self.result = None
         self.update_calls = 0
@@ -517,6 +662,7 @@ class LiveCalibrationArbitrationTests(unittest.TestCase):
         _FakeMakcuController.actual_identity_token = "c" * 64
         _FakeMakcuController.reject_updates = True
         _FakeCalibrationSession.instances.clear()
+        _FakeDetector.detections = []
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -589,8 +735,27 @@ class LiveCalibrationArbitrationTests(unittest.TestCase):
         self.assertEqual(controller.normal_updates, 0)
         self.assertEqual(session.update_calls, 1)
         self.assertEqual(session.abort_calls, 0)
+        self.assertEqual(session.config.minimum_confidence, 0.25)
         self.assertEqual(writes[0][0], self.evidence)
         self.assertTrue(self.source.closed)
+
+    def test_runtime_announces_ready_target_at_configured_confidence(self) -> None:
+        _FakeDetector.detections = [
+            Detection(0, "player", 0.26, (860.0, 300.0, 1060.0, 900.0))
+        ]
+        with mock.patch("builtins.print") as printer:
+            result, _writes = self._run("success")
+
+        self.assertEqual(result, 0)
+        messages = tuple(
+            " ".join(str(argument) for argument in call.args)
+            for call in printer.call_args_list
+        )
+        self.assertIn("MAKCU calibration target: target ready", messages)
+        self.assertEqual(
+            _FakeCalibrationSession.instances[0].config.minimum_confidence,
+            0.25,
+        )
 
     def test_aborted_calibration_still_writes_evidence_and_raises(self) -> None:
         result, writes = self._run("aborted")

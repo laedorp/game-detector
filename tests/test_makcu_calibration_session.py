@@ -84,6 +84,7 @@ class FakeCalibrationController:
         self.enter_calls = 0
         self.exit_calls = 0
         self.requests: list[tuple[str, int, float]] = []
+        self.lease_measurements: list[int] = []
         self.corrupt_aggregate = False
         self.activation_requires_release = False
         self.physical_pressed = False
@@ -123,9 +124,11 @@ class FakeCalibrationController:
         *,
         activation_transition_sequence: int | None = None,
     ) -> None:
-        del measurement_ns, token, activation_transition_sequence
+        del token, activation_transition_sequence
         if not self.active:
             raise RuntimeError("inactive")
+        if valid:
+            self.lease_measurements.append(measurement_ns)
         if not valid:
             self.abort_reason = self.abort_reason or "lease invalidated"
             self.pending_axis = None
@@ -319,6 +322,7 @@ class SessionHarness:
         self.step(pressed=False)
         self.step(pressed=False, milliseconds=80)
         self.step(pressed=True)
+        self.step(pressed=True, milliseconds=300)
 
     def run(self, maximum_steps: int = 1000) -> None:
         for _index in range(maximum_steps):
@@ -383,7 +387,187 @@ class MakcuCalibrationSessionTests(unittest.TestCase):
         self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
         harness.step(pressed=True)
         self.assertEqual(harness.controller.enter_calls, 1)
+        self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+        self.assertIn("aim mode settles", harness.session.message)
+        harness.step(pressed=True, milliseconds=300)
         self.assertEqual(harness.session.state, CalibrationSessionState.BASELINE_SETTLE)
+
+    def test_post_hold_settle_ignores_pretransition_and_inflight_video(self) -> None:
+        harness = SessionHarness()
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, milliseconds=80)
+
+        # This observation was computed before the fresh physical press was
+        # consumed. It must never become the calibration baseline or a lease.
+        pretransition = harness.observation(
+            error_x=140.0,
+            normalized_bbox=(0.20, 0.12, 0.42, 0.88),
+        )
+        harness.step(pressed=True, observation=pretransition)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+        self.assertIn("aim mode settles", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+        inflight = harness.observation(
+            error_x=-120.0,
+            normalized_bbox=(0.58, 0.10, 0.80, 0.90),
+        )
+        harness.step(pressed=True, observation=inflight, milliseconds=299)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+        self.assertIn("aim mode settles", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+        harness.step(pressed=True, milliseconds=1)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.BASELINE_SETTLE)
+        self.assertEqual(len(harness.controller.lease_measurements), 1)
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+    def test_release_during_post_hold_settle_aborts_without_a_lease(self) -> None:
+        harness = SessionHarness()
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, milliseconds=80)
+        harness.step(pressed=True)
+
+        harness.step(pressed=False, milliseconds=150)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.ABORTED)
+        self.assertIn("post-hold settling", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+    def test_release_confirmation_waits_for_target_before_requesting_hold(self) -> None:
+        harness = SessionHarness()
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, observation=None, milliseconds=80)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+        self.assertIn("Keep activation released", harness.session.message)
+        self.assertIn("no exact target", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+        harness.step(pressed=False)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+        self.assertIn("target ready", harness.session.message)
+        self.assertIn("Press and continuously hold", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+
+        harness.step(pressed=True)
+
+        self.assertEqual(
+            harness.session.state,
+            CalibrationSessionState.WAIT_HOLD,
+        )
+        self.assertIn("aim mode settles", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+
+        harness.step(pressed=True, milliseconds=300)
+
+        self.assertEqual(
+            harness.session.state,
+            CalibrationSessionState.BASELINE_SETTLE,
+        )
+        self.assertEqual(len(harness.controller.lease_measurements), 1)
+
+    def test_first_held_frame_without_target_waits_without_authorizing_movement(self) -> None:
+        harness = SessionHarness()
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, milliseconds=80)
+
+        harness.step(pressed=True, observation=None)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+        self.assertIn("aim mode settles", harness.session.message)
+        self.assertIn("No movement is authorized", harness.session.message)
+        self.assertFalse(harness.session.terminal)
+        self.assertEqual(harness.controller.lease_measurements, [])
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+        harness.step(pressed=True, observation=None, milliseconds=300)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+        self.assertIn("waiting for one safe exact target", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+
+        harness.step(pressed=True)
+
+        self.assertEqual(
+            harness.session.state,
+            CalibrationSessionState.BASELINE_SETTLE,
+        )
+        self.assertEqual(len(harness.controller.lease_measurements), 1)
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+    def test_held_calibration_waits_through_multiple_target_misses(self) -> None:
+        harness = SessionHarness()
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, milliseconds=80)
+        harness.step(pressed=True, observation=None)
+        harness.step(pressed=True, observation=None, milliseconds=300)
+
+        for _index in range(12):
+            harness.step(pressed=True, observation=None)
+            self.assertEqual(harness.session.state, CalibrationSessionState.WAIT_HOLD)
+            self.assertEqual(harness.controller.lease_measurements, [])
+            self.assertEqual(harness.controller.requests, [])
+
+        harness.step(pressed=True)
+
+        self.assertEqual(
+            harness.session.state,
+            CalibrationSessionState.BASELINE_SETTLE,
+        )
+        self.assertEqual(len(harness.controller.lease_measurements), 1)
+
+    def test_safe_target_wait_aborts_on_release_without_authorizing_movement(self) -> None:
+        harness = SessionHarness()
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, milliseconds=80)
+        harness.step(pressed=True, observation=None)
+
+        harness.step(pressed=False, observation=None)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.ABORTED)
+        self.assertIn("released", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
+
+    def test_safe_target_wait_has_a_bounded_deadline(self) -> None:
+        config = CalibrationSessionConfig(target_acquire_timeout_seconds=0.05)
+        harness = SessionHarness(config=config)
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, milliseconds=80)
+        harness.step(pressed=True, observation=None)
+        harness.step(pressed=True, observation=None, milliseconds=300)
+
+        harness.step(pressed=True, observation=None, milliseconds=51)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.ABORTED)
+        self.assertIn("safe target was not ready", harness.session.message)
+        self.assertEqual(harness.controller.lease_measurements, [])
+        self.assertEqual(harness.controller.requests, [])
+        self.assertEqual(harness.controller.events, [])
 
     def test_prediction_after_exclusive_entry_aborts_and_exits(self) -> None:
         harness = SessionHarness()
