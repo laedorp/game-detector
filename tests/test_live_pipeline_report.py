@@ -532,6 +532,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             corroboration_point=(24.0, 12.0),
         )
         head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
         head_runtime.status = SimpleNamespace()
         head_runtime.identity_generation = 1
         head_runtime.accept_body.return_value = False
@@ -541,6 +542,11 @@ class LivePipelineIntegrationTests(unittest.TestCase):
 
         config = self._config(
             report_path,
+            "--backend",
+            "onnxruntime",
+            "--device",
+            "MIGRAPHX",
+            "--require-full-provider",
             "--max-frames",
             "2",
             "--aim",
@@ -559,6 +565,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             contextlib.redirect_stdout(output),
             mock.patch("main._build_capture", return_value=source),
             mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
             mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
             mock.patch("aiming.TargetTracker", side_effect=recording_tracker),
             mock.patch(
@@ -622,7 +629,11 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(cleanup_order, ["aim", "head"])
         startup = output.getvalue()
         self.assertIn("control automatic command-aware observer", startup)
-        self.assertIn("head source pinned SunXDS 0.8.0 direct boxes", startup)
+        self.assertIn(
+            "head source pinned SunXDS 0.8.0 direct boxes on "
+            "MIGraphXExecutionProvider GPU-only (CPU fallback disabled)",
+            startup,
+        )
         self.assertIn(
             "direct-head prediction gated by same-frame player motion",
             startup,
@@ -654,6 +665,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
                 return MakcuTelemetrySnapshot()
 
         head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
         head_runtime.status = SimpleNamespace()
         head_runtime.stop.return_value = True
         head_runtime.raise_if_failed.side_effect = RuntimeError(
@@ -661,6 +673,11 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         )
         config = self._config(
             report_path,
+            "--backend",
+            "onnxruntime",
+            "--device",
+            "MIGRAPHX",
+            "--require-full-provider",
             "--max-seconds",
             "0.1",
             "--aim",
@@ -676,6 +693,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         with (
             mock.patch("main._build_capture", return_value=source),
             mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
             mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
             mock.patch(
                 "main._build_automatic_head_runtime",

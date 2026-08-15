@@ -444,20 +444,42 @@ class CalibrationInputHelperTests(unittest.TestCase):
 
 class _FakeDetector:
     detections: list[Detection] = []
+    last_arguments: dict[str, object] | None = None
 
     def __init__(self, **arguments) -> None:
+        type(self).last_arguments = dict(arguments)
         size = arguments["inference_size"]
         height, width = (size, size) if isinstance(size, int) else size
         self.available_devices = ("GPU",)
-        self.runtime_summary = {
-            "runtime": "OpenVINO",
-            "openvino_version": "test",
-            "physical_device_identity": "test-openvino-gpu",
-            "model_path": str(arguments["model_path"]),
-            "requested_device": "GPU",
-            "device": "GPU",
-            "input_shape": [1, 3, height, width],
-        }
+        if arguments.get("require_full_provider") is True:
+            self.runtime_summary = {
+                "runtime": "ONNX Runtime",
+                "onnxruntime_version": "test",
+                "model_path": str(arguments["model_path"]),
+                "requested_device": "MIGraphXExecutionProvider",
+                "requested_provider": "MIGraphXExecutionProvider",
+                "active_providers": [
+                    "MIGraphXExecutionProvider",
+                    "CPUExecutionProvider",
+                ],
+                "device": "MIGraphXExecutionProvider",
+                "input_shape": [1, 3, height, width],
+                "require_full_provider": True,
+                "configured_session_options": {
+                    "disable_cpu_ep_fallback": True,
+                },
+                "runtime_ep_fail_fallback_disabled": True,
+            }
+        else:
+            self.runtime_summary = {
+                "runtime": "OpenVINO",
+                "openvino_version": "test",
+                "physical_device_identity": "test-openvino-gpu",
+                "model_path": str(arguments["model_path"]),
+                "requested_device": "GPU",
+                "device": "GPU",
+                "input_shape": [1, 3, height, width],
+            }
 
     def warmup(self) -> None:
         return None
@@ -834,6 +856,11 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
                 "0.5",
             ]
         )
+        self.automatic_config = replace(
+            self.base_config,
+            backend="onnxruntime",
+            require_full_provider=True,
+        )
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
@@ -881,6 +908,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
                 return_value=("7be5eb1", "test-build"),
             ),
             mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
             mock.patch("aiming.MakcuAimingController", _FakeMakcuController),
         ):
             result = run(config or self._config_with_profile())
@@ -1031,6 +1059,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
 
     def test_absent_profile_selects_direct_head_command_aware_controller(self) -> None:
         head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
         head_runtime.status = SimpleNamespace()
         head_runtime.revoke_body.return_value = False
         head_runtime.visible_sample.return_value = None
@@ -1040,10 +1069,18 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             "main._build_automatic_head_runtime",
             return_value=head_runtime,
         ) as build_head_runtime:
-            result, output = self._run(self.base_config)
+            result, output = self._run(self.automatic_config)
 
         self.assertEqual(result, 0)
-        build_head_runtime.assert_called_once_with()
+        build_head_runtime.assert_called_once()
+        primary_summary = build_head_runtime.call_args.args[0]
+        self.assertEqual(primary_summary["device"], "MIGraphXExecutionProvider")
+        assert _FakeDetector.last_arguments is not None
+        self.assertEqual(
+            _FakeDetector.last_arguments["device"],
+            "MIGraphXExecutionProvider",
+        )
+        self.assertIs(_FakeDetector.last_arguments["require_full_provider"], True)
         head_runtime.start.assert_called_once_with()
         head_runtime.stop.assert_called_once_with()
         controller = _FakeMakcuController.instances[0]
@@ -1086,11 +1123,21 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(numeric.config.position_time_constant_seconds, 0.022)
         self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
+        self.assertIn(
+            "Loading direct-head model on MIGraphXExecutionProvider GPU-only; "
+            "first compile may take about 40 seconds; CPU inference fallback "
+            "disabled.",
+            output,
+        )
         self.assertIn("control automatic command-aware observer", output)
         self.assertIn("gains X/Y 0.125/0.12 px/count", output)
         self.assertIn("delay 8.00 ms", output)
-        self.assertIn("head source pinned SunXDS 0.8.0 direct boxes on CPU", output)
-        self.assertIn("CPU (4 threads)", output)
+        self.assertIn(
+            "head source pinned SunXDS 0.8.0 direct boxes on "
+            "MIGraphXExecutionProvider GPU-only",
+            output,
+        )
+        self.assertIn("CPU fallback disabled", output)
         self.assertIn(
             "direct-head prediction gated by same-frame player motion",
             output,
@@ -1099,6 +1146,32 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("caps X/Y 12000/12000 counts/s", output)
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)
+
+    def test_automatic_mode_rejects_non_strict_backend_before_model_startup(self) -> None:
+        invalid_configs = (
+            self.base_config,
+            replace(
+                self.base_config,
+                backend="onnxruntime",
+                require_full_provider=False,
+            ),
+        )
+        for config in invalid_configs:
+            with (
+                self.subTest(
+                    backend=config.backend,
+                    require_full_provider=config.require_full_provider,
+                ),
+                mock.patch(
+                    "main._build_automatic_head_runtime",
+                    side_effect=AssertionError("head model startup was reached"),
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "requires (?:the ONNX Runtime|--require-full-provider)",
+                ),
+            ):
+                self._run(config)
 
     def test_head_job_starts_only_after_current_primary_inference(self) -> None:
         events: list[str] = []
@@ -1109,6 +1182,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             return original_infer(detector, tensor)
 
         head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
         head_runtime.status = SimpleNamespace()
         head_runtime.identity_generation = 7
         head_runtime.accept_body.return_value = False
@@ -1141,7 +1215,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
                 return_value=True,
             ),
         ):
-            result, _output = self._run(self.base_config)
+            result, _output = self._run(self.automatic_config)
 
         self.assertEqual(result, 0)
         self.assertGreaterEqual(len(events), 2)
@@ -1194,8 +1268,11 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
 
         source = TimestampedSource()
         worker = RecordingHeadWorker()
-        head_runtime = _AutomaticHeadRuntime(worker)
-        config = replace(self.base_config, max_frames=3)
+        head_runtime = _AutomaticHeadRuntime(
+            worker,
+            provider="MIGraphXExecutionProvider",
+        )
+        config = replace(self.automatic_config, max_frames=3)
 
         def sequenced_postprocess(_detector, _raw, **_arguments):
             return list(next(batches))
@@ -1203,6 +1280,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         with (
             mock.patch("main._build_capture", return_value=source),
             mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
             mock.patch("aiming.MakcuAimingController", _FakeMakcuController),
             mock.patch(
                 "main._build_automatic_head_runtime",
@@ -1245,6 +1323,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             corroboration_point=None,
         )
         head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
         head_runtime.status = SimpleNamespace()
         head_runtime.identity_generation = 1
         head_runtime.accept_body.return_value = False
@@ -1268,7 +1347,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
                 return_value=True,
             ),
         ):
-            result, _output = self._run(self.base_config)
+            result, _output = self._run(self.automatic_config)
 
         self.assertEqual(result, 0)
         controller = _FakeMakcuController.instances[0]

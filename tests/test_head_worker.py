@@ -10,11 +10,13 @@ import numpy as np
 from detection.base import DeviceNotAvailableError, ModelError
 from detection.head_worker import (
     CPU_PROVIDER,
+    MIGRAPHX_PROVIDER,
     CpuOnnxSession,
     HeadObservation,
     LatestHeadWorker,
     OnnxModelContract,
     OnnxTensorContract,
+    StrictProviderOnnxSession,
 )
 
 
@@ -55,6 +57,7 @@ class FakeSession:
         self.contract = contract
         self.providers = providers
         self.calls: list[tuple[list[str], dict[str, np.ndarray]]] = []
+        self.fallback_disabled = False
 
     def get_providers(self) -> list[str]:
         return list(self.providers)
@@ -66,6 +69,9 @@ class FakeSession:
     def get_outputs(self) -> list[FakeValueInfo]:
         value = self.contract.output
         return [FakeValueInfo(value.name, value.shape, value.element_type)]
+
+    def disable_fallback(self) -> None:
+        self.fallback_disabled = True
 
     def run(
         self,
@@ -82,8 +88,15 @@ class FakeRuntime:
     class ExecutionMode:
         ORT_SEQUENTIAL = object()
 
+    class GraphOptimizationLevel:
+        ORT_ENABLE_ALL = object()
+
     class SessionOptions:
-        pass
+        def __init__(self) -> None:
+            self.entries: list[tuple[str, str]] = []
+
+        def add_session_config_entry(self, key: str, value: str) -> None:
+            self.entries.append((key, value))
 
     def __init__(self, providers: tuple[str, ...] = (CPU_PROVIDER,)) -> None:
         self.providers = providers
@@ -177,6 +190,172 @@ class CpuOnnxSessionTests(unittest.TestCase):
             session.infer(np.zeros((1, 3, 640, 640), dtype=np.float32))
         with self.assertRaisesRegex(ValueError, "float32"):
             session.infer(np.zeros((1, 3, 320, 320), dtype=np.float16))
+
+
+class StrictProviderOnnxSessionTests(unittest.TestCase):
+    def test_factory_registers_only_migraphx_and_disables_both_fallbacks(self) -> None:
+        runtime = FakeRuntime(providers=(MIGRAPHX_PROVIDER, CPU_PROVIDER))
+        fake_session = FakeSession(providers=(MIGRAPHX_PROVIDER,))
+        captured: dict[str, object] = {}
+
+        def factory(path, *, sess_options, providers):
+            captured["path"] = path
+            captured["providers"] = providers
+            captured["options"] = sess_options
+            return fake_session
+
+        session = StrictProviderOnnxSession(
+            "synthetic.onnx",
+            DIRECT_HEAD_CONTRACT,
+            provider=MIGRAPHX_PROVIDER,
+            runtime_module=runtime,
+            session_factory=factory,
+        )
+
+        self.assertEqual(captured["providers"], [MIGRAPHX_PROVIDER])
+        options = captured["options"]
+        self.assertEqual(
+            options.entries,
+            [("session.disable_cpu_ep_fallback", "1")],
+        )
+        self.assertIs(
+            options.graph_optimization_level,
+            runtime.GraphOptimizationLevel.ORT_ENABLE_ALL,
+        )
+        self.assertTrue(fake_session.fallback_disabled)
+        self.assertEqual(session.info.provider, MIGRAPHX_PROVIDER)
+        self.assertTrue(session.info.cpu_graph_fallback_disabled)
+        self.assertTrue(session.info.ep_failure_fallback_disabled)
+        self.assertEqual(session.info.active_providers, (MIGRAPHX_PROVIDER,))
+        self.assertNotIn(CPU_PROVIDER, captured["providers"])
+
+        output = session.infer(
+            np.zeros(DIRECT_HEAD_CONTRACT.input.shape, dtype=np.float32)
+        )
+        self.assertEqual(output.shape, DIRECT_HEAD_CONTRACT.output.shape)
+
+    def test_unavailable_migraphx_and_explicit_cpu_fail_closed(self) -> None:
+        runtime = FakeRuntime(providers=(CPU_PROVIDER,))
+        with self.assertRaisesRegex(DeviceNotAvailableError, "not installed"):
+            StrictProviderOnnxSession(
+                "synthetic.onnx",
+                DIRECT_HEAD_CONTRACT,
+                provider=MIGRAPHX_PROVIDER,
+                runtime_module=runtime,
+                session_factory=lambda *_args, **_kwargs: FakeSession(),
+            )
+
+        with self.assertRaisesRegex(ValueError, "refuses CPUExecutionProvider"):
+            StrictProviderOnnxSession(
+                "synthetic.onnx",
+                DIRECT_HEAD_CONTRACT,
+                provider=CPU_PROVIDER,
+                runtime_module=runtime,
+                session_factory=lambda *_args, **_kwargs: FakeSession(),
+            )
+
+    def test_implicit_cpu_registration_is_allowed_but_never_requested(self) -> None:
+        runtime = FakeRuntime(providers=(MIGRAPHX_PROVIDER, CPU_PROVIDER))
+        captured: dict[str, object] = {}
+
+        def factory(_path, *, sess_options, providers):
+            captured["providers"] = providers
+            return FakeSession(providers=(MIGRAPHX_PROVIDER, CPU_PROVIDER))
+
+        session = StrictProviderOnnxSession(
+            "synthetic.onnx",
+            DIRECT_HEAD_CONTRACT,
+            provider=MIGRAPHX_PROVIDER,
+            runtime_module=runtime,
+            session_factory=factory,
+        )
+
+        self.assertEqual(captured["providers"], [MIGRAPHX_PROVIDER])
+        self.assertEqual(
+            session.info.active_providers,
+            (MIGRAPHX_PROVIDER, CPU_PROVIDER),
+        )
+        self.assertTrue(session.info.cpu_graph_fallback_disabled)
+
+    def test_alternate_or_reordered_active_provider_is_rejected(self) -> None:
+        runtime = FakeRuntime(providers=(MIGRAPHX_PROVIDER, CPU_PROVIDER))
+        invalid_chains = (
+            (CPU_PROVIDER,),
+            (CPU_PROVIDER, MIGRAPHX_PROVIDER),
+            (MIGRAPHX_PROVIDER, "DnnlExecutionProvider", CPU_PROVIDER),
+        )
+        for active in invalid_chains:
+            with self.subTest(active=active), self.assertRaisesRegex(
+                ModelError,
+                "unexpected provider chain",
+            ):
+                StrictProviderOnnxSession(
+                    "synthetic.onnx",
+                    DIRECT_HEAD_CONTRACT,
+                    provider=MIGRAPHX_PROVIDER,
+                    runtime_module=runtime,
+                    session_factory=lambda *_args, **_kwargs: FakeSession(
+                        providers=active
+                    ),
+                )
+
+    def test_missing_runtime_ep_failure_control_is_rejected(self) -> None:
+        runtime = FakeRuntime(providers=(MIGRAPHX_PROVIDER, CPU_PROVIDER))
+
+        class SessionWithoutFallbackControl:
+            def get_providers(self):
+                return [MIGRAPHX_PROVIDER]
+
+        with self.assertRaisesRegex(ModelError, "failure fallback"):
+            StrictProviderOnnxSession(
+                "synthetic.onnx",
+                DIRECT_HEAD_CONTRACT,
+                provider=MIGRAPHX_PROVIDER,
+                runtime_module=runtime,
+                session_factory=lambda *_args, **_kwargs: SessionWithoutFallbackControl(),
+            )
+
+    def test_provider_drift_after_run_fails_closed(self) -> None:
+        runtime = FakeRuntime(providers=(MIGRAPHX_PROVIDER, CPU_PROVIDER))
+
+        class DriftingSession(FakeSession):
+            def run(self, names, inputs):
+                output = super().run(names, inputs)
+                self.providers = (CPU_PROVIDER,)
+                return output
+
+        session = StrictProviderOnnxSession(
+            "synthetic.onnx",
+            DIRECT_HEAD_CONTRACT,
+            provider=MIGRAPHX_PROVIDER,
+            runtime_module=runtime,
+            session_factory=lambda *_args, **_kwargs: DriftingSession(
+                providers=(MIGRAPHX_PROVIDER,)
+            ),
+        )
+
+        with self.assertRaisesRegex(ModelError, "unexpected provider chain"):
+            session.infer(
+                np.zeros(DIRECT_HEAD_CONTRACT.input.shape, dtype=np.float32)
+            )
+
+    def test_exact_pinned_contract_is_still_required(self) -> None:
+        runtime = FakeRuntime(providers=(MIGRAPHX_PROVIDER, CPU_PROVIDER))
+        wrong = OnnxModelContract(
+            input=OnnxTensorContract("images", (1, 3, 640, 640)),
+            output=DIRECT_HEAD_CONTRACT.output,
+        )
+        with self.assertRaisesRegex(ModelError, "Strict GPU head model input shape"):
+            StrictProviderOnnxSession(
+                "synthetic.onnx",
+                DIRECT_HEAD_CONTRACT,
+                provider=MIGRAPHX_PROVIDER,
+                runtime_module=runtime,
+                session_factory=lambda *_args, **_kwargs: FakeSession(
+                    wrong,
+                    providers=(MIGRAPHX_PROVIDER,),
+                ),
+            )
 
 
 def observation_for(payload: np.ndarray) -> HeadObservation:

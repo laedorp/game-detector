@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import math
 import sys
 from dataclasses import dataclass
@@ -19,7 +20,7 @@ AUTOMATIC_MAKCU_EMPTY_GRACE_FRAMES = 3
 AUTOMATIC_MAKCU_STALE_AFTER_SECONDS = 0.065
 AUTOMATIC_HEAD_LOCALIZATION_HZ = 90.0
 AUTOMATIC_HEAD_STALE_AFTER_SECONDS = AUTOMATIC_MAKCU_STALE_AFTER_SECONDS
-AUTOMATIC_HEAD_CPU_THREADS = 4
+AUTOMATIC_HEAD_PROVIDER = "MIGraphXExecutionProvider"
 
 
 def _identity_payload(payload):
@@ -98,6 +99,7 @@ class _AutomaticHeadRuntime:
         *,
         submission_hz: float = AUTOMATIC_HEAD_LOCALIZATION_HZ,
         stale_after_seconds: float = AUTOMATIC_HEAD_STALE_AFTER_SECONDS,
+        provider: str | None = None,
     ) -> None:
         rate = float(submission_hz)
         stale = float(stale_after_seconds)
@@ -106,6 +108,10 @@ class _AutomaticHeadRuntime:
         if not math.isfinite(stale) or stale <= 0.0:
             raise ValueError("head stale_after_seconds must be finite and positive")
         self.worker = worker
+        provider_name = None if provider is None else str(provider).strip()
+        if provider is not None and not provider_name:
+            raise ValueError("head provider must not be empty")
+        self.provider = provider_name
         self.submission_interval_ns = max(1, round(1_000_000_000 / rate))
         self.stale_after_ns = max(1, round(stale * 1_000_000_000))
         self.identity_generation = 0
@@ -557,8 +563,52 @@ class _AutomaticHeadRuntime:
         return bool(self.worker.stop())
 
 
-def _build_automatic_head_runtime() -> _AutomaticHeadRuntime:
-    """Build the exact pinned CPU direct-head session with no fallback model."""
+def _strict_primary_migraphx_provider(runtime_summary) -> str:
+    """Prove the primary model cannot execute or retry on CPU."""
+
+    if not isinstance(runtime_summary, Mapping):
+        raise RuntimeError("Primary detector runtime summary is unavailable")
+    active_values = runtime_summary.get("active_providers")
+    if (
+        not isinstance(active_values, (list, tuple))
+        or isinstance(active_values, (str, bytes))
+    ):
+        raise RuntimeError("Primary detector active provider chain is unavailable")
+    active = tuple(str(value).strip() for value in active_values)
+    allowed_active = (
+        (AUTOMATIC_HEAD_PROVIDER,),
+        (AUTOMATIC_HEAD_PROVIDER, "CPUExecutionProvider"),
+    )
+    if active not in allowed_active:
+        raise RuntimeError(
+            "Automatic direct-head tracking requires the primary detector on "
+            f"{AUTOMATIC_HEAD_PROVIDER}; active provider chain is "
+            + (", ".join(active) or "unavailable")
+        )
+    if runtime_summary.get("require_full_provider") is not True:
+        raise RuntimeError(
+            "Automatic direct-head tracking requires strict primary-provider "
+            "qualification"
+        )
+    configured = runtime_summary.get("configured_session_options")
+    if (
+        not isinstance(configured, Mapping)
+        or configured.get("disable_cpu_ep_fallback") is not True
+    ):
+        raise RuntimeError(
+            "Automatic direct-head tracking requires CPU graph fallback to be "
+            "disabled for the primary detector"
+        )
+    if runtime_summary.get("runtime_ep_fail_fallback_disabled") is not True:
+        raise RuntimeError(
+            "Automatic direct-head tracking requires primary execution-provider "
+            "failure fallback to be disabled"
+        )
+    return AUTOMATIC_HEAD_PROVIDER
+
+
+def _build_automatic_head_runtime(primary_runtime_summary) -> _AutomaticHeadRuntime:
+    """Build the pinned direct-head model on MIGraphX with no CPU fallback."""
 
     import numpy as np
 
@@ -570,10 +620,17 @@ def _build_automatic_head_runtime() -> _AutomaticHeadRuntime:
         verify_pinned_head_model,
     )
     from detection.head_worker import (
-        CpuOnnxSession,
         LatestHeadWorker,
+        MIGRAPHX_PROVIDER,
         OnnxModelContract,
         OnnxTensorContract,
+        StrictProviderOnnxSession,
+    )
+
+    if AUTOMATIC_HEAD_PROVIDER != MIGRAPHX_PROVIDER:
+        raise RuntimeError("automatic head provider constant does not match MIGraphX")
+    active_primary_provider = _strict_primary_migraphx_provider(
+        primary_runtime_summary
     )
 
     model_path = verify_pinned_head_model()
@@ -587,10 +644,10 @@ def _build_automatic_head_runtime() -> _AutomaticHeadRuntime:
             (1, HEAD_OUTPUT_ATTRIBUTES, HEAD_OUTPUT_CANDIDATES),
         ),
     )
-    session = CpuOnnxSession(
+    session = StrictProviderOnnxSession(
         model_path,
         contract,
-        intra_op_threads=AUTOMATIC_HEAD_CPU_THREADS,
+        provider=active_primary_provider,
     )
     # Pay graph/allocation setup once before any physical activation can arm.
     session.infer(np.zeros(contract.input.shape, dtype=np.float32))
@@ -598,7 +655,7 @@ def _build_automatic_head_runtime() -> _AutomaticHeadRuntime:
         _PreparedDirectHeadLocalizer(session),
         payload_copier=_identity_payload,
     )
-    return _AutomaticHeadRuntime(worker)
+    return _AutomaticHeadRuntime(worker, provider=session.info.provider)
 
 
 def _publish_automatic_head_loss_once(
@@ -1978,6 +2035,21 @@ def run(config: AppConfig) -> int:
         and active_profile is None
         and not calibration_requested
     )
+    if automatic_makcu_requested:
+        # Automatic direct-head mode is an explicitly qualified MIGraphX path.
+        # Reject an arbitrary/manual CPU or OpenVINO invocation before either
+        # neural model is constructed or warmed up; the later runtime-summary
+        # checks still prove what the successfully created session activated.
+        if config.backend != "onnxruntime":
+            raise RuntimeError(
+                "Automatic direct-head MAKCU control requires the ONNX Runtime "
+                "MIGraphX GPU backend; CPU/OpenVINO inference is not permitted"
+            )
+        if config.require_full_provider is not True:
+            raise RuntimeError(
+                "Automatic direct-head MAKCU control requires --require-full-provider "
+                "so CPU graph and execution-provider failure fallback stay disabled"
+            )
     if config.crop_size is not None and config.detail_crop_size is not None:
         raise ValueError(
             "The detail pass requires a full-frame primary inference; "
@@ -2055,7 +2127,11 @@ def run(config: AppConfig) -> int:
     detector_arguments = dict(
         model_path=config.model_path,
         labels_path=config.labels_path,
-        device=config.device,
+        # The automatic direct-head implementation is qualified for this AMD
+        # host on MIGraphX only.  Resolve that exact provider before session
+        # construction rather than allowing generic GPU/AUTO selection to
+        # initialize a different accelerator and reject it after warmup.
+        device=(AUTOMATIC_HEAD_PROVIDER if automatic_makcu_requested else config.device),
         # Keep square detector-constructor integrations source-compatible;
         # rectangular shapes remain an explicit (height, width) pair.
         inference_size=compact_inference_size(config.inference_size),
@@ -2280,7 +2356,14 @@ def run(config: AppConfig) -> int:
             # This path is mandatory for automatic no-profile MAKCU.  A missing,
             # changed, or unloadable head model is a startup failure; it never
             # falls back to a body-box ratio.
-            automatic_head_runtime = _build_automatic_head_runtime()
+            print(
+                "Loading direct-head model on MIGraphXExecutionProvider GPU-only; "
+                "first compile may take about 40 seconds; CPU inference fallback "
+                "disabled."
+            )
+            automatic_head_runtime = _build_automatic_head_runtime(
+                detector.runtime_summary
+            )
             automatic_head_runtime.start()
         if calibration_requested and not isinstance(
             aim_controller, MakcuAimingController
@@ -2317,6 +2400,12 @@ def run(config: AppConfig) -> int:
             pass
         elif config.aim_output == "makcu":
             assert automatic_numeric_controller is not None
+            assert automatic_head_runtime is not None
+            head_provider = automatic_head_runtime.provider
+            if head_provider != AUTOMATIC_HEAD_PROVIDER:
+                raise RuntimeError(
+                    "Automatic head runtime provider identity is not strict MIGraphX"
+                )
             activation = (
                 f"MAKCU mouse button {config.aim_makcu_button} | "
                 f"control loop {aim_controller.config.output_hz} Hz"
@@ -2331,7 +2420,8 @@ def run(config: AppConfig) -> int:
                 f"{AUTOMATIC_MAKCU_GAIN_Y_PIXELS_PER_COUNT:g} px/count | "
                 f"delay {AUTOMATIC_MAKCU_DELAY_SECONDS * 1000.0:.2f} ms | "
                 "head source pinned SunXDS 0.8.0 direct boxes on "
-                f"CPU ({AUTOMATIC_HEAD_CPU_THREADS} threads) | "
+                f"{head_provider} GPU-only "
+                "(CPU fallback disabled) | "
                 f"latest-only {AUTOMATIC_HEAD_LOCALIZATION_HZ:g} Hz | "
                 f"fail closed after {AUTOMATIC_HEAD_STALE_AFTER_SECONDS * 1000.0:.0f} ms | "
                 "primary player box identity/safety only | "
@@ -3325,7 +3415,7 @@ def run(config: AppConfig) -> int:
                 except Exception as exc:  # noqa: BLE001 - still stop physical output
                     record_cleanup_failure("calibration evidence publication", exc)
 
-        # Stop physical output before waiting for any auxiliary CPU worker.
+        # Stop physical output before waiting for any auxiliary model worker.
         # This makes pipeline exit an immediate movement revocation even if a
         # head inference takes its full bounded join interval to return.
         if aim_controller is not None:
@@ -3342,7 +3432,7 @@ def run(config: AppConfig) -> int:
                 if not head_worker_stopped:
                     record_cleanup_failure(
                         "direct-head worker shutdown",
-                        "the CPU localization worker did not stop within its bounded timeout",
+                        "the direct-head localization worker did not stop within its bounded timeout",
                     )
                 try:
                     automatic_head_runtime.raise_if_failed()

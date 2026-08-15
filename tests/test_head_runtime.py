@@ -16,8 +16,8 @@ from detection.head_detector import (
 from detection.head_worker import HeadObservation, HeadWorkerResult
 from detection.types import Detection
 from main import (
-    AUTOMATIC_HEAD_CPU_THREADS,
     AUTOMATIC_HEAD_LOCALIZATION_HZ,
+    AUTOMATIC_HEAD_PROVIDER,
     _AutomaticHeadRuntime,
     _PreparedDirectHeadLocalizer,
     _TimestampedPreparedHeadInput,
@@ -25,6 +25,20 @@ from main import (
     _head_runtime_telemetry_summary,
     _publish_automatic_head_loss_once,
 )
+
+
+def _strict_primary_runtime_summary() -> dict[str, object]:
+    return {
+        "active_providers": [
+            "MIGraphXExecutionProvider",
+            "CPUExecutionProvider",
+        ],
+        "require_full_provider": True,
+        "configured_session_options": {
+            "disable_cpu_ep_fallback": True,
+        },
+        "runtime_ep_fail_fallback_disabled": True,
+    }
 
 
 class _FakeWorker:
@@ -175,7 +189,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
 
     def test_default_submission_gate_preserves_90_hz_phase_at_130_fps(self) -> None:
         self.assertEqual(AUTOMATIC_HEAD_LOCALIZATION_HZ, 90.0)
-        self.assertEqual(AUTOMATIC_HEAD_CPU_THREADS, 4)
+        self.assertEqual(AUTOMATIC_HEAD_PROVIDER, "MIGraphXExecutionProvider")
         worker = _FakeWorker()
         runtime = _AutomaticHeadRuntime(worker)
         runtime.accept_body(self.player.box)
@@ -919,15 +933,16 @@ class PreparedDirectHeadLocalizerTests(unittest.TestCase):
 
 
 class AutomaticHeadBuilderTests(unittest.TestCase):
-    def test_exact_cpu_contract_is_warmed_and_worker_owns_prepared_payload(self) -> None:
+    def test_exact_gpu_contract_is_warmed_and_worker_owns_prepared_payload(self) -> None:
         sessions: list[object] = []
         workers: list[object] = []
 
         class FakeSession:
-            def __init__(self, path, contract, *, intra_op_threads):
+            def __init__(self, path, contract, *, provider):
                 self.path = Path(path)
                 self.contract = contract
-                self.intra_op_threads = intra_op_threads
+                self.provider = provider
+                self.info = SimpleNamespace(provider=provider)
                 self.inputs: list[np.ndarray] = []
                 sessions.append(self)
 
@@ -947,16 +962,22 @@ class AutomaticHeadBuilderTests(unittest.TestCase):
                 "detection.head_detector.verify_pinned_head_model",
                 return_value=Path("/pinned/sunxds_0.8.0.onnx"),
             ),
-            mock.patch("detection.head_worker.CpuOnnxSession", FakeSession),
+            mock.patch(
+                "detection.head_worker.StrictProviderOnnxSession",
+                FakeSession,
+            ),
             mock.patch("detection.head_worker.LatestHeadWorker", FakeLatestWorker),
         ):
-            runtime = _build_automatic_head_runtime()
+            runtime = _build_automatic_head_runtime(
+                _strict_primary_runtime_summary()
+            )
 
         self.assertIsInstance(runtime, _AutomaticHeadRuntime)
         self.assertEqual(len(sessions), 1)
         session = sessions[0]
         self.assertEqual(session.path.name, "sunxds_0.8.0.onnx")
-        self.assertEqual(session.intra_op_threads, AUTOMATIC_HEAD_CPU_THREADS)
+        self.assertEqual(session.provider, AUTOMATIC_HEAD_PROVIDER)
+        self.assertEqual(runtime.provider, AUTOMATIC_HEAD_PROVIDER)
         self.assertEqual(session.contract.input.name, "images")
         self.assertEqual(session.contract.input.shape, (1, 3, 320, 320))
         self.assertEqual(session.contract.output.name, "output0")
@@ -964,6 +985,54 @@ class AutomaticHeadBuilderTests(unittest.TestCase):
         self.assertEqual(len(session.inputs), 1)
         self.assertEqual(session.inputs[0].dtype, np.float32)
         self.assertIs(workers[0].payload_copier("owned"), "owned")
+
+    def test_builder_rejects_any_non_strict_primary_before_model_load(self) -> None:
+        cases = {
+            "wrong_provider": {
+                **_strict_primary_runtime_summary(),
+                "active_providers": ["CPUExecutionProvider"],
+            },
+            "full_provider_disabled": {
+                **_strict_primary_runtime_summary(),
+                "require_full_provider": False,
+            },
+            "full_provider_missing": {
+                key: value
+                for key, value in _strict_primary_runtime_summary().items()
+                if key != "require_full_provider"
+            },
+            "cpu_graph_fallback_enabled": {
+                **_strict_primary_runtime_summary(),
+                "configured_session_options": {
+                    "disable_cpu_ep_fallback": False,
+                },
+            },
+            "cpu_graph_fallback_missing": {
+                **_strict_primary_runtime_summary(),
+                "configured_session_options": {},
+            },
+            "ep_failure_fallback_enabled": {
+                **_strict_primary_runtime_summary(),
+                "runtime_ep_fail_fallback_disabled": False,
+            },
+            "ep_failure_fallback_missing": {
+                key: value
+                for key, value in _strict_primary_runtime_summary().items()
+                if key != "runtime_ep_fail_fallback_disabled"
+            },
+        }
+        for name, summary in cases.items():
+            with (
+                self.subTest(name=name),
+                mock.patch(
+                    "detection.head_detector.verify_pinned_head_model",
+                    side_effect=AssertionError(
+                        "model loaded before provider validation"
+                    ),
+                ),
+                self.assertRaises(RuntimeError),
+            ):
+                _build_automatic_head_runtime(summary)
 
 
 class HeadRuntimeTelemetryTests(unittest.TestCase):

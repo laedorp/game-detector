@@ -1,11 +1,11 @@
-"""Model-agnostic latest-only head-localization worker and CPU ONNX session.
+"""Model-agnostic latest-only head-localization worker and ONNX sessions.
 
 Model-specific code prepares a bounded payload (normally an owned crop or
 input tensor) and supplies a callable that returns an absolute source-frame
 head observation.  This module owns only scheduling, identity/freshness
-metadata, lifecycle, and a strict CPU ONNX Runtime boundary.  It never derives
-an aim point from a player box and never reprojects an old result through a
-newer, potentially jittery box.
+metadata, lifecycle, and strict ONNX Runtime boundaries.  It never derives an
+aim point from a player box and never reprojects an old result through a newer,
+potentially jittery box.
 """
 
 from __future__ import annotations
@@ -28,6 +28,7 @@ from .base import DependencyError, DeviceNotAvailableError, ModelError
 Box: TypeAlias = tuple[float, float, float, float]
 Point: TypeAlias = tuple[float, float]
 CPU_PROVIDER = "CPUExecutionProvider"
+MIGRAPHX_PROVIDER = "MIGraphXExecutionProvider"
 
 
 def _non_negative_integer(value: int, name: str) -> int:
@@ -266,23 +267,29 @@ class CpuOnnxSession:
         CpuOnnxSession._validate_tensor(outputs[0], contract.output, "output")
 
     @staticmethod
-    def _validate_tensor(actual: Any, expected: OnnxTensorContract, role: str) -> None:
+    def _validate_tensor(
+        actual: Any,
+        expected: OnnxTensorContract,
+        role: str,
+        *,
+        model_label: str = "CPU head model",
+    ) -> None:
         name = str(getattr(actual, "name", ""))
         shape = tuple(getattr(actual, "shape", ()))
         element_type = str(getattr(actual, "type", ""))
         if name != expected.name:
             raise ModelError(
-                f"CPU head model {role} name {name!r} does not match "
+                f"{model_label} {role} name {name!r} does not match "
                 f"the pinned contract {expected.name!r}"
             )
         if shape != expected.shape:
             raise ModelError(
-                f"CPU head model {role} shape {list(shape)} does not match "
+                f"{model_label} {role} shape {list(shape)} does not match "
                 f"the pinned contract {list(expected.shape)}"
             )
         if element_type != expected.element_type:
             raise ModelError(
-                f"CPU head model {role} type {element_type!r} does not match "
+                f"{model_label} {role} type {element_type!r} does not match "
                 f"the pinned contract {expected.element_type!r}"
             )
 
@@ -317,6 +324,246 @@ class CpuOnnxSession:
         if output.dtype != np.float32:
             raise ModelError(
                 f"CPU head-model output must use float32, got {output.dtype}"
+            )
+        return output
+
+    def __call__(self, tensor: np.ndarray) -> np.ndarray:
+        return self.infer(tensor)
+
+
+@dataclass(frozen=True, slots=True)
+class StrictProviderOnnxSessionInfo:
+    """Auditable identity for one accelerator-only ONNX session."""
+
+    model_path: str
+    runtime_version: str
+    provider: str
+    active_providers: tuple[str, ...]
+    configured_session_options: tuple[tuple[str, str], ...]
+    cpu_graph_fallback_disabled: bool
+    ep_failure_fallback_disabled: bool
+    input: OnnxTensorContract
+    output: OnnxTensorContract
+
+
+class StrictProviderOnnxSession:
+    """Run one pinned model on exactly one non-CPU execution provider.
+
+    ONNX Runtime has two independent fallback mechanisms.  The session config
+    entry prevents unsupported graph nodes from being assigned to CPU during
+    construction, while :meth:`InferenceSession.disable_fallback` prevents the
+    Python wrapper from retrying a failed accelerator run on CPU.  Both are
+    mandatory here; an older runtime that cannot provide either control is
+    rejected before warmup.
+    """
+
+    def __init__(
+        self,
+        model_path: str | Path,
+        contract: OnnxModelContract,
+        *,
+        provider: str,
+        runtime_module: Any | None = None,
+        session_factory: Callable[..., Any] | None = None,
+    ) -> None:
+        self.model_path = Path(model_path).expanduser()
+        if session_factory is None and not self.model_path.is_file():
+            raise FileNotFoundError(f"ONNX model file not found: {self.model_path}")
+        self.contract = contract
+        requested_provider = str(provider).strip()
+        if not requested_provider:
+            raise ValueError("strict ONNX provider must not be empty")
+        if requested_provider == CPU_PROVIDER:
+            raise ValueError("strict GPU head session refuses CPUExecutionProvider")
+
+        if runtime_module is None:
+            try:
+                import onnxruntime as runtime_module  # type: ignore[import-not-found]
+            except ImportError as exc:
+                raise DependencyError(
+                    "ONNX Runtime with the requested GPU provider is required "
+                    "for the strict head localizer"
+                ) from exc
+        runtime = runtime_module
+        try:
+            available = tuple(str(value) for value in runtime.get_available_providers())
+        except Exception as exc:
+            raise DependencyError(
+                f"Could not query ONNX Runtime providers: {exc}"
+            ) from exc
+        if requested_provider not in available:
+            raise DeviceNotAvailableError(
+                f"Strict GPU head provider {requested_provider!r} is not installed; "
+                "available providers: " + (", ".join(available) or "none")
+            )
+
+        configured_session_options: dict[str, Any]
+        try:
+            # Reuse the same provider-compatible options as the primary ONNX
+            # detector instead of creating a second, subtly different GPU
+            # configuration path.
+            from .onnx_yolo import _configure_session_options
+
+            options = runtime.SessionOptions()
+            configured_session_options = _configure_session_options(
+                runtime,
+                options,
+                (requested_provider,),
+            )
+            add_config = getattr(options, "add_session_config_entry", None)
+            if not callable(add_config):
+                raise RuntimeError(
+                    "this ONNX Runtime cannot disable CPU graph fallback"
+                )
+            add_config("session.disable_cpu_ep_fallback", "1")
+            configured_session_options["disable_cpu_ep_fallback"] = True
+            factory = session_factory or runtime.InferenceSession
+            # Do not register CPU at all.  Provider availability does not grant
+            # it permission to execute any part of this model.
+            session = factory(
+                str(self.model_path),
+                sess_options=options,
+                providers=[requested_provider],
+            )
+        except Exception as exc:
+            raise ModelError(
+                f"Could not load strict GPU ONNX model {self.model_path} on "
+                f"{requested_provider}: {exc}"
+            ) from exc
+
+        disable_runtime_fallback = getattr(session, "disable_fallback", None)
+        if not callable(disable_runtime_fallback):
+            raise ModelError(
+                "Strict GPU head inference requires an ONNX Runtime session "
+                "that can disable execution-provider failure fallback"
+            )
+        try:
+            disable_runtime_fallback()
+        except Exception as exc:
+            raise ModelError(
+                "Could not disable ONNX Runtime execution-provider failure "
+                f"fallback for the GPU head session: {exc}"
+            ) from exc
+
+        active_providers = self._validate_session(
+            session,
+            contract,
+            requested_provider,
+        )
+        self._session = session
+        self._provider = requested_provider
+        self._input_name = contract.input.name
+        self._output_name = contract.output.name
+        self.info = StrictProviderOnnxSessionInfo(
+            model_path=str(self.model_path),
+            runtime_version=str(getattr(runtime, "__version__", "unknown")),
+            provider=requested_provider,
+            active_providers=active_providers,
+            configured_session_options=tuple(
+                sorted(
+                    (str(key), str(value))
+                    for key, value in configured_session_options.items()
+                )
+            ),
+            cpu_graph_fallback_disabled=True,
+            ep_failure_fallback_disabled=True,
+            input=contract.input,
+            output=contract.output,
+        )
+
+    @staticmethod
+    def _require_strict_provider_chain(
+        session: Any,
+        provider: str,
+    ) -> tuple[str, ...]:
+        try:
+            active = tuple(str(value) for value in session.get_providers())
+        except Exception as exc:
+            raise ModelError(
+                f"Could not inspect strict GPU head providers: {exc}"
+            ) from exc
+        # ORT 1.28 implicitly reports CPUExecutionProvider after the explicitly
+        # registered accelerator even when providers=[provider].  The required
+        # session.disable_cpu_ep_fallback=1 option prevents it from receiving
+        # graph nodes.  Accept that one documented implicit registration, but
+        # no alternate accelerator, reordered provider, or CPU-only chain.
+        if active not in ((provider,), (provider, CPU_PROVIDER)):
+            raise ModelError(
+                "Strict GPU head session activated an unexpected provider chain: "
+                + (", ".join(active) or "none")
+                + f"; required {provider} first with CPU execution disabled"
+            )
+        return active
+
+    @staticmethod
+    def _validate_session(
+        session: Any,
+        contract: OnnxModelContract,
+        provider: str,
+    ) -> tuple[str, ...]:
+        active = StrictProviderOnnxSession._require_strict_provider_chain(
+            session,
+            provider,
+        )
+        try:
+            inputs = list(session.get_inputs())
+            outputs = list(session.get_outputs())
+        except Exception as exc:
+            raise ModelError(f"Could not inspect strict GPU ONNX session: {exc}") from exc
+        if len(inputs) != 1 or len(outputs) != 1:
+            raise ModelError(
+                "Strict GPU head model must expose exactly one input and one output"
+            )
+        CpuOnnxSession._validate_tensor(
+            inputs[0],
+            contract.input,
+            "input",
+            model_label="Strict GPU head model",
+        )
+        CpuOnnxSession._validate_tensor(
+            outputs[0],
+            contract.output,
+            "output",
+            model_label="Strict GPU head model",
+        )
+        return active
+
+    def infer(self, tensor: np.ndarray) -> np.ndarray:
+        array = np.asarray(tensor)
+        if array.shape != self.contract.input.shape:
+            raise ValueError(
+                f"head model input must have shape {self.contract.input.shape}, "
+                f"got {array.shape}"
+            )
+        if array.dtype != np.float32:
+            raise ValueError(f"head model input must use float32, got {array.dtype}")
+        # Check before and after every inference.  ``disable_fallback`` is the
+        # prevention mechanism; these checks make any runtime contract drift
+        # visible and permanently fail the worker instead of continuing.
+        self._require_strict_provider_chain(self._session, self._provider)
+        try:
+            outputs = self._session.run(
+                [self._output_name],
+                {self._input_name: array},
+            )
+        except Exception as exc:
+            raise ModelError(
+                f"Strict GPU head-model inference failed on {self._provider}: {exc}"
+            ) from exc
+        self._require_strict_provider_chain(self._session, self._provider)
+        if len(outputs) != 1:
+            raise ModelError(
+                f"Strict GPU head-model inference returned {len(outputs)} outputs"
+            )
+        output = np.asarray(outputs[0])
+        if output.shape != self.contract.output.shape:
+            raise ModelError(
+                f"Strict GPU head-model output must have shape "
+                f"{self.contract.output.shape}, got {output.shape}"
+            )
+        if output.dtype != np.float32:
+            raise ModelError(
+                f"Strict GPU head-model output must use float32, got {output.dtype}"
             )
         return output
 
