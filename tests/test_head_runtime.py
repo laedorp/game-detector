@@ -8,12 +8,18 @@ from unittest import mock
 import numpy as np
 
 from detection.head_detector import (
+    HeadAssociationOutcome,
     HeadCandidate,
     HeadLocalization,
     PreparedHeadInput,
     associate_head_to_player,
 )
-from detection.head_worker import HeadObservation, HeadWorkerResult
+from detection.head_worker import (
+    HeadLocalizationOutcome,
+    HeadLocalizationReason,
+    HeadObservation,
+    HeadWorkerResult,
+)
 from detection.types import Detection
 from main import (
     AUTOMATIC_HEAD_LOCALIZATION_HZ,
@@ -871,7 +877,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
 
 
 class PreparedDirectHeadLocalizerTests(unittest.TestCase):
-    def test_no_decoded_head_returns_none_without_box_proxy(self) -> None:
+    def test_no_decoded_head_returns_typed_rejection_without_box_proxy(self) -> None:
         prepared = SimpleNamespace(
             tensor=np.zeros((1, 3, 320, 320), np.float32),
             transform=object(),
@@ -887,12 +893,20 @@ class PreparedDirectHeadLocalizerTests(unittest.TestCase):
             "detection.head_detector.decode_head_output",
             return_value=[],
         ), mock.patch(
-            "detection.head_detector.associate_head_to_player",
-            return_value=None,
+            "detection.head_detector.associate_head_to_player_outcome",
+            return_value=HeadAssociationOutcome(
+                HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE,
+                None,
+            ),
         ):
-            self.assertIsNone(
-                localizer(payload, (100.0, 100.0, 300.0, 700.0))
-            )
+            outcome = localizer(payload, (100.0, 100.0, 300.0, 700.0))
+
+        self.assertIsInstance(outcome, HeadLocalizationOutcome)
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE,
+        )
+        self.assertIsNone(outcome.observation)
 
     def test_localization_is_wrapped_as_direct_evidence(self) -> None:
         prepared = SimpleNamespace(
@@ -919,14 +933,19 @@ class PreparedDirectHeadLocalizerTests(unittest.TestCase):
             "detection.head_detector.decode_head_output",
             return_value=[object()],
         ), mock.patch(
-            "detection.head_detector.associate_head_to_player",
-            return_value=localization,
+            "detection.head_detector.associate_head_to_player_outcome",
+            return_value=HeadAssociationOutcome(
+                HeadLocalizationReason.LOCALIZED,
+                localization,
+            ),
         ):
-            observation = localizer(
+            outcome = localizer(
                 payload,
                 (100.0, 100.0, 500.0, 800.0),
             )
 
+        self.assertIs(outcome.reason, HeadLocalizationReason.LOCALIZED)
+        observation = outcome.observation
         assert observation is not None
         self.assertEqual(observation.point, localization.point)
         self.assertIn("direct head box", observation.evidence)
@@ -1038,9 +1057,16 @@ class AutomaticHeadBuilderTests(unittest.TestCase):
 class HeadRuntimeTelemetryTests(unittest.TestCase):
     def test_summary_reports_only_counts_and_freshness_not_coordinates(self) -> None:
         fields = dict(
-            jobs_completed=10,
-            localized_heads=7,
-            no_head_results=3,
+            jobs_completed=7,
+            localized_heads=1,
+            no_head_results=6,
+            no_decoded_head_candidates=1,
+            no_plausible_heads=1,
+            multiple_plausible_heads=1,
+            no_matching_secondary_players=1,
+            multiple_matching_secondary_players=1,
+            head_unsupported_by_matched_player=1,
+            unspecified_no_head_results=0,
             pending_overwrites=1,
             result_overwrites=2,
             stale_submissions=1,
@@ -1062,9 +1088,15 @@ class HeadRuntimeTelemetryTests(unittest.TestCase):
             visible_sample=sample,
         )
 
-        self.assertIn("HEAD completed 10/s", summary)
-        self.assertIn("localized 7/s", summary)
-        self.assertIn("no-head 3/s", summary)
+        self.assertIn("HEAD completed 7/s", summary)
+        self.assertIn("localized 1/s", summary)
+        self.assertIn("no-head 6/s", summary)
+        self.assertIn(
+            "why no-decoded/no-plausible/multi-head 1/1/1/s",
+            summary,
+        )
+        self.assertIn("secondary none/multi/unsupported 1/1/1/s", summary)
+        self.assertIn("other 0/s", summary)
         self.assertIn("overwrites 3", summary)
         self.assertIn("stale 3", summary)
         self.assertIn("point age 20ms bridge", summary)

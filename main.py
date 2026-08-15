@@ -44,10 +44,10 @@ class _PreparedDirectHeadLocalizer:
     def __call__(self, payload, selected_player_box):
         from detection.head_detector import (
             PreparedHeadInput,
-            associate_head_to_player,
+            associate_head_to_player_outcome,
             decode_head_output,
         )
-        from detection.head_worker import HeadObservation
+        from detection.head_worker import HeadLocalizationOutcome, HeadObservation
 
         if not isinstance(payload, _TimestampedPreparedHeadInput):
             raise TypeError("head worker payload must be timestamped prepared input")
@@ -56,19 +56,23 @@ class _PreparedDirectHeadLocalizer:
             raise TypeError("timestamped head payload must own PreparedHeadInput")
         output = self._session.infer(prepared.tensor)
         candidates = decode_head_output(output, prepared.transform)
-        localization = associate_head_to_player(
+        association = associate_head_to_player_outcome(
             candidates,
             selected_player_box,
             source_timestamp_ns=payload.source_timestamp_ns,
         )
+        localization = association.localization
         if localization is None:
-            return None
+            return HeadLocalizationOutcome(association.reason, None)
         if localization.source_timestamp_ns != payload.source_timestamp_ns:
             raise RuntimeError("direct-head localization changed its source timestamp")
-        return HeadObservation(
-            point=localization.point,
-            confidence=localization.confidence,
-            evidence="SunXDS 0.8.0 direct head box",
+        return HeadLocalizationOutcome(
+            association.reason,
+            HeadObservation(
+                point=localization.point,
+                confidence=localization.confidence,
+                evidence="SunXDS 0.8.0 direct head box",
+            ),
         )
 
 
@@ -1735,7 +1739,10 @@ def _head_runtime_telemetry_summary(
     elapsed = max(float(elapsed_seconds), 1e-9)
 
     def delta(name: str) -> int:
-        return max(0, int(getattr(current, name)) - int(getattr(previous, name)))
+        return max(
+            0,
+            int(getattr(current, name, 0)) - int(getattr(previous, name, 0)),
+        )
 
     overwrites = delta("pending_overwrites") + delta("result_overwrites")
     stale = (
@@ -1752,6 +1759,15 @@ def _head_runtime_telemetry_summary(
         f"HEAD completed {delta('jobs_completed') / elapsed:.0f}/s | "
         f"localized {delta('localized_heads') / elapsed:.0f}/s | "
         f"no-head {delta('no_head_results') / elapsed:.0f}/s | "
+        "why no-decoded/no-plausible/multi-head "
+        f"{delta('no_decoded_head_candidates') / elapsed:.0f}/"
+        f"{delta('no_plausible_heads') / elapsed:.0f}/"
+        f"{delta('multiple_plausible_heads') / elapsed:.0f}/s | "
+        "secondary none/multi/unsupported "
+        f"{delta('no_matching_secondary_players') / elapsed:.0f}/"
+        f"{delta('multiple_matching_secondary_players') / elapsed:.0f}/"
+        f"{delta('head_unsupported_by_matched_player') / elapsed:.0f}/s | "
+        f"other {delta('unspecified_no_head_results') / elapsed:.0f}/s | "
         f"overwrites {overwrites} | stale {stale} | point age {freshness}"
     )
 

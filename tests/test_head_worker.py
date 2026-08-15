@@ -12,6 +12,8 @@ from detection.head_worker import (
     CPU_PROVIDER,
     MIGRAPHX_PROVIDER,
     CpuOnnxSession,
+    HeadLocalizationOutcome,
+    HeadLocalizationReason,
     HeadObservation,
     LatestHeadWorker,
     OnnxModelContract,
@@ -512,7 +514,84 @@ class LatestHeadWorkerTests(unittest.TestCase):
         self.assertIsNone(result.observation)
         self.assertIsNone(result.head_point)
         self.assertEqual(result.selected_player_box, selected_box)
+        self.assertIs(
+            result.localization_reason,
+            HeadLocalizationReason.UNSPECIFIED_NO_HEAD,
+        )
         self.assertEqual(worker.status.no_head_results, 1)
+        self.assertEqual(worker.status.unspecified_no_head_results, 1)
+
+    def test_typed_outcome_is_frozen_and_enforces_disposition(self) -> None:
+        outcome = HeadLocalizationOutcome(
+            HeadLocalizationReason.NO_PLAUSIBLE_HEAD,
+            None,
+        )
+
+        with self.assertRaises(FrozenInstanceError):
+            outcome.reason = (  # type: ignore[misc]
+                HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE
+            )
+        with self.assertRaisesRegex(ValueError, "require an observation"):
+            HeadLocalizationOutcome(HeadLocalizationReason.LOCALIZED, None)
+        with self.assertRaisesRegex(ValueError, "forbid one"):
+            HeadLocalizationOutcome(
+                HeadLocalizationReason.NO_PLAUSIBLE_HEAD,
+                observation_for(np.ones((1, 1), dtype=np.uint8)),
+            )
+
+    def test_reason_specific_status_counters_follow_exact_job_outcomes(self) -> None:
+        rejected_reasons = (
+            HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE,
+            HeadLocalizationReason.NO_PLAUSIBLE_HEAD,
+            HeadLocalizationReason.MULTIPLE_PLAUSIBLE_HEADS,
+            HeadLocalizationReason.NO_MATCHING_SECONDARY_PLAYER,
+            HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
+            HeadLocalizationReason.HEAD_UNSUPPORTED_BY_MATCHED_PLAYER,
+        )
+        outcomes = [HeadLocalizationOutcome(reason, None) for reason in rejected_reasons]
+        outcomes.append(
+            HeadLocalizationOutcome(
+                HeadLocalizationReason.LOCALIZED,
+                observation_for(np.full((1, 1), 9, dtype=np.uint8)),
+            )
+        )
+
+        def localize(_payload, _box):
+            return outcomes.pop(0)
+
+        worker = LatestHeadWorker(localize)
+        self.addCleanup(lambda: worker.stop(timeout_s=1.0))
+        worker.start()
+
+        expected_reasons = (*rejected_reasons, HeadLocalizationReason.LOCALIZED)
+        for completed, reason in enumerate(expected_reasons, start=1):
+            self.assertTrue(
+                worker.submit(
+                    np.zeros((1, 1), dtype=np.uint8),
+                    source_timestamp_ns=completed,
+                    identity_generation=1,
+                    selected_player_box=(0, 0, 10, 20),
+                )
+            )
+            self.assertTrue(
+                wait_until(lambda: worker.status.jobs_completed == completed)
+            )
+            result = worker.take_latest(1)
+            self.assertIsNotNone(result)
+            assert result is not None
+            self.assertIs(result.localization_reason, reason)
+
+        status = worker.status
+        self.assertEqual(status.jobs_completed, 7)
+        self.assertEqual(status.localized_heads, 1)
+        self.assertEqual(status.no_head_results, 6)
+        self.assertEqual(status.no_decoded_head_candidates, 1)
+        self.assertEqual(status.no_plausible_heads, 1)
+        self.assertEqual(status.multiple_plausible_heads, 1)
+        self.assertEqual(status.no_matching_secondary_players, 1)
+        self.assertEqual(status.multiple_matching_secondary_players, 1)
+        self.assertEqual(status.head_unsupported_by_matched_player, 1)
+        self.assertEqual(status.unspecified_no_head_results, 0)
 
     def test_result_is_frozen_and_keeps_absolute_source_point(self) -> None:
         worker = LatestHeadWorker(lambda payload, _box: observation_for(payload))

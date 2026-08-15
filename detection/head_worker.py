@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
+from enum import Enum
 from math import isfinite
 from numbers import Integral
 from pathlib import Path
@@ -81,6 +82,41 @@ class HeadObservation:
         object.__setattr__(self, "evidence", evidence)
 
 
+class HeadLocalizationReason(str, Enum):
+    """Finite, non-spatial disposition for one completed localization job."""
+
+    LOCALIZED = "localized"
+    NO_DECODED_HEAD_CANDIDATE = "no_decoded_head_candidate"
+    NO_PLAUSIBLE_HEAD = "no_plausible_head"
+    MULTIPLE_PLAUSIBLE_HEADS = "multiple_plausible_heads"
+    NO_MATCHING_SECONDARY_PLAYER = "no_matching_secondary_player"
+    MULTIPLE_MATCHING_SECONDARY_PLAYERS = "multiple_matching_secondary_players"
+    HEAD_UNSUPPORTED_BY_MATCHED_PLAYER = "head_unsupported_by_matched_player"
+    UNSPECIFIED_NO_HEAD = "unspecified_no_head"
+
+
+@dataclass(frozen=True, slots=True)
+class HeadLocalizationOutcome:
+    """One callable result whose disposition travels with its observation."""
+
+    reason: HeadLocalizationReason
+    observation: HeadObservation | None
+
+    def __post_init__(self) -> None:
+        try:
+            reason = HeadLocalizationReason(self.reason)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("unknown head-localization reason") from exc
+        observation = self.observation
+        if observation is not None and not isinstance(observation, HeadObservation):
+            raise TypeError("head-localization observation must be HeadObservation or None")
+        if (observation is not None) != (reason is HeadLocalizationReason.LOCALIZED):
+            raise ValueError(
+                "localized outcomes require an observation and rejected outcomes forbid one"
+            )
+        object.__setattr__(self, "reason", reason)
+
+
 @dataclass(frozen=True, slots=True)
 class HeadWorkerResult:
     """Immutable localization result tied to one exact source observation."""
@@ -91,6 +127,18 @@ class HeadWorkerResult:
     identity_generation: int
     selected_player_box: Box
     observation: HeadObservation | None
+    localization_reason: HeadLocalizationReason | None = None
+
+    def __post_init__(self) -> None:
+        reason = self.localization_reason
+        if reason is None:
+            reason = (
+                HeadLocalizationReason.LOCALIZED
+                if self.observation is not None
+                else HeadLocalizationReason.UNSPECIFIED_NO_HEAD
+            )
+        outcome = HeadLocalizationOutcome(reason, self.observation)
+        object.__setattr__(self, "localization_reason", outcome.reason)
 
     @property
     def head_point(self) -> Point | None:
@@ -125,6 +173,13 @@ class HeadWorkerStatus:
     jobs_completed: int
     localized_heads: int
     no_head_results: int
+    no_decoded_head_candidates: int
+    no_plausible_heads: int
+    multiple_plausible_heads: int
+    no_matching_secondary_players: int
+    multiple_matching_secondary_players: int
+    head_unsupported_by_matched_player: int
+    unspecified_no_head_results: int
     stale_results_dropped: int
     stopped_results_dropped: int
     result_overwrites: int
@@ -583,16 +638,20 @@ class _PendingJob:
 class LatestHeadWorker:
     """Run one model-specific callable with at most one pending payload.
 
-    ``localize(payload, selected_player_box)`` must return a
-    :class:`HeadObservation` containing the absolute point measured in the
-    submitted source frame, or ``None`` when head evidence is insufficient.
+    ``localize(payload, selected_player_box)`` may return a typed
+    :class:`HeadLocalizationOutcome`, or the legacy ``HeadObservation | None``
+    shape.  A typed outcome keeps the exact non-spatial rejection disposition
+    attached to the completed job instead of publishing a racy side channel.
     The default payload copier is ``deepcopy``; integrations should submit a
     bounded prepared crop/tensor rather than a full 240 FPS capture frame.
     """
 
     def __init__(
         self,
-        localize: Callable[[Any, Box], HeadObservation | None],
+        localize: Callable[
+            [Any, Box],
+            HeadLocalizationOutcome | HeadObservation | None,
+        ],
         *,
         payload_copier: Callable[[Any], Any] = deepcopy,
         thread_name: str = "proaim-head-localizer",
@@ -635,6 +694,13 @@ class LatestHeadWorker:
         self._jobs_completed = 0
         self._localized_heads = 0
         self._no_head_results = 0
+        self._no_decoded_head_candidates = 0
+        self._no_plausible_heads = 0
+        self._multiple_plausible_heads = 0
+        self._no_matching_secondary_players = 0
+        self._multiple_matching_secondary_players = 0
+        self._head_unsupported_by_matched_player = 0
+        self._unspecified_no_head_results = 0
         self._stale_results_dropped = 0
         self._stopped_results_dropped = 0
         self._result_overwrites = 0
@@ -826,6 +892,19 @@ class LatestHeadWorker:
                 jobs_completed=self._jobs_completed,
                 localized_heads=self._localized_heads,
                 no_head_results=self._no_head_results,
+                no_decoded_head_candidates=self._no_decoded_head_candidates,
+                no_plausible_heads=self._no_plausible_heads,
+                multiple_plausible_heads=self._multiple_plausible_heads,
+                no_matching_secondary_players=(
+                    self._no_matching_secondary_players
+                ),
+                multiple_matching_secondary_players=(
+                    self._multiple_matching_secondary_players
+                ),
+                head_unsupported_by_matched_player=(
+                    self._head_unsupported_by_matched_player
+                ),
+                unspecified_no_head_results=self._unspecified_no_head_results,
                 stale_results_dropped=self._stale_results_dropped,
                 stopped_results_dropped=self._stopped_results_dropped,
                 result_overwrites=self._result_overwrites,
@@ -851,16 +930,26 @@ class LatestHeadWorker:
                 assert job is not None
 
                 try:
-                    observation = self._localize(
+                    raw_outcome = self._localize(
                         job.payload,
                         job.selected_player_box,
                     )
-                    if observation is not None and not isinstance(
-                        observation,
-                        HeadObservation,
-                    ):
+                    if isinstance(raw_outcome, HeadLocalizationOutcome):
+                        outcome = raw_outcome
+                    elif isinstance(raw_outcome, HeadObservation):
+                        outcome = HeadLocalizationOutcome(
+                            HeadLocalizationReason.LOCALIZED,
+                            raw_outcome,
+                        )
+                    elif raw_outcome is None:
+                        outcome = HeadLocalizationOutcome(
+                            HeadLocalizationReason.UNSPECIFIED_NO_HEAD,
+                            None,
+                        )
+                    else:
                         raise TypeError(
-                            "localize must return HeadObservation or None"
+                            "localize must return HeadLocalizationOutcome, "
+                            "HeadObservation, or None"
                         )
                     completed_timestamp = _non_negative_integer(
                         self._clock_ns(),
@@ -886,15 +975,17 @@ class LatestHeadWorker:
                         completed_timestamp_ns=completed_timestamp,
                         identity_generation=job.identity_generation,
                         selected_player_box=job.selected_player_box,
-                        observation=observation,
+                        observation=outcome.observation,
+                        localization_reason=outcome.reason,
                     )
                     if self._latest_result is not None:
                         self._result_overwrites += 1
                     self._latest_result = result
-                    if observation is None:
+                    if outcome.observation is None:
                         self._no_head_results += 1
                     else:
                         self._localized_heads += 1
+                    self._record_localization_reason(outcome.reason)
                     self._condition.notify_all()
         finally:
             with self._condition:
@@ -903,6 +994,28 @@ class LatestHeadWorker:
                 if self._lifecycle != "failed":
                     self._lifecycle = "stopped"
                 self._condition.notify_all()
+
+    def _record_localization_reason(self, reason: HeadLocalizationReason) -> None:
+        """Increment one exact disposition counter while holding the condition."""
+
+        if reason is HeadLocalizationReason.LOCALIZED:
+            return
+        if reason is HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE:
+            self._no_decoded_head_candidates += 1
+        elif reason is HeadLocalizationReason.NO_PLAUSIBLE_HEAD:
+            self._no_plausible_heads += 1
+        elif reason is HeadLocalizationReason.MULTIPLE_PLAUSIBLE_HEADS:
+            self._multiple_plausible_heads += 1
+        elif reason is HeadLocalizationReason.NO_MATCHING_SECONDARY_PLAYER:
+            self._no_matching_secondary_players += 1
+        elif reason is HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS:
+            self._multiple_matching_secondary_players += 1
+        elif reason is HeadLocalizationReason.HEAD_UNSUPPORTED_BY_MATCHED_PLAYER:
+            self._head_unsupported_by_matched_player += 1
+        elif reason is HeadLocalizationReason.UNSPECIFIED_NO_HEAD:
+            self._unspecified_no_head_results += 1
+        else:  # pragma: no cover - enum exhaustiveness guard
+            raise AssertionError(f"unhandled head-localization reason: {reason}")
 
     def _record_failure(self, job: _PendingJob, exc: BaseException) -> None:
         error = RuntimeError(

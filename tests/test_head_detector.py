@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import FrozenInstanceError
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,15 +17,18 @@ from detection.head_detector import (
     PINNED_HEAD_MODEL_RELATIVE_PATH,
     PLAYER_CLASS_ID,
     DirectHeadLocalizer,
+    HeadAssociationOutcome,
     HeadCandidate,
     HeadCropTransform,
     associate_head_to_player,
+    associate_head_to_player_outcome,
     decode_head_output,
     plan_head_crop,
     pinned_head_model_path,
     prepare_head_input,
     verify_pinned_head_model,
 )
+from detection.head_worker import HeadLocalizationReason
 
 
 try:
@@ -276,6 +280,138 @@ class HeadDecoderTests(unittest.TestCase):
 
 
 class HeadAssociationTests(unittest.TestCase):
+    def test_outcome_reports_localized_and_is_frozen(self) -> None:
+        supporting_player = candidate(
+            (95, 95, 205, 305),
+            0.88,
+            class_id=PLAYER_CLASS_ID,
+            row_index=1,
+        )
+        outcome = associate_head_to_player_outcome(
+            [supporting_player, candidate((135, 105, 165, 135), 0.75)],
+            (100, 100, 200, 300),
+            source_timestamp_ns=10,
+        )
+
+        self.assertIsInstance(outcome, HeadAssociationOutcome)
+        self.assertIs(outcome.reason, HeadLocalizationReason.LOCALIZED)
+        self.assertIsNotNone(outcome.localization)
+        with self.assertRaises(FrozenInstanceError):
+            outcome.reason = (  # type: ignore[misc]
+                HeadLocalizationReason.NO_PLAUSIBLE_HEAD
+            )
+
+    def test_outcome_reports_no_decoded_head_candidate(self) -> None:
+        player = candidate(
+            (95, 95, 205, 305),
+            0.88,
+            class_id=PLAYER_CLASS_ID,
+        )
+
+        outcome = associate_head_to_player_outcome(
+            [player],
+            (100, 100, 200, 300),
+            source_timestamp_ns=11,
+        )
+
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE,
+        )
+        self.assertIsNone(outcome.localization)
+
+    def test_outcome_reports_no_plausible_head(self) -> None:
+        supporting_player = candidate(
+            (95, 95, 205, 305),
+            0.88,
+            class_id=PLAYER_CLASS_ID,
+        )
+        torso_head = candidate((135, 220, 165, 250), 0.91)
+
+        outcome = associate_head_to_player_outcome(
+            [supporting_player, torso_head],
+            (100, 100, 200, 300),
+            source_timestamp_ns=12,
+        )
+
+        self.assertIs(outcome.reason, HeadLocalizationReason.NO_PLAUSIBLE_HEAD)
+        self.assertIsNone(outcome.localization)
+
+    def test_outcome_reports_multiple_plausible_heads(self) -> None:
+        outcome = associate_head_to_player_outcome(
+            [
+                candidate((120, 105, 145, 135), 0.80),
+                candidate((160, 105, 185, 135), 0.90, row_index=1),
+            ],
+            (100, 100, 200, 300),
+            source_timestamp_ns=13,
+        )
+
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.MULTIPLE_PLAUSIBLE_HEADS,
+        )
+        self.assertIsNone(outcome.localization)
+
+    def test_outcome_reports_no_matching_secondary_player(self) -> None:
+        outcome = associate_head_to_player_outcome(
+            [candidate((135, 105, 165, 135), 0.90)],
+            (100, 100, 200, 300),
+            source_timestamp_ns=14,
+        )
+
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.NO_MATCHING_SECONDARY_PLAYER,
+        )
+        self.assertIsNone(outcome.localization)
+
+    def test_outcome_reports_multiple_matching_secondary_players(self) -> None:
+        first_player = candidate(
+            (95, 95, 175, 310),
+            0.90,
+            class_id=PLAYER_CLASS_ID,
+        )
+        second_player = candidate(
+            (125, 95, 205, 310),
+            0.91,
+            class_id=PLAYER_CLASS_ID,
+            row_index=1,
+        )
+        head = candidate((135, 105, 165, 135), 0.80, row_index=2)
+
+        outcome = associate_head_to_player_outcome(
+            [first_player, second_player, head],
+            (100, 100, 200, 300),
+            source_timestamp_ns=15,
+        )
+
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
+        )
+        self.assertIsNone(outcome.localization)
+
+    def test_outcome_reports_head_unsupported_by_matched_player(self) -> None:
+        supporting_player = candidate(
+            (95, 95, 170, 305),
+            0.90,
+            class_id=PLAYER_CLASS_ID,
+        )
+        head_outside_support = candidate((180, 105, 195, 135), 0.88)
+
+        outcome = associate_head_to_player_outcome(
+            [supporting_player, head_outside_support],
+            (100, 100, 200, 300),
+            source_timestamp_ns=16,
+        )
+
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.HEAD_UNSUPPORTED_BY_MATCHED_PLAYER,
+        )
+        self.assertIsNone(outcome.localization)
+
     def test_unique_matching_player_and_head_are_accepted(self) -> None:
         other = candidate((290, 90, 330, 130), 0.99, row_index=3)
         selected = candidate((135, 105, 165, 135), 0.75, row_index=4)

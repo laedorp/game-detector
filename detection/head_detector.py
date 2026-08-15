@@ -31,6 +31,7 @@ from typing import TypeAlias
 import numpy as np
 
 from .base import OutputDecodeError
+from .head_worker import HeadLocalizationReason
 from .postprocess import class_aware_nms
 
 
@@ -203,6 +204,29 @@ class HeadLocalization:
     containment: float
     candidate_index: int
     supporting_player_index: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class HeadAssociationOutcome:
+    """One direct-head association result with an immutable disposition."""
+
+    reason: HeadLocalizationReason
+    localization: HeadLocalization | None
+
+    def __post_init__(self) -> None:
+        try:
+            reason = HeadLocalizationReason(self.reason)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("unknown head-association reason") from exc
+        localization = self.localization
+        if localization is not None and not isinstance(localization, HeadLocalization):
+            raise TypeError("localization must be HeadLocalization or None")
+        if (localization is not None) != (reason is HeadLocalizationReason.LOCALIZED):
+            raise ValueError(
+                "localized association outcomes require a localization and "
+                "rejected outcomes forbid one"
+            )
+        object.__setattr__(self, "reason", reason)
 
 
 def plan_head_crop(
@@ -434,7 +458,7 @@ def _intersection_area(first: Box, second: Box) -> float:
     )
 
 
-def associate_head_to_player(
+def associate_head_to_player_outcome(
     candidates: Sequence[HeadCandidate],
     player_box: Sequence[float],
     *,
@@ -447,8 +471,8 @@ def associate_head_to_player(
     player_box_margin: float = DEFAULT_PLAYER_BOX_MARGIN,
     max_head_area_ratio: float = DEFAULT_MAX_HEAD_AREA_RATIO,
     max_head_center_y_ratio: float = DEFAULT_MAX_HEAD_CENTER_Y_RATIO,
-) -> HeadLocalization | None:
-    """Accept one head corroborated by one matching secondary player instance."""
+) -> HeadAssociationOutcome:
+    """Classify one head association without changing its acceptance policy."""
 
     target = _validated_box(player_box, "player_box")
     source_timestamp_ns = _non_negative_integer(
@@ -492,12 +516,14 @@ def associate_head_to_player(
         target[3] + margin_y,
     )
 
+    decoded_head_present = False
     plausible_heads: list[
         tuple[int, HeadCandidate, Box, float, Point, float]
     ] = []
     for index, candidate in enumerate(candidates):
         if candidate.class_id != HEAD_CLASS_ID:
             continue
+        decoded_head_present = True
         try:
             head_box = _validated_box(candidate.box, "candidate.box")
         except ValueError:
@@ -529,11 +555,25 @@ def associate_head_to_player(
             (index, candidate, head_box, head_area, center, containment)
         )
 
+    if not decoded_head_present:
+        return HeadAssociationOutcome(
+            HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE,
+            None,
+        )
+    if not plausible_heads:
+        return HeadAssociationOutcome(
+            HeadLocalizationReason.NO_PLAUSIBLE_HEAD,
+            None,
+        )
+
     # Any second head that independently passes the primary target's anatomy
     # gates makes the crop ambiguous.  A player box must not be allowed to
     # select between globally plausible heads after the fact.
-    if len(plausible_heads) != 1:
-        return None
+    if len(plausible_heads) > 1:
+        return HeadAssociationOutcome(
+            HeadLocalizationReason.MULTIPLE_PLAUSIBLE_HEADS,
+            None,
+        )
 
     # A head candidate alone cannot establish that it belongs to the primary
     # detector's selected target.  Always require exactly one player instance
@@ -573,8 +613,16 @@ def associate_head_to_player(
             <= max_player_center_displacement_ratio
         ):
             matching_players.append((index, secondary_box))
-    if len(matching_players) != 1:
-        return None
+    if not matching_players:
+        return HeadAssociationOutcome(
+            HeadLocalizationReason.NO_MATCHING_SECONDARY_PLAYER,
+            None,
+        )
+    if len(matching_players) > 1:
+        return HeadAssociationOutcome(
+            HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
+            None,
+        )
 
     supporting_player_index, supporting_box = matching_players[0]
     supporting_area = _box_area(supporting_box)
@@ -590,20 +638,55 @@ def associate_head_to_player(
         containment = _intersection_area(head[2], supporting_box) / head_area
         if containment >= min_containment and supporting_area > 0.0:
             supported_heads.append(head)
-    if len(supported_heads) != 1:
-        return None
+    if not supported_heads:
+        return HeadAssociationOutcome(
+            HeadLocalizationReason.HEAD_UNSUPPORTED_BY_MATCHED_PLAYER,
+            None,
+        )
     plausible_heads = supported_heads
 
     index, selected, head_box, _area, center, containment = plausible_heads[0]
-    return HeadLocalization(
-        point=center,
-        source_timestamp_ns=source_timestamp_ns,
-        confidence=float(selected.confidence),
-        head_box=head_box,
-        containment=containment,
-        candidate_index=index,
-        supporting_player_index=supporting_player_index,
+    return HeadAssociationOutcome(
+        HeadLocalizationReason.LOCALIZED,
+        HeadLocalization(
+            point=center,
+            source_timestamp_ns=source_timestamp_ns,
+            confidence=float(selected.confidence),
+            head_box=head_box,
+            containment=containment,
+            candidate_index=index,
+            supporting_player_index=supporting_player_index,
+        ),
     )
+
+
+def associate_head_to_player(
+    candidates: Sequence[HeadCandidate],
+    player_box: Sequence[float],
+    *,
+    source_timestamp_ns: int,
+    min_containment: float = DEFAULT_MIN_HEAD_CONTAINMENT,
+    min_player_overlap: float = DEFAULT_MIN_PLAYER_OVERLAP,
+    max_player_center_displacement_ratio: float = (
+        DEFAULT_MAX_PLAYER_CENTER_DISPLACEMENT_RATIO
+    ),
+    player_box_margin: float = DEFAULT_PLAYER_BOX_MARGIN,
+    max_head_area_ratio: float = DEFAULT_MAX_HEAD_AREA_RATIO,
+    max_head_center_y_ratio: float = DEFAULT_MAX_HEAD_CENTER_Y_RATIO,
+) -> HeadLocalization | None:
+    """Preserve the public localization-only API over the typed outcome."""
+
+    return associate_head_to_player_outcome(
+        candidates,
+        player_box,
+        source_timestamp_ns=source_timestamp_ns,
+        min_containment=min_containment,
+        min_player_overlap=min_player_overlap,
+        max_player_center_displacement_ratio=max_player_center_displacement_ratio,
+        player_box_margin=player_box_margin,
+        max_head_area_ratio=max_head_area_ratio,
+        max_head_center_y_ratio=max_head_center_y_ratio,
+    ).localization
 
 
 class DirectHeadLocalizer:
