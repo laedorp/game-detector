@@ -528,7 +528,13 @@ class QtLauncherTests(unittest.TestCase):
 
             self.assertNotEqual(first, second)
             self.assertFalse(os.path.lexists(second))
-            self.assertTrue(str(second).startswith(str(settings_target.parent)))
+            # Windows may canonicalize RUNNER~1 to its long path spelling
+            # inside _private_calibration_path(). Compare resolved components,
+            # not lexical prefixes, while still proving containment.
+            self.assertEqual(
+                second.parents[2],
+                settings_target.parent.resolve(),
+            )
 
     def test_calibration_motion_warning_defaults_to_no_and_creates_nothing(self) -> None:
         window = self.window(self.calibration_settings())

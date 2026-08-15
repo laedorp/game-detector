@@ -553,8 +553,9 @@ class MakcuAimingTests(unittest.TestCase):
         target = Detection(0, "player", 0.9, (700, 200, 900, 800))
         controller.start()
         active = self.factory.connections[-1]
+        normalized_port = os.path.normcase(os.path.normpath("/dev/ttyACM0"))
         expected_identity = sha256(
-            b"proaim-makcu-identity-v1\0/dev/ttyACM0"
+            f"proaim-makcu-identity-v1\0{normalized_port}".encode("utf-8")
         ).hexdigest()
         self.assertEqual(controller.identity_token, expected_identity)
         self.assertNotIn("ttyACM0", controller.identity_token or "")
