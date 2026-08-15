@@ -6,6 +6,7 @@ import math
 import os
 from pathlib import Path
 import stat
+import statistics
 import tempfile
 import unittest
 from unittest import mock
@@ -25,6 +26,9 @@ from aiming.makcu_calibration import (
     make_profile,
     profile_from_bytes,
     write_profile_atomic,
+    _axis_candidates,
+    _prefix_counts,
+    _regression_window_intervals,
 )
 
 
@@ -185,6 +189,74 @@ def _fit(**options: object) -> MakcuCalibrationFit:
     return fit_makcu_calibration(*_synthetic_evidence(**options))
 
 
+def _high_rate_quantized_evidence() -> tuple[
+    tuple[CalibrationMeasurement, ...],
+    tuple[EmittedCount, ...],
+    tuple[CalibrationPulse, ...],
+]:
+    """Model high-rate box quantization with sparse deterministic jumps."""
+
+    measurements, commands, pulses = _synthetic_evidence(
+        gain_x=0.115,
+        gain_y=0.105,
+        noise_pixels=0.0,
+    )
+    noisy: list[CalibrationMeasurement] = []
+    for index, measurement in enumerate(measurements):
+        x_noise = (
+            1.8
+            if index % 53 == 11
+            else (-0.63 if index % 53 == 12 else 0.0)
+        )
+        y_noise = (
+            2.8
+            if index % 37 == 7
+            else (-1.12 if index % 37 == 8 else 0.0)
+        )
+        noisy.append(
+            replace(
+                measurement,
+                error_x=round((measurement.error_x + x_noise) * 4.0) / 4.0,
+                error_y=round((measurement.error_y + y_noise) * 4.0) / 4.0,
+            )
+        )
+    return tuple(noisy), commands, pulses
+
+
+def _best_candidate_r_squared(
+    evidence: tuple[
+        tuple[CalibrationMeasurement, ...],
+        tuple[EmittedCount, ...],
+        tuple[CalibrationPulse, ...],
+    ],
+    axis: str,
+    regression_window_intervals: int,
+) -> float:
+    measurements, commands, _pulses = evidence
+    timestamp_steps = [
+        current.timestamp_ns - previous.timestamp_ns
+        for previous, current in zip(measurements, measurements[1:])
+    ]
+    detector_period_ns = round(statistics.median(timestamp_steps))
+    maximum_delay_ns = 100_000_000
+    delays = list(range(0, maximum_delay_ns + 1, detector_period_ns))
+    if delays[-1] != maximum_delay_ns:
+        delays.append(maximum_delay_ns)
+    command_timestamps, prefix_x, prefix_y = _prefix_counts(commands)
+    candidates = _axis_candidates(
+        axis,
+        measurements,
+        command_timestamps,
+        prefix_x,
+        prefix_y,
+        delays,
+        regression_window_intervals,
+    )
+    return max(
+        candidate.r_squared for candidate in candidates if candidate.gain > 0.0
+    )
+
+
 def _profile(fit: MakcuCalibrationFit) -> MakcuCalibrationProfile:
     return make_profile(
         fit,
@@ -200,6 +272,34 @@ def _profile(fit: MakcuCalibrationFit) -> MakcuCalibrationProfile:
 
 
 class MakcuCalibrationFitTests(unittest.TestCase):
+    def test_integrated_regression_survives_high_rate_quantized_box_noise(self) -> None:
+        evidence = _high_rate_quantized_evidence()
+        measurements, _commands, _pulses = evidence
+        detector_period_ns = round(
+            statistics.median(
+                current.timestamp_ns - previous.timestamp_ns
+                for previous, current in zip(measurements, measurements[1:])
+            )
+        )
+
+        legacy_x_r_squared = _best_candidate_r_squared(evidence, "x", 1)
+        legacy_y_r_squared = _best_candidate_r_squared(evidence, "y", 1)
+        self.assertLess(legacy_x_r_squared, 0.85)
+        self.assertLess(legacy_y_r_squared, 0.85)
+        self.assertAlmostEqual(legacy_x_r_squared, 0.72, delta=0.08)
+        self.assertAlmostEqual(legacy_y_r_squared, 0.35, delta=0.08)
+        self.assertGreaterEqual(
+            _regression_window_intervals(detector_period_ns),
+            12,
+        )
+
+        fit = fit_makcu_calibration(*evidence)
+
+        self.assertGreaterEqual(fit.x.r_squared, 0.85)
+        self.assertGreaterEqual(fit.y.r_squared, 0.85)
+        self.assertAlmostEqual(fit.x.gain_pixels_per_count, 0.115, delta=0.012)
+        self.assertAlmostEqual(fit.y.gain_pixels_per_count, 0.105, delta=0.012)
+
     def test_unequal_axis_gains_and_12_to_50_ms_delays_recover_with_noise(self) -> None:
         for delay_ms in (12.0, 24.0, 50.0):
             with self.subTest(delay_ms=delay_ms):
@@ -277,6 +377,22 @@ class MakcuCalibrationFitTests(unittest.TestCase):
         self.assertAlmostEqual(fit.x.gain_pixels_per_count, 0.10, delta=0.01)
         self.assertEqual((fit.x.positive_pulses, fit.x.negative_pulses), (2, 2))
 
+    def test_endpoint_quality_uses_one_repeated_count_magnitude(self) -> None:
+        fit = fit_makcu_calibration(
+            *_synthetic_evidence(
+                adaptive_scouts=True,
+                scout_counts=(130, 150),
+                gain_x=0.10,
+                gain_y=0.10,
+            )
+        )
+
+        # The 130- and 150-count scouts also exceed 12 px, but each has only
+        # one pulse per polarity. Only the final repeated 140-count group may
+        # establish repeatability quality.
+        self.assertEqual((fit.x.positive_pulses, fit.x.negative_pulses), (2, 2))
+        self.assertEqual((fit.y.positive_pulses, fit.y.negative_pulses), (2, 2))
+
     def test_evidence_hash_binds_exact_emitted_history(self) -> None:
         measurements, commands, pulses = _synthetic_evidence()
         digest = calibration_evidence_sha256(measurements, commands, pulses)
@@ -321,7 +437,13 @@ class MakcuCalibrationFitTests(unittest.TestCase):
 
     def test_rejects_pulse_to_pulse_delay_spread(self) -> None:
         with self.assertRaisesRegex(CalibrationQualityError, "delay"):
-            _fit(pulse_delay_offsets_ms=(0.0, 13.0), noise_pixels=0.12)
+            _fit(pulse_delay_offsets_ms=(0.0, 24.0), noise_pixels=0.12)
+
+    def test_accepts_local_delays_one_frame_each_side_of_global_fit(self) -> None:
+        fit = _fit(pulse_delay_offsets_ms=(0.0, 16.0), noise_pixels=0.12)
+
+        self.assertAlmostEqual(fit.x.pulse_delay_spread_seconds, 0.008)
+        self.assertAlmostEqual(fit.y.pulse_delay_spread_seconds, 0.008)
 
     def test_rejects_nonfinite_or_out_of_order_evidence(self) -> None:
         with self.assertRaises(CalibrationDataError):
@@ -335,6 +457,21 @@ class MakcuCalibrationFitTests(unittest.TestCase):
     def test_rejects_missing_symmetric_polarity(self) -> None:
         with self.assertRaisesRegex(CalibrationQualityError, "symmetric"):
             fit_makcu_calibration(*_synthetic_evidence(missing_x_negative=True))
+
+    def test_rejects_an_axis_without_command_excitation(self) -> None:
+        measurements, commands, pulses = _synthetic_evidence()
+        x_pulses = tuple(pulse for pulse in pulses if pulse.axis == "x")
+        x_commands = tuple(
+            command
+            for command in commands
+            if any(
+                pulse.start_ns <= command.timestamp_ns <= pulse.end_ns
+                for pulse in x_pulses
+            )
+        )
+
+        with self.assertRaisesRegex(CalibrationDataError, "no solvable [xy]-axis"):
+            fit_makcu_calibration(measurements, x_commands, x_pulses)
 
 
 class MakcuCalibrationProfileTests(unittest.TestCase):

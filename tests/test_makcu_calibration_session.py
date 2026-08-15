@@ -19,6 +19,7 @@ from aiming.makcu_calibration_session import (
     CalibrationSessionState,
     MAX_SESSION_EVIDENCE_BYTES,
     MakcuCalibrationSession,
+    SessionPulseRecord,
     evidence_matches_binding,
     normalize_calibration_context,
     load_session_evidence,
@@ -333,6 +334,39 @@ class SessionHarness:
 
 
 class MakcuCalibrationSessionTests(unittest.TestCase):
+    @staticmethod
+    def _qualifying_pair(
+        axis: str,
+        counts: int,
+        response_pixels: float,
+    ) -> list[SessionPulseRecord]:
+        records: list[SessionPulseRecord] = []
+        for index, polarity in enumerate((1, -1)):
+            timestamp_ns = (index + 1) * MS
+            records.append(
+                SessionPulseRecord(
+                    axis=axis,
+                    polarity=polarity,
+                    requested_counts=counts,
+                    requested_rate=2400.0,
+                    request_ns=timestamp_ns,
+                    event_start_index=index,
+                    event_end_index=index + 1,
+                    first_emitted_ns=timestamp_ns + 1,
+                    last_emitted_ns=timestamp_ns + 2,
+                    actual_counts=polarity * counts,
+                    baseline_x=0.0,
+                    baseline_y=0.0,
+                    settled_x=0.0,
+                    settled_y=0.0,
+                    signed_response_pixels=response_pixels,
+                    cross_response_pixels=0.0,
+                    qualifying=True,
+                    complete=True,
+                )
+            )
+        return records
+
     def test_happy_path_fits_unequal_gains_from_actual_emitted_events(self) -> None:
         harness = SessionHarness(gain_x=0.14, gain_y=0.10, delay_ms=24)
         harness.arm()
@@ -351,6 +385,22 @@ class MakcuCalibrationSessionTests(unittest.TestCase):
         self.assertTrue(result.evidence.evidence_complete)
         self.assertTrue(evidence_matches_binding(result.evidence, _binding()))
         self.assertEqual(harness.controller.exit_calls, 1)
+        for axis in ("x", "y"):
+            qualifying_by_amplitude: dict[int, dict[int, int]] = {}
+            for pulse in result.evidence.pulses:
+                if pulse.axis != axis or not pulse.qualifying:
+                    continue
+                counts = qualifying_by_amplitude.setdefault(
+                    pulse.requested_counts,
+                    {1: 0, -1: 0},
+                )
+                counts[pulse.polarity] += 1
+            self.assertTrue(
+                any(
+                    min(counts.values()) >= 2
+                    for counts in qualifying_by_amplitude.values()
+                )
+            )
 
     def test_stationary_window_works_at_240hz_and_approximately_143hz(self) -> None:
         for sample_period_ms in (4, 7):
@@ -364,6 +414,104 @@ class MakcuCalibrationSessionTests(unittest.TestCase):
                 result = harness.session.result
                 assert result is not None
                 self.assertEqual(result.outcome, "success")
+
+    def test_mixed_171_and_200_pairs_require_second_pair_at_200(self) -> None:
+        """Regression for the physical Y plan which stopped one pair too soon."""
+
+        harness = SessionHarness()
+        session = harness.session
+        controller = harness.controller
+        controller.active = True
+        controller.activation_known = True
+        controller.physical_pressed = True
+        controller.activation_requires_release = False
+        session._token = object()
+        session._axis_index = 1
+        session._amplitude = 171
+        session._pair_number = 1
+        session._qualifying_amplitude["y"] = 171
+        session._qualifying["y"] = {1: 1, -1: 1}
+        session._pair_records = self._qualifying_pair("y", 171, 14.0)
+        session._pulses.extend(session._pair_records)
+        session._last_snapshot = MakcuCalibrationSnapshot(
+            active=True,
+            emitted_abs_counts=1342,
+        )
+
+        status = session._complete_pair(10 * MS, 0.0, 0.0)
+
+        self.assertFalse(status.terminal)
+        self.assertEqual(session._amplitude, 200)
+        self.assertEqual(status.qualifying_y_positive, 0)
+        self.assertEqual(status.qualifying_y_negative, 0)
+        self.assertEqual(controller.requests[-1], ("y", 200, 2400.0))
+
+        # Completing only one pair at 200 must schedule the second same-size
+        # net-zero pair; the earlier qualifying 171 pair cannot count toward it.
+        controller.pending_axis = None
+        controller.pending_counts = 0
+        controller.pending_rate = 0.0
+        session._current = None
+        session._pair_records = self._qualifying_pair("y", 200, 24.0)
+        session._pulses.extend(session._pair_records)
+        session._qualifying["y"] = {1: 1, -1: 1}
+        session._last_snapshot = MakcuCalibrationSnapshot(
+            active=True,
+            emitted_abs_counts=1742,
+        )
+
+        status = session._complete_pair(20 * MS, 0.0, 0.0)
+
+        self.assertFalse(status.terminal)
+        self.assertEqual(session._amplitude, 200)
+        self.assertEqual(status.qualifying_y_positive, 1)
+        self.assertEqual(status.qualifying_y_negative, 1)
+        self.assertEqual(controller.requests[-1], ("y", -200, 2400.0))
+
+        # Once the first half completes, the reserved opposite half is queued
+        # and the full additional pair remains net-zero at 2142 total counts.
+        controller.pending_axis = None
+        controller.pending_counts = 0
+        controller.pending_rate = 0.0
+        session._current = None
+        session._last_snapshot = MakcuCalibrationSnapshot(
+            active=True,
+            emitted_abs_counts=1942,
+        )
+        status = session._request_next_pulse(21 * MS, 0.0, 0.0)
+
+        self.assertFalse(status.terminal)
+        self.assertEqual(
+            controller.requests[-2:],
+            [("y", -200, 2400.0), ("y", 200, 2400.0)],
+        )
+        self.assertEqual(sum(request[1] for request in controller.requests[-2:]), 0)
+        self.assertEqual(1742 + 2 * session._amplitude, 2142)
+
+    def test_insufficient_final_amplitude_stops_before_unpaired_budget_move(self) -> None:
+        harness = SessionHarness()
+        session = harness.session
+        controller = harness.controller
+        controller.active = True
+        controller.activation_known = True
+        controller.physical_pressed = True
+        controller.activation_requires_release = False
+        session._token = object()
+        session._axis_index = 1
+        session._amplitude = 200
+        session._qualifying_amplitude["y"] = 200
+        session._qualifying["y"] = {1: 1, -1: 1}
+        session._pair_records = self._qualifying_pair("y", 200, 24.0)
+        session._last_snapshot = MakcuCalibrationSnapshot(
+            active=True,
+            emitted_abs_counts=2201,
+        )
+
+        status = session._complete_pair(20 * MS, 0.0, 0.0)
+
+        self.assertTrue(status.terminal)
+        self.assertIn("complete symmetric Y pair", status.message)
+        self.assertEqual(controller.requests, [])
 
     def test_snapshot_capture_ceiling_accepts_concurrent_worker_event(self) -> None:
         harness = SessionHarness()

@@ -34,6 +34,8 @@ MAX_POLARITY_MISMATCH = 0.20
 MAX_CROSS_AXIS_RATIO = 0.15
 MAX_DELAY_SECONDS = 0.100
 MIN_PULSES_PER_POLARITY = 2
+MIN_REGRESSION_WINDOW_INTERVALS = 12
+REGRESSION_TARGET_WINDOW_SECONDS = 0.120
 _HASH_RE = re.compile(r"[0-9a-f]{64}")
 _COMMIT_RE = re.compile(r"[0-9a-f]{7,64}")
 _PROFILE_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 ._+-]{0,63}")
@@ -246,6 +248,7 @@ class _CandidateFit:
 @dataclass(frozen=True, slots=True)
 class _PulseMetric:
     polarity: int
+    count_magnitude: int
     excursion: float
     gain: float
     delay_ns: int
@@ -442,13 +445,23 @@ def _axis_candidates(
     prefix_x: Sequence[int],
     prefix_y: Sequence[int],
     delay_candidates_ns: Sequence[int],
+    regression_window_intervals: int,
 ) -> list[_CandidateFit]:
     observed = [measurement for measurement in measurements if measurement.observed]
+    if (
+        isinstance(regression_window_intervals, bool)
+        or not isinstance(regression_window_intervals, int)
+        or regression_window_intervals < 1
+    ):
+        raise CalibrationDataError("regression window intervals must be positive")
     candidates: list[_CandidateFit] = []
     for delay_ns in delay_candidates_ns:
         rows: list[tuple[float, float, float]] = []
         responses: list[float] = []
-        for previous, current in zip(observed, observed[1:]):
+        for previous, current in zip(
+            observed,
+            observed[regression_window_intervals:],
+        ):
             elapsed = (current.timestamp_ns - previous.timestamp_ns) / 1_000_000_000
             if elapsed <= 0.0:
                 continue
@@ -480,6 +493,25 @@ def _axis_candidates(
     if not candidates:
         raise CalibrationDataError(f"no solvable {axis}-axis delay candidate")
     return candidates
+
+
+def _regression_window_intervals(detector_period_ns: int) -> int:
+    """Return a detector-rate-independent interval for count/response fitting.
+
+    Adjacent high-rate detector samples contain very little commanded travel, so
+    detector quantization and an isolated bounding-box jump can be larger than
+    the signal being scored.  Integrating the *actual* emitted counts and target
+    displacement over roughly 120 ms preserves the command timing while making
+    the physical response large relative to per-frame detector noise.
+    """
+
+    if detector_period_ns <= 0:
+        raise CalibrationDataError("detector timestamp period must be positive")
+    target_ns = round(REGRESSION_TARGET_WINDOW_SECONDS * 1_000_000_000)
+    return max(
+        MIN_REGRESSION_WINDOW_INTERVALS,
+        math.ceil(target_ns / detector_period_ns),
+    )
 
 
 def _median_error(
@@ -585,6 +617,7 @@ def _pulse_metric(
     )
     return _PulseMetric(
         polarity=pulse.polarity,
+        count_magnitude=abs(count),
         excursion=excursion,
         gain=gain,
         delay_ns=local_delay,
@@ -610,6 +643,7 @@ def _fit_axis(
     detector_period_ns: int,
 ) -> AxisCalibrationFit:
     axis_pulses = [pulse for pulse in pulses if pulse.axis == axis]
+    regression_window_intervals = _regression_window_intervals(detector_period_ns)
     candidates = _axis_candidates(
         axis,
         measurements,
@@ -617,6 +651,7 @@ def _fit_axis(
         prefix_x,
         prefix_y,
         delay_candidates_ns,
+        regression_window_intervals,
     )
     positive_gain_candidates = [
         candidate for candidate in candidates if candidate.gain > 0.0
@@ -667,22 +702,36 @@ def _fit_axis(
     # timestamped regression/evidence.  They are intentionally excluded from
     # per-pulse repeatability metrics: below 12 px, detector quantization and
     # stationary-target jitter can dominate both gain and polarity estimates.
-    qualifying_metrics = [
+    excursion_metrics = [
         metric
         for metric in metrics
         if metric.gain > 0.0 and metric.excursion >= MIN_EXCURSION_PIXELS
     ]
-    positive_count = sum(
-        metric.polarity > 0 for metric in qualifying_metrics
-    )
-    negative_count = sum(
-        metric.polarity < 0 for metric in qualifying_metrics
-    )
-    if min(positive_count, negative_count) < MIN_PULSES_PER_POLARITY:
+    metrics_by_count: dict[int, list[_PulseMetric]] = {}
+    for metric in excursion_metrics:
+        metrics_by_count.setdefault(metric.count_magnitude, []).append(metric)
+    valid_count_groups = {
+        count_magnitude: group
+        for count_magnitude, group in metrics_by_count.items()
+        if min(
+            sum(metric.polarity > 0 for metric in group),
+            sum(metric.polarity < 0 for metric in group),
+        )
+        >= MIN_PULSES_PER_POLARITY
+    }
+    if not valid_count_groups:
         raise CalibrationQualityError(
             f"{axis}-axis calibration requires symmetric evidence with at least "
-            f"{MIN_PULSES_PER_POLARITY} qualifying 12px excursions in each polarity"
+            f"{MIN_PULSES_PER_POLARITY} qualifying 12px excursions in each polarity "
+            "at one emitted count magnitude"
         )
+    # Scouts only establish a safe useful amplitude. Repeatability is meaningful
+    # only among like-for-like pulses, so select the largest magnitude that has
+    # the full symmetric evidence contract instead of pooling adaptive levels.
+    selected_count_magnitude = max(valid_count_groups)
+    qualifying_metrics = valid_count_groups[selected_count_magnitude]
+    positive_count = sum(metric.polarity > 0 for metric in qualifying_metrics)
+    negative_count = sum(metric.polarity < 0 for metric in qualifying_metrics)
 
     excursions = [metric.excursion for metric in qualifying_metrics]
     minimum_excursion = min(excursions)
@@ -716,10 +765,17 @@ def _fit_axis(
             f"{MAX_CROSS_AXIS_RATIO:.2f}"
         )
     pulse_delays = [metric.delay_ns for metric in qualifying_metrics]
-    pulse_delay_spread_ns = max(pulse_delays) - min(pulse_delays)
+    # A local estimate one detector frame on either side of the global delay is
+    # the same +/- one-frame uncertainty accepted by the global ambiguity gate.
+    # The extrema may consequently be two frames apart without either pulse
+    # disagreeing with the fitted delay by more than one frame.
+    pulse_delay_spread_ns = max(
+        abs(pulse_delay_ns - best.delay_ns) for pulse_delay_ns in pulse_delays
+    )
     if pulse_delay_spread_ns > detector_period_ns:
         raise CalibrationQualityError(
-            f"{axis}-axis pulse delay spread exceeds one detector frame"
+            f"{axis}-axis pulse delay differs from the fitted delay by more than "
+            "one detector frame"
         )
 
     return AxisCalibrationFit(

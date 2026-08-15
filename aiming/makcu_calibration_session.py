@@ -619,6 +619,13 @@ class MakcuCalibrationSession:
             "x": {1: 0, -1: 0},
             "y": {1: 0, -1: 0},
         }
+        # Repeatability is meaningful only between equal-size pulses. Scouts
+        # may choose the final amplitude, but their qualifying responses must
+        # not be pooled with a later amplitude to satisfy the two-pair gate.
+        self._qualifying_amplitude: dict[str, int] = {
+            "x": self.config.initial_scout_counts,
+            "y": self.config.initial_scout_counts,
+        }
         self._pulses: list[SessionPulseRecord] = []
         self._current: _PulseWork | None = None
         self._last_events: tuple[tuple[int, int, int], ...] = ()
@@ -1425,6 +1432,9 @@ class MakcuCalibrationSession:
         self._pulses.append(record)
         self._pair_records.append(record)
         if qualifying:
+            if self._qualifying_amplitude[current.axis] != current.counts:
+                self._qualifying[current.axis] = {1: 0, -1: 0}
+                self._qualifying_amplitude[current.axis] = current.counts
             self._qualifying[current.axis][current.polarity] += 1
         self._current = None
         if self._next_polarities:
@@ -1466,8 +1476,18 @@ class MakcuCalibrationSession:
         if not self._next_polarities:
             return self._abort(now_ns, "pulse planner exhausted an empty pair")
         axis = ("x", "y")[self._axis_index]
-        polarity = self._next_polarities.pop(0)
         snapshot = self._last_snapshot
+        if (
+            len(self._next_polarities) == 2
+            and snapshot.emitted_abs_counts + 2 * self._amplitude
+            > CALIBRATION_MAX_SESSION_ABS_COUNTS
+        ):
+            return self._abort(
+                now_ns,
+                "bounded calibration budget cannot fit another complete symmetric "
+                f"{axis.upper()} pair at {self._amplitude} counts",
+            )
+        polarity = self._next_polarities.pop(0)
         if snapshot.emitted_abs_counts + self._amplitude > (
             CALIBRATION_MAX_SESSION_ABS_COUNTS
         ):
@@ -1519,7 +1539,10 @@ class MakcuCalibrationSession:
             for record in self._pair_records
         ]
         mean_response = statistics.fmean(responses)
-        enough = min(self._qualifying[axis].values()) >= 2
+        enough = bool(
+            self._qualifying_amplitude[axis] == self._amplitude
+            and min(self._qualifying[axis].values()) >= 2
+        )
         if enough:
             self._axis_index += 1
             self._amplitude = self.config.initial_scout_counts
@@ -1528,21 +1551,17 @@ class MakcuCalibrationSession:
             self._next_polarities = [1, -1]
             if self._axis_index >= 2:
                 return self._finish_fit(now_ns)
+            next_axis = ("x", "y")[self._axis_index]
+            self._qualifying[next_axis] = {1: 0, -1: 0}
+            self._qualifying_amplitude[next_axis] = self._amplitude
             return self._request_next_pulse(now_ns, baseline_x, baseline_y)
 
         current_amplitude = self._amplitude
         if current_amplitude >= CALIBRATION_MAX_EXCURSION_COUNTS:
-            max_amplitude_pairs = sum(
-                1
-                for record in self._pulses
-                if record.axis == axis
-                and record.requested_counts == CALIBRATION_MAX_EXCURSION_COUNTS
-            ) // 2
-            if max_amplitude_pairs >= 2:
-                return self._abort(
-                    now_ns,
-                    f"{axis.upper()} response could not produce symmetric 12px evidence",
-                )
+            # Stay at the bounded final amplitude until two qualifying pairs
+            # agree or the hard session budget can no longer fit a full
+            # net-zero pair. `_request_next_pulse` performs that budget gate
+            # before either half is queued.
             next_amplitude = CALIBRATION_MAX_EXCURSION_COUNTS
         elif mean_response <= 1.0:
             next_amplitude = min(
@@ -1565,6 +1584,9 @@ class MakcuCalibrationSession:
             )
 
         self._amplitude = next_amplitude
+        if next_amplitude != current_amplitude:
+            self._qualifying[axis] = {1: 0, -1: 0}
+            self._qualifying_amplitude[axis] = next_amplitude
         self._pair_number += 1
         order = [-1, 1] if self._pair_number % 2 else [1, -1]
         self._next_polarities = order
