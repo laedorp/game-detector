@@ -13,6 +13,7 @@ from unittest import mock
 
 import numpy as np
 
+from aiming.direct_head_anchor import DirectHeadProvenance
 from aiming.makcu import MakcuTelemetrySnapshot
 from capture.base import CaptureStats, FramePacket
 from config import parse_args
@@ -418,6 +419,87 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         ):
             return run(config)
 
+    def _run_automatic_detail_case(
+        self,
+        name: str,
+        detection_batches: list[list[Detection]],
+        *,
+        activation_pressed: bool = True,
+        max_frames: int = 1,
+        extra_arguments: tuple[str, ...] = (),
+    ) -> tuple[_FakeDetector, dict[str, object], str, mock.Mock]:
+        report_path = self.root / f"automatic-detail-{name}.json"
+        source = _FakeSource(shape=(1080, 1920, 3))
+        _FakeDetector.detection_batches = detection_batches
+
+        class RecordingMakcuController:
+            def __init__(self, config, *, calibrated_controller=None) -> None:
+                self.config = config
+                self.calibrated_controller = calibrated_controller
+                self.activation_pressed = activation_pressed
+                self.updates: list[tuple[Detection | None, dict[str, object]]] = []
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, target, _frame_shape, **keywords) -> None:
+                self.updates.append((target, dict(keywords)))
+
+            def revoke_motion_corroboration(self) -> None:
+                return None
+
+            def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
+                return MakcuTelemetrySnapshot()
+
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 0
+        head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.return_value = False
+        head_runtime.take_latest.return_value = None
+        head_runtime.visible_sample.return_value = None
+        head_runtime.revoke_body.return_value = False
+        head_runtime.stop.return_value = True
+        config = self._config(
+            report_path,
+            "--backend",
+            "onnxruntime",
+            "--device",
+            "MIGRAPHX",
+            "--require-full-provider",
+            "--max-frames",
+            str(max_frames),
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "makcu",
+            "--aim-makcu-port",
+            "/dev/serial/by-id/test-makcu",
+            *extra_arguments,
+        )
+        output = io.StringIO()
+        with (
+            contextlib.redirect_stdout(output),
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
+            mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+        ):
+            self.assertEqual(run(config), 0)
+        detector = _FakeDetector.instances[-1]
+        report = json.loads(report_path.read_text(encoding="utf-8"))
+        return detector, report, output.getvalue(), head_runtime
+
     def test_max_frames_uses_the_real_pipeline_and_is_exact(self) -> None:
         report_path = self.root / "three-frames.json"
         source = _FakeSource()
@@ -448,6 +530,251 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(timings["detail_preprocess_ms"], 0.0)
             self.assertEqual(timings["detail_inference_ms"], 0.0)
             self.assertEqual(timings["detail_postprocess_ms"], 0.0)
+
+    def test_automatic_detail_rescues_a_missing_held_target(self) -> None:
+        rescued = Detection(0, "player", 0.88, (930, 500, 990, 580))
+
+        detector, report, startup, _head_runtime = self._run_automatic_detail_case(
+            "no-target",
+            [[], [rescued]],
+        )
+
+        self.assertEqual(detector.infer_calls, 2)
+        detail = report["detail_pass"]
+        self.assertEqual(detail["mode"], "automatic_activation_need_gated")
+        self.assertIsNone(detail["configured_crop_size"])
+        self.assertEqual(detail["effective_crop_size"], 768)
+        self.assertEqual(detail["frames_applied"], 1)
+        self.assertEqual(detail["unmatched_detail_accepted"], 1)
+        self.assertEqual(
+            detail["automatic_frames_triggered_no_exact_target"],
+            1,
+        )
+        self.assertIn("activation/need gated", startup)
+        self.assertIn("released preview skip", startup)
+
+    def test_visible_full_pass_self_cannot_suppress_opponent_rescue(self) -> None:
+        visible_self = Detection(
+            0,
+            "player",
+            0.92,
+            (850.0, 650.0, 1070.0, 1080.0),
+        )
+        distinct_small_opponent = Detection(
+            0,
+            "player",
+            0.88,
+            (1100.0, 500.0, 1160.0, 580.0),
+        )
+
+        batches: list[list[Detection]] = []
+        for _ in range(3):
+            batches.extend(([visible_self], [distinct_small_opponent]))
+
+        detector, report, startup, head_runtime = (
+            self._run_automatic_detail_case(
+                "self-does-not-suppress",
+                batches,
+                max_frames=3,
+            )
+        )
+
+        self.assertEqual(detector.infer_calls, 6)
+        detail = report["detail_pass"]
+        self.assertEqual(
+            detail["automatic_frames_triggered_no_exact_target"],
+            3,
+        )
+        self.assertEqual(detail["unmatched_detail_accepted"], 3)
+        self.assertTrue(detail["automatic_self_guarded_need"])
+        self.assertTrue(
+            detail["automatic_self_relative_detail_exclusion_enabled"]
+        )
+        self.assertTrue(
+            detail["automatic_lower_edge_self_fragment_exclusion_enabled"]
+        )
+        self.assertIn("self-guarded full-pass need decision", startup)
+        self.assertIn(
+            "lower-ROI-edge detail-only self fragments within 4 model px",
+            startup,
+        )
+        head_runtime.accept_body.assert_called()
+        accepted_box = head_runtime.accept_body.call_args.args[0]
+        self.assertEqual(accepted_box, distinct_small_opponent.box)
+
+    def test_detail_fragment_of_guarded_self_never_enters_aim_authority(
+        self,
+    ) -> None:
+        weak_full_self = Detection(
+            0,
+            "player",
+            0.24,
+            (850.0, 650.0, 1070.0, 1080.0),
+        )
+        strong_upper_self_fragment = Detection(
+            0,
+            "player",
+            0.88,
+            (850.0, 850.0, 910.0, 920.0),
+        )
+        batches: list[list[Detection]] = []
+        for _ in range(3):
+            batches.extend(([weak_full_self], [strong_upper_self_fragment]))
+        # Once confirmed, the weak parent can disappear for a frame without
+        # letting its detail-only child inherit aim authority.
+        batches.extend(([], [strong_upper_self_fragment]))
+
+        detector, report, _startup, head_runtime = (
+            self._run_automatic_detail_case(
+                "guarded-self-fragment",
+                batches,
+                max_frames=4,
+            )
+        )
+
+        self.assertEqual(detector.infer_calls, 8)
+        detail = report["detail_pass"]
+        self.assertEqual(
+            detail["automatic_frames_triggered_no_exact_target"],
+            4,
+        )
+        self.assertEqual(detail["unmatched_detail_accepted"], 0)
+        head_runtime.accept_body.assert_not_called()
+        head_runtime.submit.assert_not_called()
+
+    def test_cold_start_detail_only_self_fragment_never_enters_aim_authority(
+        self,
+    ) -> None:
+        strong_upper_self_fragment = Detection(
+            0,
+            "player",
+            0.88,
+            (850.0, 850.0, 910.0, 920.0),
+        )
+
+        detector, report, startup, head_runtime = (
+            self._run_automatic_detail_case(
+                "cold-start-self-fragment",
+                [[], [strong_upper_self_fragment]],
+            )
+        )
+
+        self.assertEqual(detector.infer_calls, 2)
+        detail = report["detail_pass"]
+        self.assertEqual(
+            detail["automatic_frames_triggered_no_exact_target"],
+            1,
+        )
+        self.assertEqual(detail["unmatched_detail_accepted"], 0)
+        self.assertTrue(
+            detail["automatic_lower_edge_self_fragment_exclusion_enabled"]
+        )
+        self.assertEqual(
+            detail["automatic_lower_edge_self_fragment_margin_model_pixels"],
+            4.0,
+        )
+        self.assertIn(
+            "lower-ROI-edge detail-only self fragments within 4 model px",
+            startup,
+        )
+        head_runtime.accept_body.assert_not_called()
+        head_runtime.submit.assert_not_called()
+
+    def test_automatic_detail_refreshes_a_small_central_target(self) -> None:
+        primary = Detection(0, "player", 0.60, (930, 500, 990, 580))
+        refined = Detection(0, "player", 0.91, (931, 501, 991, 581))
+
+        detector, report, _startup, _head_runtime = self._run_automatic_detail_case(
+            "small-central",
+            [[primary], [refined]],
+        )
+
+        self.assertEqual(detector.infer_calls, 2)
+        detail = report["detail_pass"]
+        self.assertEqual(
+            detail["automatic_frames_triggered_small_central_target"],
+            1,
+        )
+        self.assertEqual(detail["cross_pass_matches"], 1)
+        self.assertEqual(detail["detail_replacements"], 1)
+
+    def test_automatic_detail_skips_close_and_off_center_targets(self) -> None:
+        cases = {
+            "close": Detection(0, "player", 0.90, (900, 440, 1020, 640)),
+            "off-center": Detection(0, "player", 0.90, (420, 500, 500, 580)),
+        }
+        for name, primary in cases.items():
+            with self.subTest(name=name):
+                detector, report, _startup, _head_runtime = (
+                    self._run_automatic_detail_case(
+                        name,
+                        [[primary]],
+                    )
+                )
+
+                self.assertEqual(detector.infer_calls, 1)
+                detail = report["detail_pass"]
+                self.assertEqual(detail["frames_applied"], 0)
+                self.assertEqual(detail["automatic_frames_triggered"], 0)
+                self.assertEqual(detail["automatic_frames_skipped_not_needed"], 1)
+
+    def test_automatic_detail_skips_released_preview(self) -> None:
+        detector, report, _startup, _head_runtime = self._run_automatic_detail_case(
+            "released",
+            [[]],
+            activation_pressed=False,
+        )
+
+        self.assertEqual(detector.infer_calls, 1)
+        detail = report["detail_pass"]
+        self.assertEqual(detail["automatic_frames_triggered"], 0)
+        self.assertEqual(detail["automatic_frames_activation_released"], 1)
+        self.assertEqual(detail["frames_applied"], 0)
+
+    def test_explicit_primary_crop_and_detail_settings_take_precedence(self) -> None:
+        rescued = Detection(0, "player", 0.88, (930, 500, 990, 580))
+        detector, report, startup, _head_runtime = self._run_automatic_detail_case(
+            "explicit-detail",
+            [[], [rescued]],
+            activation_pressed=False,
+            extra_arguments=("--detail-crop-size", "768"),
+        )
+        self.assertEqual(detector.infer_calls, 2)
+        detail = report["detail_pass"]
+        self.assertEqual(detail["mode"], "explicit_always")
+        self.assertEqual(detail["configured_crop_size"], 768)
+        self.assertEqual(detail["automatic_frames_evaluated"], 0)
+        self.assertIn("explicit always-on", startup)
+
+        detector, report, startup, _head_runtime = self._run_automatic_detail_case(
+            "explicit-primary-crop",
+            [[]],
+            extra_arguments=("--crop-size", "768"),
+        )
+        self.assertEqual(detector.infer_calls, 1)
+        detail = report["detail_pass"]
+        self.assertFalse(detail["enabled"])
+        self.assertEqual(detail["mode"], "disabled")
+        self.assertNotIn("Automatic MAKCU detail rescue", startup)
+
+    def test_automatic_detail_does_not_leak_into_detector_only_mode(self) -> None:
+        report_path = self.root / "automatic-detail-no-mode-leak.json"
+        source = _FakeSource(shape=(1080, 1920, 3))
+
+        self.assertEqual(
+            self._run_with(
+                source,
+                self._config(report_path, "--max-frames", "1"),
+            ),
+            0,
+        )
+
+        detector = _FakeDetector.instances[0]
+        self.assertEqual(detector.infer_calls, 1)
+        detail = json.loads(report_path.read_text(encoding="utf-8"))["detail_pass"]
+        self.assertFalse(detail["enabled"])
+        self.assertEqual(detail["mode"], "disabled")
+        self.assertIsNone(detail["effective_crop_size"])
 
     def test_makcu_automatic_startup_uses_equal_axis_caps(self) -> None:
         from aiming.controller import TargetTracker as RealTargetTracker
@@ -497,6 +824,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
                         dict[str, object],
                     ]
                 ] = []
+                self.control_events: list[str] = []
                 self.__class__.instances.append(self)
 
             def start(self) -> None:
@@ -512,9 +840,13 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             ) -> None:
                 if self.stopped:
                     raise AssertionError("aim controller stopped before frame update")
+                self.control_events.append("update")
                 self.updates.append(
                     (target, frame_shape, active, dict(kwargs))
                 )
+
+            def revoke_motion_corroboration(self) -> None:
+                self.control_events.append("revoke_motion_corroboration")
 
             def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
                 return MakcuTelemetrySnapshot()
@@ -526,16 +858,28 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         direct_sample = SimpleNamespace(
             point=(24.0, 5.0),
             source_timestamp_ns=source.base_ns,
+            direct_source_timestamp_ns=source.base_ns - 20_000_000,
+            identity_deadline_ns=source.base_ns + 180_000_000,
+            track_generation=1,
+            provenance=DirectHeadProvenance.MEASURED_PRIMARY,
             confidence=0.9,
-            evidence="direct head box",
+            evidence="filtered direct-head anchor",
             bridging=False,
-            corroboration_point=(24.0, 12.0),
+            body_derived_motion_permitted=True,
+            body_derived_motion_deadline_ns=source.base_ns + 45_000_000,
+            corroboration_point=None,
         )
         head_runtime = mock.Mock()
         head_runtime.provider = "MIGraphXExecutionProvider"
         head_runtime.status = SimpleNamespace()
         head_runtime.identity_generation = 1
         head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.side_effect = [
+            False,
+            False,
+            True,
+            False,
+        ]
         head_runtime.take_latest.side_effect = [direct_sample, None]
         head_runtime.visible_sample.return_value = direct_sample
         head_runtime.stop.side_effect = lambda: cleanup_order.append("head") or True
@@ -603,10 +947,18 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             0.040,
         )
         self.assertEqual(numeric.config.position_time_constant_seconds, 0.012)
-        self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
+        self.assertEqual(numeric.config.feedback_deadzone_pixels, 4.0)
         self.assertEqual(numeric.config.maximum_velocity_feedforward_fraction, 0.95)
         self.assertTrue(
             numeric.config.require_motion_corroboration_for_feedforward
+        )
+        self.assertEqual(
+            numeric.config.maximum_body_derived_projection_fraction,
+            1.0,
+        )
+        self.assertEqual(
+            numeric.config.maximum_body_derived_feedforward_fraction,
+            0.25,
         )
         self.assertEqual(len(controller.updates), 2)
         first_target, _shape, _active, first_keywords = controller.updates[0]
@@ -620,10 +972,28 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             direct_sample.source_timestamp_ns,
         )
         self.assertNotIn("velocity_target", direct_keywords)
+        self.assertEqual(direct_keywords["velocity_point"], direct_sample.point)
+        self.assertTrue(direct_keywords["body_derived_motion_permitted"])
+        self.assertEqual(
+            direct_keywords["body_derived_motion_deadline_ns"],
+            direct_sample.body_derived_motion_deadline_ns,
+        )
+        self.assertEqual(
+            direct_keywords["identity_deadline_ns"],
+            direct_sample.identity_deadline_ns,
+        )
         self.assertTrue(direct_keywords["measurement_observed"])
         self.assertEqual(
             direct_keywords["motion_corroboration_point"],
-            direct_sample.corroboration_point,
+            None,
+        )
+        self.assertEqual(
+            controller.control_events,
+            [
+                "update",
+                "update",
+                "revoke_motion_corroboration",
+            ],
         )
         head_runtime.submit.assert_called_once()
         self.assertEqual(cleanup_order, ["aim", "head"])
@@ -636,7 +1006,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         )
         self.assertIn("direct-head confidence >= 0.25", startup)
         self.assertIn(
-            "direct-head prediction gated by same-frame player motion",
+            "explicit feed-forward capped at 25%",
             startup,
         )
         self.assertIn("latest-only 90 Hz", startup)

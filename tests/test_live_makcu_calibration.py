@@ -13,6 +13,7 @@ from unittest import mock
 
 import numpy as np
 
+from aiming.direct_head_anchor import DirectHeadProvenance
 from aiming.makcu import MakcuTelemetrySnapshot
 from aiming.makcu_calibration import AxisCalibrationFit, MakcuCalibrationFit
 from aiming.makcu_calibration_activation import (
@@ -572,6 +573,7 @@ class _FakeMakcuController:
         self.normal_update_arguments: list[tuple[object, ...]] = []
         self.normal_update_keywords: list[dict[str, object]] = []
         self.corroboration_revocations = 0
+        self.control_events: list[str] = []
         self.__class__.instances.append(self)
 
     @property
@@ -590,6 +592,7 @@ class _FakeMakcuController:
         self.stopped = True
 
     def update(self, *_arguments, **_keywords) -> None:
+        self.control_events.append("update")
         self.normal_updates += 1
         self.normal_update_arguments.append(tuple(_arguments))
         self.normal_update_keywords.append(dict(_keywords))
@@ -597,6 +600,7 @@ class _FakeMakcuController:
             raise AssertionError("normal MAKCU update ran during calibration")
 
     def revoke_motion_corroboration(self) -> None:
+        self.control_events.append("revoke_motion_corroboration")
         self.corroboration_revocations += 1
 
     def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
@@ -1121,8 +1125,16 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertTrue(
             numeric.config.require_motion_corroboration_for_feedforward
         )
+        self.assertEqual(
+            numeric.config.maximum_body_derived_projection_fraction,
+            1.0,
+        )
+        self.assertEqual(
+            numeric.config.maximum_body_derived_feedforward_fraction,
+            0.25,
+        )
         self.assertEqual(numeric.config.position_time_constant_seconds, 0.012)
-        self.assertEqual(numeric.config.feedback_deadzone_pixels, 3.0)
+        self.assertEqual(numeric.config.feedback_deadzone_pixels, 4.0)
         self.assertIn(
             "Loading direct-head model on MIGraphXExecutionProvider GPU-only; "
             "first compile may take about 40 seconds; CPU inference fallback "
@@ -1140,10 +1152,10 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertIn("CPU fallback disabled", output)
         self.assertIn("direct-head confidence >= 0.25", output)
         self.assertIn(
-            "direct-head prediction gated by same-frame player motion",
+            "explicit feed-forward capped at 25%",
             output,
         )
-        self.assertIn("position tau/deadzone 12 ms/3 px", output)
+        self.assertIn("position tau/deadzone 12 ms/4 px", output)
         self.assertIn("caps X/Y 12000/12000 counts/s", output)
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)
@@ -1224,7 +1236,10 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
 
     def test_two_live_primary_misses_do_not_submit_from_prediction(self) -> None:
         player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
-        batches = iter(([player], [], []))
+        # The two held full-pass misses each invoke the bounded centered rescue,
+        # which also misses.  Neither empty detail result may create or submit
+        # head geometry from the tracker's prediction.
+        batches = iter(([player], [], [], [], []))
 
         class TimestampedSource(_FakeSource):
             def __init__(self) -> None:
@@ -1312,15 +1327,21 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         controller = _FakeMakcuController.instances[0]
         self.assertEqual(controller.corroboration_revocations, 2)
 
-    def test_automatic_mode_publishes_only_direct_head_point_after_player_safety(self) -> None:
+    def test_automatic_mode_publishes_current_anchor_without_resetting_derived_history(self) -> None:
         player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
         _FakeDetector.detections = [player]
         sample = SimpleNamespace(
             point=(915.0, 238.0),
             source_timestamp_ns=123,
+            direct_source_timestamp_ns=100,
+            identity_deadline_ns=200_000_100,
+            track_generation=1,
+            provenance=DirectHeadProvenance.MEASURED_PRIMARY,
             confidence=0.88,
-            evidence="direct head box",
+            evidence="filtered direct-head anchor",
             bridging=False,
+            body_derived_motion_permitted=True,
+            body_derived_motion_deadline_ns=65_000_100,
             corroboration_point=None,
         )
         head_runtime = mock.Mock()
@@ -1330,7 +1351,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         head_runtime.accept_body.return_value = False
         head_runtime.consume_motion_corroboration_revocation.side_effect = [
             False,
-            True,
+            False,
         ]
         head_runtime.take_latest.return_value = sample
         head_runtime.visible_sample.return_value = sample
@@ -1365,16 +1386,43 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             sample.source_timestamp_ns,
         )
         self.assertNotIn("velocity_target", controller.normal_update_keywords[1])
+        self.assertEqual(
+            controller.normal_update_keywords[1]["velocity_point"],
+            sample.point,
+        )
+        self.assertTrue(
+            controller.normal_update_keywords[1][
+                "body_derived_motion_permitted"
+            ]
+        )
+        self.assertEqual(
+            controller.normal_update_keywords[1][
+                "body_derived_motion_deadline_ns"
+            ],
+            sample.body_derived_motion_deadline_ns,
+        )
+        self.assertEqual(
+            controller.normal_update_keywords[1]["identity_deadline_ns"],
+            sample.identity_deadline_ns,
+        )
         self.assertIsNone(
             controller.normal_update_keywords[1]["motion_corroboration_point"]
         )
-        self.assertEqual(controller.corroboration_revocations, 1)
+        self.assertEqual(controller.corroboration_revocations, 0)
+        self.assertEqual(
+            controller.control_events,
+            ["update", "update"],
+        )
         head_runtime.submit.assert_called_once()
         submitted_player = head_runtime.submit.call_args.args[1]
         self.assertEqual(submitted_player, player)
         self.assertEqual(
             head_runtime.accept_body.call_args.kwargs["track_generation"],
             1,
+        )
+        self.assertEqual(
+            head_runtime.accept_body.call_args.kwargs["aim_box"],
+            player.box,
         )
 
 

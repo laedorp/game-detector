@@ -832,6 +832,11 @@ class MakcuAimingController:
         self._latest_measurement_observed = True
         self._latest_velocity_error: tuple[float, float] | None = None
         self._latest_motion_corroboration_error: tuple[float, float] | None = None
+        self._latest_body_derived_motion_permitted = False
+        self._latest_body_derived_motion_deadline_ns: int | None = None
+        self._latest_identity_deadline_ns: int | None = None
+        self._body_derived_motion_revocation_pending = False
+        self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -1002,6 +1007,11 @@ class MakcuAimingController:
         self._latest_measurement_observed = True
         self._latest_velocity_error = None
         self._latest_motion_corroboration_error = None
+        self._latest_body_derived_motion_permitted = False
+        self._latest_body_derived_motion_deadline_ns = None
+        self._latest_identity_deadline_ns = None
+        self._body_derived_motion_revocation_pending = False
+        self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -1588,6 +1598,11 @@ class MakcuAimingController:
         self._latest_measurement_observed = True
         self._latest_velocity_error = None
         self._latest_motion_corroboration_error = None
+        self._latest_body_derived_motion_permitted = False
+        self._latest_body_derived_motion_deadline_ns = None
+        self._latest_identity_deadline_ns = None
+        self._body_derived_motion_revocation_pending = False
+        self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0
@@ -1709,6 +1724,22 @@ class MakcuAimingController:
                 if not is_pressed:
                     self._activation_started_ns = 0
                     self._activation_requires_release = False
+                    # A release is an evidence boundary even when a repress is
+                    # coalesced into this same serial read.  Clear the latest
+                    # publication now and let the output owner synchronously
+                    # revoke the numeric permission before its next snapshot.
+                    self._body_derived_motion_revocation_pending = bool(
+                        self._body_derived_motion_revocation_pending
+                        or self._latest_body_derived_motion_permitted
+                        or self._latest_body_derived_motion_deadline_ns is not None
+                    )
+                    self._identity_deadline_revocation_pending = bool(
+                        self._identity_deadline_revocation_pending
+                        or self._latest_identity_deadline_ns is not None
+                    )
+                    self._latest_body_derived_motion_permitted = False
+                    self._latest_body_derived_motion_deadline_ns = None
+                    self._latest_identity_deadline_ns = None
                 elif not was_pressed and not self._activation_requires_release:
                     self._activation_started_ns = event_ns
                 # Even a release/repress pair which ends in the same mask must
@@ -1874,6 +1905,9 @@ class MakcuAimingController:
         aim_point: tuple[float, float] | None = None,
         velocity_point: tuple[float, float] | None = None,
         motion_corroboration_point: tuple[float, float] | None = None,
+        body_derived_motion_permitted: bool = False,
+        body_derived_motion_deadline_ns: int | None = None,
+        identity_deadline_ns: int | None = None,
     ) -> None:
         """Publish one target-presence decision and optional exact aim point.
 
@@ -1886,6 +1920,11 @@ class MakcuAimingController:
         that exact same source frame; it can authorize bounded feed-forward
         but can never move the requested aim coordinate. Existing callers
         which omit these points retain the body-box/head-ratio path.
+        ``body_derived_motion_permitted`` is a separate per-sample assertion
+        for an aim point mapped from a real observed body. It is mutually
+        exclusive with independent motion corroboration and defaults closed.
+        Its immutable motion deadline ends only predictive authority, while
+        the optional identity deadline ends all control from that observation.
         """
 
         if self._serial is None:
@@ -1897,8 +1936,73 @@ class MakcuAimingController:
             isinstance(measurement_ns, bool) or not isinstance(measurement_ns, int)
         ):
             raise TypeError("measurement_ns must be an integer monotonic timestamp")
+        source_ns = published_ns if measurement_ns is None else measurement_ns
+        if source_ns < 0:
+            raise ValueError("measurement_ns cannot be negative")
         if not isinstance(measurement_observed, bool):
             raise TypeError("measurement_observed must be bool")
+        if not isinstance(body_derived_motion_permitted, bool):
+            raise TypeError("body_derived_motion_permitted must be bool")
+        if body_derived_motion_permitted and (
+            aim_point is None or not measurement_observed or target is None
+        ):
+            raise ValueError(
+                "body-derived motion permission requires an aim point with "
+                "a real observed target"
+            )
+        if (
+            body_derived_motion_permitted
+            and motion_corroboration_point is not None
+        ):
+            raise ValueError(
+                "body-derived motion permission cannot accompany independent "
+                "motion corroboration"
+            )
+        if body_derived_motion_deadline_ns is not None and (
+            isinstance(body_derived_motion_deadline_ns, bool)
+            or not isinstance(body_derived_motion_deadline_ns, int)
+        ):
+            raise TypeError(
+                "body_derived_motion_deadline_ns must be an integer monotonic "
+                "timestamp"
+            )
+        if body_derived_motion_permitted:
+            if body_derived_motion_deadline_ns is None:
+                raise ValueError(
+                    "body-derived motion permission requires an immutable deadline"
+                )
+            if body_derived_motion_deadline_ns <= source_ns:
+                raise ValueError(
+                    "body-derived motion deadline must be after measurement_ns"
+                )
+        elif body_derived_motion_deadline_ns is not None:
+            raise ValueError(
+                "body-derived motion deadline requires motion permission"
+            )
+        if identity_deadline_ns is not None:
+            if (
+                isinstance(identity_deadline_ns, bool)
+                or not isinstance(identity_deadline_ns, int)
+            ):
+                raise TypeError(
+                    "identity_deadline_ns must be an integer monotonic timestamp"
+                )
+            if not measurement_observed or target is None:
+                raise ValueError(
+                    "an identity deadline requires a real observed target"
+                )
+            if identity_deadline_ns <= source_ns:
+                raise ValueError(
+                    "identity deadline must be after measurement_ns"
+                )
+            if (
+                body_derived_motion_deadline_ns is not None
+                and identity_deadline_ns < body_derived_motion_deadline_ns
+            ):
+                raise ValueError(
+                    "identity deadline cannot precede the body-derived motion "
+                    "deadline"
+                )
         if not measurement_observed and target is None:
             raise ValueError("an unobserved measurement requires a predicted target")
         if velocity_target is not None and (
@@ -1923,9 +2027,6 @@ class MakcuAimingController:
             raise ValueError(
                 "velocity_target cannot be combined with explicit aim points"
             )
-        source_ns = published_ns if measurement_ns is None else measurement_ns
-        if source_ns < 0:
-            raise ValueError("measurement_ns cannot be negative")
         if aim_point is not None:
             error_x, error_y = _explicit_point_error_pixels(
                 aim_point,
@@ -2037,6 +2138,13 @@ class MakcuAimingController:
             self._latest_motion_corroboration_error = (
                 motion_corroboration_error
             )
+            self._latest_body_derived_motion_permitted = (
+                body_derived_motion_permitted
+            )
+            self._latest_body_derived_motion_deadline_ns = (
+                body_derived_motion_deadline_ns
+            )
+            self._latest_identity_deadline_ns = identity_deadline_ns
             if measurement_observed:
                 self._latest_measurement_ns = source_ns
                 self._measurement_target_present = target is not None
@@ -2077,7 +2185,76 @@ class MakcuAimingController:
             self._fractional_y = 0.0
             with self._state_lock:
                 self._latest_motion_corroboration_error = None
+                self._latest_body_derived_motion_permitted = False
+                self._latest_body_derived_motion_deadline_ns = None
+                self._body_derived_motion_revocation_pending = False
                 self._calibrated_processed_sample_id = self._latest_sample_id
+
+    def revoke_body_derived_motion(self) -> None:
+        """Synchronously withdraw only body-derived predictive permission.
+
+        Automatic mapped-head callers use this when measured-body provenance
+        expires or becomes predicted.  Independent corroboration, accepted
+        position, and landed-command accounting remain intact.  Explicit
+        profiles and controllers without an enabled body-derived fraction keep
+        their historical behavior.
+        """
+
+        controller = self._calibrated_controller
+        if (
+            controller is None
+            or not controller.config.require_motion_corroboration_for_feedforward
+            or (
+                controller.config.maximum_body_derived_projection_fraction <= 0.0
+                and controller.config.maximum_body_derived_feedforward_fraction
+                <= 0.0
+            )
+        ):
+            return
+        # Serialize with the numeric owner. If the latest body-derived sample
+        # is still queued, consuming its id prevents the pre-revoke assertion
+        # from being reconstructed after this method returns.
+        with self._calibrated_lock:
+            controller.revoke_body_derived_motion()
+            self._fractional_x = 0.0
+            self._fractional_y = 0.0
+            with self._state_lock:
+                if self._latest_body_derived_motion_permitted:
+                    self._calibrated_processed_sample_id = self._latest_sample_id
+                self._latest_body_derived_motion_permitted = False
+                self._latest_body_derived_motion_deadline_ns = None
+                self._body_derived_motion_revocation_pending = False
+
+    def _consume_body_derived_motion_revocation(self) -> None:
+        """Let the output owner consume a release detected by button parsing."""
+
+        with self._state_lock:
+            pending = self._body_derived_motion_revocation_pending
+            identity_pending = self._identity_deadline_revocation_pending
+            self._body_derived_motion_revocation_pending = False
+            self._identity_deadline_revocation_pending = False
+        if identity_pending:
+            self._revoke_identity_bound_control()
+        elif pending:
+            self.revoke_body_derived_motion()
+
+    def _revoke_identity_bound_control(self) -> None:
+        """Synchronously discard an expired/released identity-bound sample."""
+
+        with self._calibrated_lock:
+            if self._calibrated_controller is not None:
+                self._reset_calibrated_tracking_locked()
+            self._fractional_x = 0.0
+            self._fractional_y = 0.0
+            with self._state_lock:
+                # A queued sample from before the boundary cannot re-arm the
+                # core after this synchronous revoke returns.
+                self._calibrated_processed_sample_id = self._latest_sample_id
+                self._latest_body_derived_motion_permitted = False
+                self._latest_body_derived_motion_deadline_ns = None
+                self._latest_identity_deadline_ns = None
+                self._body_derived_motion_revocation_pending = False
+                self._identity_deadline_revocation_pending = False
 
     def _run_output_loop(self) -> None:
         period_ns = max(1, round(1_000_000_000 / self.config.output_hz))
@@ -2230,6 +2407,9 @@ class MakcuAimingController:
         position_error: tuple[float, float],
         velocity_error: tuple[float, float] | None,
         motion_corroboration_error: tuple[float, float] | None,
+        body_derived_motion_permitted: bool,
+        body_derived_motion_deadline_ns: int | None,
+        identity_deadline_ns: int | None,
         source_ns: int,
         sample_id: int,
         generation: int,
@@ -2241,6 +2421,51 @@ class MakcuAimingController:
         if controller is None:  # pragma: no cover - caller guards this branch
             return
         with self._calibrated_lock:
+            if (
+                identity_deadline_ns is not None
+                and current_ns >= identity_deadline_ns
+            ):
+                # Enforce the adapter snapshot's immutable identity boundary
+                # even if a prior narrow motion revoke deliberately consumed
+                # the queued numeric observation before the core saw it.
+                self._reset_calibrated_tracking_locked()
+                self._calibrated_processed_sample_id = sample_id
+                self._fractional_x = 0.0
+                self._fractional_y = 0.0
+                with self._state_lock:
+                    if self._latest_sample_id == sample_id:
+                        self._latest_body_derived_motion_permitted = False
+                        self._latest_body_derived_motion_deadline_ns = None
+                        self._latest_identity_deadline_ns = None
+                self._calibrated_last_output = CalibratedControlOutput(
+                    timestamp_ns=current_ns,
+                    rate_x_counts_per_second=0.0,
+                    rate_y_counts_per_second=0.0,
+                    target_velocity_x_pixels_per_second=0.0,
+                    target_velocity_y_pixels_per_second=0.0,
+                    projected_error_x_pixels=0.0,
+                    projected_error_y_pixels=0.0,
+                    valid=False,
+                    reset_reason="identity-expired",
+                )
+                return
+            if body_derived_motion_permitted and (
+                body_derived_motion_deadline_ns is None
+                or current_ns >= body_derived_motion_deadline_ns
+            ):
+                # Expiry is evaluated before accepting/accumulating this tick.
+                # A sub-count computed under the former predictive grant may
+                # never combine with later static feedback into a post-deadline
+                # physical count.
+                controller.revoke_body_derived_motion()
+                self._fractional_x = 0.0
+                self._fractional_y = 0.0
+                body_derived_motion_permitted = False
+                body_derived_motion_deadline_ns = None
+                with self._state_lock:
+                    if self._latest_sample_id == sample_id:
+                        self._latest_body_derived_motion_permitted = False
+                        self._latest_body_derived_motion_deadline_ns = None
             new_sample = sample_id != self._calibrated_processed_sample_id
             observation = None
             target_lost = False
@@ -2272,6 +2497,13 @@ class MakcuAimingController:
                             if motion_corroboration_error is not None
                             else None
                         ),
+                        body_derived_motion_permitted=(
+                            body_derived_motion_permitted
+                        ),
+                        body_derived_motion_deadline_ns=(
+                            body_derived_motion_deadline_ns
+                        ),
+                        identity_deadline_ns=identity_deadline_ns,
                     )
                 elif measurement_observed:
                     # This is explicit real detector/tracker loss. A synthetic
@@ -2392,6 +2624,17 @@ class MakcuAimingController:
             if not output.valid:
                 self._fractional_x = 0.0
                 self._fractional_y = 0.0
+                if output.reset_reason in {
+                    "released",
+                    "target-lost",
+                    "stale-observation",
+                    "identity-expired",
+                }:
+                    with self._state_lock:
+                        if self._latest_sample_id == sample_id:
+                            self._latest_body_derived_motion_permitted = False
+                            self._latest_body_derived_motion_deadline_ns = None
+                            self._latest_identity_deadline_ns = None
                 return
 
             bounded_elapsed = min(max(float(elapsed), 0.0), 0.01)
@@ -2442,7 +2685,7 @@ class MakcuAimingController:
                         )
                     )
                 )
-                commit_authorized = bool(
+                base_commit_authorized = bool(
                     not self._stop_event.is_set()
                     and self._calibration_token is None
                     and self._normal_motion_generation == generation
@@ -2457,10 +2700,50 @@ class MakcuAimingController:
                         controller.config.stale_after_seconds * 1_000_000_000
                     )
                 )
+                body_motion_fresh = bool(
+                    not body_derived_motion_permitted
+                    or (
+                        body_derived_motion_deadline_ns is not None
+                        and commit_ns < body_derived_motion_deadline_ns
+                    )
+                )
+                identity_fresh = bool(
+                    identity_deadline_ns is None
+                    or commit_ns < identity_deadline_ns
+                )
+                commit_authorized = bool(
+                    base_commit_authorized
+                    and body_motion_fresh
+                    and identity_fresh
+                )
                 if not commit_authorized:
                     self._fractional_x = 0.0
                     self._fractional_y = 0.0
-                    self._reset_calibrated_tracking_locked()
+                    if self._latest_sample_id == sample_id:
+                        if not body_motion_fresh:
+                            self._latest_body_derived_motion_permitted = False
+                            self._latest_body_derived_motion_deadline_ns = None
+                        if not base_commit_authorized or not identity_fresh:
+                            self._latest_body_derived_motion_permitted = False
+                            self._latest_body_derived_motion_deadline_ns = None
+                            self._latest_identity_deadline_ns = None
+                    if (
+                        base_commit_authorized
+                        and identity_fresh
+                        and not body_motion_fresh
+                    ):
+                        # Motion authority expired while this decision was in
+                        # flight. Preserve the accepted static point, but drop
+                        # this entire command and every predictive remainder.
+                        controller.revoke_body_derived_motion()
+                    else:
+                        self._reset_calibrated_tracking_locked()
+                        # The reset deliberately erases numeric state, but the
+                        # rejected wrapper snapshot must remain consumed. If
+                        # its deadline was cleared above, replaying the same
+                        # sample on the next 1 kHz tick would otherwise rebuild
+                        # it without the immutable expiry boundary.
+                        self._calibrated_processed_sample_id = sample_id
                     return
                 if not delta_x and not delta_y:
                     return
@@ -2496,6 +2779,7 @@ class MakcuAimingController:
         decision_started_ns = time.perf_counter_ns()
         current_ns = decision_started_ns if now_ns is None else now_ns
         self._read_buttons(now_ns=current_ns)
+        self._consume_body_derived_motion_revocation()
         button_pressed = self._activation_pressed_at(current_ns)
         with self._state_lock:
             calibration_token = self._calibration_token
@@ -2527,6 +2811,13 @@ class MakcuAimingController:
             motion_corroboration_error = (
                 self._latest_motion_corroboration_error
             )
+            body_derived_motion_permitted = (
+                self._latest_body_derived_motion_permitted
+            )
+            body_derived_motion_deadline_ns = (
+                self._latest_body_derived_motion_deadline_ns
+            )
+            identity_deadline_ns = self._latest_identity_deadline_ns
             velocity_x = self._latest_velocity_x
             velocity_y = self._latest_velocity_y
             sample_id = self._latest_sample_id
@@ -2564,6 +2855,13 @@ class MakcuAimingController:
                 position_error=position_error,
                 velocity_error=velocity_error,
                 motion_corroboration_error=motion_corroboration_error,
+                body_derived_motion_permitted=(
+                    body_derived_motion_permitted
+                ),
+                body_derived_motion_deadline_ns=(
+                    body_derived_motion_deadline_ns
+                ),
+                identity_deadline_ns=identity_deadline_ns,
                 source_ns=source_ns,
                 sample_id=sample_id,
                 generation=generation,
@@ -2995,6 +3293,11 @@ class MakcuAimingController:
         self._latest_measurement_observed = True
         self._latest_velocity_error = None
         self._latest_motion_corroboration_error = None
+        self._latest_body_derived_motion_permitted = False
+        self._latest_body_derived_motion_deadline_ns = None
+        self._latest_identity_deadline_ns = None
+        self._body_derived_motion_revocation_pending = False
+        self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
         self._latest_velocity_x = 0.0
         self._latest_velocity_y = 0.0

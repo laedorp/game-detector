@@ -72,6 +72,7 @@ _CORROBORATION_FULL_SIGNAL_TO_NOISE = 1.75
 _CORROBORATION_MINIMUM_DIRECTION_COSINE = 0.90
 _CORROBORATION_ZERO_DIRECTION_PERSISTENCE_SECONDS = 0.016
 _CORROBORATION_FULL_DIRECTION_PERSISTENCE_SECONDS = 0.050
+_BODY_DERIVED_MINIMUM_DIRECTION_COSINE = 0.90
 _CORROBORATION_RISE_TIME_CONSTANT_SECONDS = 0.050
 _CORROBORATION_FALL_TIME_CONSTANT_SECONDS = 0.010
 # Positional lead is a short, closed-loop horizon rather than an open-loop
@@ -80,6 +81,12 @@ _CORROBORATION_FALL_TIME_CONSTANT_SECONDS = 0.010
 # the unmodified, slower confidence. This preserves prompt pursuit without
 # weakening the exact-zero revoke boundary.
 _CORROBORATION_FULL_MOTION_PROJECTION_CONFIDENCE = 0.50
+# A body-mapped head coordinate and the body box which translated it are one
+# item of evidence, not two independent motion measurements.  A recent direct-
+# head identity lease may authorize source-age projection of that same mapped
+# point, while its additional open-loop velocity command remains deliberately
+# bounded by this hard ceiling.
+_MAXIMUM_BODY_DERIVED_FEEDFORWARD_FRACTION = 0.25
 _MAXIMUM_OBSERVER_DIAGNOSTIC = 1_000_000.0
 
 
@@ -161,6 +168,8 @@ class CalibratedControlConfig:
     maximum_velocity_feedforward_fraction: float = 1.0
     require_motion_corroboration_for_feedforward: bool = False
     maximum_command_history: int = 4096
+    maximum_body_derived_projection_fraction: float = 0.0
+    maximum_body_derived_feedforward_fraction: float = 0.0
 
     def __post_init__(self) -> None:
         for name in (
@@ -197,6 +206,40 @@ class CalibratedControlConfig:
             raise TypeError(
                 "require_motion_corroboration_for_feedforward must be bool"
             )
+        body_derived_projection_fraction = _finite(
+            self.maximum_body_derived_projection_fraction,
+            "maximum_body_derived_projection_fraction",
+        )
+        if not (
+            0.0
+            <= body_derived_projection_fraction
+            <= 1.0
+        ):
+            raise ValueError(
+                "maximum_body_derived_projection_fraction must be between zero and one"
+            )
+        object.__setattr__(
+            self,
+            "maximum_body_derived_projection_fraction",
+            body_derived_projection_fraction,
+        )
+        body_derived_feedforward_fraction = _finite(
+            self.maximum_body_derived_feedforward_fraction,
+            "maximum_body_derived_feedforward_fraction",
+        )
+        if not (
+            0.0
+            <= body_derived_feedforward_fraction
+            <= _MAXIMUM_BODY_DERIVED_FEEDFORWARD_FRACTION
+        ):
+            raise ValueError(
+                "maximum_body_derived_feedforward_fraction must be between zero and 0.25"
+            )
+        object.__setattr__(
+            self,
+            "maximum_body_derived_feedforward_fraction",
+            body_derived_feedforward_fraction,
+        )
         if (
             isinstance(self.velocity_median_window, bool)
             or not isinstance(self.velocity_median_window, int)
@@ -231,6 +274,24 @@ class ScreenErrorObservation:
     Its separate observer can authorize coherent translation feed-forward, but
     can never move or replace the raw aim coordinate.  Omitting the optional
     fields preserves the historical single-channel controller exactly.
+
+    ``body_derived_motion_permitted`` is a narrow, per-observation provenance
+    assertion for an aim point translated from a measured primary/body box.
+    It is not independent corroboration and therefore cannot accompany the
+    corroboration pair.  When both it and the separately configured bounded
+    fractions are present, automatic corroboration-required control may use
+    the separately bounded source-age projection and explicit feed-forward.
+    Neither grant changes independent corroboration confidence.  The caller
+    must revoke it on a primary prediction or when its immutable direct-head
+    identity lease expires.  A permitted sample must carry that immutable
+    lease's exclusive ``body_derived_motion_deadline_ns``; permission is
+    withdrawn when the control clock reaches the deadline even if the mapped
+    position observation itself remains fresh.
+
+    ``identity_deadline_ns`` is a separate optional absolute authority lease.
+    At that exclusive deadline all tracking/output is invalidated, preventing
+    a fresh-looking mapped position from outliving the identity anchor which
+    authorized it.  Callers without identity-bound control omit it unchanged.
     """
 
     timestamp_ns: int
@@ -240,6 +301,9 @@ class ScreenErrorObservation:
     velocity_error_y_pixels: float | None = None
     corroboration_error_x_pixels: float | None = None
     corroboration_error_y_pixels: float | None = None
+    body_derived_motion_permitted: bool = False
+    body_derived_motion_deadline_ns: int | None = None
+    identity_deadline_ns: int | None = None
 
     def __post_init__(self) -> None:
         _timestamp(self.timestamp_ns, "observation timestamp")
@@ -306,6 +370,54 @@ class ScreenErrorObservation:
                     self.corroboration_error_y_pixels,
                     "observation corroboration Y error",
                 ),
+            )
+        if not isinstance(self.body_derived_motion_permitted, bool):
+            raise TypeError("body_derived_motion_permitted must be bool")
+        if self.body_derived_motion_permitted and not paired[0]:
+            raise ValueError(
+                "body-derived motion permission requires the paired velocity error channel"
+            )
+        if self.body_derived_motion_permitted and corroboration[0]:
+            raise ValueError(
+                "body-derived motion permission cannot accompany independent corroboration"
+            )
+        deadline = self.body_derived_motion_deadline_ns
+        if self.body_derived_motion_permitted:
+            if deadline is None:
+                raise ValueError(
+                    "body-derived motion permission requires an immutable deadline"
+                )
+            parsed_deadline = _timestamp(
+                deadline,
+                "body-derived motion deadline",
+            )
+            if parsed_deadline <= self.timestamp_ns:
+                raise ValueError(
+                    "body-derived motion deadline must be after the observation timestamp"
+                )
+            object.__setattr__(
+                self,
+                "body_derived_motion_deadline_ns",
+                parsed_deadline,
+            )
+        elif deadline is not None:
+            raise ValueError(
+                "body-derived motion deadline requires motion permission"
+            )
+        identity_deadline = self.identity_deadline_ns
+        if identity_deadline is not None:
+            parsed_identity_deadline = _timestamp(
+                identity_deadline,
+                "identity deadline",
+            )
+            if parsed_identity_deadline <= self.timestamp_ns:
+                raise ValueError(
+                    "identity deadline must be after the observation timestamp"
+                )
+            object.__setattr__(
+                self,
+                "identity_deadline_ns",
+                parsed_identity_deadline,
             )
 
 
@@ -384,6 +496,7 @@ class MakcuCalibratedController:
         self._last_command_ns = -1
         self._last_step_ns = -1
         self._last_observation: ScreenErrorObservation | None = None
+        self._identity_deadline_ns: int | None = None
         self._ready = False
         self._velocity_x = 0.0
         self._velocity_y = 0.0
@@ -421,6 +534,16 @@ class MakcuCalibratedController:
         self._corroboration_direction_anchor_y = 0.0
         self._corroboration_direction_persistence_seconds = 0.0
         self._corroboration_reseed_required = False
+        # Per-sample permission for a body-mapped coordinate is deliberately
+        # separate from the independent corroboration observer above.  It is
+        # cleared before every new measurement is evaluated, so a missing or
+        # rejected authorization can never inherit predictive motion.
+        self._body_derived_motion_permitted = False
+        self._body_derived_motion_deadline_ns: int | None = None
+        self._body_derived_motion_confidence = 0.0
+        self._body_derived_direction_anchor_x = 0.0
+        self._body_derived_direction_anchor_y = 0.0
+        self._body_derived_direction_persistence_seconds = 0.0
 
     @property
     def ready(self) -> bool:
@@ -461,6 +584,32 @@ class MakcuCalibratedController:
         self._corroboration_direction_anchor_y = 0.0
         self._corroboration_direction_persistence_seconds = 0.0
         self._corroboration_reseed_required = True
+        # This operation is the existing runtime's broad predictive-motion
+        # revoke on no-head/current-primary-prediction events.  The evidence
+        # models remain separate, but no body-derived lease may survive it.
+        self._clear_body_derived_motion()
+
+    def revoke_body_derived_motion(self) -> None:
+        """Immediately withdraw body-derived predictive-motion permission.
+
+        Call this when the current primary/body geometry is predicted rather
+        than measured, or when the direct-head identity lease which authorized
+        its mapping expires.  Position freshness remains untouched, allowing
+        ordinary bounded static feedback without retaining velocity lead.
+        This narrower operation leaves the independent corroboration observer
+        untouched.  :meth:`revoke_motion_corroboration` remains the broad
+        runtime revoke and clears this permission as well.
+        """
+
+        self._clear_body_derived_motion()
+
+    def _clear_body_derived_motion(self) -> None:
+        self._body_derived_motion_permitted = False
+        self._body_derived_motion_deadline_ns = None
+        self._body_derived_motion_confidence = 0.0
+        self._body_derived_direction_anchor_x = 0.0
+        self._body_derived_direction_anchor_y = 0.0
+        self._body_derived_direction_persistence_seconds = 0.0
 
     def record_emitted(self, command: EmittedMouseCommand) -> None:
         """Record one successful physical write exactly once.
@@ -560,9 +709,43 @@ class MakcuCalibratedController:
             if observation.timestamp_ns > current_ns:
                 self._reset_tracking()
                 return self._zero(current_ns, "future-observation")
+            incoming_identity_deadline_ns = observation.identity_deadline_ns
+            effective_identity_deadline_ns = (
+                incoming_identity_deadline_ns
+                if incoming_identity_deadline_ns is not None
+                else self._identity_deadline_ns
+            )
+            if (
+                effective_identity_deadline_ns is not None
+                and current_ns >= effective_identity_deadline_ns
+            ):
+                self._reset_tracking()
+                self._prune_commands(current_ns)
+                return self._zero(current_ns, "identity-expired")
             discontinuity = self._accept_observation(observation)
             if discontinuity is not None:
                 return self._zero(current_ns, discontinuity)
+
+        identity_deadline_ns = self._identity_deadline_ns
+        if (
+            identity_deadline_ns is not None
+            and current_ns >= identity_deadline_ns
+        ):
+            # Identity authority is an absolute lease, not observation
+            # freshness.  Once it expires neither static position nor
+            # predictive motion may survive a capture/detector starvation.
+            self._reset_tracking()
+            self._prune_commands(current_ns)
+            return self._zero(current_ns, "identity-expired")
+
+        if self._body_derived_motion_permitted:
+            deadline_ns = self._body_derived_motion_deadline_ns
+            if deadline_ns is None or current_ns >= deadline_ns:
+                # The direct-head identity lease is independent of the mapped
+                # position freshness lease.  Expiry withdraws only predictive
+                # motion; the accepted absolute point may continue its ordinary
+                # static bridge until the existing observation lease expires.
+                self._clear_body_derived_motion()
 
         latest = self._last_observation
         if latest is None:
@@ -617,39 +800,97 @@ class MakcuCalibratedController:
                 velocity_sigma_y,
             ) * self._paired_measurement_agreement_y
             if self.config.require_motion_corroboration_for_feedforward:
-                feedforward_confidence_x *= self._motion_corroboration_confidence
-                feedforward_confidence_y *= self._motion_corroboration_confidence
+                if self._body_derived_motion_permitted:
+                    # These are explicit provenance grants, not synthesized
+                    # corroboration.  A high-confidence paired observer cannot
+                    # multiply or otherwise bypass either configured ceiling.
+                    # Projection additionally retains the paired observer's
+                    # covariance/signal confidence: a bounded circular point
+                    # wobble does not become full source-age translation merely
+                    # because its anatomical identity lease is still valid.
+                    motion_projection_confidence = (
+                        self.config.maximum_body_derived_projection_fraction
+                        * self._body_derived_motion_confidence
+                    )
+                    motion_projection_confidence_x = (
+                        motion_projection_confidence
+                    )
+                    motion_projection_confidence_y = (
+                        motion_projection_confidence
+                    )
+                    feedforward_confidence_x = min(
+                        feedforward_confidence_x,
+                        self.config.maximum_body_derived_feedforward_fraction,
+                    ) * self._body_derived_motion_confidence
+                    feedforward_confidence_y = min(
+                        feedforward_confidence_y,
+                        self.config.maximum_body_derived_feedforward_fraction,
+                    ) * self._body_derived_motion_confidence
+                else:
+                    feedforward_confidence_x *= (
+                        self._motion_corroboration_confidence
+                    )
+                    feedforward_confidence_y *= (
+                        self._motion_corroboration_confidence
+                    )
+                    motion_projection_confidence = min(
+                        self._motion_corroboration_confidence
+                        / _CORROBORATION_FULL_MOTION_PROJECTION_CONFIDENCE,
+                        1.0,
+                    )
+                    motion_projection_confidence_x = (
+                        motion_projection_confidence
+                    )
+                    motion_projection_confidence_y = (
+                        motion_projection_confidence
+                    )
 
                 # A velocity estimate is predictive motion whether it enters
                 # as the explicit feed-forward term or as ``v * horizon`` in
-                # positional feedback.  Independent corroboration therefore
-                # gates both paths.  With no evidence (including immediately
-                # after an explicit revoke), bridge only the last accepted
-                # absolute head position minus commands which will have
-                # landed; never let retained velocity drive an open-loop P
-                # command.  Default/explicit profiles retain their historical
-                # full paired projection because they do not enable this
-                # automatic-only requirement.
-                static_projected_x = (
-                    self._paired_position_x
-                    - self.plant.gain_x_pixels_per_count * pending_x
-                )
-                static_projected_y = (
-                    self._paired_position_y
-                    - self.plant.gain_y_pixels_per_count * pending_y
-                )
-                motion_projection_confidence = min(
-                    self._motion_corroboration_confidence
-                    / _CORROBORATION_FULL_MOTION_PROJECTION_CONFIDENCE,
-                    1.0,
-                )
+                # positional feedback, so the selected evidence path gates
+                # both.  Body-derived control keeps the caller's causal mapped
+                # point as its exact static position; the paired Kalman state
+                # supplies velocity only.  That prevents observer overshoot
+                # from carrying a filtered <=4 px orbit outside its deadzone.
+                # Independent direct-head control retains its historical
+                # paired position. Default/explicit profiles retain their
+                # historical full paired projection because they do not enable
+                # this automatic-only requirement.
+                if self._body_derived_motion_permitted:
+                    static_projected_x = (
+                        latest.error_x_pixels
+                        - self.plant.gain_x_pixels_per_count * pending_x
+                    )
+                    static_projected_y = (
+                        latest.error_y_pixels
+                        - self.plant.gain_y_pixels_per_count * pending_y
+                    )
+                    full_projected_x = (
+                        static_projected_x
+                        + projected_velocity_x * horizon_seconds
+                    )
+                    full_projected_y = (
+                        static_projected_y
+                        + projected_velocity_y * horizon_seconds
+                    )
+                else:
+                    static_projected_x = (
+                        self._paired_position_x
+                        - self.plant.gain_x_pixels_per_count * pending_x
+                    )
+                    static_projected_y = (
+                        self._paired_position_y
+                        - self.plant.gain_y_pixels_per_count * pending_y
+                    )
+                    full_projected_x = projected_x
+                    full_projected_y = projected_y
                 projected_x = static_projected_x + (
-                    motion_projection_confidence
-                    * (projected_x - static_projected_x)
+                    motion_projection_confidence_x
+                    * (full_projected_x - static_projected_x)
                 )
                 projected_y = static_projected_y + (
-                    motion_projection_confidence
-                    * (projected_y - static_projected_y)
+                    motion_projection_confidence_y
+                    * (full_projected_y - static_projected_y)
                 )
             self._paired_feedback_hold_x = self._paired_feedback_hold(
                 self._paired_feedback_hold_x,
@@ -769,6 +1010,7 @@ class MakcuCalibratedController:
 
     def _reset_tracking(self) -> None:
         self._last_observation = None
+        self._identity_deadline_ns = None
         self._ready = False
         self._velocity_x = 0.0
         self._velocity_y = 0.0
@@ -796,6 +1038,12 @@ class MakcuCalibratedController:
         self._corroboration_direction_anchor_y = 0.0
         self._corroboration_direction_persistence_seconds = 0.0
         self._corroboration_reseed_required = False
+        self._body_derived_motion_permitted = False
+        self._body_derived_motion_deadline_ns = None
+        self._body_derived_motion_confidence = 0.0
+        self._body_derived_direction_anchor_x = 0.0
+        self._body_derived_direction_anchor_y = 0.0
+        self._body_derived_direction_persistence_seconds = 0.0
 
     def _zero(self, now_ns: int, reason: str) -> CalibratedControlOutput:
         return CalibratedControlOutput(
@@ -867,6 +1115,14 @@ class MakcuCalibratedController:
         return None
 
     def _accept_observation(self, observation: ScreenErrorObservation) -> str | None:
+        # Authorization belongs to one accepted measured sample.  Clear the
+        # former sample before evaluating this one so absence, a discontinuity,
+        # or an innovation rejection all fail closed immediately.
+        self._body_derived_motion_permitted = False
+        self._body_derived_motion_deadline_ns = None
+        self._body_derived_motion_confidence = 0.0
+        if not observation.body_derived_motion_permitted:
+            self._clear_body_derived_motion()
         previous = self._last_observation
         if previous is None:
             self._seed_observation(observation)
@@ -957,6 +1213,7 @@ class MakcuCalibratedController:
             speed_limit,
         )
         self._last_observation = observation
+        self._identity_deadline_ns = observation.identity_deadline_ns
         self._ready = True
         self._prune_commands(observation.timestamp_ns)
         return None
@@ -1054,6 +1311,7 @@ class MakcuCalibratedController:
             # bridge, but predictive feed-forward fails closed immediately.
             self._motion_corroboration_confidence = 0.0
             self._corroboration_direction_persistence_seconds = 0.0
+            self._clear_body_derived_motion()
             if self._paired_rejection_count >= _PAIRED_REJECTIONS_BEFORE_RESEED:
                 self._seed_observation(observation)
                 return "innovation-reacquired"
@@ -1091,8 +1349,17 @@ class MakcuCalibratedController:
             landed_x_pixels=self.plant.gain_x_pixels_per_count * count_x,
             landed_y_pixels=self.plant.gain_y_pixels_per_count * count_y,
         )
+        self._body_derived_motion_permitted = (
+            observation.body_derived_motion_permitted
+        )
+        if self._body_derived_motion_permitted:
+            deadline_ns = observation.body_derived_motion_deadline_ns
+            assert deadline_ns is not None
+            self._body_derived_motion_deadline_ns = deadline_ns
+            self._update_body_derived_motion_confidence(elapsed)
         self._paired_rejection_count = 0
         self._last_observation = observation
+        self._identity_deadline_ns = observation.identity_deadline_ns
         self._ready = True
         self._prune_commands(observation.timestamp_ns)
         return None
@@ -1100,6 +1367,7 @@ class MakcuCalibratedController:
     def _seed_observation(self, observation: ScreenErrorObservation) -> None:
         self._reset_tracking()
         self._last_observation = observation
+        self._identity_deadline_ns = observation.identity_deadline_ns
         if observation.velocity_error_x_pixels is not None:
             assert observation.velocity_error_y_pixels is not None
             self._paired_position_x = observation.velocity_error_x_pixels
@@ -1334,6 +1602,74 @@ class MakcuCalibratedController:
             _CORROBORATION_FULL_DIRECTION_PERSISTENCE_SECONDS,
         )
 
+    def _update_body_derived_motion_confidence(self, elapsed: float) -> None:
+        """Authorize only statistically coherent, persistent mapped motion.
+
+        This uses the mapped point's own paired observer and therefore is not
+        independent corroboration.  It cannot raise the independent diagnostic
+        or exceed either configured ceiling.  It distinguishes sustained
+        translation (where source-age projection and bounded FF are useful)
+        from a bounded anatomical point orbit (where prediction would magnify
+        a few pixels of jitter into a visible circle).
+        """
+
+        source_confidence_x = (
+            self._paired_velocity_evidence(
+                self._velocity_x,
+                math.sqrt(self._paired_covariance_x[2]),
+            )
+            * self._paired_measurement_agreement_x
+        )
+        source_confidence_y = (
+            self._paired_velocity_evidence(
+                self._velocity_y,
+                math.sqrt(self._paired_covariance_y[2]),
+            )
+            * self._paired_measurement_agreement_y
+        )
+        signal_confidence = min(
+            max(max(source_confidence_x, source_confidence_y), 0.0),
+            1.0,
+        )
+        magnitude = math.hypot(self._velocity_x, self._velocity_y)
+        if signal_confidence <= 0.0 or magnitude <= 1e-9:
+            self._body_derived_motion_confidence = 0.0
+            self._body_derived_direction_anchor_x = 0.0
+            self._body_derived_direction_anchor_y = 0.0
+            self._body_derived_direction_persistence_seconds = 0.0
+            return
+        direction_x = self._velocity_x / magnitude
+        direction_y = self._velocity_y / magnitude
+        anchor_magnitude = math.hypot(
+            self._body_derived_direction_anchor_x,
+            self._body_derived_direction_anchor_y,
+        )
+        if anchor_magnitude <= 1e-9:
+            self._body_derived_direction_anchor_x = direction_x
+            self._body_derived_direction_anchor_y = direction_y
+            self._body_derived_direction_persistence_seconds = 0.0
+            self._body_derived_motion_confidence = 0.0
+            return
+        alignment = (
+            direction_x * self._body_derived_direction_anchor_x
+            + direction_y * self._body_derived_direction_anchor_y
+        )
+        if alignment < _BODY_DERIVED_MINIMUM_DIRECTION_COSINE:
+            self._body_derived_direction_anchor_x = direction_x
+            self._body_derived_direction_anchor_y = direction_y
+            self._body_derived_direction_persistence_seconds = 0.0
+            self._body_derived_motion_confidence = 0.0
+            return
+        self._body_derived_direction_persistence_seconds += elapsed
+        persistence_confidence = self._ramp(
+            self._body_derived_direction_persistence_seconds,
+            _CORROBORATION_ZERO_DIRECTION_PERSISTENCE_SECONDS,
+            _CORROBORATION_FULL_DIRECTION_PERSISTENCE_SECONDS,
+        )
+        self._body_derived_motion_confidence = (
+            signal_confidence * persistence_confidence
+        )
+
     @staticmethod
     def _ramp(value: float, zero: float, full: float) -> float:
         return min(max((value - zero) / (full - zero), 0.0), 1.0)
@@ -1505,6 +1841,40 @@ class MakcuCalibratedController:
     ) -> float:
         """Return covariance- and signal-limited velocity feed-forward weight."""
 
+        covariance_confidence, signal_confidence = (
+            self._paired_velocity_confidence_components(
+                velocity,
+                velocity_sigma,
+            )
+        )
+        # Retain the historical multiplication order for existing profiles.
+        return (
+            self.config.maximum_velocity_feedforward_fraction
+            * covariance_confidence
+            * signal_confidence
+        )
+
+    @classmethod
+    def _paired_velocity_evidence(
+        cls,
+        velocity: float,
+        velocity_sigma: float,
+    ) -> float:
+        """Return normalized paired evidence, independent of explicit FF cap."""
+
+        covariance_confidence, signal_confidence = (
+            cls._paired_velocity_confidence_components(
+                velocity,
+                velocity_sigma,
+            )
+        )
+        return covariance_confidence * signal_confidence
+
+    @staticmethod
+    def _paired_velocity_confidence_components(
+        velocity: float,
+        velocity_sigma: float,
+    ) -> tuple[float, float]:
         covariance_confidence = min(
             max(
                 (
@@ -1534,11 +1904,7 @@ class MakcuCalibratedController:
             ),
             1.0,
         )
-        return (
-            self.config.maximum_velocity_feedforward_fraction
-            * covariance_confidence
-            * signal_confidence
-        )
+        return covariance_confidence, signal_confidence
 
     @staticmethod
     def _paired_channel_agreement(

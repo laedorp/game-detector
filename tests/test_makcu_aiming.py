@@ -330,6 +330,57 @@ class MakcuAimingTests(unittest.TestCase):
             raise AssertionError("calibrated adapter did not become ready")
         return controller, calibrated, active, target, base_ns + 8_000_000
 
+    def _body_derived_calibrated_adapter(
+        self,
+    ) -> tuple[
+        MakcuAimingController,
+        MakcuCalibratedController,
+        FakeSerial,
+        Detection,
+    ]:
+        """Return an armed adapter with the bounded mapped-body path enabled."""
+
+        factory = FakeSerialFactory()
+        calibrated = MakcuCalibratedController(
+            CalibratedPlant(0.125, 0.120, 0.008),
+            CalibratedControlConfig(
+                position_time_constant_seconds=0.012,
+                velocity_median_window=1,
+                maximum_velocity_feedforward_fraction=0.25,
+                require_motion_corroboration_for_feedforward=True,
+                maximum_body_derived_projection_fraction=0.25,
+                maximum_body_derived_feedforward_fraction=0.25,
+                stale_after_seconds=0.065,
+                maximum_observation_interval_seconds=0.040,
+                feedback_deadzone_pixels=4.0,
+            ),
+        )
+        controller = MakcuAimingController(
+            MakcuAimConfig(
+                max_step=320,
+                output_hz=1000,
+                vertical_rate_ratio=1.0,
+            ),
+            calibrated_controller=calibrated,
+            serial_factory=factory,
+            ports_provider=lambda: (self.port,),
+            sleep=lambda _seconds: None,
+            threaded_output=False,
+        )
+        controller.start(output_loop=False)
+        worker = mock.Mock()
+        worker.is_alive.return_value = True
+        controller._output_thread = worker
+        active = factory.connections[-1]
+        active.responses.extend(bytes((0b00010,)))
+        target = Detection(
+            0,
+            "player",
+            0.95,
+            (850.0, 200.0, 1070.0, 800.0),
+        )
+        return controller, calibrated, active, target
+
     def _run_horizontal_fake_plant(
         self,
         velocity_for_tick: Callable[[int], float],
@@ -917,6 +968,613 @@ class MakcuAimingTests(unittest.TestCase):
             controller._output_thread = None
             controller.stop()
 
+    def test_body_derived_permission_validates_and_is_per_sample(self) -> None:
+        controller, calibrated, _active, target = (
+            self._body_derived_calibrated_adapter()
+        )
+        frame_shape = (1080, 1920, 3)
+        base_ns = 51_625_000_000
+        try:
+            original_sample_id = controller._latest_sample_id
+            invalid_calls = (
+                (
+                    {"body_derived_motion_permitted": 1},
+                    TypeError,
+                    "must be bool",
+                ),
+                (
+                    {"body_derived_motion_permitted": True},
+                    ValueError,
+                    "requires an aim point with a real observed target",
+                ),
+                (
+                    {
+                        "aim_point": (960.0, 540.0),
+                        "motion_corroboration_point": (1060.0, 740.0),
+                        "body_derived_motion_permitted": True,
+                    },
+                    ValueError,
+                    "cannot accompany independent motion corroboration",
+                ),
+                (
+                    {
+                        "measurement_observed": False,
+                        "aim_point": (960.0, 540.0),
+                        "body_derived_motion_permitted": True,
+                    },
+                    ValueError,
+                    "requires an aim point with a real observed target",
+                ),
+                (
+                    {
+                        "aim_point": (960.0, 540.0),
+                        "body_derived_motion_permitted": True,
+                    },
+                    ValueError,
+                    "requires an immutable deadline",
+                ),
+                (
+                    {"body_derived_motion_deadline_ns": base_ns + 1},
+                    ValueError,
+                    "requires motion permission",
+                ),
+                (
+                    {
+                        "aim_point": (960.0, 540.0),
+                        "body_derived_motion_permitted": True,
+                        "body_derived_motion_deadline_ns": True,
+                    },
+                    TypeError,
+                    "must be an integer",
+                ),
+                (
+                    {
+                        "aim_point": (960.0, 540.0),
+                        "body_derived_motion_permitted": True,
+                        "body_derived_motion_deadline_ns": base_ns,
+                    },
+                    ValueError,
+                    "must be after measurement_ns",
+                ),
+                (
+                    {"identity_deadline_ns": True},
+                    TypeError,
+                    "must be an integer",
+                ),
+                (
+                    {"identity_deadline_ns": base_ns},
+                    ValueError,
+                    "must be after measurement_ns",
+                ),
+                (
+                    {
+                        "aim_point": (960.0, 540.0),
+                        "body_derived_motion_permitted": True,
+                        "body_derived_motion_deadline_ns": base_ns + 10,
+                        "identity_deadline_ns": base_ns + 9,
+                    },
+                    ValueError,
+                    "cannot precede",
+                ),
+            )
+            for kwargs, exception, message in invalid_calls:
+                with (
+                    self.subTest(kwargs=kwargs),
+                    self.assertRaisesRegex(exception, message),
+                ):
+                    controller.update(
+                        target,
+                        frame_shape,
+                        measurement_ns=base_ns,
+                        **kwargs,
+                    )
+            self.assertEqual(controller._latest_sample_id, original_sample_id)
+            self.assertFalse(controller._latest_body_derived_motion_permitted)
+
+            motion_deadline_ns = base_ns + 64_000_000
+            identity_deadline_ns = base_ns + 160_000_000
+            for index, point_x in enumerate((956.0, 960.0)):
+                timestamp_ns = base_ns + index * 8_000_000
+                controller.update(
+                    target,
+                    frame_shape,
+                    measurement_ns=timestamp_ns,
+                    aim_point=(point_x, 540.0),
+                    body_derived_motion_permitted=True,
+                    body_derived_motion_deadline_ns=motion_deadline_ns,
+                    identity_deadline_ns=identity_deadline_ns,
+                )
+                self.assertTrue(
+                    controller._latest_body_derived_motion_permitted
+                )
+                controller._output_tick(0.0, now_ns=timestamp_ns)
+
+            observation = calibrated._last_observation
+            assert observation is not None
+            self.assertTrue(observation.body_derived_motion_permitted)
+            self.assertEqual(
+                observation.body_derived_motion_deadline_ns,
+                motion_deadline_ns,
+            )
+            self.assertEqual(
+                observation.identity_deadline_ns,
+                identity_deadline_ns,
+            )
+            self.assertTrue(calibrated._body_derived_motion_permitted)
+            self.assertIsNone(observation.corroboration_error_x_pixels)
+            self.assertIsNone(observation.corroboration_error_y_pixels)
+
+            # The default on the immediately following real sample is an
+            # explicit revoke, not inheritance from the prior publication.
+            next_ns = base_ns + 16_000_000
+            controller.update(
+                target,
+                frame_shape,
+                measurement_ns=next_ns,
+                aim_point=(960.0, 540.0),
+            )
+            self.assertFalse(controller._latest_body_derived_motion_permitted)
+            self.assertIsNone(
+                controller._latest_body_derived_motion_deadline_ns
+            )
+            self.assertIsNone(controller._latest_identity_deadline_ns)
+            controller._output_tick(0.0, now_ns=next_ns)
+            next_observation = calibrated._last_observation
+            assert next_observation is not None
+            self.assertFalse(next_observation.body_derived_motion_permitted)
+            self.assertFalse(calibrated._body_derived_motion_permitted)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_body_derived_revoke_discards_queued_permission_and_fraction(self) -> None:
+        controller, calibrated, active, target = (
+            self._body_derived_calibrated_adapter()
+        )
+        base_ns = 51_640_000_000
+        motion_deadline_ns = base_ns + 400_000_000
+        established_identity_deadline_ns = base_ns + 700_000_000
+        queued_identity_deadline_ns = base_ns + 500_000_000
+        try:
+            for index in range(40):
+                timestamp_ns = base_ns + index * 8_000_000
+                point_x = 960.0 + (index - 39) * 4.6
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=timestamp_ns,
+                    aim_point=(point_x, 540.0),
+                    body_derived_motion_permitted=True,
+                    body_derived_motion_deadline_ns=motion_deadline_ns,
+                    identity_deadline_ns=established_identity_deadline_ns,
+                )
+                controller._output_tick(0.0, now_ns=timestamp_ns)
+
+            self.assertTrue(calibrated.ready)
+            self.assertTrue(calibrated._body_derived_motion_permitted)
+            accepted_timestamp_ns = calibrated._last_observation.timestamp_ns
+            queued_ns = base_ns + 313_000_000
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=queued_ns,
+                aim_point=(960.575, 540.0),
+                body_derived_motion_permitted=True,
+                body_derived_motion_deadline_ns=motion_deadline_ns,
+                identity_deadline_ns=queued_identity_deadline_ns,
+            )
+            self.assertNotEqual(
+                controller._calibrated_processed_sample_id,
+                controller._latest_sample_id,
+            )
+            controller._fractional_x = 0.75
+            controller._fractional_y = -0.75
+
+            controller.revoke_body_derived_motion()
+
+            self.assertFalse(controller._latest_body_derived_motion_permitted)
+            self.assertIsNone(
+                controller._latest_body_derived_motion_deadline_ns
+            )
+            self.assertFalse(calibrated._body_derived_motion_permitted)
+            self.assertEqual(
+                controller._calibrated_processed_sample_id,
+                controller._latest_sample_id,
+            )
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+            controller._output_tick(0.0, now_ns=queued_ns)
+            self.assertEqual(
+                calibrated._last_observation.timestamp_ns,
+                accepted_timestamp_ns,
+            )
+            output = controller.calibrated_control_output
+            assert output is not None
+            self.assertEqual(output.velocity_feedforward_confidence_x, 0.0)
+            self.assertEqual(output.velocity_feedforward_confidence_y, 0.0)
+            self.assertEqual(self._movement_writes(active), ())
+
+            # The queued observation was deliberately consumed by the narrow
+            # revoke, so the core still owns the older, later deadline. The
+            # wrapper's atomic sample deadline must nevertheless zero output
+            # at the queued identity boundary.
+            controller._fractional_x = 0.75
+            controller._fractional_y = -0.75
+            movement_before = self._movement_writes(active)
+            controller._output_tick(
+                0.0,
+                now_ns=queued_identity_deadline_ns,
+            )
+            expired = controller.calibrated_control_output
+            assert expired is not None
+            self.assertFalse(expired.valid)
+            self.assertEqual(expired.reset_reason, "identity-expired")
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+            self.assertEqual(self._movement_writes(active), movement_before)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_body_derived_permission_revokes_on_release_loss_stale_and_reset(
+        self,
+    ) -> None:
+        for boundary in ("release-repress", "loss", "stale", "reset"):
+            with self.subTest(boundary=boundary):
+                controller, calibrated, active, target = (
+                    self._body_derived_calibrated_adapter()
+                )
+                base_ns = 51_645_000_000
+                motion_deadline_ns = base_ns + 64_000_000
+                identity_deadline_ns = base_ns + 128_000_000
+                try:
+                    for index in range(2):
+                        timestamp_ns = base_ns + index * 8_000_000
+                        controller.update(
+                            target,
+                            (1080, 1920, 3),
+                            measurement_ns=timestamp_ns,
+                            aim_point=(960.0, 540.0),
+                            body_derived_motion_permitted=True,
+                            body_derived_motion_deadline_ns=(
+                                motion_deadline_ns
+                            ),
+                            identity_deadline_ns=identity_deadline_ns,
+                        )
+                        controller._output_tick(0.0, now_ns=timestamp_ns)
+                    self.assertTrue(calibrated._body_derived_motion_permitted)
+                    controller._fractional_x = 0.75
+                    controller._fractional_y = -0.75
+
+                    if boundary == "release-repress":
+                        # The final mask is pressed; the intermediate release
+                        # must nevertheless revoke the old sample.
+                        self._queue_button_event(active, 0)
+                        self._queue_button_event(active, 0b00010)
+                        controller._output_tick(
+                            0.0,
+                            now_ns=base_ns + 9_000_000,
+                        )
+                    elif boundary == "loss":
+                        loss_ns = base_ns + 16_000_000
+                        controller.update(
+                            None,
+                            (1080, 1920, 3),
+                            measurement_ns=loss_ns,
+                        )
+                        controller._output_tick(0.0, now_ns=loss_ns)
+                    elif boundary == "stale":
+                        controller._output_tick(
+                            0.0,
+                            now_ns=base_ns + 74_000_000,
+                        )
+                    else:
+                        token = controller.enter_calibration_mode()
+                        self.assertIsNotNone(token)
+
+                    self.assertFalse(
+                        controller._latest_body_derived_motion_permitted
+                    )
+                    self.assertFalse(calibrated._body_derived_motion_permitted)
+                    self.assertIsNone(
+                        controller._latest_body_derived_motion_deadline_ns
+                    )
+                    self.assertIsNone(controller._latest_identity_deadline_ns)
+                    self.assertEqual(controller._fractional_x, 0.0)
+                    self.assertEqual(controller._fractional_y, 0.0)
+                finally:
+                    controller._output_thread = None
+                    controller.stop()
+
+    def test_body_and_identity_deadlines_bound_capture_starvation(self) -> None:
+        controller, calibrated, active, target = (
+            self._body_derived_calibrated_adapter()
+        )
+        base_ns = 51_647_000_000
+        motion_deadline_ns = base_ns + 65_000_000
+        identity_deadline_ns = base_ns + 200_000_000
+        try:
+            # Model a newly mapped body sample captured when its immutable
+            # direct-motion lease has only one millisecond remaining. Its
+            # ordinary 65 ms observation freshness would otherwise survive to
+            # direct age 129 ms.
+            for source_offset_ns in (56_000_000, 64_000_000):
+                source_ns = base_ns + source_offset_ns
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=source_ns,
+                    aim_point=(960.0, 540.0),
+                    body_derived_motion_permitted=True,
+                    body_derived_motion_deadline_ns=motion_deadline_ns,
+                    identity_deadline_ns=identity_deadline_ns,
+                )
+                with mock.patch(
+                    "aiming.makcu.time.perf_counter_ns",
+                    side_effect=(100, 100),
+                ):
+                    controller._output_tick(0.0, now_ns=source_ns)
+            self.assertTrue(calibrated.ready)
+            self.assertTrue(calibrated._body_derived_motion_permitted)
+
+            controller._fractional_x = 0.75
+            controller._fractional_y = -0.75
+            just_before_ns = motion_deadline_ns - 1
+            with mock.patch(
+                "aiming.makcu.time.perf_counter_ns",
+                side_effect=(100, 100),
+            ):
+                controller._output_tick(0.0, now_ns=just_before_ns)
+            self.assertTrue(calibrated._body_derived_motion_permitted)
+            self.assertEqual(controller._fractional_x, 0.75)
+
+            movement_before = self._movement_writes(active)
+            controller._output_tick(0.0, now_ns=motion_deadline_ns)
+            self.assertTrue(calibrated.ready)
+            self.assertFalse(calibrated._body_derived_motion_permitted)
+            self.assertFalse(controller._latest_body_derived_motion_permitted)
+            self.assertIsNone(
+                controller._latest_body_derived_motion_deadline_ns
+            )
+            self.assertEqual(
+                controller._latest_identity_deadline_ns,
+                identity_deadline_ns,
+            )
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+            self.assertEqual(self._movement_writes(active), movement_before)
+
+            # Static position remains usable inside the independent freshness
+            # and identity leases after predictive permission expires.
+            controller._output_tick(0.0, now_ns=base_ns + 100_000_000)
+            output = controller.calibrated_control_output
+            assert output is not None
+            self.assertTrue(output.valid)
+            self.assertTrue(calibrated.ready)
+
+            # Refresh only static identity-bound position immediately before
+            # the overall identity deadline, then starve capture again.
+            for source_offset_ns in (191_000_000, 199_000_000):
+                source_ns = base_ns + source_offset_ns
+                controller.update(
+                    target,
+                    (1080, 1920, 3),
+                    measurement_ns=source_ns,
+                    aim_point=(960.0, 540.0),
+                    identity_deadline_ns=identity_deadline_ns,
+                )
+                with mock.patch(
+                    "aiming.makcu.time.perf_counter_ns",
+                    side_effect=(100, 100),
+                ):
+                    controller._output_tick(0.0, now_ns=source_ns)
+            controller._fractional_x = 0.75
+            controller._fractional_y = -0.75
+            with mock.patch(
+                "aiming.makcu.time.perf_counter_ns",
+                side_effect=(100, 100),
+            ):
+                controller._output_tick(0.0, now_ns=identity_deadline_ns - 1)
+            self.assertTrue(controller.calibrated_control_output.valid)
+
+            movement_before = self._movement_writes(active)
+            controller._output_tick(0.0, now_ns=identity_deadline_ns)
+            expired = controller.calibrated_control_output
+            assert expired is not None
+            self.assertFalse(expired.valid)
+            self.assertEqual(expired.reset_reason, "identity-expired")
+            self.assertFalse(calibrated.ready)
+            self.assertIsNone(controller._latest_identity_deadline_ns)
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(controller._fractional_y, 0.0)
+            self.assertEqual(self._movement_writes(active), movement_before)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_queued_body_sample_cannot_replay_permission_after_deadline(self) -> None:
+        controller, calibrated, active, target = (
+            self._body_derived_calibrated_adapter()
+        )
+        base_ns = 51_648_000_000
+        motion_deadline_ns = base_ns + 65_000_000
+        identity_deadline_ns = base_ns + 200_000_000
+        try:
+            first_ns = base_ns + 56_000_000
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=first_ns,
+                aim_point=(960.0, 540.0),
+                body_derived_motion_permitted=True,
+                body_derived_motion_deadline_ns=motion_deadline_ns,
+                identity_deadline_ns=identity_deadline_ns,
+            )
+            controller._output_tick(0.0, now_ns=first_ns)
+
+            queued_ns = base_ns + 64_000_000
+            controller.update(
+                target,
+                (1080, 1920, 3),
+                measurement_ns=queued_ns,
+                aim_point=(960.0, 540.0),
+                body_derived_motion_permitted=True,
+                body_derived_motion_deadline_ns=motion_deadline_ns,
+                identity_deadline_ns=identity_deadline_ns,
+            )
+            self.assertNotEqual(
+                controller._calibrated_processed_sample_id,
+                controller._latest_sample_id,
+            )
+            controller._fractional_x = 0.75
+            movement_before = self._movement_writes(active)
+
+            controller._output_tick(0.0, now_ns=motion_deadline_ns)
+
+            observation = calibrated._last_observation
+            assert observation is not None
+            self.assertEqual(observation.timestamp_ns, queued_ns)
+            self.assertFalse(observation.body_derived_motion_permitted)
+            self.assertIsNone(observation.body_derived_motion_deadline_ns)
+            self.assertFalse(calibrated._body_derived_motion_permitted)
+            self.assertFalse(controller._latest_body_derived_motion_permitted)
+            self.assertEqual(controller._fractional_x, 0.0)
+            self.assertEqual(self._movement_writes(active), movement_before)
+        finally:
+            controller._output_thread = None
+            controller.stop()
+
+    def test_deadlines_are_rechecked_at_physical_commit(self) -> None:
+        for boundary in ("motion", "identity", "base"):
+            with self.subTest(boundary=boundary):
+                controller, calibrated, active, target = (
+                    self._body_derived_calibrated_adapter()
+                )
+                base_ns = 51_649_000_000
+                motion_deadline_ns = base_ns + 10_000_000
+                identity_deadline_ns = base_ns + 100_000_000
+                try:
+                    for source_offset_ns in (0, 8_000_000):
+                        source_ns = base_ns + source_offset_ns
+                        kwargs = {
+                            "identity_deadline_ns": identity_deadline_ns,
+                        }
+                        if boundary == "motion":
+                            kwargs.update(
+                                body_derived_motion_permitted=True,
+                                body_derived_motion_deadline_ns=(
+                                    motion_deadline_ns
+                                ),
+                            )
+                        controller.update(
+                            target,
+                            (1080, 1920, 3),
+                            measurement_ns=source_ns,
+                            aim_point=(1000.0, 540.0),
+                            **kwargs,
+                        )
+                        controller._output_tick(0.0, now_ns=source_ns)
+                    self.assertTrue(calibrated.ready)
+                    controller._fractional_x = 0.75
+                    controller._fractional_y = -0.75
+                    movement_before = self._movement_writes(active)
+
+                    if boundary == "motion":
+                        decision_ns = motion_deadline_ns - 500_000
+                    elif boundary == "identity":
+                        # Install a nearer overall deadline on a fresh pair.
+                        identity_deadline_ns = base_ns + 12_000_000
+                        for source_offset_ns in (10_000_000, 11_000_000):
+                            source_ns = base_ns + source_offset_ns
+                            controller.update(
+                                target,
+                                (1080, 1920, 3),
+                                measurement_ns=source_ns,
+                                aim_point=(1000.0, 540.0),
+                                identity_deadline_ns=identity_deadline_ns,
+                            )
+                            controller._output_tick(0.0, now_ns=source_ns)
+                        decision_ns = identity_deadline_ns - 500_000
+                    else:
+                        decision_ns = base_ns + 9_000_000
+                    if boundary == "base":
+                        clock_calls = 0
+
+                        def cross_generation_at_commit() -> int:
+                            nonlocal clock_calls
+                            clock_calls += 1
+                            if clock_calls == 2:
+                                # Model a safety epoch changing after numeric
+                                # computation but before physical commit while
+                                # the observation itself remains fresh.
+                                controller._normal_motion_generation += 1
+                            return 100
+
+                        clock_side_effect = cross_generation_at_commit
+                    else:
+                        clock_side_effect = (100, 1_000_100)
+                    with mock.patch(
+                        "aiming.makcu.time.perf_counter_ns",
+                        side_effect=clock_side_effect,
+                    ):
+                        controller._output_tick(0.001, now_ns=decision_ns)
+
+                    self.assertEqual(self._movement_writes(active), movement_before)
+                    self.assertEqual(controller._fractional_x, 0.0)
+                    self.assertEqual(controller._fractional_y, 0.0)
+                    if boundary == "motion":
+                        self.assertTrue(calibrated.ready)
+                        self.assertFalse(
+                            calibrated._body_derived_motion_permitted
+                        )
+                        self.assertIsNone(
+                            controller._latest_body_derived_motion_deadline_ns
+                        )
+                        self.assertEqual(
+                            controller._latest_identity_deadline_ns,
+                            identity_deadline_ns,
+                        )
+                    else:
+                        self.assertFalse(calibrated.ready)
+                        self.assertIsNone(controller._latest_identity_deadline_ns)
+                        self.assertEqual(
+                            controller._calibrated_processed_sample_id,
+                            controller._latest_sample_id,
+                        )
+                        # Deadline removal is not a new undated publication.
+                        # Repeated worker ticks must not reconstruct the same
+                        # observation after the commit-time identity reset.
+                        replay_base_ns = (
+                            identity_deadline_ns
+                            if boundary == "identity"
+                            else decision_ns
+                        )
+                        for offset_ns in (1, 1_000_000, 2_000_000):
+                            controller._output_tick(
+                                0.0,
+                                now_ns=replay_base_ns + offset_ns,
+                            )
+                            replay = controller.calibrated_control_output
+                            assert replay is not None
+                            self.assertFalse(replay.valid)
+                            self.assertEqual(
+                                replay.reset_reason,
+                                "awaiting-observation",
+                            )
+                            self.assertIsNone(calibrated._last_observation)
+                            self.assertFalse(calibrated.ready)
+                            self.assertEqual(
+                                controller._calibrated_processed_sample_id,
+                                controller._latest_sample_id,
+                            )
+                        self.assertEqual(
+                            self._movement_writes(active),
+                            movement_before,
+                        )
+                finally:
+                    controller._output_thread = None
+                    controller.stop()
+
     def test_corroboration_revoke_cannot_replay_or_leak_prior_feedforward(
         self,
     ) -> None:
@@ -989,10 +1647,21 @@ class MakcuAimingTests(unittest.TestCase):
             )
             controller._fractional_x = 0.75
             controller._fractional_y = -0.75
+            # Broad corroboration loss must also revoke the mutually exclusive
+            # body-derived permission if adversarial state reaches this
+            # boundary.
+            controller._latest_body_derived_motion_permitted = True
+            controller._latest_body_derived_motion_deadline_ns = queued_ns + 1
+            calibrated._body_derived_motion_permitted = True
 
             controller.revoke_motion_corroboration()
 
             self.assertIsNone(controller._latest_motion_corroboration_error)
+            self.assertFalse(controller._latest_body_derived_motion_permitted)
+            self.assertIsNone(
+                controller._latest_body_derived_motion_deadline_ns
+            )
+            self.assertFalse(calibrated._body_derived_motion_permitted)
             self.assertEqual(
                 controller._calibrated_processed_sample_id,
                 controller._latest_sample_id,
@@ -1034,6 +1703,8 @@ class MakcuAimingTests(unittest.TestCase):
             threaded_output=False,
         )
         controller._latest_motion_corroboration_error = (1.0, 2.0)
+        controller._latest_body_derived_motion_permitted = True
+        controller._latest_body_derived_motion_deadline_ns = 10
         controller._fractional_x = 0.5
         with mock.patch.object(
             calibrated,
@@ -1047,6 +1718,63 @@ class MakcuAimingTests(unittest.TestCase):
             (1.0, 2.0),
         )
         self.assertEqual(controller._fractional_x, 0.5)
+        with mock.patch.object(
+            calibrated,
+            "revoke_body_derived_motion",
+        ) as revoke_body:
+            controller.revoke_body_derived_motion()
+        revoke_body.assert_not_called()
+        self.assertTrue(controller._latest_body_derived_motion_permitted)
+        self.assertEqual(controller._latest_body_derived_motion_deadline_ns, 10)
+        self.assertEqual(controller._fractional_x, 0.5)
+
+    def test_body_derived_revoke_enabled_by_either_split_cap(self) -> None:
+        cap_cases = (
+            {
+                "maximum_body_derived_projection_fraction": 0.25,
+                "maximum_body_derived_feedforward_fraction": 0.0,
+            },
+            {
+                "maximum_body_derived_projection_fraction": 0.0,
+                "maximum_body_derived_feedforward_fraction": 0.25,
+            },
+        )
+        for caps in cap_cases:
+            with self.subTest(caps=caps):
+                calibrated = MakcuCalibratedController(
+                    CalibratedPlant(0.10, 0.10, 0.0),
+                    CalibratedControlConfig(
+                        require_motion_corroboration_for_feedforward=True,
+                        **caps,
+                    ),
+                )
+                controller = MakcuAimingController(
+                    calibrated_controller=calibrated,
+                    serial_factory=self.factory,
+                    ports_provider=lambda: (self.port,),
+                    sleep=lambda _seconds: None,
+                    threaded_output=False,
+                )
+                controller._latest_body_derived_motion_permitted = True
+                controller._latest_body_derived_motion_deadline_ns = 10
+                controller._latest_sample_id = 3
+                controller._calibrated_processed_sample_id = 2
+                controller._fractional_x = 0.5
+                with mock.patch.object(
+                    calibrated,
+                    "revoke_body_derived_motion",
+                ) as revoke:
+                    controller.revoke_body_derived_motion()
+
+                revoke.assert_called_once_with()
+                self.assertFalse(
+                    controller._latest_body_derived_motion_permitted
+                )
+                self.assertIsNone(
+                    controller._latest_body_derived_motion_deadline_ns
+                )
+                self.assertEqual(controller._calibrated_processed_sample_id, 3)
+                self.assertEqual(controller._fractional_x, 0.0)
 
     def test_explicit_points_fail_closed_before_mutating_publication(self) -> None:
         controller = self.controller()

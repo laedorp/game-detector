@@ -13,7 +13,15 @@ from detection.detail_pass import (
     plan_detail_pass,
 )
 from detection.types import Detection
+from main import (
+    AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS,
+    _apply_hard_aim_guard,
+    _automatic_detail_rescue_reason,
+    _exclude_automatic_detail_lower_edge_self_fragments,
+    _exclude_automatic_detail_self_relatives,
+)
 from utils.preprocess import preprocess_frame
+from utils.self_filter import NormalizedBottomZone
 
 
 try:
@@ -187,6 +195,204 @@ class DetailPassGeometryTests(unittest.TestCase):
                 unmatched_rejected_large=0,
                 merged=1,
             )
+
+
+class AutomaticDetailRescueDecisionTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.frame_shape = (1080, 1920, 3)
+        self.plan = plan_detail_pass(self.frame_shape, 768, (416, 416))
+
+    def reason(self, detections) -> str:
+        return _automatic_detail_rescue_reason(
+            detections,
+            self.frame_shape,
+            self.plan,
+            aim_label="player",
+            configured_confidence=0.25,
+        )
+
+    def test_no_configured_confidence_exact_target_requests_rescue(self) -> None:
+        wrong_label = Detection(1, "vehicle", 0.99, (900, 450, 980, 550))
+        weak_player = Detection(0, "player", 0.24, (900, 450, 980, 550))
+
+        self.assertEqual(
+            self.reason([wrong_label, weak_player]),
+            "no_exact_target",
+        )
+
+    def test_small_center_nearest_target_requests_rescue(self) -> None:
+        small = Detection(0, "player", 0.80, (930, 492, 990, 588))
+
+        self.assertEqual(self.reason([small]), "small_central_target")
+
+    def test_target_label_matching_strips_and_casefolds_both_sides(self) -> None:
+        mixed_case = Detection(0, "  PlAyEr  ", 0.80, (930, 492, 990, 588))
+
+        reason = _automatic_detail_rescue_reason(
+            [mixed_case],
+            self.frame_shape,
+            self.plan,
+            aim_label="  PLAYER ",
+            configured_confidence=0.25,
+        )
+
+        self.assertEqual(reason, "small_central_target")
+
+    def test_close_center_target_skips_rescue(self) -> None:
+        close = Detection(0, "player", 0.80, (900, 440, 1020, 640))
+
+        self.assertEqual(self.reason([close]), "not_needed")
+
+    def test_small_off_center_target_skips_rescue(self) -> None:
+        # Its center is left of the centered 768px ROI (x=576..1344).
+        off_center = Detection(0, "player", 0.80, (420, 492, 500, 588))
+
+        self.assertEqual(self.reason([off_center]), "not_needed")
+
+    def test_guarded_full_pass_self_cannot_suppress_missing_target_rescue(
+        self,
+    ) -> None:
+        zone = NormalizedBottomZone(0.18, 0.34, 0.10)
+        visible_self = Detection(
+            0,
+            "player",
+            0.92,
+            (850.0, 650.0, 1070.0, 1080.0),
+        )
+
+        guard = _apply_hard_aim_guard(
+            [visible_self],
+            self.frame_shape,
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.25,
+        )
+
+        self.assertEqual(guard.detections, ())
+        self.assertEqual(guard.removed_detections, (visible_self,))
+        self.assertEqual(self.reason(guard.detections), "no_exact_target")
+
+    def test_guarded_self_fragment_is_removed_but_distinct_opponent_survives(
+        self,
+    ) -> None:
+        visible_self = Detection(
+            0,
+            "player",
+            0.24,
+            (850.0, 650.0, 1070.0, 1080.0),
+        )
+        upper_self_fragment = Detection(
+            0,
+            "player",
+            0.88,
+            (850.0, 850.0, 910.0, 920.0),
+        )
+        distinct_small_opponent = Detection(
+            0,
+            "player",
+            0.86,
+            (1100.0, 500.0, 1160.0, 580.0),
+        )
+
+        retained = _exclude_automatic_detail_self_relatives(
+            [upper_self_fragment, distinct_small_opponent],
+            self.frame_shape,
+            self_references=[visible_self],
+        )
+
+        self.assertEqual(retained, (distinct_small_opponent,))
+
+        # The ordinary post-filter guard must enforce the same relationship
+        # after the temporal filter positively identifies the full self box.
+        guarded = _apply_hard_aim_guard(
+            [upper_self_fragment, distinct_small_opponent],
+            self.frame_shape,
+            self_zone=NormalizedBottomZone(0.18, 0.34, 0.10),
+            aim_label="player",
+            configured_confidence=0.25,
+            confirmed_self_detection=visible_self,
+        )
+        self.assertEqual(guarded.detections, (distinct_small_opponent,))
+        self.assertEqual(
+            guarded.removed_detections,
+            (upper_self_fragment,),
+        )
+
+    def test_cold_start_detail_only_lower_edge_self_fragment_is_rejected(
+        self,
+    ) -> None:
+        fragment = Detection(
+            0,
+            "player",
+            0.88,
+            (850.0, 850.0, 910.0, 920.0),
+        )
+
+        retained = _exclude_automatic_detail_lower_edge_self_fragments(
+            [fragment],
+            [],
+            self.frame_shape,
+            detail_plan=self.plan,
+            self_zone=NormalizedBottomZone(0.18, 0.34, 0.10),
+        )
+
+        self.assertEqual(retained, ())
+
+    def test_lower_edge_rule_retains_safe_small_and_matched_boundaries(
+        self,
+    ) -> None:
+        zone = NormalizedBottomZone(0.18, 0.34, 0.10)
+        crop_bottom = self.plan.crop_y + self.plan.applied_crop_height
+        edge_threshold = crop_bottom - (
+            AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS
+            * self.plan.applied_crop_height
+            / self.plan.model_height
+        )
+        safe_central = Detection(
+            0,
+            "player",
+            0.86,
+            (1100.0, 500.0, 1160.0, 580.0),
+        )
+        just_above_edge_margin = Detection(
+            0,
+            "player",
+            0.87,
+            (850.0, edge_threshold - 60.0, 910.0, edge_threshold - 0.01),
+        )
+        at_rejected_boundary = Detection(
+            0,
+            "player",
+            0.88,
+            (850.0, edge_threshold - 60.0, 910.0, edge_threshold),
+        )
+        matched_primary = Detection(
+            0,
+            "player",
+            0.24,
+            (848.0, edge_threshold - 62.0, 912.0, edge_threshold + 2.0),
+        )
+
+        without_parent = _exclude_automatic_detail_lower_edge_self_fragments(
+            [safe_central, just_above_edge_margin, at_rejected_boundary],
+            [],
+            self.frame_shape,
+            detail_plan=self.plan,
+            self_zone=zone,
+        )
+        with_parent = _exclude_automatic_detail_lower_edge_self_fragments(
+            [at_rejected_boundary],
+            [matched_primary],
+            self.frame_shape,
+            detail_plan=self.plan,
+            self_zone=zone,
+        )
+
+        self.assertEqual(
+            without_parent,
+            (safe_central, just_above_edge_margin),
+        )
+        self.assertEqual(with_parent, (at_rejected_boundary,))
 
 
 class CrossPassMergeTests(unittest.TestCase):
