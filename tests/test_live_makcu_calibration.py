@@ -19,6 +19,7 @@ from aiming.makcu import MakcuTelemetrySnapshot
 from aiming.makcu_calibration import AxisCalibrationFit, MakcuCalibrationFit
 from aiming.makcu_calibration_activation import (
     ActiveMakcuCalibrationProfile,
+    CalibrationActivationBindingError,
     _profile_digest,
     write_active_profile_atomic,
 )
@@ -33,6 +34,7 @@ from main import (
     _calibration_model_sha256,
     _calibration_observation_and_target,
     _calibration_observation_target_and_readiness,
+    _validate_direct_head_plant_profile_binding,
     run,
 )
 from utils.live_report import snapshot_artifact
@@ -1041,7 +1043,13 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             aim_mode="ads",
         )
 
-    def _automatic_binding(self, config, *, build_identity="test-build"):
+    def _automatic_binding(
+        self,
+        config,
+        *,
+        source_commit="7be5eb1",
+        build_identity="test-build",
+    ):
         detector = _FakeDetector(
             model_path=self.model,
             inference_size=config.inference_size,
@@ -1054,7 +1062,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             makcu_identity_token="c" * 64,
             model_artifact_snapshot=snapshot_artifact(self.model),
             labels_artifact_snapshot=snapshot_artifact(self.labels),
-            source_identity=("7be5eb1", build_identity),
+            source_identity=(source_commit, build_identity),
         )
 
     def _write_profile(self, *, binding=None):
@@ -1424,7 +1432,9 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         profile = self._write_profile(
             binding=self._automatic_binding(
                 config,
-                # Only this dirty-tree identity may differ from the live run.
+                # Source provenance may differ without changing the physical
+                # count-to-pixel plant measured by this profile.
+                source_commit="5c03f73",
                 build_identity="older-clean-build",
             )
         )
@@ -1490,6 +1500,39 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(metadata["plant_effective_delay_seconds"], 0.012)
         self.assertAlmostEqual(metadata["plant_delay_upper_seconds"], 0.013)
         self.assertEqual(metadata["plant_delay_seconds"], 0.012)
+
+    def test_direct_head_plant_reuse_ignores_only_source_provenance(self) -> None:
+        runtime = self._automatic_binding(self.automatic_config)
+        prior_source = self._automatic_binding(
+            self.automatic_config,
+            source_commit="5c03f73",
+            build_identity="older-clean-build",
+        )
+
+        _validate_direct_head_plant_profile_binding(prior_source, runtime)
+
+        mismatches = {
+            "model_sha256": "a" * 64,
+            "runtime_version": "older-runtime",
+            "provider_options_sha256": "b" * 64,
+            "physical_device_token": "e" * 64,
+            "capture_fps": runtime.capture_fps / 2.0,
+            "makcu_identity_token": "f" * 64,
+            "activation_button": (runtime.activation_button + 1) % 5,
+            "head_ratio": min(runtime.head_ratio + 0.05, 0.5),
+        }
+        for field_name, changed_value in mismatches.items():
+            with (
+                self.subTest(field=field_name),
+                self.assertRaisesRegex(
+                    CalibrationActivationBindingError,
+                    rf"runtime fields: {field_name}$",
+                ),
+            ):
+                _validate_direct_head_plant_profile_binding(
+                    replace(prior_source, **{field_name: changed_value}),
+                    runtime,
+                )
 
     def test_recommended_direct_head_step_uses_measured_per_axis_envelope(self) -> None:
         head_runtime = mock.Mock()

@@ -5949,10 +5949,11 @@ def _validate_direct_head_plant_profile_binding(
 ) -> None:
     """Require the exact physical plant boundary used by direct-head control.
 
-    ``source_commit`` remains exact.  ``build_identity`` includes every local
-    source-tree byte, however, so any live controller repair would otherwise
-    invalidate a still-current physical MAKCU/game response measurement.  The
-    automatic detail rescue changes candidate acquisition, not the measured
+    Source revision and build identity remain recorded as audit provenance,
+    but neither identifies the physical MAKCU/game response plant.  Requiring
+    either to match would make committing an otherwise accepted controller
+    repair invalidate unchanged gain/delay measurements.  The automatic detail
+    rescue changes candidate acquisition, not the measured
     MAKCU-count-to-screen-pixel plant, so its runtime-only detail flag is also
     excluded.  No model, provider, capture, device, button, geometry, or
     aim-context field receives that plant-only exception.
@@ -5972,7 +5973,7 @@ def _validate_direct_head_plant_profile_binding(
         raise TypeError("direct-head plant bindings must be CalibrationRuntimeBinding")
     if not isinstance(runtime_detail_pass_enabled, bool):
         raise TypeError("runtime_detail_pass_enabled must be a bool")
-    plant_only_exceptions = {"build_identity"}
+    plant_only_exceptions = {"source_commit", "build_identity"}
     if runtime_detail_pass_enabled:
         plant_only_exceptions.add("detail_pass_enabled")
     mismatches = tuple(
