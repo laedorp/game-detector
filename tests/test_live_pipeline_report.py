@@ -1899,10 +1899,6 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         head_runtime.consume_motion_corroboration_revocation.return_value = False
         head_runtime.take_latest.side_effect = [direct_sample, None, None, None]
         head_runtime.visible_sample.side_effect = mapped_samples
-        head_runtime.verified_flow_point_for_frame.return_value = (
-            930.0,
-            450.0,
-        )
         head_runtime.revoke_body.return_value = False
         head_runtime.stop.return_value = True
 
@@ -1971,10 +1967,6 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         for submit_call in head_runtime.submit.call_args_list:
             self.assertIs(submit_call.args[1], opponent)
         head_runtime.revoke_body.assert_not_called()
-        self.assertEqual(
-            head_runtime.verified_flow_point_for_frame.call_count,
-            3,
-        )
 
         controller = RecordingMakcuController.instances[0]
         self.assertEqual(len(controller.updates), 5)

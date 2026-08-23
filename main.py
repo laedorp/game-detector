@@ -949,11 +949,6 @@ class _AutomaticHeadRuntime:
         self._mapped_anchor_filtered_normalized: tuple[float, float] | None = None
         self._mapped_anchor_direct_timestamp_ns: int | None = None
         self._mapped_qualified_center: tuple[float, float] | None = None
-        # Last exact measured geometry admitted to the mapped controller
-        # channel.  Keep it across a short prediction/body gap so the first
-        # returning detector box can be checked as a shape observation instead
-        # of being allowed to reseed the head point unconditionally.
-        self._mapped_reference_box: tuple[float, float, float, float] | None = None
         self._mapped_velocity_translation_point: tuple[float, float] | None = None
         self._mapped_velocity_reconcile_point: tuple[float, float] | None = None
         self._mapped_filter_timestamp_ns: int | None = None
@@ -1014,7 +1009,6 @@ class _AutomaticHeadRuntime:
         self._mapped_anchor_filtered_normalized = None
         self._mapped_anchor_direct_timestamp_ns = None
         self._mapped_qualified_center = None
-        self._mapped_reference_box = None
         self._mapped_velocity_translation_point = None
         self._mapped_velocity_reconcile_point = None
         self._mapped_filter_timestamp_ns = None
@@ -1447,100 +1441,6 @@ class _AutomaticHeadRuntime:
             and center_dy < max(ah, bh) * 0.80
         )
 
-    def _returning_mapped_geometry_is_safe(
-        self,
-        mapping_box,
-        *,
-        source_timestamp_ns: int,
-    ) -> bool:
-        """Reject a box-mode flip when exact geometry returns after a gap.
-
-        Fast rigid translation is intentionally removed before measuring the
-        innovation: the retained mapped head and the candidate box are both
-        translated by their respective box centers.  What remains is detector
-        scale/top-edge deformation, which is not evidence that the physical
-        head moved.  This check is used only on the first exact measurement
-        after prediction or a suspended body gap; ordinary continuous exact
-        tracking keeps its established behavior.
-        """
-
-        reference_box = self._mapped_reference_box
-        previous_point = self._mapped_filter_input_point
-        normalized = self._mapped_anchor_filtered_normalized
-        previous_timestamp_ns = self._mapped_filter_timestamp_ns
-        if (
-            reference_box is None
-            or previous_point is None
-            or normalized is None
-            or previous_timestamp_ns is None
-        ):
-            return True
-        try:
-            current_box = tuple(float(value) for value in mapping_box)
-            current_timestamp_ns = int(source_timestamp_ns)
-        except (TypeError, ValueError):
-            return False
-        if (
-            len(current_box) != 4
-            or not all(math.isfinite(value) for value in current_box)
-            or current_timestamp_ns <= previous_timestamp_ns
-        ):
-            return False
-        previous_width = reference_box[2] - reference_box[0]
-        previous_height = reference_box[3] - reference_box[1]
-        current_width = current_box[2] - current_box[0]
-        current_height = current_box[3] - current_box[1]
-        if (
-            min(
-                previous_width,
-                previous_height,
-                current_width,
-                current_height,
-            )
-            <= 0.0
-        ):
-            return False
-        width_ratio = min(previous_width, current_width) / max(
-            previous_width,
-            current_width,
-        )
-        height_ratio = min(previous_height, current_height) / max(
-            previous_height,
-            current_height,
-        )
-        area_ratio = min(
-            previous_width * previous_height,
-            current_width * current_height,
-        ) / max(
-            previous_width * previous_height,
-            current_width * current_height,
-        )
-        if width_ratio < 0.65 or height_ratio < 0.65 or area_ratio < 0.45:
-            return False
-
-        previous_center = (
-            (reference_box[0] + reference_box[2]) * 0.5,
-            (reference_box[1] + reference_box[3]) * 0.5,
-        )
-        current_center = (
-            (current_box[0] + current_box[2]) * 0.5,
-            (current_box[1] + current_box[3]) * 0.5,
-        )
-        translated_previous = (
-            previous_point[0] + current_center[0] - previous_center[0],
-            previous_point[1] + current_center[1] - previous_center[1],
-        )
-        candidate = (
-            current_box[0] + normalized[0] * current_width,
-            current_box[1] + normalized[1] * current_height,
-        )
-        tolerance = self._flow_body_residual_tolerance(
-            reference_box,
-            current_box,
-            elapsed_ns=current_timestamp_ns - previous_timestamp_ns,
-        )
-        return math.dist(candidate, translated_previous) <= tolerance
-
     @staticmethod
     def _head_point_belongs_to_player(point, player_box) -> bool:
         """Require a direct point to remain in the current body's head region."""
@@ -1568,17 +1468,17 @@ class _AutomaticHeadRuntime:
         player_box,
         head_box=None,
     ) -> tuple[float, float, float, float] | None:
-        """Return a fallback feature ROI strictly inside one exact body.
+        """Return a long-range-only fallback ROI inside one exact body.
 
-        Head-only LK remains the first choice. If it lacks enough reliable
-        texture, the exact primary body is already the identity authority, so
-        LK may retry from the central upper 80% width and upper 44% height
-        while continuing to move only the verified head point and head box.
-        The fallback retains the existing forward/backward, inlier-span,
-        displacement, identity, and body-residual gates. Keeping every edge
-        strictly inside the exact body avoids admitting background or a
-        neighboring player, including for close targets where build effects
-        made the head-only stream collapse in the recorded run.
+        Long-range direct-head boxes can be only a few source pixels across,
+        and the fixed crosshair exclusion may leave no independent corners.
+        The exact primary body is already the identity authority, so LK may
+        retry a failed head-only measurement from the central upper 80% width
+        and upper 44% height while continuing to move only the head point and
+        head box. At normal range, keep the established head-only flow path:
+        the broader ROI is enabled only for an at-most-80-pixel body or an
+        at-most-18-pixel head dimension. Keeping every edge strictly inside
+        the exact body avoids admitting background or a neighboring player.
         """
 
         x1, y1, x2, y2 = (float(value) for value in player_box)
@@ -1590,6 +1490,7 @@ class _AutomaticHeadRuntime:
             or height <= 0.0
         ):
             raise ValueError("player_box must have finite positive geometry")
+        tiny_head = False
         if head_box is not None:
             hx1, hy1, hx2, hy2 = (float(value) for value in head_box)
             head_width = hx2 - hx1
@@ -1603,6 +1504,9 @@ class _AutomaticHeadRuntime:
                 or head_height <= 0.0
             ):
                 raise ValueError("head_box must have finite positive geometry")
+            tiny_head = min(head_width, head_height) <= 18.0
+        if height > 80.0 and not tiny_head:
+            return None
         return (
             x1 + width * 0.10,
             y1 + height * 0.01,
@@ -2200,27 +2104,8 @@ class _AutomaticHeadRuntime:
                 or self._current_player_timestamp_ns is None
                 else body_timestamp_ns - self._current_player_timestamp_ns
             )
-            returning_to_exact_measurement = bool(
-                corroboration is not None
-                and body_timestamp_ns is not None
-                and (
-                    self._body_gap_suspended
-                    or (self.body_valid and not self._current_body_observed)
-                )
-            )
-            returning_mapping_box = (
-                candidate if mapped_geometry is None else mapped_geometry
-            )
-            returning_geometry_safe = bool(
-                not returning_to_exact_measurement
-                or self._returning_mapped_geometry_is_safe(
-                    returning_mapping_box,
-                    source_timestamp_ns=body_timestamp_ns,
-                )
-            )
             ordinary_body_association = bool(
-                returning_geometry_safe
-                and self._current_player_box is not None
+                self._current_player_box is not None
                 and self._player_boxes_associate(
                     self._current_player_box,
                     candidate,
@@ -2241,8 +2126,7 @@ class _AutomaticHeadRuntime:
             # valid head anchor during fast camera-plus-target motion in the
             # recorded run; disjoint and predicted geometry stay conservative.
             same_generation_measured_motion = bool(
-                returning_geometry_safe
-                and self.body_valid
+                self.body_valid
                 and self._current_player_box is not None
                 and self._player_boxes_associate(
                     self._current_player_box,
@@ -2264,8 +2148,7 @@ class _AutomaticHeadRuntime:
                 )
             )
             confirmed_trajectory_continues = bool(
-                returning_geometry_safe
-                and not ordinary_body_association
+                not ordinary_body_association
                 and not same_generation_measured_motion
                 and corroboration is not None
                 and track_generation is not None
@@ -2619,10 +2502,7 @@ class _AutomaticHeadRuntime:
         self._clear_live_flow()
         self._clear_phase_history()
         self._capture_phase_body_timestamp_ns = None
-        # Keep the private causal map across this output-disabled interval.
-        # The first same-generation exact return is shape-checked against it
-        # and then slew-limited normally. Identity advance, expiry, and an
-        # over-stale interval still reset/reseed it explicitly.
+        self._reset_mapped_filter()
         return True
 
     @property
@@ -3700,9 +3580,8 @@ class _AutomaticHeadRuntime:
                 velocity_point = body_velocity_point
         else:
             # Prediction is display-only and is a physical observation gap.
-            # Do not advance or publish the causal controller-input filter.
-            # Retaining its last exact state prevents the first measured frame
-            # after a short gap from bypassing the innovation/slew bounds.
+            # Do not advance or preserve the causal controller-input filter.
+            self._reset_mapped_filter()
             filtered_point = anchored.point
             velocity_point = anchored.point
             pixel_tracked = False
@@ -3936,7 +3815,6 @@ class _AutomaticHeadRuntime:
         self._mapped_filter_input_point = qualified_input
         self._mapped_velocity_filter_point = velocity_filtered
         self._mapped_qualified_center = qualified_center
-        self._mapped_reference_box = tuple(float(value) for value in mapping_box)
         self._mapped_velocity_translation_point = translation_point
         self._mapped_velocity_reconcile_point = reconcile_point
         self._mapped_filter_timestamp_ns = timestamp_ns
@@ -4248,45 +4126,6 @@ class _AutomaticHeadRuntime:
             and self._tracker_generation is not None
             and anchor_generation == self._tracker_generation
         )
-
-    def verified_flow_point_for_frame(
-        self,
-        *,
-        source_timestamp_ns: int,
-        now_ns: int,
-    ) -> tuple[float, float] | None:
-        """Return an exact-frame pixel endpoint for the live anchored target.
-
-        The capture mailbox can phase a verified head into the frame that the
-        primary detector consumes on the following loop iteration.  Exposing
-        only that exact timestamp match lets the self-filter integration keep
-        a known opponent cluster out of self-avatar acquisition without using
-        stale geometry or granting a new identity.
-        """
-
-        source_ns = int(source_timestamp_ns)
-        current_ns = int(now_ns)
-        if source_ns < 0 or current_ns < 0:
-            raise ValueError("verified flow timestamps cannot be negative")
-        deadline_ns = self.anchor.identity_deadline_ns
-        point = self._flow_point
-        if (
-            not self.body_valid
-            or not self._current_body_observed
-            or self._body_update_deferred
-            or not self._flow_coordinate_current
-            or not self._flow_pixel_observed_current
-            or point is None
-            or self._flow_source_timestamp_ns != source_ns
-            or deadline_ns is None
-            or max(source_ns, current_ns) >= deadline_ns
-            or self._tracker_generation is None
-            or self.anchor.track_generation != self._tracker_generation
-        ):
-            return None
-        if not all(math.isfinite(value) for value in point):
-            return None
-        return point
 
     def body_fallback_no_decoded_deadline_ns(self, *, now_ns: int) -> int | None:
         """Return the immutable deadline for one clean head-decoder miss.
@@ -5851,68 +5690,6 @@ def _aim_detections_safely_distinct_from_uncertain_self(
         for detection in distinct
     )
     return distinct if has_current_target_authority else ()
-
-
-def _verified_flow_continuation_cluster(
-    detections,
-    frame_shape: tuple[int, ...],
-    *,
-    previous_player,
-    verified_head_point: tuple[float, float] | None,
-    aim_label: str,
-    confidence_floor: float,
-    self_zone,
-) -> tuple[object, ...]:
-    """Protect only the exact opponent cluster proven by current head pixels.
-
-    A close opponent can enter the configured bottom self zone and make the
-    heuristic self filter ambiguous.  Cold acquisition remains fail-closed.
-    During an already measured direct-head lease, however, LK may have moved
-    that same head into this exact captured frame.  Retain only detections that
-    both associate with the preceding measured player and anatomically contain
-    that exact-frame pixel endpoint.  The stricter obvious-bottom avatar guard
-    still has final authority.
-    """
-
-    if previous_player is None or verified_head_point is None:
-        return ()
-    threshold = float(confidence_floor)
-    if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
-        raise ValueError("continuation confidence floor must be in [0,1]")
-    normalized_label = str(aim_label).strip().casefold()
-    if not normalized_label:
-        raise ValueError("aim label must not be empty")
-    associated = tuple(
-        detection
-        for detection in detections
-        if (
-            str(getattr(detection, "class_name", "")).strip().casefold()
-            == normalized_label
-            and float(getattr(detection, "confidence", float("-inf")))
-            >= threshold
-            and _AutomaticHeadRuntime._player_boxes_associate(
-                previous_player.box,
-                detection.box,
-            )
-            and _AutomaticHeadRuntime._head_point_belongs_to_player(
-                verified_head_point,
-                detection.box,
-            )
-        )
-    )
-    if not associated:
-        return ()
-    guarded = _apply_hard_aim_guard(
-        associated,
-        frame_shape,
-        self_zone=self_zone,
-        aim_label=aim_label,
-        configured_confidence=threshold,
-        confirmed_self_detection=None,
-        unconfirmed_zone_guard=False,
-        obvious_bottom_shoulder_guard=True,
-    )
-    return guarded.detections
 
 
 def _exclude_automatic_detail_self_relatives(
@@ -8016,66 +7793,9 @@ def run(config: AppConfig) -> int:
             self_exclusion_ready = self_filter is None
             aim_self_exclusion_safe = self_exclusion_ready
             uncertain_self_safe_aim_source: tuple[object, ...] | None = None
-            verified_flow_continuation: tuple[object, ...] = ()
             if self_filter is not None:
-                previous_measured_player = (
-                    None
-                    if target_tracker is None
-                    else getattr(
-                        target_tracker,
-                        "accepted_measurement",
-                        None,
-                    )
-                )
-                verified_flow_point = None
-                flow_point_reader = getattr(
-                    automatic_head_runtime,
-                    "verified_flow_point_for_frame",
-                    None,
-                )
-                if (
-                    automatic_direct_head_requested
-                    and automatic_frame_activation_active is True
-                    and previous_measured_player is not None
-                    and callable(flow_point_reader)
-                ):
-                    candidate_flow_point = flow_point_reader(
-                        source_timestamp_ns=packet.read_started_ns,
-                        now_ns=perf_counter_ns(),
-                    )
-                    if (
-                        isinstance(candidate_flow_point, tuple)
-                        and len(candidate_flow_point) == 2
-                    ):
-                        verified_flow_point = candidate_flow_point
-                if (
-                    verified_flow_point is not None
-                    and config.aim_label is not None
-                    and self_zone is not None
-                ):
-                    verified_flow_continuation = (
-                        _verified_flow_continuation_cluster(
-                            calibration_detections,
-                            packet.image.shape,
-                            previous_player=previous_measured_player,
-                            verified_head_point=verified_flow_point,
-                            aim_label=config.aim_label,
-                            confidence_floor=(
-                                AUTOMATIC_DIRECT_HEAD_ACQUISITION_CONFIDENCE_FLOOR
-                            ),
-                            self_zone=self_zone,
-                        )
-                    )
-                protected_detection_ids = {
-                    id(detection) for detection in verified_flow_continuation
-                }
-                self_filter_input = tuple(
-                    detection
-                    for detection in all_detections
-                    if id(detection) not in protected_detection_ids
-                )
                 exclusion = self_filter.apply(
-                    self_filter_input,
+                    all_detections,
                     packet.image.shape,
                 )
                 if exclusion.ignored_detection is not None:
@@ -8089,14 +7809,7 @@ def run(config: AppConfig) -> int:
                     # the full-pass parent is temporarily absent, without
                     # permanently suppressing a later distinct opponent.
                     automatic_detail_confirmed_self_detection = None
-                retained_detection_ids = {
-                    id(detection) for detection in exclusion.detections
-                } | protected_detection_ids
-                all_detections = tuple(
-                    detection
-                    for detection in calibration_detections
-                    if id(detection) in retained_detection_ids
-                )
+                all_detections = tuple(exclusion.detections)
                 detections, continuation_detections = (
                     _partition_detections_by_confidence(
                         all_detections,
@@ -8121,17 +7834,6 @@ def run(config: AppConfig) -> int:
                 self_exclusion_ready = exclusion.aim_safe
                 aim_self_exclusion_safe = self_exclusion_ready
                 if (
-                    verified_flow_continuation
-                    and not self_exclusion_ready
-                ):
-                    # The heuristic may remain uncertain about a separate
-                    # avatar, but only the exact-frame pixel-bound opponent
-                    # cluster is eligible for this continuation update.
-                    uncertain_self_safe_aim_source = (
-                        verified_flow_continuation
-                    )
-                    aim_self_exclusion_safe = True
-                elif (
                     automatic_direct_head_requested
                     and not self_exclusion_ready
                     and aim_configured_confidence is not None
@@ -9183,9 +8885,6 @@ def run(config: AppConfig) -> int:
                             "self_exclusion_ready": bool(self_exclusion_ready),
                             "aim_self_exclusion_safe": bool(
                                 aim_self_exclusion_safe
-                            ),
-                            "verified_flow_self_continuation": bool(
-                                verified_flow_continuation
                             ),
                             "hard_guard_revoked_prediction_grace": bool(
                                 hard_guard_revoked_prediction_grace

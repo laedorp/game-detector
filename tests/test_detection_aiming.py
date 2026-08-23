@@ -37,7 +37,6 @@ from main import (
     _target_tracker_telemetry_summary,
     _update_aim_target,
     _validate_aim_safety,
-    _verified_flow_continuation_cluster,
 )
 from utils.render import draw_aim_target
 from utils.self_filter import NormalizedBottomZone, SelfAvatarFilter
@@ -404,80 +403,6 @@ class AimingControllerTests(unittest.TestCase):
 
         self.assertEqual(result.detections, ())
         self.assertTrue(result.targetless_after_exact_removal)
-
-    def test_verified_flow_protects_only_recorded_opponent_cluster(self) -> None:
-        frame_shape = (1080, 1920, 3)
-        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
-        previous = Detection(
-            0,
-            "player",
-            0.377,
-            (659.87, 473.84, 854.31, 962.69),
-        )
-        opponent_duplicates = (
-            Detection(0, "player", 0.646, (683.6, 473.4, 885.4, 987.2)),
-            Detection(0, "player", 0.318, (698.2, 476.2, 891.1, 985.5)),
-        )
-        inset_self = Detection(
-            0,
-            "player",
-            0.1514,
-            (77.37, 283.41, 542.58, 1074.35),
-        )
-
-        protected = _verified_flow_continuation_cluster(
-            (*opponent_duplicates, inset_self),
-            frame_shape,
-            previous_player=previous,
-            verified_head_point=(732.85, 526.19),
-            aim_label="player",
-            confidence_floor=0.15,
-            self_zone=zone,
-        )
-
-        self.assertEqual(protected, opponent_duplicates)
-
-    def test_verified_flow_cannot_protect_recorded_inset_self_avatar(self) -> None:
-        frame_shape = (1080, 1920, 3)
-        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
-        inset_self = Detection(
-            0,
-            "player",
-            0.1514,
-            (77.37, 283.41, 542.58, 1074.35),
-        )
-
-        protected = _verified_flow_continuation_cluster(
-            (inset_self,),
-            frame_shape,
-            previous_player=inset_self,
-            verified_head_point=(300.0, 350.0),
-            aim_label="player",
-            confidence_floor=0.15,
-            self_zone=zone,
-        )
-
-        self.assertEqual(protected, ())
-
-    def test_verified_flow_continuation_requires_exact_frame_head(self) -> None:
-        player = Detection(0, "player", 0.9, (680.0, 470.0, 890.0, 988.0))
-
-        self.assertEqual(
-            _verified_flow_continuation_cluster(
-                (player,),
-                (1080, 1920, 3),
-                previous_player=player,
-                verified_head_point=None,
-                aim_label="player",
-                confidence_floor=0.15,
-                self_zone=NormalizedBottomZone(
-                    left=0.18,
-                    width=0.34,
-                    height=0.10,
-                ),
-            ),
-            (),
-        )
 
     def test_confirmed_self_removal_retains_distinct_in_zone_opponent(self) -> None:
         frame_shape = (1080, 1920, 3)

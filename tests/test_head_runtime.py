@@ -859,7 +859,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertGreaterEqual(len(worker.submissions), 899)
         self.assertLessEqual(len(worker.submissions), 901)
 
-    def test_failed_head_flow_can_use_exact_upper_body_roi_at_any_range(self) -> None:
+    def test_long_range_flow_fallback_tracks_exact_upper_body_roi(self) -> None:
         worker = _FakeWorker()
         phase_advancer = _ScriptedPhaseAdvancer(
             ((133.0, 107.0), (136.0, 107.0))
@@ -924,12 +924,11 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
             runtime._flow_feature_box,
             (114.0, 100.76, 178.0, 134.2),
         )
-        self.assertEqual(
+        self.assertIsNone(
             runtime._flow_feature_box_for_player(
                 self.player.box,
                 (180.0, 120.0, 220.0, 180.0),
-            ),
-            (120.0, 106.0, 280.0, 370.0),
+            )
         )
 
     def test_anchored_maintenance_survives_single_lk_loss_without_gpu_burst(
@@ -1931,19 +1930,6 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertFalse(peeked.body_derived_motion_permitted)
         self.assertIsNone(peeked.body_derived_motion_deadline_ns)
         self.assertIsNone(peeked.corroboration_point)
-        self.assertEqual(
-            runtime.verified_flow_point_for_frame(
-                source_timestamp_ns=peek_ns,
-                now_ns=peek_ns + 1,
-            ),
-            peeked.point,
-        )
-        self.assertIsNone(
-            runtime.verified_flow_point_for_frame(
-                source_timestamp_ns=peek_ns + 1,
-                now_ns=peek_ns + 1,
-            )
-        )
 
         # A second uninferred endpoint cannot chain from the first one.
         self.assertFalse(
@@ -2312,77 +2298,6 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertIsNone(safe.corroboration_point)
         self.assertFalse(safe.phase_advanced)
         self.assertTrue(runtime.consume_motion_corroboration_revocation())
-
-    def test_box_mode_flip_after_prediction_is_quarantined_without_snap(
-        self,
-    ) -> None:
-        generation = 26
-        first_ns = 100_000_000
-        predicted_ns = 112_000_000
-        outlier_ns = 125_000_000
-        recovered_ns = 138_000_000
-        first_box = (899.95, 452.24, 1000.02, 655.76)
-        outlier_box = (881.86, 326.28, 1053.54, 698.51)
-        recovered_box = (902.0, 454.0, 1002.0, 658.0)
-        direct_point = (945.4, 473.9)
-        self.runtime.accept_body(
-            first_box,
-            aim_box=first_box,
-            corroboration_box=first_box,
-            track_generation=generation,
-            source_timestamp_ns=first_ns,
-        )
-        self.worker.result = _result(
-            source_ns=first_ns,
-            point=direct_point,
-            selected_player_box=first_box,
-        )
-        self.assertIsNotNone(self.runtime.take_latest(now_ns=first_ns + 1))
-        original = self.runtime.visible_sample(now_ns=first_ns + 1)
-        assert original is not None
-        original_filter_point = self.runtime._mapped_filter_point
-        original_reference_box = self.runtime._mapped_reference_box
-
-        self.runtime.accept_body(
-            first_box,
-            aim_box=first_box,
-            corroboration_box=None,
-            track_generation=generation,
-            source_timestamp_ns=predicted_ns,
-        )
-        self.assertIsNone(self.runtime.take_latest(now_ns=predicted_ns + 1))
-        self.assertEqual(self.runtime._mapped_filter_point, original_filter_point)
-        self.assertEqual(self.runtime._mapped_reference_box, original_reference_box)
-
-        self.assertFalse(
-            self.runtime.accept_body(
-                outlier_box,
-                aim_box=outlier_box,
-                corroboration_box=outlier_box,
-                track_generation=generation,
-                source_timestamp_ns=outlier_ns,
-            )
-        )
-        self.assertTrue(self.runtime.body_update_deferred)
-        self.assertIsNone(self.runtime.visible_sample(now_ns=outlier_ns + 1))
-        self.assertEqual(self.runtime.identity_generation, 0)
-        self.assertEqual(self.runtime._mapped_filter_point, original_filter_point)
-
-        self.assertFalse(
-            self.runtime.accept_body(
-                recovered_box,
-                aim_box=recovered_box,
-                corroboration_box=recovered_box,
-                track_generation=generation,
-                source_timestamp_ns=recovered_ns,
-            )
-        )
-        self.assertIsNone(self.runtime.take_latest(now_ns=recovered_ns + 1))
-        recovered = self.runtime.visible_sample(now_ns=recovered_ns + 1)
-        assert recovered is not None
-        self.assertFalse(self.runtime.body_update_deferred)
-        self.assertEqual(self.runtime.identity_generation, 0)
-        self.assertLess(math.dist(recovered.point, original.point), 8.0)
 
     def test_velocity_lp_duplicate_stale_and_prediction_boundaries(self) -> None:
         def sample(
@@ -3552,21 +3467,8 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.assertEqual(resumed.source_timestamp_ns, resumed_ns)
         self.assertEqual(resumed.direct_source_timestamp_ns, direct_ns)
         self.assertEqual(resumed.identity_deadline_ns, original_deadline_ns)
-        resumed_alpha = 1.0 - math.exp(
-            -(resumed_ns - direct_ns)
-            / (
-                AUTOMATIC_HEAD_MAPPED_FILTER_TIME_CONSTANT_SECONDS
-                * 1_000_000_000
-            )
-        )
-        self.assertAlmostEqual(
-            resumed.point[0],
-            original_point[0] + resumed_alpha * 8.0,
-        )
-        self.assertAlmostEqual(
-            resumed.point[1],
-            original_point[1] + resumed_alpha * 8.0,
-        )
+        self.assertAlmostEqual(resumed.point[0], original_point[0] + 8.0)
+        self.assertAlmostEqual(resumed.point[1], original_point[1] + 8.0)
 
     def test_suspended_anchor_cannot_cross_generation_or_unsafe_revoke(self) -> None:
         generation = 11
