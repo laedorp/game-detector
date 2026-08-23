@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import ast
+from dataclasses import fields, replace
+import inspect
 import json
 from pathlib import Path
 import sys
 import tempfile
+import textwrap
 import types
 import unittest
 from unittest import mock
@@ -40,9 +44,19 @@ from launcher.settings import (
     SETTINGS_VERSION,
     load_settings,
     model_preset,
+    model_preset_detail_crop_text,
     model_preset_paths,
     save_settings,
 )
+from utils.inference_size import format_inference_size
+from utils.release_model_contract import load_release_default_contract
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+RELEASE_DEFAULT = load_release_default_contract(PROJECT_ROOT)
+RELEASE_DEFAULT_PRESET = RELEASE_DEFAULT["preset"]
+RELEASE_DEFAULT_SHAPE = RELEASE_DEFAULT["input_shape_nchw"][2:4]
+RELEASE_DEFAULT_SIZE = format_inference_size(RELEASE_DEFAULT_SHAPE)
 
 
 class FakeVariable:
@@ -93,7 +107,7 @@ class ModelPresetSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED).label,
-            "Game players — Balanced 416 (Recommended)",
+            RELEASE_DEFAULT_PRESET["label"],
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED_INT8).label,
@@ -109,14 +123,14 @@ class ModelPresetSettingsTests(unittest.TestCase):
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_COCO_HIGH).label,
-            "Ultralytics YOLO11l — High-end 1080p test (GPU)",
+            "Benchmark only — YOLO11l 640 (slow, generic COCO)",
         )
         self.assertEqual(
             model_preset(MODEL_PRESET_COCO).label,
             "People — Fast 320",
         )
         player = model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED)
-        self.assertEqual(player.inference_size, 416)
+        self.assertEqual(format_inference_size(player.inference_size), RELEASE_DEFAULT_SIZE)
         self.assertIn("player", player.description.lower())
         self.assertEqual(model_preset(MODEL_PRESET_FORT_PLAYER).inference_size, 320)
         responsive = model_preset(MODEL_PRESET_FORT_PLAYER_BALANCED_INT8)
@@ -128,17 +142,51 @@ class ModelPresetSettingsTests(unittest.TestCase):
         self.assertIn("person", balanced.description.lower())
         high_end = model_preset(MODEL_PRESET_COCO_HIGH)
         self.assertEqual(high_end.inference_size, 640)
-        self.assertIn("gpu", high_end.description.lower())
+        self.assertIn("benchmark", high_end.description.lower())
+        self.assertIn("not recommended", high_end.description.lower())
 
-    def test_high_end_settings_keep_player_semantics_and_1080p_capture_defaults(self) -> None:
-        settings = LauncherSettings(model_tier="high")
+    def test_accuracy_workload_keeps_player_semantics_and_saved_capture_rate(self) -> None:
+        settings = LauncherSettings(
+            model_tier="high",
+            capture_width="1280",
+            capture_height="720",
+            capture_fps="60",
+            screen_fps="60",
+        )
 
         self.assertEqual(settings.model_preset, MODEL_PRESET_FORT_PLAYER_BALANCED)
-        self.assertEqual(settings.capture_width, "1920")
-        self.assertEqual(settings.capture_height, "1080")
-        self.assertEqual(settings.capture_fps, "100")
-        self.assertEqual(settings.screen_fps, "100")
-        self.assertEqual(settings.inference_size, "416")
+        self.assertEqual(settings.capture_width, "1280")
+        self.assertEqual(settings.capture_height, "720")
+        self.assertEqual(settings.capture_fps, "60")
+        self.assertEqual(settings.screen_fps, "60")
+        self.assertEqual(settings.inference_size, RELEASE_DEFAULT_SIZE)
+        expected_detail = RELEASE_DEFAULT["detail_crop_size_source_pixels"]
+        self.assertEqual(
+            settings.detail_crop_size,
+            str(expected_detail) if expected_detail else "",
+        )
+
+    def test_fresh_workload_follows_pointer_but_persisted_profile_is_not_opted_in(self) -> None:
+        selected = model_preset(DEFAULT_MODEL_PRESET)
+        configured = replace(selected, detail_crop_size_source_pixels=768)
+        with mock.patch.dict(
+            "launcher.settings._MODEL_PRESETS_BY_KEY",
+            {DEFAULT_MODEL_PRESET: configured},
+        ):
+            self.assertEqual(model_preset_detail_crop_text(DEFAULT_MODEL_PRESET), "768")
+            self.assertEqual(LauncherSettings().detail_crop_size, "768")
+            migrated = LauncherSettings.from_mapping(
+                {"version": SETTINGS_VERSION - 1, "model_preset": DEFAULT_MODEL_PRESET}
+            )
+            explicit = LauncherSettings.from_mapping(
+                {
+                    "version": SETTINGS_VERSION - 1,
+                    "model_preset": DEFAULT_MODEL_PRESET,
+                    "detail_crop_size": "512",
+                }
+            )
+        self.assertEqual(migrated.detail_crop_size, "")
+        self.assertEqual(explicit.detail_crop_size, "512")
 
     def test_high_end_coco_benchmark_remains_an_explicit_choice(self) -> None:
         settings = LauncherSettings(
@@ -147,6 +195,22 @@ class ModelPresetSettingsTests(unittest.TestCase):
 
         self.assertEqual(settings.model_preset, MODEL_PRESET_COCO_HIGH)
         self.assertEqual(settings.inference_size, "640")
+
+    def test_v4_explicit_benchmark_choice_is_preserved(self) -> None:
+        loaded = LauncherSettings.from_mapping(
+            {
+                "version": 4,
+                "model_tier": "high",
+                "model_preset": MODEL_PRESET_COCO_HIGH,
+                "screen_fps": "60",
+                "aim_label": "person",
+            }
+        )
+
+        self.assertEqual(loaded.model_preset, MODEL_PRESET_COCO_HIGH)
+        self.assertEqual(loaded.inference_size, "640")
+        self.assertEqual(loaded.screen_fps, "60")
+        self.assertEqual(loaded.aim_label, "person")
 
     def test_int8_player_preset_is_openvino_only_and_not_the_fresh_default(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -164,7 +228,10 @@ class ModelPresetSettingsTests(unittest.TestCase):
         self.assertEqual(int8.model_preset, MODEL_PRESET_FORT_PLAYER_BALANCED_INT8)
         self.assertIn("fort_player_416_int8.xml", int8.model_path)
         self.assertEqual(onnx.model_preset, DEFAULT_MODEL_PRESET)
-        self.assertIn("fort_player_416.onnx", onnx.model_path)
+        self.assertEqual(
+            Path(onnx.model_path).as_posix(),
+            (root / RELEASE_DEFAULT["artifacts"]["onnx"]["path"]).as_posix(),
+        )
 
     def test_fresh_settings_choose_recommended_pair_from_resource_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -174,7 +241,7 @@ class ModelPresetSettingsTests(unittest.TestCase):
                 expected = model_preset_paths(DEFAULT_MODEL_PRESET)
         self.assertEqual(settings.model_preset, MODEL_PRESET_FORT_PLAYER_BALANCED)
         self.assertEqual((settings.model_path, settings.labels_path), expected)
-        self.assertEqual(settings.inference_size, "416")
+        self.assertEqual(settings.inference_size, RELEASE_DEFAULT_SIZE)
 
     def test_bundled_pair_is_resolved_atomically_when_arguments_are_built(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -382,6 +449,26 @@ class ModelPresetUiStateTests(unittest.TestCase):
         self.assertEqual(self.launcher.labels_browse_button.state, "normal")
         self.assertEqual(self.launcher.output_format.get(), "traditional")
 
+    def test_explicit_recommended_choice_applies_pointer_workload(self) -> None:
+        self.launcher.detail_crop_size = FakeVariable("512")
+        self.launcher.model_preset.set(
+            MODEL_PRESET_LABELS[MODEL_PRESET_FORT_PLAYER_BALANCED]
+        )
+        with (
+            mock.patch(
+                "launcher.application.model_preset_paths",
+                return_value=("/bundle/recommended.xml", "/bundle/player.txt"),
+            ),
+            mock.patch(
+                "launcher.application.model_preset_detail_crop_text",
+                return_value="768",
+            ),
+            mock.patch.object(self.launcher, "_update_model_preset_controls"),
+        ):
+            self.launcher._model_preset_changed(object())  # type: ignore[arg-type]
+
+        self.assertEqual(self.launcher.detail_crop_size.get(), "768")
+
     def test_latest_custom_edits_are_cached_when_switching_away(self) -> None:
         self.launcher.model_path.set("/custom/new.xml")
         self.launcher.labels_path.set("/custom/new.txt")
@@ -404,6 +491,28 @@ class ModelPresetUiStateTests(unittest.TestCase):
             output_format="traditional",
         )
         self.assertEqual(settings.output_format, "auto")
+
+    def test_tk_form_collection_covers_every_launcher_setting(self) -> None:
+        """Keep the compatibility launcher from silently resetting new fields."""
+
+        tree = ast.parse(textwrap.dedent(inspect.getsource(DetectorLauncher._settings_from_form)))
+        constructor = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "LauncherSettings"
+        )
+        actual = {keyword.arg for keyword in constructor.keywords if keyword.arg is not None}
+        expected = {field.name for field in fields(LauncherSettings)}
+
+        self.assertEqual(actual, expected)
+        self.assertNotIn("self.settings", inspect.getsource(DetectorLauncher._settings_from_form))
+
+        backend = next(keyword for keyword in constructor.keywords if keyword.arg == "backend")
+        self.assertIsInstance(backend.value, ast.Call)
+        self.assertIsInstance(backend.value.func, ast.Attribute)
+        self.assertEqual(backend.value.func.attr, "get")
 
 
 if __name__ == "__main__":

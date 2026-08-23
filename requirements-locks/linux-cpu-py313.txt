@@ -1,0 +1,19 @@
+# ProAim release lock: Ubuntu 22.04-compatible Linux x86-64, CPython 3.13.14.
+# Hashes select the audited manylinux wheel or, for evdev, the audited sdist.
+# PySide6 6.9.3 is deliberate: 6.11.1's Linux wheel requires a newer glibc than
+# the ubuntu-22.04 release runner, while the Windows lock can use 6.11.1.
+altgraph==0.17.5 --hash=sha256:f3a22400bce1b0c701683820ac4f3b159cd301acab067c51c653e06961600597
+evdev==1.9.3 --hash=sha256:2c140e01ac8437758fa23fe5c871397412461f42d421aa20241dc8fe8cfccbc9
+flatbuffers==25.12.19 --hash=sha256:7634f50c427838bb021c2d66a3d1168e9d199b0607e6329399f04846d42e20b4
+mss==10.2.0 --hash=sha256:e79f428899280e7e64e38365b5bfed683851ebea807eeaeadaf06eb8e0d67197
+numpy==2.5.2 --hash=sha256:29b86ff8a6cc556b47ec6b64b194815cc80e6bf5eedcc6cddfd65318cb0b4eee
+onnxruntime==1.28.0 --hash=sha256:54fa221d669282bd8f582708ce4c96010a7e9fb0661f9006b37fe2fedafb73fe
+opencv-python==4.14.0.94 --hash=sha256:726a2b40c1120a0bbd0116394c6a5b2aa0a4dfa4e609a81ee10d12c6a34cd372
+openvino==2026.3.0 --hash=sha256:b7d09f20f009b9167a863f615a2b27400ce025bda8086cc72a2eb6ac3bf1d2af
+openvino-telemetry==2025.2.0 --hash=sha256:bcb667e83a44f202ecf4cfa49281715c6d7e21499daec04ff853b7f964833599
+protobuf==7.35.1 --hash=sha256:74758715c53d7158fb76caf4f0cfdacc5329a4b1bb994f865d6cf302d413a1c4
+pyinstaller==6.22.0 --hash=sha256:b07ac9fd1d661ae4d0af6752c3941e4e5576a16cfe7e2d6504a32d57e17d0acc
+pyinstaller-hooks-contrib==2026.6 --hash=sha256:fd13b8ac126b35361175edacd41a0d97080b75dd5f4b594ecefefff969509dd3
+pyserial==3.5 --hash=sha256:c4451db6ba391ca6ca299fb3ec7bae67a5c55dde170964c7a14ceefec02f2cf0
+pyside6-essentials==6.9.3 --hash=sha256:c70d5544e892b201a677b615156fab6a0fef865e7fc287f55a0eae00a682e83f
+shiboken6==6.9.3 --hash=sha256:f3f5337a3a8fc660ba1462265bd9a2bdda9588f8d90fbc3d5ac4ce3134c11e59

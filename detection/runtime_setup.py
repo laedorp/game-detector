@@ -38,7 +38,10 @@ DISTRIBUTION_ROCM = "onnxruntime-rocm"
 
 RUNTIME_REQUIREMENTS = {
     DISTRIBUTION_CPU: "onnxruntime==1.28.0",
-    DISTRIBUTION_NVIDIA: "onnxruntime-gpu==1.28.0",
+    # The extras install the matching CUDA 13 and cuDNN 9 user-space libraries
+    # used by the frozen/manual NVIDIA build; the display driver remains an
+    # explicit system prerequisite.
+    DISTRIBUTION_NVIDIA: "onnxruntime-gpu[cuda,cudnn]==1.28.0",
     DISTRIBUTION_DIRECTML: "onnxruntime-directml==1.24.4",
     DISTRIBUTION_ROCM: "onnxruntime-rocm==1.22.2.post3",
 }
@@ -131,10 +134,12 @@ def plan_for(vendor: str, system: str) -> RuntimePlan:
             )
         return RuntimePlan(
             DISTRIBUTION_ROCM,
-            "AMD GPUs run through the ROCm execution provider on Linux",
+            "legacy AMD Linux setups can use the ROCm execution provider",
             driver_note=(
-                "Install ROCm from AMD; RDNA2 cards such as the RX 6900/6950 "
-                "series commonly also need HSA_OVERRIDE_GFX_VERSION=10.3.0."
+                "This pinned provider is experimental and was removed from ONNX "
+                "Runtime after 1.22. Verify the exact GPU/OS against AMD's current "
+                "support matrix; use MIGraphX for a supported modern AMD stack. "
+                "The RX 6950 XT target should use DirectML on Windows."
             ),
         )
 

@@ -1,0 +1,607 @@
+name: Qualify one-time independent holdout
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Exact staged v* tag
+        required: true
+        type: string
+      source_build_run_id:
+        description: Exact tagged release-candidate build run ID
+        required: true
+        type: string
+      candidate_manifest_sha256:
+        description: Exact staged RELEASE-CANDIDATE-MANIFEST.json SHA-256
+        required: true
+        type: string
+      directml_zip_sha256:
+        description: Exact staged Windows DirectML ZIP SHA-256
+        required: true
+        type: string
+      amd_evidence_run_id:
+        description: Successful RX 6950 XT DirectML qualification run ID
+        required: true
+        type: string
+      amd_adapter_index:
+        description: Exact RX 6950 XT DXGI adapter index
+        required: true
+        type: number
+      amd_evidence_archive_sha256:
+        description: Sealed RX 6950 XT evidence ZIP SHA-256
+        required: true
+        type: string
+      amd_qualification_manifest_sha256:
+        description: RX 6950 XT inner qualification-manifest SHA-256
+        required: true
+        type: string
+      amd_physical_attestation_sha256:
+        description: RX 6950 XT physical-attestation SHA-256
+        required: true
+        type: string
+      amd_public_receipt_sha256:
+        description: RX 6950 XT redacted receipt SHA-256
+        required: true
+        type: string
+      nvidia_evidence_run_id:
+        description: Successful RTX 5060 Laptop DirectML qualification run ID
+        required: true
+        type: string
+      nvidia_adapter_index:
+        description: Exact RTX 5060 Laptop DXGI adapter index
+        required: true
+        type: number
+      nvidia_evidence_archive_sha256:
+        description: Sealed RTX 5060 Laptop evidence ZIP SHA-256
+        required: true
+        type: string
+      nvidia_qualification_manifest_sha256:
+        description: RTX 5060 Laptop inner qualification-manifest SHA-256
+        required: true
+        type: string
+      nvidia_physical_attestation_sha256:
+        description: RTX 5060 Laptop physical-attestation SHA-256
+        required: true
+        type: string
+      nvidia_public_receipt_sha256:
+        description: RTX 5060 Laptop redacted receipt SHA-256
+        required: true
+        type: string
+      confirmation:
+        description: Type CONSUME SEALED INDEPENDENT HOLDOUT followed by the exact tag
+        required: true
+        type: string
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: independent-holdout-${{ inputs.tag }}
+  cancel-in-progress: false
+
+env:
+  PYTHONDONTWRITEBYTECODE: "1"
+  REPOSITORY_INPUT: ${{ github.repository }}
+  TAG_INPUT: ${{ inputs.tag }}
+  SOURCE_RUN_INPUT: ${{ inputs.source_build_run_id }}
+  CANDIDATE_MANIFEST_SHA_INPUT: ${{ inputs.candidate_manifest_sha256 }}
+  DIRECTML_ZIP_SHA_INPUT: ${{ inputs.directml_zip_sha256 }}
+  AMD_EVIDENCE_RUN_INPUT: ${{ inputs.amd_evidence_run_id }}
+  AMD_ADAPTER_INDEX_INPUT: ${{ inputs.amd_adapter_index }}
+  AMD_EVIDENCE_ARCHIVE_SHA_INPUT: ${{ inputs.amd_evidence_archive_sha256 }}
+  AMD_QUALIFICATION_MANIFEST_SHA_INPUT: ${{ inputs.amd_qualification_manifest_sha256 }}
+  AMD_PHYSICAL_ATTESTATION_SHA_INPUT: ${{ inputs.amd_physical_attestation_sha256 }}
+  AMD_PUBLIC_RECEIPT_SHA_INPUT: ${{ inputs.amd_public_receipt_sha256 }}
+  NVIDIA_EVIDENCE_RUN_INPUT: ${{ inputs.nvidia_evidence_run_id }}
+  NVIDIA_ADAPTER_INDEX_INPUT: ${{ inputs.nvidia_adapter_index }}
+  NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT: ${{ inputs.nvidia_evidence_archive_sha256 }}
+  NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT: ${{ inputs.nvidia_qualification_manifest_sha256 }}
+  NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT: ${{ inputs.nvidia_physical_attestation_sha256 }}
+  NVIDIA_PUBLIC_RECEIPT_SHA_INPUT: ${{ inputs.nvidia_public_receipt_sha256 }}
+  ACCESS_CONFIRMATION_INPUT: ${{ inputs.confirmation }}
+
+jobs:
+  verify-physical-prerequisites:
+    name: Verify exact source and both sealed physical DirectML bundles
+    runs-on: windows-2022
+    timeout-minutes: 30
+    outputs:
+      tag_commit: ${{ steps.identity.outputs.tag_commit }}
+      candidate_artifact_id: ${{ steps.identity.outputs.candidate_artifact_id }}
+      amd_evidence_artifact_id: ${{ steps.identity.outputs.amd_evidence_artifact_id }}
+      nvidia_evidence_artifact_id: ${{ steps.identity.outputs.nvidia_evidence_artifact_id }}
+      prerequisite_artifact_id: ${{ steps.prerequisite.outputs.artifact-id }}
+      prerequisite_artifact_digest: ${{ steps.prerequisite.outputs.artifact-digest }}
+      staged_content_manifest_sha256: ${{ steps.stage.outputs.staged_content_manifest_sha256 }}
+    steps:
+      - name: Require protected main source and explicit destructive confirmation
+        shell: pwsh
+        run: |
+          if ($env:GITHUB_RUN_ATTEMPT -cne "1") {
+            throw "The one-time holdout workflow cannot be rerun; dispatch a new first attempt."
+          }
+          if ($env:GITHUB_REF -ne "refs/heads/main") {
+            throw "Independent holdout qualification must be dispatched from refs/heads/main."
+          }
+          $Expected = "CONSUME SEALED INDEPENDENT HOLDOUT $env:TAG_INPUT"
+          if ($env:ACCESS_CONFIRMATION_INPUT -cne $Expected) {
+            throw "Confirmation must equal: $Expected"
+          }
+
+      - name: Check out exact protected workflow source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Set up verification Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Resolve exact remote artifact identities
+        id: identity
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Confirmation = "PUBLISH DUAL-GPU QUALIFIED DIRECTML RELEASE $env:TAG_INPUT"
+          python scripts/manage_directml_release.py verify-metadata `
+            --repository $env:REPOSITORY_INPUT `
+            --tag $env:TAG_INPUT `
+            --source-build-run-id $env:SOURCE_RUN_INPUT `
+            --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT `
+            --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT `
+            --confirmation $Confirmation `
+            --amd-evidence-run-id $env:AMD_EVIDENCE_RUN_INPUT `
+            --amd-adapter-index $env:AMD_ADAPTER_INDEX_INPUT `
+            --amd-evidence-archive-sha256 $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT `
+            --amd-qualification-manifest-sha256 $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT `
+            --amd-physical-attestation-sha256 $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT `
+            --amd-public-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT `
+            --nvidia-evidence-run-id $env:NVIDIA_EVIDENCE_RUN_INPUT `
+            --nvidia-adapter-index $env:NVIDIA_ADAPTER_INDEX_INPUT `
+            --nvidia-evidence-archive-sha256 $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT `
+            --nvidia-qualification-manifest-sha256 $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT `
+            --nvidia-physical-attestation-sha256 $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT `
+            --nvidia-public-receipt-sha256 $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT `
+            --output verified-remote-metadata.json
+          $Metadata = Get-Content -LiteralPath verified-remote-metadata.json -Raw | ConvertFrom-Json
+          if ([string]$Metadata.source.tag_commit -ne $env:GITHUB_SHA) {
+            throw "The staged tag commit must equal this protected workflow source SHA."
+          }
+          "tag_commit=$($Metadata.source.tag_commit)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "candidate_artifact_id=$($Metadata.source.candidate_artifact.id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "amd_evidence_artifact_id=$($Metadata.evidence.amd_rx_6950_xt.artifact.id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "nvidia_evidence_artifact_id=$($Metadata.evidence.nvidia_rtx_5060_laptop.artifact.id)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Download exact staged candidate
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.candidate_artifact_id }}
+          path: downloaded-release-candidate
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.source_build_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact RX 6950 XT evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.amd_evidence_artifact_id }}
+          path: downloaded-amd-evidence
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.amd_evidence_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact RTX 5060 Laptop evidence
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ steps.identity.outputs.nvidia_evidence_artifact_id }}
+          path: downloaded-nvidia-evidence
+          repository: ${{ github.repository }}
+          run-id: ${{ inputs.nvidia_evidence_run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Validate every source and physical-evidence byte
+        id: stage
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Confirmation = "PUBLISH DUAL-GPU QUALIFIED DIRECTML RELEASE $env:TAG_INPUT"
+          python scripts/manage_directml_release.py prepare-stage `
+            --repository $env:REPOSITORY_INPUT --tag $env:TAG_INPUT `
+            --source-build-run-id $env:SOURCE_RUN_INPUT `
+            --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT `
+            --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT --confirmation $Confirmation `
+            --amd-evidence-run-id $env:AMD_EVIDENCE_RUN_INPUT --amd-adapter-index $env:AMD_ADAPTER_INDEX_INPUT `
+            --amd-evidence-archive-sha256 $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT `
+            --amd-qualification-manifest-sha256 $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT `
+            --amd-physical-attestation-sha256 $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT `
+            --amd-public-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT `
+            --nvidia-evidence-run-id $env:NVIDIA_EVIDENCE_RUN_INPUT --nvidia-adapter-index $env:NVIDIA_ADAPTER_INDEX_INPUT `
+            --nvidia-evidence-archive-sha256 $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT `
+            --nvidia-qualification-manifest-sha256 $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT `
+            --nvidia-physical-attestation-sha256 $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT `
+            --nvidia-public-receipt-sha256 $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT `
+            --candidate-directory downloaded-release-candidate `
+            --amd-evidence-directory downloaded-amd-evidence `
+            --nvidia-evidence-directory downloaded-nvidia-evidence `
+            --stage-directory verified-holdout-prerequisites `
+            --verification-run-id $env:GITHUB_RUN_ID `
+            --result verified-holdout-prerequisites-result.json
+          $Result = Get-Content verified-holdout-prerequisites-result.json -Raw | ConvertFrom-Json
+          "staged_content_manifest_sha256=$($Result.staged_content_manifest_sha256)" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload immutable verified prerequisite stage
+        id: prerequisite
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ProAim-Verified-Holdout-Prerequisites
+          path: verified-holdout-prerequisites
+          if-no-files-found: error
+          retention-days: 30
+
+  freeze-plan-before-access:
+    name: Freeze and upload canonical plan before sealed-member access
+    needs: verify-physical-prerequisites
+    runs-on: [self-hosted, Windows, X64, proaim-independent-holdout-directml, proaim-rx-6950-xt-holdout]
+    timeout-minutes: 30
+    environment:
+      name: independent-holdout-access
+    outputs:
+      plan_artifact_id: ${{ steps.plan-artifact.outputs.artifact-id }}
+      plan_artifact_digest: ${{ steps.plan-artifact.outputs.artifact-digest }}
+      plan_sha256: ${{ steps.freeze.outputs.plan_sha256 }}
+    steps:
+      - name: Require protected access environment and sealed runner policy
+        shell: pwsh
+        env:
+          ENVIRONMENT_GUARD: ${{ secrets.INDEPENDENT_HOLDOUT_ACCESS_GUARD }}
+          ENVIRONMENT_POLICY: ${{ vars.INDEPENDENT_HOLDOUT_ACCESS_POLICY_VERSION }}
+          REVIEWER_GROUP: ${{ vars.INDEPENDENT_HOLDOUT_ACCESS_REVIEWER_GROUP }}
+          RUNNER_POLICY: ${{ vars.INDEPENDENT_HOLDOUT_RUNNER_POLICY_VERSION }}
+        run: |
+          if ($env:GITHUB_RUN_ATTEMPT -cne "1") { throw "Holdout access requires run attempt 1." }
+          if ([string]::IsNullOrWhiteSpace($env:ENVIRONMENT_GUARD)) { throw "Missing protected access guard." }
+          if ($env:ENVIRONMENT_POLICY -cne "required-reviewers-v1") { throw "Wrong access environment policy." }
+          if ($env:REVIEWER_GROUP -cne "independent-holdout-access-reviewers-v1") { throw "Wrong access reviewer marker." }
+          if ($env:RUNNER_POLICY -cne "sealed-directml-v1") { throw "Wrong sealed runner policy." }
+
+      - name: Check out exact tagged candidate source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.verify-physical-prerequisites.outputs.tag_commit }}
+          persist-credentials: false
+
+      - name: Set up exact holdout Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Build and verify fresh hash-locked DirectML environment
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m venv .holdout-venv
+          New-Item -ItemType Directory -Path .holdout-environment -ErrorAction Stop | Out-Null
+          $HoldoutPython = (Resolve-Path ".holdout-venv\Scripts\python.exe").Path
+          & $HoldoutPython -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall --report .holdout-environment/pip-bootstrap-windows-directml-py313.json -r requirements-locks/bootstrap-py313.txt
+          & $HoldoutPython -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall --report .holdout-environment/pip-dependencies-windows-directml-py313.json -r requirements-locks/bootstrap-py313.txt -r requirements-locks/windows-directml-py313.txt
+          & $HoldoutPython scripts/write_dependency_manifest.py --profile windows-directml-py313 --pip-report .holdout-environment/pip-bootstrap-windows-directml-py313.json --pip-report .holdout-environment/pip-dependencies-windows-directml-py313.json --output .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json
+          (Resolve-Path ".holdout-venv\Scripts").Path | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download exact verified prerequisite artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.verify-physical-prerequisites.outputs.prerequisite_artifact_id }}
+          path: verified-holdout-prerequisites
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Revalidate both physical bundles before mapping sealed paths
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE_MANIFEST: ${{ needs.verify-physical-prerequisites.outputs.staged_content_manifest_sha256 }}
+        run: |
+          $Confirmation = "PUBLISH DUAL-GPU QUALIFIED DIRECTML RELEASE $env:TAG_INPUT"
+          python scripts/manage_directml_release.py verify-stage `
+            --repository $env:REPOSITORY_INPUT --tag $env:TAG_INPUT `
+            --source-build-run-id $env:SOURCE_RUN_INPUT --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT `
+            --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT --confirmation $Confirmation `
+            --amd-evidence-run-id $env:AMD_EVIDENCE_RUN_INPUT --amd-adapter-index $env:AMD_ADAPTER_INDEX_INPUT `
+            --amd-evidence-archive-sha256 $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT --amd-qualification-manifest-sha256 $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT `
+            --amd-physical-attestation-sha256 $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT --amd-public-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT `
+            --nvidia-evidence-run-id $env:NVIDIA_EVIDENCE_RUN_INPUT --nvidia-adapter-index $env:NVIDIA_ADAPTER_INDEX_INPUT `
+            --nvidia-evidence-archive-sha256 $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT --nvidia-qualification-manifest-sha256 $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT `
+            --nvidia-physical-attestation-sha256 $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT --nvidia-public-receipt-sha256 $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT `
+            --stage-directory verified-holdout-prerequisites `
+            --verification-run-id $env:GITHUB_RUN_ID `
+            --staged-content-manifest-sha256 $env:STAGE_MANIFEST `
+            --output reverified-prerequisites.json
+
+      - name: Prove exact RX 6950 XT identity before sealed access
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python scripts/verify_windows_holdout_adapter.py --adapter-index $env:AMD_ADAPTER_INDEX_INPUT --physical-receipt verified-holdout-prerequisites/ProAim-Windows-DirectML-AMD-RX-6950-XT-Qualification.json --physical-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --project-root . --output verified-holdout-adapter.json | Out-File local-adapter-verification.json -Encoding utf8
+      - name: Freeze canonical manifest-only plan
+        id: freeze
+        shell: pwsh
+        env:
+          HOLDOUT_PACKAGE: ${{ secrets.INDEPENDENT_HOLDOUT_PACKAGE_PATH }}
+          HOLDOUT_LEDGER: ${{ secrets.INDEPENDENT_HOLDOUT_LEDGER_PATH }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Package = [IO.Path]::GetFullPath($env:HOLDOUT_PACKAGE)
+          $Ledger = [IO.Path]::GetFullPath($env:HOLDOUT_LEDGER)
+          $Sensitive = @($env:HOLDOUT_PACKAGE, $env:HOLDOUT_LEDGER, $Package, $Ledger)
+          $Sensitive += @($Sensitive | ForEach-Object { $_.Replace('\', '/') })
+          $Sensitive += @($Sensitive | ForEach-Object { $_.ToLowerInvariant(); $_.ToUpperInvariant() })
+          $Sensitive | Sort-Object -Unique | ForEach-Object { if (-not [string]::IsNullOrWhiteSpace($_)) { Write-Output "::add-mask::$_" } }
+          if ($Ledger -cne [IO.Path]::Combine($Package, "access-ledger")) { throw "Ledger path must be package/access-ledger." }
+          $Detail = python -c "from pathlib import Path; from utils.release_model_contract import load_release_default_contract; print(load_release_default_contract(Path('.'), verify_files=True)['detail_crop_size_source_pixels'])"
+          New-Item -ItemType Directory -Path frozen-plan -ErrorAction Stop | Out-Null
+          python scripts/evaluate_independent_holdout_runtime.py plan `
+            --package $Package `
+            --output frozen-plan/evaluation-plan.json `
+            --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json `
+            --hardware-identity verified-holdout-adapter.json `
+            --project-root . `
+            --device "DML:$env:AMD_ADAPTER_INDEX_INPUT" `
+            --expected-provider DmlExecutionProvider `
+            --detail-crop-size $Detail | Out-File local-plan-result.json -Encoding utf8
+          $PlanSha = (Get-FileHash -Algorithm SHA256 -LiteralPath frozen-plan/evaluation-plan.json).Hash.ToLowerInvariant()
+          "plan_sha256=$PlanSha" | Out-File $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Commit frozen plan as immutable Actions artifact
+        id: plan-artifact
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ProAim-Independent-Holdout-Frozen-Plan
+          path: frozen-plan/evaluation-plan.json
+          if-no-files-found: error
+          retention-days: 30
+
+  evaluate-once:
+    name: Consume exact downloaded plan once and retire holdout
+    needs: [verify-physical-prerequisites, freeze-plan-before-access]
+    runs-on: [self-hosted, Windows, X64, proaim-independent-holdout-directml, proaim-rx-6950-xt-holdout]
+    timeout-minutes: 180
+    environment:
+      name: independent-holdout-access
+    outputs:
+      evidence_artifact_id: ${{ steps.evidence.outputs.artifact-id }}
+      evidence_artifact_digest: ${{ steps.evidence.outputs.artifact-digest }}
+    steps:
+      - name: Require protected access environment
+        shell: pwsh
+        env:
+          ENVIRONMENT_GUARD: ${{ secrets.INDEPENDENT_HOLDOUT_ACCESS_GUARD }}
+          ENVIRONMENT_POLICY: ${{ vars.INDEPENDENT_HOLDOUT_ACCESS_POLICY_VERSION }}
+          REVIEWER_GROUP: ${{ vars.INDEPENDENT_HOLDOUT_ACCESS_REVIEWER_GROUP }}
+          RUNNER_POLICY: ${{ vars.INDEPENDENT_HOLDOUT_RUNNER_POLICY_VERSION }}
+        run: |
+          if ($env:GITHUB_RUN_ATTEMPT -cne "1") { throw "Holdout evaluation requires run attempt 1." }
+          if ([string]::IsNullOrWhiteSpace($env:ENVIRONMENT_GUARD)) { throw "Missing protected access guard." }
+          if ($env:ENVIRONMENT_POLICY -cne "required-reviewers-v1") { throw "Wrong access environment policy." }
+          if ($env:REVIEWER_GROUP -cne "independent-holdout-access-reviewers-v1") { throw "Wrong access reviewer marker." }
+          if ($env:RUNNER_POLICY -cne "sealed-directml-v1") { throw "Wrong sealed runner policy." }
+
+      - name: Check out exact tagged candidate source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.verify-physical-prerequisites.outputs.tag_commit }}
+          persist-credentials: false
+
+      - name: Set up exact holdout Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Build and verify fresh hash-locked DirectML environment
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m venv .holdout-venv
+          New-Item -ItemType Directory -Path .holdout-environment -ErrorAction Stop | Out-Null
+          $HoldoutPython = (Resolve-Path ".holdout-venv\Scripts\python.exe").Path
+          & $HoldoutPython -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall --report .holdout-environment/pip-bootstrap-windows-directml-py313.json -r requirements-locks/bootstrap-py313.txt
+          & $HoldoutPython -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall --report .holdout-environment/pip-dependencies-windows-directml-py313.json -r requirements-locks/bootstrap-py313.txt -r requirements-locks/windows-directml-py313.txt
+          & $HoldoutPython scripts/write_dependency_manifest.py --profile windows-directml-py313 --pip-report .holdout-environment/pip-bootstrap-windows-directml-py313.json --pip-report .holdout-environment/pip-dependencies-windows-directml-py313.json --output .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json
+          (Resolve-Path ".holdout-venv\Scripts").Path | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download exact prerequisite stage
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.verify-physical-prerequisites.outputs.prerequisite_artifact_id }}
+          path: verified-holdout-prerequisites
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact pre-access plan artifact
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.freeze-plan-before-access.outputs.plan_artifact_id }}
+          path: downloaded-frozen-plan
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Revalidate hardware and exact plan before sealed access
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE_MANIFEST: ${{ needs.verify-physical-prerequisites.outputs.staged_content_manifest_sha256 }}
+          PLAN_SHA: ${{ needs.freeze-plan-before-access.outputs.plan_sha256 }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          if ((Get-ChildItem downloaded-frozen-plan -File -Recurse).Count -ne 1) { throw "Plan artifact inventory is not exact." }
+          $ActualPlan = (Get-FileHash -Algorithm SHA256 downloaded-frozen-plan/evaluation-plan.json).Hash.ToLowerInvariant()
+          if ($ActualPlan -cne $env:PLAN_SHA) { throw "Downloaded plan SHA differs from pre-access output." }
+          $Confirmation = "PUBLISH DUAL-GPU QUALIFIED DIRECTML RELEASE $env:TAG_INPUT"
+          python scripts/manage_directml_release.py verify-stage --repository $env:REPOSITORY_INPUT --tag $env:TAG_INPUT --source-build-run-id $env:SOURCE_RUN_INPUT --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT --confirmation $Confirmation --amd-evidence-run-id $env:AMD_EVIDENCE_RUN_INPUT --amd-adapter-index $env:AMD_ADAPTER_INDEX_INPUT --amd-evidence-archive-sha256 $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT --amd-qualification-manifest-sha256 $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT --amd-physical-attestation-sha256 $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT --amd-public-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT --nvidia-evidence-run-id $env:NVIDIA_EVIDENCE_RUN_INPUT --nvidia-adapter-index $env:NVIDIA_ADAPTER_INDEX_INPUT --nvidia-evidence-archive-sha256 $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT --nvidia-qualification-manifest-sha256 $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT --nvidia-physical-attestation-sha256 $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT --nvidia-public-receipt-sha256 $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT --stage-directory verified-holdout-prerequisites --verification-run-id $env:GITHUB_RUN_ID --staged-content-manifest-sha256 $env:STAGE_MANIFEST --output reverified-prerequisites.json
+          python scripts/verify_windows_holdout_adapter.py --adapter-index $env:AMD_ADAPTER_INDEX_INPUT --physical-receipt verified-holdout-prerequisites/ProAim-Windows-DirectML-AMD-RX-6950-XT-Qualification.json --physical-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --project-root . --output verified-holdout-adapter.json | Out-File local-adapter-verification.json -Encoding utf8
+
+      - name: Evaluate, atomically consume, retire, and build fixed public bundle
+        shell: pwsh
+        env:
+          HOLDOUT_PACKAGE: ${{ secrets.INDEPENDENT_HOLDOUT_PACKAGE_PATH }}
+          HOLDOUT_LEDGER: ${{ secrets.INDEPENDENT_HOLDOUT_LEDGER_PATH }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Package = [IO.Path]::GetFullPath($env:HOLDOUT_PACKAGE)
+          $Ledger = [IO.Path]::GetFullPath($env:HOLDOUT_LEDGER)
+          $Sensitive = @($env:HOLDOUT_PACKAGE, $env:HOLDOUT_LEDGER, $Package, $Ledger)
+          $Sensitive += @($Sensitive | ForEach-Object { $_.Replace('\', '/') })
+          $Sensitive += @($Sensitive | ForEach-Object { $_.ToLowerInvariant(); $_.ToUpperInvariant() })
+          $Sensitive | Sort-Object -Unique | ForEach-Object { if (-not [string]::IsNullOrWhiteSpace($_)) { Write-Output "::add-mask::$_" } }
+          if ($Ledger -cne [IO.Path]::Combine($Package, "access-ledger")) { throw "Ledger path must be package/access-ledger." }
+          $Event = "gh$env:GITHUB_RUN_ID-consumed"
+          $Retirement = "gh$env:GITHUB_RUN_ID-retired"
+          python scripts/evaluate_independent_holdout_runtime.py evaluate --package $Package --plan downloaded-frozen-plan/evaluation-plan.json --output holdout-evidence --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --hardware-identity verified-holdout-adapter.json --project-root . --event-id $Event --actor-id protected-holdout-workflow --retirement-event-id $Retirement --retirement-reason canonical-final-evaluation-completed | Out-File local-evaluation-result.json -Encoding utf8
+          python scripts/evaluate_independent_holdout_runtime.py verify --evidence holdout-evidence --plan downloaded-frozen-plan/evaluation-plan.json --package $Package --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --hardware-identity verified-holdout-adapter.json --project-root . --receipt-output portable-holdout-receipt.json | Out-File local-verification-result.json -Encoding utf8
+          python scripts/evaluate_independent_holdout_runtime.py publish-bundle --output holdout-publication-bundle --receipt portable-holdout-receipt.json --evidence holdout-evidence --plan downloaded-frozen-plan/evaluation-plan.json --package $Package --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --hardware-identity verified-holdout-adapter.json --project-root . | Out-File local-publication-result.json -Encoding utf8
+          python scripts/evaluate_independent_holdout_runtime.py verify-bundle --bundle holdout-publication-bundle --evidence holdout-evidence --plan downloaded-frozen-plan/evaluation-plan.json --package $Package --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --hardware-identity verified-holdout-adapter.json --project-root . | Out-File local-bundle-verification.json -Encoding utf8
+
+      - name: Upload exact fixed-inventory evidence bundle
+        id: evidence
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ProAim-Independent-Holdout-Evidence
+          path: holdout-publication-bundle
+          if-no-files-found: error
+          retention-days: 30
+
+  attest-independently:
+    name: Protected independent attestation of exact artifacts and retired ledger
+    needs: [verify-physical-prerequisites, freeze-plan-before-access, evaluate-once]
+    runs-on: [self-hosted, Windows, X64, proaim-independent-holdout-directml, proaim-rx-6950-xt-holdout]
+    timeout-minutes: 45
+    environment:
+      name: independent-holdout-attestation
+    outputs:
+      attestation_artifact_id: ${{ steps.attestation.outputs.artifact-id }}
+      attestation_artifact_digest: ${{ steps.attestation.outputs.artifact-digest }}
+    steps:
+      - name: Require separately protected independent attestation environment
+        shell: pwsh
+        env:
+          ENVIRONMENT_GUARD: ${{ secrets.INDEPENDENT_HOLDOUT_ATTESTATION_GUARD }}
+          ENVIRONMENT_POLICY: ${{ vars.INDEPENDENT_HOLDOUT_ATTESTATION_POLICY_VERSION }}
+          REVIEWER_GROUP: ${{ vars.INDEPENDENT_HOLDOUT_ATTESTATION_REVIEWER_GROUP }}
+        run: |
+          if ($env:GITHUB_RUN_ATTEMPT -cne "1") { throw "Independent attestation requires run attempt 1." }
+          if ([string]::IsNullOrWhiteSpace($env:ENVIRONMENT_GUARD)) { throw "Missing protected attestation guard." }
+          if ($env:ENVIRONMENT_POLICY -cne "required-reviewers-v1") { throw "Wrong attestation environment policy." }
+          if ($env:REVIEWER_GROUP -cne "independent-holdout-attestation-reviewers-v1") { throw "Wrong independent reviewer marker." }
+
+      - name: Check out exact tagged candidate source
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          ref: ${{ needs.verify-physical-prerequisites.outputs.tag_commit }}
+          persist-credentials: false
+
+      - name: Set up exact holdout Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
+        with:
+          python-version: "3.13.14"
+
+      - name: Build and verify fresh hash-locked DirectML environment
+        shell: pwsh
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          python -m venv .holdout-venv
+          New-Item -ItemType Directory -Path .holdout-environment -ErrorAction Stop | Out-Null
+          $HoldoutPython = (Resolve-Path ".holdout-venv\Scripts\python.exe").Path
+          & $HoldoutPython -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall --report .holdout-environment/pip-bootstrap-windows-directml-py313.json -r requirements-locks/bootstrap-py313.txt
+          & $HoldoutPython -m pip install --disable-pip-version-check --require-hashes --no-compile --no-build-isolation --force-reinstall --report .holdout-environment/pip-dependencies-windows-directml-py313.json -r requirements-locks/bootstrap-py313.txt -r requirements-locks/windows-directml-py313.txt
+          & $HoldoutPython scripts/write_dependency_manifest.py --profile windows-directml-py313 --pip-report .holdout-environment/pip-bootstrap-windows-directml-py313.json --pip-report .holdout-environment/pip-dependencies-windows-directml-py313.json --output .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json
+          (Resolve-Path ".holdout-venv\Scripts").Path | Out-File $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Download exact prerequisite stage
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.verify-physical-prerequisites.outputs.prerequisite_artifact_id }}
+          path: verified-holdout-prerequisites
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact pre-access plan
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.freeze-plan-before-access.outputs.plan_artifact_id }}
+          path: downloaded-frozen-plan
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Download exact evaluated public bundle
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          artifact-ids: ${{ needs.evaluate-once.outputs.evidence_artifact_id }}
+          path: downloaded-holdout-bundle
+          repository: ${{ github.repository }}
+          run-id: ${{ github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Revalidate hardware prerequisite before mapping sealed paths
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE_MANIFEST: ${{ needs.verify-physical-prerequisites.outputs.staged_content_manifest_sha256 }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Confirmation = "PUBLISH DUAL-GPU QUALIFIED DIRECTML RELEASE $env:TAG_INPUT"
+          python scripts/manage_directml_release.py verify-stage --repository $env:REPOSITORY_INPUT --tag $env:TAG_INPUT --source-build-run-id $env:SOURCE_RUN_INPUT --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT --confirmation $Confirmation --amd-evidence-run-id $env:AMD_EVIDENCE_RUN_INPUT --amd-adapter-index $env:AMD_ADAPTER_INDEX_INPUT --amd-evidence-archive-sha256 $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT --amd-qualification-manifest-sha256 $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT --amd-physical-attestation-sha256 $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT --amd-public-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT --nvidia-evidence-run-id $env:NVIDIA_EVIDENCE_RUN_INPUT --nvidia-adapter-index $env:NVIDIA_ADAPTER_INDEX_INPUT --nvidia-evidence-archive-sha256 $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT --nvidia-qualification-manifest-sha256 $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT --nvidia-physical-attestation-sha256 $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT --nvidia-public-receipt-sha256 $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT --stage-directory verified-holdout-prerequisites --verification-run-id $env:GITHUB_RUN_ID --staged-content-manifest-sha256 $env:STAGE_MANIFEST --output reverified-attestation-prerequisites.json
+          python scripts/verify_windows_holdout_adapter.py --adapter-index $env:AMD_ADAPTER_INDEX_INPUT --physical-receipt verified-holdout-prerequisites/ProAim-Windows-DirectML-AMD-RX-6950-XT-Qualification.json --physical-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --project-root . --output verified-holdout-adapter.json | Out-File local-adapter-verification.json -Encoding utf8
+
+      - name: Authoritatively reverify retired private package and exact public bundle
+        shell: pwsh
+        env:
+          HOLDOUT_PACKAGE: ${{ secrets.INDEPENDENT_HOLDOUT_PACKAGE_PATH }}
+          HOLDOUT_LEDGER: ${{ secrets.INDEPENDENT_HOLDOUT_LEDGER_PATH }}
+        run: |
+          $PSNativeCommandUseErrorActionPreference = $true
+          $Package = [IO.Path]::GetFullPath($env:HOLDOUT_PACKAGE)
+          $Ledger = [IO.Path]::GetFullPath($env:HOLDOUT_LEDGER)
+          $Sensitive = @($env:HOLDOUT_PACKAGE, $env:HOLDOUT_LEDGER, $Package, $Ledger)
+          $Sensitive += @($Sensitive | ForEach-Object { $_.Replace('\', '/') })
+          $Sensitive += @($Sensitive | ForEach-Object { $_.ToLowerInvariant(); $_.ToUpperInvariant() })
+          $Sensitive | Sort-Object -Unique | ForEach-Object { if (-not [string]::IsNullOrWhiteSpace($_)) { Write-Output "::add-mask::$_" } }
+          if ($Ledger -cne [IO.Path]::Combine($Package, "access-ledger")) { throw "Ledger path must be package/access-ledger." }
+          New-Item -ItemType Directory -Path authoritative-evidence -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath downloaded-holdout-bundle/metrics.json -Destination authoritative-evidence/metrics.json -ErrorAction Stop
+          if ((Get-FileHash -Algorithm SHA256 authoritative-evidence/metrics.json).Hash -cne (Get-FileHash -Algorithm SHA256 downloaded-holdout-bundle/metrics.json).Hash) { throw "Authoritative evidence copy differs." }
+          python scripts/evaluate_independent_holdout_runtime.py verify-bundle --bundle downloaded-holdout-bundle --evidence authoritative-evidence --plan downloaded-frozen-plan/evaluation-plan.json --package $Package --dependency-manifest .holdout-environment/windows-directml-py313-DEPENDENCY-MANIFEST.json --hardware-identity verified-holdout-adapter.json --project-root . --authenticated-evaluation-environment | Out-File authoritative-holdout-verification.json -Encoding utf8
+
+      - name: Create authenticated redacted attestation
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STAGE_MANIFEST: ${{ needs.verify-physical-prerequisites.outputs.staged_content_manifest_sha256 }}
+          PREREQUISITE_ID: ${{ needs.verify-physical-prerequisites.outputs.prerequisite_artifact_id }}
+          PREREQUISITE_DIGEST: ${{ needs.verify-physical-prerequisites.outputs.prerequisite_artifact_digest }}
+          PLAN_ID: ${{ needs.freeze-plan-before-access.outputs.plan_artifact_id }}
+          PLAN_DIGEST: ${{ needs.freeze-plan-before-access.outputs.plan_artifact_digest }}
+          EVIDENCE_ID: ${{ needs.evaluate-once.outputs.evidence_artifact_id }}
+          EVIDENCE_DIGEST: ${{ needs.evaluate-once.outputs.evidence_artifact_digest }}
+        run: |
+          $Confirmation = "PUBLISH DUAL-GPU QUALIFIED DIRECTML RELEASE $env:TAG_INPUT"
+          python scripts/manage_directml_release.py attest-holdout --repository $env:REPOSITORY_INPUT --tag $env:TAG_INPUT --source-build-run-id $env:SOURCE_RUN_INPUT --candidate-manifest-sha256 $env:CANDIDATE_MANIFEST_SHA_INPUT --directml-zip-sha256 $env:DIRECTML_ZIP_SHA_INPUT --confirmation $Confirmation --amd-evidence-run-id $env:AMD_EVIDENCE_RUN_INPUT --amd-adapter-index $env:AMD_ADAPTER_INDEX_INPUT --amd-evidence-archive-sha256 $env:AMD_EVIDENCE_ARCHIVE_SHA_INPUT --amd-qualification-manifest-sha256 $env:AMD_QUALIFICATION_MANIFEST_SHA_INPUT --amd-physical-attestation-sha256 $env:AMD_PHYSICAL_ATTESTATION_SHA_INPUT --amd-public-receipt-sha256 $env:AMD_PUBLIC_RECEIPT_SHA_INPUT --nvidia-evidence-run-id $env:NVIDIA_EVIDENCE_RUN_INPUT --nvidia-adapter-index $env:NVIDIA_ADAPTER_INDEX_INPUT --nvidia-evidence-archive-sha256 $env:NVIDIA_EVIDENCE_ARCHIVE_SHA_INPUT --nvidia-qualification-manifest-sha256 $env:NVIDIA_QUALIFICATION_MANIFEST_SHA_INPUT --nvidia-physical-attestation-sha256 $env:NVIDIA_PHYSICAL_ATTESTATION_SHA_INPUT --nvidia-public-receipt-sha256 $env:NVIDIA_PUBLIC_RECEIPT_SHA_INPUT --stage-directory verified-holdout-prerequisites --staged-content-manifest-sha256 $env:STAGE_MANIFEST --holdout-workflow-run-id $env:GITHUB_RUN_ID --holdout-workflow-run-attempt $env:GITHUB_RUN_ATTEMPT --prerequisite-artifact-id $env:PREREQUISITE_ID --prerequisite-artifact-digest $env:PREREQUISITE_DIGEST --plan-artifact-id $env:PLAN_ID --plan-artifact-digest $env:PLAN_DIGEST --plan-artifact-directory downloaded-frozen-plan --evidence-artifact-id $env:EVIDENCE_ID --evidence-artifact-digest $env:EVIDENCE_DIGEST --bundle-directory downloaded-holdout-bundle --authoritative-verification authoritative-holdout-verification.json --output AUTHENTICATED-INDEPENDENT-HOLDOUT-ATTESTATION.json --result attestation-result.json
+
+      - name: Upload final protected attestation
+        id: attestation
+        uses: actions/upload-artifact@330a01c490aca151604b8cf639adc76d48f6c5d4 # v5
+        with:
+          name: ProAim-Independent-Holdout-Attestation
+          path: AUTHENTICATED-INDEPENDENT-HOLDOUT-ATTESTATION.json
+          if-no-files-found: error
+          retention-days: 30

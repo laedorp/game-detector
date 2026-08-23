@@ -6,18 +6,21 @@ from threading import local
 
 import numpy as np
 
+from .inference_size import InferenceSize, InferenceSizeLike, normalize_inference_size
+
 
 _LETTERBOX_LOCAL = local()
 
 
-def _letterbox_workspace(inference_size: int) -> np.ndarray:
+def _letterbox_workspace(inference_size: InferenceSize) -> np.ndarray:
     workspaces = getattr(_LETTERBOX_LOCAL, "workspaces", None)
     if workspaces is None:
         workspaces = {}
         _LETTERBOX_LOCAL.workspaces = workspaces
     workspace = workspaces.get(inference_size)
     if workspace is None:
-        workspace = np.empty((inference_size, inference_size, 3), dtype=np.uint8)
+        height, width = inference_size
+        workspace = np.empty((height, width, 3), dtype=np.uint8)
         workspaces[inference_size] = workspace
     workspace.fill(114)
     return workspace
@@ -58,8 +61,10 @@ class PreprocessedFrame:
 
 def preprocess_frame(
     frame: np.ndarray,
-    inference_size: int,
-    crop_size: int | None = None,
+    inference_size: InferenceSizeLike,
+    crop_size: int | tuple[int, int] | None = None,
+    *,
+    crop_origin: tuple[int, int] | None = None,
 ) -> PreprocessedFrame:
     try:
         import cv2
@@ -68,17 +73,45 @@ def preprocess_frame(
             "OpenCV is not installed. Install the packages from requirements.txt."
         ) from exc
 
-    if isinstance(inference_size, bool) or not isinstance(inference_size, Integral):
-        raise TypeError("inference_size must be a positive integer")
-    inference_size = int(inference_size)
-    if inference_size <= 0:
-        raise ValueError("inference_size must be a positive integer")
+    model_height, model_width = normalize_inference_size(inference_size)
+    crop_height: int | None = None
+    crop_width: int | None = None
     if crop_size is not None:
-        if isinstance(crop_size, bool) or not isinstance(crop_size, Integral):
-            raise TypeError("crop_size must be a positive integer or None")
-        crop_size = int(crop_size)
-        if crop_size <= 0:
-            raise ValueError("crop_size must be a positive integer or None")
+        if isinstance(crop_size, bool):
+            raise TypeError(
+                "crop_size must be a positive integer, an (height, width) pair, or None"
+            )
+        if isinstance(crop_size, Integral):
+            crop_height = crop_width = int(crop_size)
+        elif isinstance(crop_size, tuple) and len(crop_size) == 2:
+            raw_height, raw_width = crop_size
+            if any(
+                isinstance(value, bool) or not isinstance(value, Integral)
+                for value in (raw_height, raw_width)
+            ):
+                raise TypeError(
+                    "crop_size pair must contain positive integer height and width"
+                )
+            crop_height, crop_width = int(raw_height), int(raw_width)
+        else:
+            raise TypeError(
+                "crop_size must be a positive integer, an (height, width) pair, or None"
+            )
+        if crop_height <= 0 or crop_width <= 0:
+            raise ValueError(
+                "crop_size must contain positive dimensions or be None"
+            )
+    if crop_origin is not None:
+        if crop_size is None:
+            raise ValueError("crop_origin requires crop_size")
+        if not isinstance(crop_origin, tuple) or len(crop_origin) != 2:
+            raise TypeError("crop_origin must be an (x, y) integer pair or None")
+        raw_crop_x, raw_crop_y = crop_origin
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral)
+            for value in (raw_crop_x, raw_crop_y)
+        ):
+            raise TypeError("crop_origin must contain integer x and y")
 
     if not isinstance(frame, np.ndarray):
         raise TypeError("frame must be a NumPy array")
@@ -95,15 +128,31 @@ def preprocess_frame(
     crop_was_clamped = False
     roi = frame
 
-    if crop_size is not None:
-        applied_crop = min(crop_size, source_width, source_height)
-        crop_was_clamped = applied_crop != crop_size
-        crop_x = (source_width - applied_crop) // 2
-        crop_y = (source_height - applied_crop) // 2
-        roi = frame[crop_y : crop_y + applied_crop, crop_x : crop_x + applied_crop]
+    if crop_height is not None and crop_width is not None:
+        applied_crop_height = min(crop_height, source_height)
+        applied_crop_width = min(crop_width, source_width)
+        crop_was_clamped = (
+            applied_crop_height != crop_height
+            or applied_crop_width != crop_width
+        )
+        if crop_origin is None:
+            crop_x = (source_width - applied_crop_width) // 2
+            crop_y = (source_height - applied_crop_height) // 2
+        else:
+            crop_x, crop_y = (int(value) for value in crop_origin)
+            maximum_crop_x = source_width - applied_crop_width
+            maximum_crop_y = source_height - applied_crop_height
+            if not 0 <= crop_x <= maximum_crop_x or not 0 <= crop_y <= maximum_crop_y:
+                raise ValueError(
+                    "crop_origin must keep the applied crop within the source frame"
+                )
+        roi = frame[
+            crop_y : crop_y + applied_crop_height,
+            crop_x : crop_x + applied_crop_width,
+        ]
 
     roi_height, roi_width = roi.shape[:2]
-    scale = min(inference_size / roi_width, inference_size / roi_height)
+    scale = min(model_width / roi_width, model_height / roi_height)
     resized_width = max(1, int(round(roi_width * scale)))
     resized_height = max(1, int(round(roi_height * scale)))
 
@@ -116,13 +165,13 @@ def preprocess_frame(
             interpolation=cv2.INTER_LINEAR,
         )
 
-    horizontal_padding = inference_size - resized_width
-    vertical_padding = inference_size - resized_height
+    horizontal_padding = model_width - resized_width
+    vertical_padding = model_height - resized_height
     pad_left = int(round(horizontal_padding / 2 - 0.1))
     pad_top = int(round(vertical_padding / 2 - 0.1))
 
     if horizontal_padding or vertical_padding:
-        letterboxed = _letterbox_workspace(inference_size)
+        letterboxed = _letterbox_workspace((model_height, model_width))
         letterboxed[
             pad_top : pad_top + resized_height,
             pad_left : pad_left + resized_width,
@@ -145,7 +194,7 @@ def preprocess_frame(
         crop_y=crop_y,
         source_width=source_width,
         source_height=source_height,
-        model_width=inference_size,
-        model_height=inference_size,
+        model_width=model_width,
+        model_height=model_height,
     )
     return PreprocessedFrame(tensor, transform, crop_was_clamped)

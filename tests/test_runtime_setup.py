@@ -29,12 +29,13 @@ def completed(returncode: int = 0, stderr: str = "") -> subprocess.CompletedProc
 
 
 class PlanTests(unittest.TestCase):
-    def test_amd_on_linux_uses_rocm_and_warns_about_the_driver(self) -> None:
+    def test_amd_on_linux_marks_legacy_rocm_as_experimental(self) -> None:
         plan = plan_for("amd", "linux")
 
         self.assertEqual(plan.distribution, DISTRIBUTION_ROCM)
         self.assertTrue(plan.needs_driver)
-        self.assertIn("HSA_OVERRIDE_GFX_VERSION", plan.driver_note)
+        self.assertIn("experimental", plan.driver_note)
+        self.assertIn("RX 6950 XT", plan.driver_note)
 
     def test_amd_on_windows_uses_directml(self) -> None:
         plan = plan_for("amd", "windows")
@@ -62,6 +63,12 @@ class PlanTests(unittest.TestCase):
 
     def test_vendor_and_system_are_case_insensitive(self) -> None:
         self.assertEqual(plan_for("AMD", "Linux").distribution, DISTRIBUTION_ROCM)
+
+    def test_source_nvidia_install_includes_cuda_and_cudnn_user_libraries(self) -> None:
+        self.assertEqual(
+            RUNTIME_REQUIREMENTS[DISTRIBUTION_NVIDIA],
+            "onnxruntime-gpu[cuda,cudnn]==1.28.0",
+        )
 
 
 class EnsureRuntimeTests(unittest.TestCase):

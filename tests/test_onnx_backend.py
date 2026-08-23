@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
@@ -13,6 +14,7 @@ from detection.onnx_yolo import (
     OnnxRuntimeYoloDetector,
     _configure_session_options,
     _preload_nvidia_libraries,
+    _provider_options_record,
     _require_active_provider,
     resolve_providers,
 )
@@ -22,6 +24,7 @@ ALL_PROVIDERS = (
     "TensorrtExecutionProvider",
     "CUDAExecutionProvider",
     "ROCMExecutionProvider",
+    "MIGraphXExecutionProvider",
     "DmlExecutionProvider",
     "CPUExecutionProvider",
 )
@@ -59,6 +62,12 @@ class ProviderResolutionTests(unittest.TestCase):
 
         self.assertEqual(target, "CUDAExecutionProvider")
         self.assertEqual(chain[0], "CUDAExecutionProvider")
+
+    def test_generic_gpu_alias_never_silently_falls_back_to_cpu(self) -> None:
+        with self.assertRaisesRegex(
+            DeviceNotAvailableError, "no GPU execution provider"
+        ):
+            resolve_providers("GPU", CPU_ONLY)
 
     def test_full_provider_name_is_case_insensitive_for_old_launcher_settings(self) -> None:
         chain, target = resolve_providers("TENSORRTEXECUTIONPROVIDER", ALL_PROVIDERS)
@@ -110,15 +119,32 @@ class ProviderResolutionTests(unittest.TestCase):
             self.assertEqual(chain[-1], "CPUExecutionProvider", requested)
             self.assertEqual(len(chain), 2, requested)
 
-    def test_amd_aliases_resolve_to_rocm(self) -> None:
-        for alias in ("AMD", "ROCM", "rocm"):
+    def test_rocm_aliases_resolve_to_legacy_rocm_provider(self) -> None:
+        for alias in ("ROCM", "rocm"):
             _, target = resolve_providers(alias, ALL_PROVIDERS)
             self.assertEqual(target, "ROCMExecutionProvider", alias)
 
+    def test_amd_alias_prefers_migraphx_then_legacy_rocm(self) -> None:
+        _, target = resolve_providers("AMD", ALL_PROVIDERS)
+        self.assertEqual(target, "MIGraphXExecutionProvider")
+
+        _, target = resolve_providers(
+            "AMD", ("ROCMExecutionProvider", "CPUExecutionProvider")
+        )
+        self.assertEqual(target, "ROCMExecutionProvider")
+
+        with self.assertRaisesRegex(DeviceNotAvailableError, "neither the MIGraphX"):
+            resolve_providers("AMD", CPU_ONLY)
+
     def test_windows_amd_alias_resolves_to_directml(self) -> None:
-        for alias in ("DIRECTML", "DML"):
+        for alias in ("DIRECTML", "DML", "DIRECTML:1", "dml:2"):
             _, target = resolve_providers(alias, ALL_PROVIDERS)
             self.assertEqual(target, "DmlExecutionProvider", alias)
+
+    def test_directml_adapter_index_must_be_non_negative_integer(self) -> None:
+        for requested in ("DIRECTML:-1", "DML:gpu", "DIRECTML:"):
+            with self.subTest(requested=requested), self.assertRaises(ValueError):
+                resolve_providers(requested, ALL_PROVIDERS)
 
     def test_nvidia_alias_resolves_to_cuda(self) -> None:
         _, target = resolve_providers("NVIDIA", ALL_PROVIDERS)
@@ -158,9 +184,9 @@ class SessionOptionsTests(unittest.TestCase):
     class _Options:
         pass
 
-    def test_gpu_chains_use_low_latency_threading(self) -> None:
+    def test_directml_chain_uses_its_mandatory_session_options(self) -> None:
         options = self._Options()
-        _configure_session_options(
+        configured = _configure_session_options(
             self._FakeRuntime(),
             options,
             ["DmlExecutionProvider", "CPUExecutionProvider"],
@@ -169,22 +195,39 @@ class SessionOptionsTests(unittest.TestCase):
         self.assertIsNotNone(options.graph_optimization_level)
         self.assertIsNotNone(options.execution_mode)
         self.assertFalse(options.enable_mem_pattern)
-        self.assertEqual(options.intra_op_num_threads, 1)
-        self.assertEqual(options.inter_op_num_threads, 1)
+        self.assertEqual(configured["execution_mode"], "ORT_SEQUENTIAL")
+        self.assertFalse(configured["enable_mem_pattern"])
+        self.assertFalse(hasattr(options, "intra_op_num_threads"))
 
     def test_cpu_only_chain_keeps_default_thread_pool(self) -> None:
         options = self._Options()
-        _configure_session_options(
+        configured = _configure_session_options(
             self._FakeRuntime(),
             options,
             ["CPUExecutionProvider"],
         )
 
         self.assertIsNotNone(options.graph_optimization_level)
-        self.assertIsNotNone(options.execution_mode)
-        self.assertFalse(options.enable_mem_pattern)
+        self.assertFalse(hasattr(options, "execution_mode"))
+        self.assertFalse(hasattr(options, "enable_mem_pattern"))
         self.assertFalse(hasattr(options, "intra_op_num_threads"))
         self.assertFalse(hasattr(options, "inter_op_num_threads"))
+        self.assertNotIn("enable_mem_pattern", configured)
+
+    def test_cuda_chain_keeps_cuda_memory_and_thread_defaults(self) -> None:
+        options = self._Options()
+        configured = _configure_session_options(
+            self._FakeRuntime(),
+            options,
+            ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+
+        self.assertFalse(hasattr(options, "enable_mem_pattern"))
+        self.assertFalse(hasattr(options, "intra_op_num_threads"))
+        self.assertEqual(
+            configured,
+            {"graph_optimization_level": "ORT_ENABLE_ALL"},
+        )
 
 
 class NvidiaRuntimePreparationTests(unittest.TestCase):
@@ -269,6 +312,41 @@ class NvidiaRuntimePreparationTests(unittest.TestCase):
         )
 
 
+class ProviderDiagnosticsTests(unittest.TestCase):
+    def test_provider_options_are_normalized_for_json(self) -> None:
+        class Session:
+            @staticmethod
+            def get_provider_options():
+                return {
+                    "CUDAExecutionProvider": {
+                        "device_id": "0",
+                        "opaque": Path("cache"),
+                    },
+                    "CPUExecutionProvider": {},
+                }
+
+        options, status = _provider_options_record(Session())
+
+        self.assertEqual(status, "ok")
+        self.assertEqual(options["CUDAExecutionProvider"]["device_id"], "0")
+        self.assertEqual(options["CUDAExecutionProvider"]["opaque"], "cache")
+
+    def test_provider_diagnostics_do_not_break_an_older_runtime(self) -> None:
+        self.assertEqual(_provider_options_record(object()), ({}, "unavailable"))
+
+    def test_provider_diagnostic_failure_omits_machine_specific_message(self) -> None:
+        class Session:
+            @staticmethod
+            def get_provider_options():
+                raise OSError("secret/install/path")
+
+        options, status = _provider_options_record(Session())
+
+        self.assertEqual(options, {})
+        self.assertEqual(status, "query_failed:OSError")
+        self.assertNotIn("secret", status)
+
+
 class FakeTensorSpec:
     def __init__(
         self,
@@ -295,9 +373,14 @@ class FakeSession:
         output_count: int = 1,
         output: np.ndarray | None = None,
         fail: Exception | None = None,
+        provider_options: dict | None = None,
     ) -> None:
         self.path = path
-        self.providers = list(providers or [])
+        self.provider_specs = list(providers or [])
+        self.providers = [
+            provider[0] if isinstance(provider, tuple) else provider
+            for provider in self.provider_specs
+        ]
         self._inputs = [
             FakeTensorSpec(
                 "images" if index == 0 else f"input{index}",
@@ -315,6 +398,12 @@ class FakeSession:
         ]
         self._output = output if output is not None else np.zeros((1, 300, 6), np.float32)
         self._fail = fail
+        self._provider_options = (
+            provider_options
+            if provider_options is not None
+            else {provider: {} for provider in self.providers}
+        )
+        self.fallback_disabled = False
         self.runs = 0
 
     def get_inputs(self):
@@ -325,6 +414,12 @@ class FakeSession:
 
     def get_providers(self):
         return self.providers
+
+    def get_provider_options(self):
+        return self._provider_options
+
+    def disable_fallback(self):
+        self.fallback_disabled = True
 
     def run(self, names, feed):
         if self._fail is not None:
@@ -359,6 +454,166 @@ class DetectorContractTests(unittest.TestCase):
         self.assertEqual(summary["runtime"], "ONNX Runtime")
         self.assertEqual(summary["device"], "CPUExecutionProvider")
         self.assertIn("CPUExecutionProvider", summary["active_providers"])
+        self.assertEqual(summary["requested_device_input"], "CPU")
+        self.assertEqual(summary["requested_provider"], "CPUExecutionProvider")
+        self.assertEqual(summary["provider_options_status"], "ok")
+        self.assertEqual(summary["provider_options"], {"CPUExecutionProvider": {}})
+        self.assertEqual(summary["provider_option_overrides"], {})
+        self.assertNotIn("execution_mode", summary["configured_session_options"])
+
+    def test_summary_records_runtime_reported_provider_options(self) -> None:
+        detector = make_detector(
+            session_kwargs={
+                "provider_options": {
+                    "CPUExecutionProvider": {"arena_extend_strategy": "0"}
+                }
+            }
+        )
+
+        self.assertEqual(
+            detector.runtime_summary["provider_options"],
+            {"CPUExecutionProvider": {"arena_extend_strategy": "0"}},
+        )
+
+    def test_directml_device_id_is_bound_and_reported(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Runtime:
+            class GraphOptimizationLevel:
+                ORT_ENABLE_ALL = object()
+
+            class ExecutionMode:
+                ORT_SEQUENTIAL = object()
+
+            class SessionOptions:
+                pass
+
+            @staticmethod
+            def get_available_providers():
+                return ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+        def factory(path, sess_options=None, providers=None):
+            captured["providers"] = providers
+            return FakeSession(path, sess_options, providers)
+
+        with patch(
+            "detection.onnx_yolo._load_onnxruntime",
+            return_value=(Runtime, "test"),
+        ):
+            detector = OnnxRuntimeYoloDetector(
+                model_path="unused.onnx",
+                labels_path=None,
+                device="DIRECTML:1",
+                inference_size=416,
+                session_factory=factory,
+            )
+
+        self.assertEqual(
+            captured["providers"],
+            [
+                ("DmlExecutionProvider", {"device_id": "1"}),
+                "CPUExecutionProvider",
+            ],
+        )
+        self.assertEqual(
+            detector.runtime_summary["provider_option_overrides"],
+            {"DmlExecutionProvider": {"device_id": "1"}},
+        )
+
+    def test_full_provider_qualification_disables_cpu_graph_fallback(self) -> None:
+        captured: dict[str, object] = {}
+
+        class Runtime:
+            class GraphOptimizationLevel:
+                ORT_ENABLE_ALL = object()
+
+            class ExecutionMode:
+                ORT_SEQUENTIAL = object()
+
+            class SessionOptions:
+                def __init__(self) -> None:
+                    self.entries: list[tuple[str, str]] = []
+
+                def add_session_config_entry(self, key: str, value: str) -> None:
+                    self.entries.append((key, value))
+
+            @staticmethod
+            def get_available_providers():
+                return ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+        def factory(path, sess_options=None, providers=None):
+            captured["providers"] = providers
+            captured["entries"] = list(sess_options.entries)
+            session = FakeSession(path, sess_options, providers)
+            captured["session"] = session
+            return session
+
+        with patch(
+            "detection.onnx_yolo._load_onnxruntime",
+            return_value=(Runtime, "test"),
+        ):
+            detector = OnnxRuntimeYoloDetector(
+                model_path="unused.onnx",
+                device="DIRECTML:1",
+                inference_size=416,
+                session_factory=factory,
+                require_full_provider=True,
+            )
+
+        self.assertEqual(
+            captured["providers"],
+            [("DmlExecutionProvider", {"device_id": "1"})],
+        )
+        self.assertEqual(
+            captured["entries"],
+            [("session.disable_cpu_ep_fallback", "1")],
+        )
+        self.assertTrue(detector.runtime_summary["require_full_provider"])
+        self.assertTrue(
+            detector.runtime_summary["configured_session_options"][
+                "disable_cpu_ep_fallback"
+            ]
+        )
+        self.assertTrue(captured["session"].fallback_disabled)
+        self.assertTrue(
+            detector.runtime_summary["runtime_ep_fail_fallback_disabled"]
+        )
+
+    def test_full_provider_qualification_requires_epfail_fallback_control(self) -> None:
+        class Runtime:
+            class GraphOptimizationLevel:
+                ORT_ENABLE_ALL = object()
+
+            class ExecutionMode:
+                ORT_SEQUENTIAL = object()
+
+            class SessionOptions:
+                def add_session_config_entry(self, key: str, value: str) -> None:
+                    pass
+
+            @staticmethod
+            def get_available_providers():
+                return ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+        class SessionWithoutFallbackControl:
+            def get_providers(self):
+                return ["DmlExecutionProvider", "CPUExecutionProvider"]
+
+        with patch(
+            "detection.onnx_yolo._load_onnxruntime",
+            return_value=(Runtime, "test"),
+        ), self.assertRaisesRegex(ModelError, "execution-provider failure fallback"):
+            OnnxRuntimeYoloDetector(
+                model_path="unused.onnx",
+                device="DIRECTML",
+                inference_size=416,
+                require_full_provider=True,
+                session_factory=lambda *args, **kwargs: SessionWithoutFallbackControl(),
+            )
+
+    def test_full_provider_qualification_rejects_cpu(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires an accelerator"):
+            make_detector(require_full_provider=True)
 
     def test_wrong_tensor_shape_is_rejected_before_the_session_runs(self) -> None:
         detector = make_detector()
@@ -483,6 +738,37 @@ class DetectorContractTests(unittest.TestCase):
 
         self.assertEqual(len(detections), 1)
         self.assertAlmostEqual(detections[0].confidence, 0.9, places=5)
+
+    def test_postprocess_override_does_not_change_configured_default(self) -> None:
+        raw = np.zeros((1, 300, 6), np.float32)
+        raw[0, 0] = (100.0, 120.0, 200.0, 300.0, 0.9, 0.0)
+        raw[0, 1] = (220.0, 120.0, 320.0, 300.0, 0.18, 0.0)
+        detector = make_detector(
+            confidence=0.25,
+            session_kwargs={"output": raw},
+        )
+        inferred = detector.infer(np.zeros((1, 3, 416, 416), np.float32))
+
+        configured = detector.postprocess(inferred, frame_shape=(416, 416, 3))
+        continuation_decode = detector.postprocess(
+            inferred,
+            frame_shape=(416, 416, 3),
+            confidence=0.15,
+        )
+
+        self.assertEqual(len(configured), 1)
+        self.assertAlmostEqual(configured[0].confidence, 0.9, places=5)
+        self.assertEqual(len(continuation_decode), 2)
+        self.assertAlmostEqual(continuation_decode[1].confidence, 0.18, places=5)
+        self.assertEqual(detector.confidence, 0.25)
+
+        for invalid in (-0.1, 1.1, float("nan")):
+            with self.subTest(invalid=invalid), self.assertRaises(ValueError):
+                detector.postprocess(
+                    inferred,
+                    frame_shape=(416, 416, 3),
+                    confidence=invalid,
+                )
 
 
 if __name__ == "__main__":

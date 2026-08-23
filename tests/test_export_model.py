@@ -13,6 +13,7 @@ from unittest import mock
 from scripts.export_model import (
     ExportArtifactError,
     _artifact_basename,
+    build_parser as build_export_parser,
     main as export_main,
     normalize_ir_basename,
 )
@@ -42,6 +43,17 @@ class ExportModelTests(unittest.TestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaises(argparse.ArgumentTypeError):
                     _artifact_basename(invalid)
+
+    def test_image_size_accepts_legacy_square_and_explicit_height_width(self) -> None:
+        self.assertEqual(build_export_parser().parse_args([]).imgsz, (320, 320))
+        self.assertEqual(
+            build_export_parser().parse_args(["--imgsz", "416"]).imgsz,
+            (416, 416),
+        )
+        self.assertEqual(
+            build_export_parser().parse_args(["--imgsz", "384x640"]).imgsz,
+            (384, 640),
+        )
 
     def test_normalizes_both_ir_artifacts_and_preserves_other_files(self) -> None:
         source_xml, source_bin = self.write_pair(self.root)

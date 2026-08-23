@@ -9,8 +9,12 @@ import unittest
 import numpy as np
 
 from scripts.benchmark_models import (
+    _artifact_record,
+    _specs_from_args,
+    _verified_artifact_after_run,
     PROJECT_ROOT,
     _timed_pipeline,
+    build_parser,
     deterministic_sample,
     main,
     selection_sha256,
@@ -67,11 +71,90 @@ class BenchmarkUtilityTests(unittest.TestCase):
 
         self.assertEqual(summary["samples"], 4)
         self.assertEqual(summary["mean"], 2.5)
+        self.assertEqual(summary["p50"], 2.5)
         self.assertEqual(summary["median"], 2.5)
         self.assertAlmostEqual(float(summary["p95"]), 3.85)
         self.assertAlmostEqual(float(summary["stdev"]), np.sqrt(1.25))
         with self.assertRaisesRegex(ValueError, "empty"):
             summarize_ms([])
+
+    def test_onnx_backend_uses_only_available_bundled_onnx_presets(self) -> None:
+        args = build_parser().parse_args(["--backend", "onnxruntime"])
+
+        specs = _specs_from_args(args)
+
+        self.assertEqual(
+            [spec.key for spec in specs],
+            ["fort-320-fp32", "fort-416-fp32"],
+        )
+        self.assertTrue(all(spec.model.suffix == ".onnx" for spec in specs))
+
+    def test_custom_model_parses_explicit_height_width(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--model",
+                "custom.onnx",
+                "--inference-size",
+                "384x640",
+            ]
+        )
+
+        self.assertEqual(args.inference_size, (384, 640))
+        self.assertEqual(_specs_from_args(args)[0].inference_size, (384, 640))
+
+    def test_onnx_backend_rejects_openvino_only_int8_preset(self) -> None:
+        args = build_parser().parse_args(
+            ["--backend", "onnxruntime", "--preset", "fort-416-int8"]
+        )
+
+        with self.assertRaisesRegex(ValueError, "not available for onnxruntime"):
+            _specs_from_args(args)
+
+    def test_full_provider_flag_is_explicit_onnx_qualification(self) -> None:
+        args = build_parser().parse_args(
+            ["--backend", "onnxruntime", "--require-full-provider"]
+        )
+        self.assertTrue(args.require_full_provider)
+
+        openvino = build_parser().parse_args(["--require-full-provider"])
+        from scripts.benchmark_models import run
+
+        with self.assertRaisesRegex(ValueError, "only for ONNX Runtime"):
+            run(openvino)
+
+    def test_onnx_artifact_record_hashes_only_the_single_graph(self) -> None:
+        model = (
+            PROJECT_ROOT
+            / "models"
+            / "fort_player_416_onnx"
+            / "fort_player_416.onnx"
+        )
+
+        record = _artifact_record(model, "onnxruntime")
+
+        self.assertEqual(len(record["files"]), 1)
+        self.assertEqual(
+            record["files"][0]["path"],
+            "models/fort_player_416_onnx/fort_player_416.onnx",
+        )
+        self.assertEqual(record["files"][0]["resolved_path"], str(model.resolve()))
+        self.assertEqual(record["bytes_total"], model.stat().st_size)
+
+    def test_model_or_labels_mutation_during_benchmark_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "labels.txt"
+            path.write_bytes(b"player\n")
+            before = _artifact_record(path, "onnxruntime")
+
+            path.write_bytes(b"changed\n")
+
+            with self.assertRaisesRegex(RuntimeError, "labels changed"):
+                _verified_artifact_after_run(
+                    path,
+                    before,
+                    backend="onnxruntime",
+                    description="labels",
+                )
 
     def test_pipeline_times_each_stage_and_reports_repeat_distribution(self) -> None:
         class Detector:

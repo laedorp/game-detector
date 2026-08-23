@@ -17,7 +17,9 @@ from utils.render import console_summary
 from utils.self_filter import (
     NormalizedBottomZone,
     SelfAvatarFilter,
+    boxes_are_safely_distinct,
     exclude_self_avatar,
+    is_obvious_bottom_shoulder_avatar,
     is_player_like,
 )
 
@@ -26,9 +28,15 @@ class SelfFilterConfigTests(unittest.TestCase):
     def test_filter_is_opt_in_with_documented_defaults(self) -> None:
         config = parse_args([])
         self.assertFalse(config.ignore_self)
+        self.assertEqual(config.preview_fps, 15.0)
         self.assertEqual(config.self_zone_left, DEFAULT_SELF_ZONE_LEFT)
         self.assertEqual(config.self_zone_width, DEFAULT_SELF_ZONE_WIDTH)
         self.assertEqual(config.self_zone_height, DEFAULT_SELF_ZONE_HEIGHT)
+
+    def test_preview_fps_is_configurable_and_positive(self) -> None:
+        self.assertEqual(parse_args(["--preview-fps", "20"]).preview_fps, 20.0)
+        with self.assertRaises(SystemExit):
+            parse_args(["--preview-fps", "0"])
 
     def test_custom_zone_is_parsed(self) -> None:
         config = parse_args(
@@ -100,6 +108,89 @@ class NormalizedBottomZoneTests(unittest.TestCase):
         result = exclude_self_avatar([opponent], self.frame_shape, self.zone)
         self.assertEqual(result.detections, (opponent,))
 
+    def test_wide_bottom_avatar_is_obvious_only_in_configured_shoulder_band(
+        self,
+    ) -> None:
+        left_avatar = self.detection((4, 340, 760, 1000), "player")
+        right_avatar = self.detection((1240, 340, 1996, 1000), "player")
+
+        self.assertTrue(
+            is_obvious_bottom_shoulder_avatar(
+                left_avatar,
+                self.frame_shape,
+                self.zone,
+            )
+        )
+        self.assertFalse(
+            is_obvious_bottom_shoulder_avatar(
+                right_avatar,
+                self.frame_shape,
+                self.zone,
+            )
+        )
+
+    def test_obvious_guard_covers_recorded_clipped_outer_edge_avatar(self) -> None:
+        # Recorded 1920x1080 self boxes from diagnostic 20260822T032717.  Their
+        # centers landed at x=.179 and x=.173, narrowly outside the configured
+        # left=.18 boundary because the avatar was clipped by the screen edge.
+        recorded_self_boxes = (
+            (9.6, 346.2, 676.2, 1079.6),
+            (18.3, 630.0, 645.8, 1080.0),
+        )
+        for box in recorded_self_boxes:
+            with self.subTest(box=box):
+                self.assertTrue(
+                    is_obvious_bottom_shoulder_avatar(
+                        self.detection(box, "player"),
+                        (1080, 1920, 3),
+                        self.zone,
+                    )
+                )
+
+        # The extra outboard margin is not a generic widening toward nearby
+        # players: only a box inside the narrow recorded edge-contact band may
+        # use it.
+        close_opponent = self.detection(
+            (110.0, 340.0, 600.0, 1000.0),
+            "player",
+        )
+        self.assertFalse(
+            is_obvious_bottom_shoulder_avatar(
+                close_opponent,
+                self.frame_shape,
+                self.zone,
+            )
+        )
+
+        recorded_inset_self = self.detection(
+            (77.37, 283.41, 542.58, 1074.35),
+            "player",
+        )
+        self.assertTrue(
+            is_obvious_bottom_shoulder_avatar(
+                recorded_inset_self,
+                (1080, 1920, 3),
+                self.zone,
+            )
+        )
+
+    def test_obvious_shoulder_guard_requires_screen_bottom_and_avatar_height(
+        self,
+    ) -> None:
+        above_bottom = self.detection((4, 300, 760, 980), "player")
+        short = self.detection((400, 800, 800, 1000), "player")
+        outside_shoulders = self.detection((0, 300, 200, 1000), "player")
+
+        for detection in (above_bottom, short, outside_shoulders):
+            with self.subTest(box=detection.box):
+                self.assertFalse(
+                    is_obvious_bottom_shoulder_avatar(
+                        detection,
+                        self.frame_shape,
+                        self.zone,
+                    )
+                )
+
     def test_edges_are_inclusive(self) -> None:
         # Anchor x is exactly 0.18 and bottom y exactly 0.90.
         boundary = self.detection((260, 100, 460, 900))
@@ -125,6 +216,22 @@ class NormalizedBottomZoneTests(unittest.TestCase):
         result = exclude_self_avatar([smaller, larger], self.frame_shape, self.zone)
         self.assertEqual(result.detections, (smaller, larger))
         self.assertEqual(result.ignored_count, 0)
+        self.assertEqual(
+            result.uncertain_self_detections,
+            (smaller, larger),
+        )
+
+    def test_uncertain_candidates_are_deduplicated_by_identity(self) -> None:
+        avatar = self.detection((550, 200, 850, 1000), "person")
+
+        result = exclude_self_avatar(
+            [avatar, avatar],
+            self.frame_shape,
+            self.zone,
+        )
+
+        self.assertEqual(result.detections, (avatar, avatar))
+        self.assertEqual(result.uncertain_self_detections, (avatar,))
 
     def test_non_player_class_is_never_suppressed(self) -> None:
         car = self.detection((500, 300, 1000, 1000), "car")
@@ -164,6 +271,45 @@ class NormalizedBottomZoneTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.zone.pixel_bounds((0, 1920, 3))
 
+    def test_distinct_box_check_rejects_duplicates_but_allows_separate_player(
+        self,
+    ) -> None:
+        confirmed = (430, 560, 850, 1080)
+        overlapping_duplicate = (440, 570, 860, 1080)
+        nested_duplicate = (560, 700, 760, 1050)
+        separate_opponent = (850, 600, 1050, 1080)
+
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                confirmed,
+                overlapping_duplicate,
+                (1080, 1920, 3),
+            )
+        )
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                confirmed,
+                nested_duplicate,
+                (1080, 1920, 3),
+            )
+        )
+        self.assertTrue(
+            boxes_are_safely_distinct(
+                confirmed,
+                separate_opponent,
+                (1080, 1920, 3),
+            )
+        )
+
+    def test_malformed_box_is_never_declared_safely_distinct(self) -> None:
+        self.assertFalse(
+            boxes_are_safely_distinct(
+                (430, 560, 850, 1080),
+                (math.nan, 600, 1050, 1080),
+                (1080, 1920, 3),
+            )
+        )
+
 
 class StatefulSelfAvatarFilterTests(unittest.TestCase):
     frame_shape = (1080, 1920, 3)
@@ -199,6 +345,9 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         self.assertFalse(first.aim_safe)
         self.assertFalse(second.aim_safe)
         self.assertTrue(third.aim_safe)
+        self.assertEqual(first.uncertain_self_detections, (self.avatar,))
+        self.assertEqual(second.uncertain_self_detections, (self.avatar,))
+        self.assertEqual(third.uncertain_self_detections, ())
         self.assertEqual(third.detections, (enemy,))
         self.assertIs(third.ignored_detection, self.avatar)
 
@@ -224,12 +373,46 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         self.assertTrue(second.aim_safe)
         self.assertEqual(first.detections, (enemy,))
         self.assertEqual(second.detections, (enemy,))
+        self.assertEqual(first.uncertain_self_detections, ())
+        self.assertEqual(second.uncertain_self_detections, ())
 
     def test_ambiguous_self_overlap_blocks_aim(self) -> None:
         self.acquire()
         duplicate = self.detection((440, 570, 860, 1080), "person")
         result = self.filter.apply([self.avatar, duplicate], self.frame_shape)
         self.assertFalse(result.aim_safe)
+        self.assertEqual(
+            result.uncertain_self_detections,
+            (self.avatar, duplicate),
+        )
+
+    def test_opposite_shoulder_avatar_blocks_aim_until_reacquired(self) -> None:
+        self.acquire()
+        opposite_shoulder = self.detection((1200, 550, 1450, 1080), "person")
+
+        first = self.filter.apply([opposite_shoulder], self.frame_shape)
+        second = self.filter.apply([opposite_shoulder], self.frame_shape)
+        third = self.filter.apply([opposite_shoulder], self.frame_shape)
+
+        self.assertFalse(first.aim_safe)
+        self.assertFalse(second.aim_safe)
+        self.assertEqual(first.uncertain_self_detections, (opposite_shoulder,))
+        self.assertEqual(second.uncertain_self_detections, (opposite_shoulder,))
+        self.assertEqual(first.detections, (opposite_shoulder,))
+        self.assertEqual(second.detections, (opposite_shoulder,))
+        self.assertTrue(third.aim_safe)
+        self.assertEqual(third.uncertain_self_detections, ())
+        self.assertEqual(third.detections, ())
+        self.assertIs(third.ignored_detection, opposite_shoulder)
+
+    def test_bottom_opponent_outside_selected_shoulder_is_not_suppressed(self) -> None:
+        opponent = self.detection((1300, 430, 1550, 1080), "person")
+
+        result = self.filter.apply([opponent], self.frame_shape)
+
+        self.assertEqual(result.detections, (opponent,))
+        self.assertEqual(result.ignored_count, 0)
+        self.assertTrue(result.aim_safe)
 
     def test_one_or_two_frame_transient_is_retained(self) -> None:
         first = self.filter.apply([self.avatar], self.frame_shape)
@@ -242,6 +425,10 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         for _ in range(5):
             result = self.filter.apply([self.avatar, opponent], self.frame_shape)
             self.assertEqual(result.ignored_count, 0)
+            self.assertEqual(
+                result.uncertain_self_detections,
+                (self.avatar, opponent),
+            )
         self.assertFalse(self.filter.acquired)
 
     def test_taller_opponent_does_not_steal_existing_lock(self) -> None:
@@ -263,6 +450,9 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         third = self.filter.apply([possible_handoff], self.frame_shape)
         self.assertEqual(first.detections, (possible_handoff,))
         self.assertEqual(second.detections, (possible_handoff,))
+        self.assertEqual(first.uncertain_self_detections, (possible_handoff,))
+        self.assertEqual(second.uncertain_self_detections, (possible_handoff,))
+        self.assertEqual(third.uncertain_self_detections, ())
         self.assertEqual(third.detections, ())
         self.assertIs(third.ignored_detection, possible_handoff)
 
@@ -293,6 +483,25 @@ class StatefulSelfAvatarFilterTests(unittest.TestCase):
         result = self.filter.apply([merged], self.frame_shape)
         self.assertEqual(result.detections, (merged,))
         self.assertEqual(result.ignored_count, 0)
+        self.assertFalse(result.aim_safe)
+        self.assertEqual(result.uncertain_self_detections, (merged,))
+
+    def test_wide_bottom_handoff_does_not_taint_distinct_opponent(self) -> None:
+        self.acquire()
+        wide_self = self.detection((4, 370, 750, 1080), "person")
+        distinct_opponent = self.detection((903, 438, 954, 522), "person")
+
+        result = self.filter.apply(
+            [wide_self, distinct_opponent],
+            self.frame_shape,
+        )
+
+        self.assertFalse(result.aim_safe)
+        self.assertEqual(
+            result.detections,
+            (wide_self, distinct_opponent),
+        )
+        self.assertEqual(result.uncertain_self_detections, (wide_self,))
 
     def test_non_player_never_enters_acquisition(self) -> None:
         vehicle = self.detection((430, 400, 900, 1080), "car")

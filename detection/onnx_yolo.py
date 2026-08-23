@@ -19,6 +19,8 @@ from typing import Any
 
 import numpy as np
 
+from utils.inference_size import InferenceSizeLike, compact_inference_size
+
 from .base import (
     DependencyError,
     DetectorError,
@@ -45,8 +47,8 @@ PROVIDER_PREFERENCE = (
     # installed. Prefer CUDA for a reliable one-click default; TensorRT remains
     # available as an explicit advanced choice.
     "TensorrtExecutionProvider",
-    "ROCMExecutionProvider",
     "MIGraphXExecutionProvider",
+    "ROCMExecutionProvider",
     "DmlExecutionProvider",
     "OpenVINOExecutionProvider",
     "CPUExecutionProvider",
@@ -57,15 +59,19 @@ PROVIDER_PREFERENCE = (
 PROVIDER_ALIASES = {
     "AUTO": None,
     # Launcher/device settings historically used OpenVINO-style tokens (CPU/GPU).
-    # Treat generic GPU as AUTO so ONNX Runtime picks the best installed GPU
-    # provider (DirectML/CUDA/ROCM/TensorRT) instead of failing hard.
+    # ``GPU`` is handled as a distinct accelerator-only request below.  It must
+    # never inherit AUTO's CPU fallback, otherwise a stale/manual GPU profile
+    # can appear to work while silently becoming the slow path.
     "GPU": None,
     "CPU": "CPUExecutionProvider",
     "CUDA": "CUDAExecutionProvider",
     "NVIDIA": "CUDAExecutionProvider",
     "TENSORRT": "TensorrtExecutionProvider",
     "ROCM": "ROCMExecutionProvider",
-    "AMD": "ROCMExecutionProvider",
+    # ``AMD`` is handled as an accelerator-only family request below. Current
+    # ONNX Runtime uses MIGraphX for supported Linux AMD stacks, while older
+    # installations may still expose the retired ROCm EP.
+    "AMD": None,
     "MIGRAPHX": "MIGraphXExecutionProvider",
     "DIRECTML": "DmlExecutionProvider",
     "DML": "DmlExecutionProvider",
@@ -75,6 +81,20 @@ PROVIDER_ALIASES = {
 NVIDIA_EXECUTION_PROVIDERS = frozenset(
     {"CUDAExecutionProvider", "TensorrtExecutionProvider"}
 )
+
+
+def _directml_device_id(requested: str) -> int | None:
+    """Parse ``DIRECTML:N``/``DML:N`` while keeping legacy aliases intact."""
+
+    normalized = str(requested).strip().upper()
+    prefix, separator, raw_index = normalized.partition(":")
+    if not separator:
+        return None
+    if prefix not in {"DIRECTML", "DML", "DMLEXECUTIONPROVIDER"}:
+        return None
+    if not raw_index.isdecimal():
+        raise ValueError("DirectML adapter index must be a non-negative integer.")
+    return int(raw_index)
 
 
 def _load_onnxruntime() -> tuple[Any, str]:
@@ -90,37 +110,29 @@ def _load_onnxruntime() -> tuple[Any, str]:
     return onnxruntime, getattr(onnxruntime, "__version__", "unknown")
 
 
-def _configure_session_options(runtime: Any, options: Any, providers: Sequence[str]) -> None:
-    """Apply latency-oriented defaults that work across GPU providers.
+def _configure_session_options(
+    runtime: Any, options: Any, providers: Sequence[str]
+) -> dict[str, Any]:
+    """Apply only provider requirements that are justified across machines.
 
-    ONNX Runtime defaults are throughput-friendly on some platforms. Real-time
-    single-frame detection benefits from sequential execution and lower host
-    scheduling overhead, especially when CUDA/ROCm/DirectML do the heavy work.
+    DirectML explicitly requires sequential execution and memory patterns off.
+    CUDA, ROCm, and CPU do not share that restriction, so keep their runtime
+    defaults until a same-hardware benchmark proves a narrower override wins.
     """
 
     options.graph_optimization_level = runtime.GraphOptimizationLevel.ORT_ENABLE_ALL
+    configured: dict[str, Any] = {
+        "graph_optimization_level": "ORT_ENABLE_ALL",
+    }
 
-    execution_mode = getattr(runtime, "ExecutionMode", None)
-    if execution_mode is not None and hasattr(execution_mode, "ORT_SEQUENTIAL"):
-        options.execution_mode = execution_mode.ORT_SEQUENTIAL
-
-    # DirectML paths in particular can stutter with memory pattern reuse.
-    options.enable_mem_pattern = False
-
-    gpu_chain = any(
-        provider
-        in {
-            "TensorrtExecutionProvider",
-            "CUDAExecutionProvider",
-            "ROCMExecutionProvider",
-            "MIGraphXExecutionProvider",
-            "DmlExecutionProvider",
-        }
-        for provider in providers
-    )
-    if gpu_chain:
-        options.intra_op_num_threads = 1
-        options.inter_op_num_threads = 1
+    if "DmlExecutionProvider" in providers:
+        execution_mode = getattr(runtime, "ExecutionMode", None)
+        if execution_mode is not None and hasattr(execution_mode, "ORT_SEQUENTIAL"):
+            options.execution_mode = execution_mode.ORT_SEQUENTIAL
+            configured["execution_mode"] = "ORT_SEQUENTIAL"
+        options.enable_mem_pattern = False
+        configured["enable_mem_pattern"] = False
+    return configured
 
 
 def _preload_nvidia_libraries(runtime: Any, providers: Sequence[str]) -> bool:
@@ -165,6 +177,42 @@ def _require_active_provider(requested: str, active: Sequence[str]) -> None:
     )
 
 
+def _provider_options_record(session: Any) -> tuple[dict[str, dict[str, Any]], str]:
+    """Return JSON-safe provider options without making diagnostics fatal.
+
+    ``InferenceSession.get_provider_options`` is available in current ONNX
+    Runtime releases, but older builds and lightweight test doubles may not
+    expose it.  Provider activation remains the authoritative startup check;
+    diagnostics must never turn an otherwise usable session into a failure.
+    Exception text is deliberately omitted because provider errors can contain
+    machine-specific installation paths.
+    """
+
+    getter = getattr(session, "get_provider_options", None)
+    if not callable(getter):
+        return {}, "unavailable"
+    try:
+        reported = getter()
+    except Exception as exc:
+        return {}, f"query_failed:{type(exc).__name__}"
+    if not isinstance(reported, Mapping):
+        return {}, "invalid_response"
+
+    normalized: dict[str, dict[str, Any]] = {}
+    for provider, raw_options in reported.items():
+        if not isinstance(raw_options, Mapping):
+            continue
+        options: dict[str, Any] = {}
+        for key, value in raw_options.items():
+            if value is None or isinstance(value, (bool, int, float, str)):
+                safe_value = value
+            else:
+                safe_value = str(value)
+            options[str(key)] = safe_value
+        normalized[str(provider)] = options
+    return normalized, "ok"
+
+
 def resolve_providers(
     requested: str, available: Sequence[str]
 ) -> tuple[list[str], str]:
@@ -178,6 +226,9 @@ def resolve_providers(
     normalized = str(requested).strip().upper()
     if not normalized:
         raise ValueError("device must not be empty.")
+    directml_id = _directml_device_id(requested)
+    if directml_id is not None:
+        normalized = "DIRECTML"
 
     available_set = set(available)
     available_by_normalized = {
@@ -187,7 +238,46 @@ def resolve_providers(
         provider.upper(): provider for provider in PROVIDER_PREFERENCE
     }
     if normalized in PROVIDER_ALIASES:
-        target = PROVIDER_ALIASES[normalized]
+        if normalized == "GPU":
+            target = next(
+                (
+                    provider
+                    for provider in PROVIDER_PREFERENCE
+                    if provider in available_set
+                    and provider
+                    not in {"CPUExecutionProvider", "OpenVINOExecutionProvider"}
+                ),
+                None,
+            )
+            if target is None:
+                raise DeviceNotAvailableError(
+                    "GPU was requested, but ONNX Runtime reports no GPU execution "
+                    "provider. Install the matching CUDA, DirectML, ROCm, or MIGraphX "
+                    "runtime, or explicitly select CPU. Available: "
+                    + (", ".join(sorted(available_set)) or "none")
+                )
+        elif normalized == "AMD":
+            target = next(
+                (
+                    provider
+                    for provider in (
+                        "MIGraphXExecutionProvider",
+                        "ROCMExecutionProvider",
+                    )
+                    if provider in available_set
+                ),
+                None,
+            )
+            if target is None:
+                raise DeviceNotAvailableError(
+                    "AMD GPU was requested, but ONNX Runtime reports neither the "
+                    "MIGraphX nor legacy ROCm execution provider. Install a runtime "
+                    "supported by this exact GPU/OS combination, use DirectML on "
+                    "Windows, or explicitly select CPU. Available: "
+                    + (", ".join(sorted(available_set)) or "none")
+                )
+        else:
+            target = PROVIDER_ALIASES[normalized]
     elif normalized in available_by_normalized:
         # Launcher settings were historically uppercased, turning for example
         # ``TensorrtExecutionProvider`` into ``TENSORRTEXECUTIONPROVIDER``.
@@ -234,19 +324,23 @@ class OnnxRuntimeYoloDetector(Detector):
         model_path: str | Path,
         labels_path: str | Path | None = None,
         device: str = "AUTO",
-        inference_size: int | Sequence[int] = 416,
+        inference_size: InferenceSizeLike = 416,
         confidence: float = 0.25,
         iou: float = 0.45,
         output_format: str = "auto",
         *,
         decoder: Decoder | None = None,
         session_factory: Any | None = None,
+        require_full_provider: bool = False,
     ) -> None:
+        requested_device_input = str(device)
         self.model_path = Path(model_path).expanduser()
         if session_factory is None and not self.model_path.is_file():
             raise FileNotFoundError(f"ONNX model file not found: {self.model_path}")
         self.labels = _load_labels(labels_path)
-        self.inference_size = _normalize_inference_size(inference_size)
+        self.input_size = _normalize_inference_size(inference_size)
+        # Compatibility for square integrations that inspect this attribute.
+        self.inference_size = compact_inference_size(self.input_size)
         self.confidence = float(confidence)
         self.iou = float(iou)
         self.output_format = str(output_format).lower()
@@ -265,14 +359,45 @@ class OnnxRuntimeYoloDetector(Detector):
             raise DependencyError(f"Could not query ONNX Runtime providers: {exc}") from exc
 
         chain, requested_device = resolve_providers(device, self._available_devices)
+        if require_full_provider and requested_device == "CPUExecutionProvider":
+            raise ValueError(
+                "Full-provider qualification requires an accelerator, not CPU."
+            )
+        directml_device_id = _directml_device_id(device)
         nvidia_preload_requested = _preload_nvidia_libraries(runtime, chain)
 
         try:
             options = runtime.SessionOptions()
-            _configure_session_options(runtime, options, chain)
+            configured_session_options = _configure_session_options(
+                runtime, options, chain
+            )
+            provider_specs: list[Any] = list(chain)
+            if require_full_provider:
+                add_config = getattr(options, "add_session_config_entry", None)
+                if not callable(add_config):
+                    raise RuntimeError(
+                        "this ONNX Runtime does not expose the CPU-fallback "
+                        "qualification option"
+                    )
+                add_config("session.disable_cpu_ep_fallback", "1")
+                # ONNX Runtime rejects the qualification option when CPU is
+                # also explicitly registered. Unsupported graph nodes must
+                # make session creation fail instead of silently running there.
+                provider_specs = [
+                    provider
+                    for provider in provider_specs
+                    if provider != "CPUExecutionProvider"
+                ]
+                configured_session_options["disable_cpu_ep_fallback"] = True
+            provider_option_overrides: dict[str, dict[str, str]] = {}
+            if directml_device_id is not None:
+                dml_index = chain.index("DmlExecutionProvider")
+                dml_options = {"device_id": str(directml_device_id)}
+                provider_specs[dml_index] = ("DmlExecutionProvider", dml_options)
+                provider_option_overrides["DmlExecutionProvider"] = dml_options
             factory = session_factory or runtime.InferenceSession
             self._session = factory(
-                str(self.model_path), sess_options=options, providers=chain
+                str(self.model_path), sess_options=options, providers=provider_specs
             )
         except Exception as exc:
             raise ModelError(
@@ -286,6 +411,28 @@ class OnnxRuntimeYoloDetector(Detector):
                 f"Could not inspect active ONNX Runtime providers: {exc}"
             ) from exc
         _require_active_provider(requested_device, active)
+        runtime_ep_fail_fallback_disabled = False
+        if require_full_provider:
+            # ``session.disable_cpu_ep_fallback=1`` rejects graph nodes that
+            # would be assigned to CPU while the session is built.  Python's
+            # InferenceSession also has an independent EPFail retry path which
+            # can replace the requested providers with CPU after a Run fails.
+            # Qualification must close both paths before any warmup/inference.
+            disable_runtime_fallback = getattr(self._session, "disable_fallback", None)
+            if not callable(disable_runtime_fallback):
+                raise ModelError(
+                    "Full-provider qualification requires an ONNX Runtime session "
+                    "that can disable execution-provider failure fallback."
+                )
+            try:
+                disable_runtime_fallback()
+            except Exception as exc:
+                raise ModelError(
+                    "Could not disable ONNX Runtime execution-provider failure "
+                    f"fallback for full-provider qualification: {exc}"
+                ) from exc
+            runtime_ep_fail_fallback_disabled = True
+        provider_options, provider_options_status = _provider_options_record(self._session)
 
         try:
             inputs = self._session.get_inputs()
@@ -324,14 +471,19 @@ class OnnxRuntimeYoloDetector(Detector):
 
         # A static export pins spatial dimensions; a dynamic axis arrives as a
         # string or None. Dynamic H/W legitimately accept the configured size.
-        for value in declared[2:4]:
+        for axis, (value, configured) in enumerate(
+            zip(declared[2:4], self.input_size, strict=True),
+            start=2,
+        ):
             if isinstance(value, bool):
                 raise ModelError(f"Invalid ONNX model input shape {declared}.")
             if isinstance(value, Integral):
-                if int(value) <= 0 or int(value) != self.inference_size:
+                if int(value) <= 0 or int(value) != configured:
                     raise ModelError(
                         f"ONNX model expects input {declared}, which does not match the "
-                        f"configured inference size {self.inference_size}."
+                        "configured input shape "
+                        f"[1, 3, {self.input_size[0]}, {self.input_size[1]}] "
+                        f"(dimension {axis} should be {configured})."
                     )
             elif value is not None and not isinstance(value, str):
                 raise ModelError(f"Could not interpret ONNX model input shape {declared}.")
@@ -355,13 +507,26 @@ class OnnxRuntimeYoloDetector(Detector):
             "onnxruntime_version": version,
             "model_path": str(self.model_path),
             "device": active_device,
+            "requested_device_input": requested_device_input,
             "requested_device": requested_device,
+            "requested_provider": requested_device,
             "available_devices": list(self._available_devices),
             "provider_chain": chain,
             "active_providers": active,
+            "provider_options": provider_options,
+            "provider_options_status": provider_options_status,
+            "provider_options_source": "InferenceSession.get_provider_options",
+            "provider_option_overrides": provider_option_overrides,
+            "configured_session_options": configured_session_options,
+            "require_full_provider": bool(require_full_provider),
+            "runtime_ep_fail_fallback_disabled": (
+                runtime_ep_fail_fallback_disabled
+            ),
             "nvidia_preload_requested": nvidia_preload_requested,
             "input_name": self._input_name,
-            "input_shape": declared,
+            "input_shape": [1, 3, *self.input_size],
+            "declared_input_shape": declared,
+            "configured_input_shape": [1, 3, *self.input_size],
             "input_type": input_type,
             "output_name": self._output_name,
             "output_shape": output_shape,
@@ -381,15 +546,19 @@ class OnnxRuntimeYoloDetector(Detector):
         return dict(self._runtime_summary)
 
     def warmup(self, iterations: int = 3) -> None:
-        if iterations <= 0:
+        if isinstance(iterations, bool) or not isinstance(iterations, Integral):
+            raise ValueError("warmup iterations must be a non-negative integer.")
+        if iterations < 0:
+            raise ValueError("warmup iterations must be a non-negative integer.")
+        if iterations == 0:
             return
-        blank = np.zeros((1, 3, self.inference_size, self.inference_size), dtype=np.float32)
+        blank = np.zeros((1, 3, *self.input_size), dtype=np.float32)
         for _ in range(iterations):
             self.infer(blank)
 
     def infer(self, tensor: np.ndarray) -> np.ndarray:
         array = np.asarray(tensor)
-        expected_shape = (1, 3, self.inference_size, self.inference_size)
+        expected_shape = (1, 3, *self.input_size)
         if array.shape != expected_shape:
             raise ValueError(
                 f"Inference tensor must have shape {expected_shape}, got {array.shape}."
@@ -411,14 +580,21 @@ class OnnxRuntimeYoloDetector(Detector):
         raw: np.ndarray,
         transform: FrameTransformLike | None = None,
         frame_shape: Sequence[int] | None = None,
+        *,
+        confidence: float | None = None,
     ) -> list[Detection]:
+        decode_confidence = (
+            self.confidence if confidence is None else float(confidence)
+        )
+        if not np.isfinite(decode_confidence) or not 0.0 <= decode_confidence <= 1.0:
+            raise ValueError("confidence must be a finite value between 0 and 1.")
         if self._decoder is None:
             return decode_yolo_output(
                 raw,
                 transform=transform,
                 frame_shape=frame_shape,
                 labels=self.labels,
-                confidence=self.confidence,
+                confidence=decode_confidence,
                 iou=self.iou,
                 output_format=self.output_format,
             )
@@ -429,7 +605,7 @@ class OnnxRuntimeYoloDetector(Detector):
                     transform=transform,
                     frame_shape=frame_shape,
                     labels=self.labels,
-                    confidence=self.confidence,
+                    confidence=decode_confidence,
                     iou=self.iou,
                 )
             )

@@ -56,10 +56,109 @@ OMP_NUM_THREADS=6 MKL_NUM_THREADS=6 .venv/bin/python scripts/benchmark_models.py
 
 The script is read-only with respect to the repository. It prints one
 machine-readable JSON document containing artifact hashes, host/runtime data,
-the input selection fingerprint, every repeat, and aggregate mean, median,
+the input selection fingerprint, every repeat, and aggregate mean, p50/median,
 p95, and p99 timing. Progress goes to stderr. To benchmark an installed bundle
-without the dataset, add `--synthetic`; synthetic results are useful for
-runtime comparison but say nothing about accuracy.
+without the dataset, add `--synthetic`; synthetic results are useful for runtime
+comparison but say nothing about accuracy.
+
+A frozen ProAim bundle exposes the same benchmark through
+`ProAimCLI.exe --benchmark-models` on Windows or `ProAim --benchmark-models`
+on Linux. Use that entry point for release qualification so the measured
+runtime and model are the exact files shipped to users rather than a separate
+Python environment.
+
+For the Windows GPU path, run the same workload through ONNX Runtime. For
+example, this measures the shipped 416 player graph on DirectML:
+
+```powershell
+ProAimCLI.exe --benchmark-models --backend onnxruntime `
+  --preset fort-416-fp32 --device DIRECTML:1 --synthetic `
+  --require-full-provider `
+  --samples 32 --warmup 30 --iterations 100 --repeats 3 `
+  > benchmark-directml-416.json
+```
+
+Repeat with `--preset fort-320-fp32` to measure the responsiveness tradeoff on
+the same machine. An NVIDIA CUDA runtime build can use `--device CUDA`; the
+benchmark does not silently substitute a synthetic FP16 graph or change model
+precision.
+
+Replace `1` with the DXGI adapter index shown by **Scan hardware**. If ProAim
+cannot match the WMI GPU to exactly one DXGI adapter, use plain `DIRECTML` and
+verify the active physical GPU in Task Manager rather than guessing an index.
+Run this command from the extracted `ProAim` folder and keep the complete JSON
+with that bundle's `BUILD-INFO.json`.
+
+Each ONNX result records the original device request, resolved provider chain,
+active providers, and the provider options reported by
+`InferenceSession.get_provider_options()`. An active DirectML or CUDA provider
+confirms which execution provider ran, but it does not by itself identify the
+physical GPU selected on a hybrid-graphics laptop. Keep the complete JSON with
+the driver's GPU activity evidence when qualifying a machine.
+
+`--require-full-provider` is a qualification gate: session creation fails if
+any model node would be assigned to CPU. It is intentionally not a normal
+production setting because ordinary runtime fallback is more compatible.
+
+## Frozen live-pipeline qualification (RTX 5060 example)
+
+The model benchmark above isolates runtime inference. A release candidate must
+also exercise the normal capture, preprocessing, detector, postprocessing, and
+preview path from the exact frozen ZIP. From the extracted `ProAim` directory,
+replace `1` with the RTX adapter index shown by **Scan hardware**, start a
+Moonlight stream, and run the no-preview baseline in PowerShell:
+
+```powershell
+.\ProAimCLI.exe --cli `
+  --source screen --screen-monitor 1 --screen-fps 60 `
+  --backend onnxruntime --device DIRECTML:1 --require-full-provider `
+  --model .\_internal\models\fort_player_416_onnx\fort_player_416.onnx `
+  --labels .\_internal\models\fort_player.txt --inference-size 416 `
+  --stats-window 1000 --max-frames 1000 --max-seconds 60 `
+  --no-preview --metrics-json .\rtx5060-fort416-live-no-preview.json
+```
+
+Then run the same workload with the capped preview enabled:
+
+```powershell
+.\ProAimCLI.exe --cli `
+  --source screen --screen-monitor 1 --screen-fps 60 `
+  --backend onnxruntime --device DIRECTML:1 --require-full-provider `
+  --model .\_internal\models\fort_player_416_onnx\fort_player_416.onnx `
+  --labels .\_internal\models\fort_player.txt --inference-size 416 `
+  --stats-window 1000 --max-frames 1000 --max-seconds 60 `
+  --preview-fps 15 --metrics-json .\rtx5060-fort416-live-preview15.json
+```
+
+Each destination must be new; ProAim refuses to overwrite an earlier report.
+Both runs stop at exactly 1,000 processed frames or after 60 seconds, including
+when an unchanged desktop produces no new DXGI frames. The JSON records the
+bundle build identity, UTC timestamps, model and label SHA-256 hashes, active
+provider/options, selected DXGI adapter, negotiated capture backend and
+fallback reason, capture/overwrite/failure counters, preview mailbox counters,
+and rolling mean/p50/p95/p99 for every live timing field. Pairing keys and
+auto-detected controller, activation, and serial paths are not included.
+
+While each run is active, open Windows Task Manager's Performance page and
+confirm that the named **GeForce RTX 5060 Laptop GPU** engine, not the integrated
+GPU, shows the inference load. Keep that evidence, both JSON files, and the
+ZIP's `BUILD-INFO.json` together. An active DirectML provider plus an enumerated
+DXGI adapter proves the software selection; Task Manager independently confirms
+physical activity on the intended hybrid-laptop adapter. Compare `elapsed_fps`,
+`update_fps`, processing/freshness percentiles, capture overwrites, and preview
+service/replacement counts between the two reports.
+
+Experimental `--detail-crop-size` qualification uses the same live report
+schema. Schema v2 records requested and actually applied source-pixel crop,
+source/model dimensions, crop area coverage, exact full/detail letterbox
+scales, their derived linear-detail ratio, applied/redundant/clamped frame
+counts, the cross-pass duplicate IoU threshold, and separate
+`detail_preprocess_ms`, `detail_inference_ms`, and
+`detail_postprocess_ms` distributions. Total `processing_ms` still covers both
+passes, consolidation, filtering, tracking, and control preparation. Do not
+publish a fixed magnification or enable this mode in a default preset before
+the exact model shape, source geometry, far-recall result, and target-hardware
+latency report have all been retained.
 
 Method used for the table below:
 

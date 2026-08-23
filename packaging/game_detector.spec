@@ -9,7 +9,7 @@ binary must be produced on Linux.
 from importlib import metadata
 from importlib.util import find_spec
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import sysconfig
 import sys
 
@@ -22,6 +22,14 @@ from PyInstaller.utils.hooks import (
 
 
 PROJECT_ROOT = Path(SPECPATH).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.release_model_contract import (  # noqa: E402
+    CONTRACT_RELATIVE as RELEASE_DEFAULT_CONTRACT_RELATIVE,
+    load_release_default_contract,
+)
+
 ENTRY_POINT = PROJECT_ROOT / "app.py"
 ASSETS_DIR = PROJECT_ROOT / "assets"
 MODEL_DIR = PROJECT_ROOT / "models" / "yolo26n_openvino_model"
@@ -29,20 +37,32 @@ BALANCED_MODEL_DIR = PROJECT_ROOT / "models" / "yolo26n_416_openvino_model"
 HIGH_END_MODEL_DIR = PROJECT_ROOT / "models" / "yolo11l_openvino_model"
 HIGH_END_ONNX_DIR = PROJECT_ROOT / "models" / "yolo11l_onnx"
 PLAYER_MODEL_DIR = PROJECT_ROOT / "models" / "fort_player_openvino_model"
-PLAYER_BALANCED_MODEL_DIR = PROJECT_ROOT / "models" / "fort_player_416_openvino_model"
 PLAYER_INT8_MODEL_DIR = PROJECT_ROOT / "models" / "fort_player_416_int8_openvino_model"
+HEAD_MODEL_DIR = PROJECT_ROOT / "models" / "sunxds_head_onnx"
 # ONNX copies of every bundled model.  OpenVINO cannot drive AMD or NVIDIA
 # GPUs, so a build without these cannot run on that hardware at all.
 ONNX_MODEL_DIRS = {
-    "models/fort_player_416_onnx": "fort_player_416.onnx",
     "models/fort_player_onnx": "fort_player.onnx",
     "models/yolo26n_416_onnx": "yolo26n_416.onnx",
     "models/yolo26n_onnx": "yolo26n.onnx",
 }
 THIRD_PARTY_NOTICES = PROJECT_ROOT / "THIRD_PARTY_NOTICES.md"
 MODEL_MANIFEST = PROJECT_ROOT / "models" / "RELEASE-MANIFEST.sha256"
+RELEASE_DEFAULT_CONTRACT = PROJECT_ROOT.joinpath(
+    *RELEASE_DEFAULT_CONTRACT_RELATIVE.parts
+)
+RELEASE_DEFAULT_POINTER = load_release_default_contract(
+    PROJECT_ROOT, verify_files=True
+)
+RELEASE_DEFAULT_MEMBER_PATHS = tuple(
+    PROJECT_ROOT.joinpath(*PurePosixPath(record["path"]).parts)
+    for record in RELEASE_DEFAULT_POINTER["artifacts"].values()
+)
 PYSERIAL_LICENSE = (
     PROJECT_ROOT / "packaging" / "licenses" / "pyserial-3.5-BSD-3-Clause.txt"
+)
+DXCAM_LICENSE = (
+    PROJECT_ROOT / "packaging" / "licenses" / "dxcam-0.3.0-MIT.txt"
 )
 WINDOWS_ICON = ASSETS_DIR / "game-detector.ico"
 RUNTIME_VARIANT = os.environ.get("PROAIM_RUNTIME_VARIANT", "cpu").strip().lower()
@@ -77,6 +97,8 @@ required_files = (
     ENTRY_POINT,
     PROJECT_ROOT / "LICENSE",
     PROJECT_ROOT / "README.md",
+    PROJECT_ROOT / "docs" / "DEPENDENCY_LOCKS.md",
+    PROJECT_ROOT / "docs" / "MODEL_ACCURACY_EVALUATION.md",
     PROJECT_ROOT / "docs" / "MODEL_BENCHMARKS.md",
     PROJECT_ROOT / "docs" / "RELEASE_CHECKLIST.md",
     THIRD_PARTY_NOTICES,
@@ -101,22 +123,22 @@ required_files = (
     PLAYER_MODEL_DIR / "fort_player.xml",
     PLAYER_MODEL_DIR / "fort_player.bin",
     PLAYER_MODEL_DIR / "ATTRIBUTION.md",
-    PLAYER_BALANCED_MODEL_DIR / "fort_player_416.xml",
-    PLAYER_BALANCED_MODEL_DIR / "fort_player_416.bin",
-    PLAYER_BALANCED_MODEL_DIR / "ATTRIBUTION.md",
     PLAYER_INT8_MODEL_DIR / "fort_player_416_int8.xml",
     PLAYER_INT8_MODEL_DIR / "fort_player_416_int8.bin",
     PLAYER_INT8_MODEL_DIR / "metadata.yaml",
     PLAYER_INT8_MODEL_DIR / "ATTRIBUTION.md",
+    HEAD_MODEL_DIR / "sunxds_0.8.0.onnx",
+    HEAD_MODEL_DIR / "ATTRIBUTION.md",
 ) + tuple(
     PROJECT_ROOT / directory / filename
     for directory, filename in ONNX_MODEL_DIRS.items()
 ) + tuple(
     PROJECT_ROOT / directory / "ATTRIBUTION.md"
-    for directory in ("models/fort_player_416_onnx", "models/fort_player_onnx")
-)
+    for directory in ("models/fort_player_onnx",)
+) + (RELEASE_DEFAULT_CONTRACT,) + RELEASE_DEFAULT_MEMBER_PATHS
+required_files = tuple(dict.fromkeys(required_files))
 if sys.platform == "win32":
-    required_files += (WINDOWS_ICON,)
+    required_files += (WINDOWS_ICON, DXCAM_LICENSE)
 missing_files = [str(path) for path in required_files if not path.is_file()]
 if missing_files:
     raise SystemExit(
@@ -128,6 +150,8 @@ if missing_files:
 datas = [
     (str(PROJECT_ROOT / "LICENSE"), "."),
     (str(PROJECT_ROOT / "README.md"), "."),
+    (str(PROJECT_ROOT / "docs" / "DEPENDENCY_LOCKS.md"), "docs"),
+    (str(PROJECT_ROOT / "docs" / "MODEL_ACCURACY_EVALUATION.md"), "docs"),
     (str(PROJECT_ROOT / "docs" / "MODEL_BENCHMARKS.md"), "docs"),
     (str(PROJECT_ROOT / "docs" / "RELEASE_CHECKLIST.md"), "docs"),
     (str(THIRD_PARTY_NOTICES), "."),
@@ -164,18 +188,6 @@ datas = [
     (str(PLAYER_MODEL_DIR / "fort_player.bin"), "models/fort_player_openvino_model"),
     (str(PLAYER_MODEL_DIR / "ATTRIBUTION.md"), "models/fort_player_openvino_model"),
     (
-        str(PLAYER_BALANCED_MODEL_DIR / "fort_player_416.xml"),
-        "models/fort_player_416_openvino_model",
-    ),
-    (
-        str(PLAYER_BALANCED_MODEL_DIR / "fort_player_416.bin"),
-        "models/fort_player_416_openvino_model",
-    ),
-    (
-        str(PLAYER_BALANCED_MODEL_DIR / "ATTRIBUTION.md"),
-        "models/fort_player_416_openvino_model",
-    ),
-    (
         str(PLAYER_INT8_MODEL_DIR / "fort_player_416_int8.xml"),
         "models/fort_player_416_int8_openvino_model",
     ),
@@ -191,6 +203,8 @@ datas = [
         str(PLAYER_INT8_MODEL_DIR / "ATTRIBUTION.md"),
         "models/fort_player_416_int8_openvino_model",
     ),
+    (str(HEAD_MODEL_DIR / "sunxds_0.8.0.onnx"), "models/sunxds_head_onnx"),
+    (str(HEAD_MODEL_DIR / "ATTRIBUTION.md"), "models/sunxds_head_onnx"),
 ]
 
 def _find_python_license():
@@ -237,9 +251,18 @@ datas += [
 ]
 datas += [
     (str(PROJECT_ROOT / directory / "ATTRIBUTION.md"), directory)
-    for directory in ("models/fort_player_416_onnx", "models/fort_player_onnx")
+    for directory in ("models/fort_player_onnx",)
 ]
 datas += [(str(HIGH_END_ONNX_DIR / "yolo11l.onnx"), "models/yolo11l_onnx")]
+datas.append((str(RELEASE_DEFAULT_CONTRACT), "models"))
+packaged_data_sources = {str(Path(source).resolve()) for source, _destination in datas}
+for member in RELEASE_DEFAULT_MEMBER_PATHS:
+    source = str(member.resolve())
+    if source in packaged_data_sources:
+        continue
+    relative_parent = member.relative_to(PROJECT_ROOT).parent.as_posix()
+    datas.append((source, relative_parent))
+    packaged_data_sources.add(source)
 
 # OpenVINO locates device plugins and model frontends dynamically in its
 # package-local libs directory. Keep both its data index and native libraries
@@ -261,6 +284,34 @@ binaries = collect_dynamic_libs(
 # MSS chooses a backend at runtime based on the host platform. Keeping all of
 # its small backend modules makes the same spec usable on Linux and Windows.
 hiddenimports = collect_submodules("mss")
+
+# Windows desktop capture prefers DXcam's Desktop Duplication path. Its
+# processor kernels and COM helpers are selected dynamically, so explicitly
+# retain the whole package rather than relying on static import discovery.
+if sys.platform == "win32":
+    dxcam_spec = find_spec("dxcam")
+    if dxcam_spec is None or dxcam_spec.origin is None:
+        raise SystemExit(
+            "Cannot build ProAim for Windows; DXcam is missing. "
+            "Install requirements.txt in the build environment first."
+        )
+    # Do not import DXcam while building: its package initializer enumerates
+    # DXGI outputs, which need not exist on a headless Windows build runner.
+    # Enumerate import names directly from the installed wheel instead.
+    dxcam_root = Path(dxcam_spec.origin).resolve().parent
+    dxcam_modules = []
+    for python_file in dxcam_root.rglob("*.py"):
+        module_parts = list(python_file.relative_to(dxcam_root).with_suffix("").parts)
+        if module_parts[-1] == "__init__":
+            module_parts.pop()
+        module_name = ".".join(("dxcam", *module_parts))
+        if module_name:
+            dxcam_modules.append(module_name)
+    hiddenimports += sorted(set(dxcam_modules))
+    hiddenimports.append("dxcam.processor._numpy_kernels")
+    binaries += collect_dynamic_libs("dxcam")
+    datas += collect_data_files("dxcam")
+    datas.append((str(DXCAM_LICENSE), "licenses/third-party/dxcam"))
 
 # Every bundle carries exactly one ONNX Runtime provider selected by its build
 # variant. The detector imports it lazily, so make the native provider package
@@ -317,6 +368,8 @@ license_distributions = [
     "mss",
     "pyserial",
 ]
+if sys.platform == "win32":
+    license_distributions.extend(["dxcam", "comtypes"])
 if sys.platform.startswith("linux"):
     license_distributions.append("evdev")
 for license_distribution in license_distributions:
@@ -343,6 +396,8 @@ hiddenimports += [
     "launcher.qt_theme",
     "launcher.process",
     "launcher.settings",
+    "scripts.benchmark_models",
+    "utils.live_report",
 ]
 
 # app.py imports the Qt front end lazily inside a function so that a source

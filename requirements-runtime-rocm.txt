@@ -1,2 +1,5 @@
-# Linux AMD provider. A compatible system ROCm installation is still required.
+# Legacy Linux AMD provider, retained only for exact hardware/OS qualification.
+# ONNX Runtime removed ROCMExecutionProvider after 1.22 and directs new AMD
+# integrations to MIGraphX. This wheel does not make unsupported Radeon hardware
+# supported; in particular, use Windows DirectML for ProAim's RX 6950 XT target.
 onnxruntime-rocm==1.22.2.post3

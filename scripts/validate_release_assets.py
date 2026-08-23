@@ -17,11 +17,33 @@ import sys
 from typing import Any, Callable, Sequence
 
 
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from utils.release_model_contract import (  # noqa: E402
+    ReleaseModelContractError,
+    load_release_default_contract,
+)
+from utils.public_evidence import contains_nonportable_path  # noqa: E402
+
+
 EXPECTED_INPUT_SHAPE = (1, 3, 320, 320)
 BALANCED_INPUT_SHAPE = (1, 3, 416, 416)
 HIGH_END_INPUT_SHAPE = (1, 3, 640, 640)
 FORT_SOURCE_URL = "https://universe.roboflow.com/aviles-joseph/fort-cuh-mji4f"
 MODEL_MANIFEST = Path("models/RELEASE-MANIFEST.sha256")
+HEAD_MODEL_ONNX = Path("models/sunxds_head_onnx/sunxds_0.8.0.onnx")
+HEAD_MODEL_ATTRIBUTION = Path("models/sunxds_head_onnx/ATTRIBUTION.md")
+HEAD_MODEL_INPUT_SHAPE = (1, 3, 320, 320)
+HEAD_MODEL_OUTPUT_SHAPE = (1, 6, 2100)
+HEAD_MODEL_ATTRIBUTION_MARKERS = (
+    "SunXDS 0.8.0",
+    "ec17c7d89ea2c940b20081d27da633f4c7491655",
+    "de8a0cf0d3911751c65193b7b487f830fd3c6cbb53866e23bf8b8be7c33b4baf",
+    "93264ec61b86b8459ef64c85a31ab3da294327ee1f95337076e57d8af24bb192",
+    "AGPL-3.0",
+)
 
 COCO80_LABELS = (
     "person",
@@ -118,6 +140,7 @@ class ModelAsset:
     onnx_relative: Path | None
     expected_labels: tuple[str, ...]
     expected_input_shape: tuple[int, int, int, int]
+    detail_crop_size_source_pixels: int = 0
     attribution_relative: Path | None = None
     attribution_markers: tuple[str, ...] = ()
     metadata_relative: Path | None = None
@@ -147,7 +170,7 @@ ULTRALYTICS_METADATA_MARKERS = (
 )
 
 
-RELEASE_MODELS = (
+NON_DEFAULT_RELEASE_MODELS = (
     ModelAsset(
         display_name="Responsive INT8 player detector",
         xml_relative=Path(
@@ -168,17 +191,6 @@ RELEASE_MODELS = (
             "models/fort_player_416_int8_openvino_model/metadata.yaml"
         ),
         metadata_markers=("precision: INT8", "method: NNCF", "output_xml_sha256"),
-    ),
-    ModelAsset(
-        display_name="Balanced player detector",
-        xml_relative=Path("models/fort_player_416_openvino_model/fort_player_416.xml"),
-        bin_relative=Path("models/fort_player_416_openvino_model/fort_player_416.bin"),
-        labels_relative=Path("models/fort_player.txt"),
-        onnx_relative=Path("models/fort_player_416_onnx/fort_player_416.onnx"),
-        expected_labels=PLAYER_LABELS,
-        expected_input_shape=BALANCED_INPUT_SHAPE,
-        attribution_relative=Path("models/fort_player_416_openvino_model/ATTRIBUTION.md"),
-        attribution_markers=PLAYER_ATTRIBUTION_MARKERS,
     ),
     ModelAsset(
         display_name="Fast player detector",
@@ -232,6 +244,48 @@ RELEASE_MODELS = (
 )
 
 
+def _release_models_for_contract(
+    contract: dict[str, Any],
+) -> tuple[ModelAsset, ...]:
+    """Insert the exact pointer-selected model into the release catalog."""
+
+    artifacts = contract["artifacts"]
+    shape = tuple(contract["input_shape_nchw"])
+    if len(shape) != 4:
+        raise ReleaseModelContractError("release-default shape must contain four axes")
+    selected = ModelAsset(
+        display_name=str(contract["preset"]["label"]),
+        xml_relative=Path(str(artifacts["openvino_xml"]["path"])),
+        bin_relative=Path(str(artifacts["openvino_bin"]["path"])),
+        labels_relative=Path(str(artifacts["labels"]["path"])),
+        onnx_relative=Path(str(artifacts["onnx"]["path"])),
+        expected_labels=PLAYER_LABELS,
+        expected_input_shape=shape,  # type: ignore[arg-type]
+        detail_crop_size_source_pixels=int(
+            contract["detail_crop_size_source_pixels"]
+        ),
+        attribution_relative=Path(str(artifacts["attribution"]["path"])),
+        attribution_markers=PLAYER_ATTRIBUTION_MARKERS,
+    )
+    return (
+        NON_DEFAULT_RELEASE_MODELS[0],
+        selected,
+        *NON_DEFAULT_RELEASE_MODELS[1:],
+    )
+
+
+# Compatibility for callers/tests that inspect the current checkout catalog.
+# Production validation reloads the pointer from its requested project root.
+try:
+    RELEASE_MODELS = _release_models_for_contract(
+        load_release_default_contract(PROJECT_ROOT)
+    )
+except ReleaseModelContractError:
+    # Keep the module importable so the CLI can report the pointer error through
+    # its normal aggregated preflight rather than failing during import.
+    RELEASE_MODELS = NON_DEFAULT_RELEASE_MODELS
+
+
 class ReleaseAssetError(RuntimeError):
     """Raised when one or more files are unsafe to include in a release."""
 
@@ -244,7 +298,12 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validate_model_manifest(root: Path, errors: list[str]) -> None:
+def _validate_model_manifest(
+    root: Path,
+    errors: list[str],
+    release_models: Sequence[ModelAsset],
+    contract: dict[str, Any] | None,
+) -> None:
     path = root / MODEL_MANIFEST
     text = _read_text(path, "release model SHA-256 manifest", errors)
     if text is None:
@@ -287,7 +346,7 @@ def _validate_model_manifest(root: Path, errors: list[str]) -> None:
             )
 
     expected_paths: set[str] = set()
-    for asset in RELEASE_MODELS:
+    for asset in release_models:
         expected_paths.update(
             (asset.xml_relative.as_posix(), asset.bin_relative.as_posix(), asset.labels_relative.as_posix())
         )
@@ -297,6 +356,13 @@ def _validate_model_manifest(root: Path, errors: list[str]) -> None:
             expected_paths.add(asset.attribution_relative.as_posix())
         if asset.metadata_relative is not None:
             expected_paths.add(asset.metadata_relative.as_posix())
+    if contract is not None:
+        expected_paths.update(
+            str(record["path"]) for record in contract["artifacts"].values()
+        )
+    expected_paths.update(
+        (HEAD_MODEL_ONNX.as_posix(), HEAD_MODEL_ATTRIBUTION.as_posix())
+    )
     missing = sorted(expected_paths - seen)
     if missing:
         errors.append("SHA-256 manifest is missing release artifact(s): " + ", ".join(missing))
@@ -384,6 +450,10 @@ def _validate_metadata(root: Path, asset: ModelAsset, errors: list[str]) -> None
     text = _read_text(path, f"{asset.display_name} metadata", errors)
     if text is None:
         return
+    if contains_nonportable_path(text):
+        errors.append(
+            f"{asset.display_name} metadata {path} contains a local or nonportable path"
+        )
     missing = [marker for marker in asset.metadata_markers if marker not in text]
     if missing:
         errors.append(
@@ -462,10 +532,12 @@ def _load_openvino_core() -> Any:
         raise ReleaseAssetError(f"OpenVINO Runtime could not initialize: {exc}") from exc
 
 
-def _all_model_files_ready(root: Path) -> bool:
+def _all_model_files_ready(
+    root: Path, release_models: Sequence[ModelAsset]
+) -> bool:
     """Check whether loading is possible without producing duplicate errors."""
 
-    for asset in RELEASE_MODELS:
+    for asset in release_models:
         model_paths = [asset.xml_relative, asset.bin_relative]
         if asset.onnx_relative is not None:
             model_paths.append(asset.onnx_relative)
@@ -476,7 +548,70 @@ def _all_model_files_ready(root: Path) -> bool:
                     return False
             except OSError:
                 return False
+    for relative_path in (HEAD_MODEL_ONNX, HEAD_MODEL_ATTRIBUTION):
+        path = root / relative_path
+        try:
+            if not path.is_file() or path.stat().st_size <= 0:
+                return False
+        except OSError:
+            return False
     return True
+
+
+def _validate_head_model(root: Path, core: Any, errors: list[str]) -> str | None:
+    """Validate the exact second-stage player/head graph contract."""
+
+    attribution = _read_text(
+        root / HEAD_MODEL_ATTRIBUTION,
+        "SunXDS head model attribution",
+        errors,
+    )
+    if attribution is not None:
+        folded = attribution.casefold()
+        missing = [
+            marker
+            for marker in HEAD_MODEL_ATTRIBUTION_MARKERS
+            if marker.casefold() not in folded
+        ]
+        if missing:
+            errors.append(
+                "SunXDS head model attribution is missing required marker(s): "
+                + ", ".join(repr(marker) for marker in missing)
+            )
+    path = root / HEAD_MODEL_ONNX
+    if not _regular_nonempty_file(path, "SunXDS head model ONNX", errors):
+        return None
+    try:
+        model = core.read_model(model=str(path))
+        inputs = tuple(model.inputs)
+        outputs = tuple(model.outputs)
+    except Exception as exc:
+        errors.append(f"OpenVINO could not inspect SunXDS head ONNX: {exc}")
+        return None
+    if len(inputs) != 1 or len(outputs) != 1:
+        errors.append(
+            "SunXDS head ONNX must expose exactly one input and one output"
+        )
+        return None
+    try:
+        input_shape = _port_shape(inputs[0])
+        output_shape = _port_shape(outputs[0])
+    except ValueError as exc:
+        errors.append(f"cannot inspect SunXDS head ONNX ports: {exc}")
+        return None
+    if input_shape != HEAD_MODEL_INPUT_SHAPE:
+        errors.append(
+            f"SunXDS head ONNX input is {input_shape}; expected "
+            f"{HEAD_MODEL_INPUT_SHAPE}"
+        )
+    if output_shape != HEAD_MODEL_OUTPUT_SHAPE:
+        errors.append(
+            f"SunXDS head ONNX output is {output_shape}; expected "
+            f"{HEAD_MODEL_OUTPUT_SHAPE}"
+        )
+    if input_shape != HEAD_MODEL_INPUT_SHAPE or output_shape != HEAD_MODEL_OUTPUT_SHAPE:
+        return None
+    return f"SunXDS head localizer: input {input_shape}; ONNX output {output_shape}"
 
 
 def _validate_model_ports(
@@ -598,13 +733,20 @@ def validate_release_assets(
 
     root = Path(project_root).expanduser().resolve()
     errors: list[str] = []
-    _validate_model_manifest(root, errors)
-    for asset in RELEASE_MODELS:
+    try:
+        release_default = load_release_default_contract(root, verify_files=True)
+        release_models = _release_models_for_contract(release_default)
+    except ReleaseModelContractError as exc:
+        errors.append(f"release-default model contract is invalid: {exc}")
+        release_default = None
+        release_models = RELEASE_MODELS
+    _validate_model_manifest(root, errors, release_models, release_default)
+    for asset in release_models:
         _validate_labels(root, asset, errors)
         _validate_attribution(root, asset, errors)
         _validate_metadata(root, asset, errors)
     summaries: list[str] = []
-    if _all_model_files_ready(root):
+    if _all_model_files_ready(root, release_models):
         try:
             core = (core_factory or _load_openvino_core)()
         except ReleaseAssetError as exc:
@@ -612,23 +754,33 @@ def validate_release_assets(
         except Exception as exc:
             errors.append(f"OpenVINO Runtime could not initialize: {exc}")
         else:
-            for asset in RELEASE_MODELS:
+            for asset in release_models:
                 ir = _validate_ir(root, asset, core, errors)
                 onnx = _validate_onnx(root, asset, core, errors)
+                detail_note = (
+                    f"; detail ROI requested width "
+                    f"{asset.detail_crop_size_source_pixels} source px"
+                    if asset.detail_crop_size_source_pixels > 0
+                    else ""
+                )
                 if ir is not None and asset.onnx_relative is None:
                     summaries.append(
                         f"{asset.display_name}: input {asset.expected_input_shape}; "
-                        f"IR output {ir[1]} ({ir[2]}); OpenVINO-only"
+                        f"IR output {ir[1]} ({ir[2]}); OpenVINO-only{detail_note}"
                     )
                 elif ir is not None and onnx is not None:
                     summaries.append(
                         f"{asset.display_name}: input {asset.expected_input_shape}; "
                         f"IR output {ir[1]} ({ir[2]}); ONNX output {onnx[1]} ({onnx[2]})"
+                        f"{detail_note}"
                     )
+            head_summary = _validate_head_model(root, core, errors)
+            if head_summary is not None:
+                summaries.append(head_summary)
     else:
         # Run the common checks to produce path-specific diagnostics.  A core
         # is intentionally unnecessary when an IR pair is not present yet.
-        for asset in RELEASE_MODELS:
+        for asset in release_models:
             _regular_nonempty_file(
                 root / asset.xml_relative, f"{asset.display_name} XML", errors
             )
@@ -638,6 +790,28 @@ def validate_release_assets(
             if asset.onnx_relative is not None:
                 _regular_nonempty_file(
                     root / asset.onnx_relative, f"{asset.display_name} ONNX", errors
+                )
+        _regular_nonempty_file(
+            root / HEAD_MODEL_ONNX,
+            "SunXDS head model ONNX",
+            errors,
+        )
+        attribution = _read_text(
+            root / HEAD_MODEL_ATTRIBUTION,
+            "SunXDS head model attribution",
+            errors,
+        )
+        if attribution is not None:
+            folded = attribution.casefold()
+            missing = [
+                marker
+                for marker in HEAD_MODEL_ATTRIBUTION_MARKERS
+                if marker.casefold() not in folded
+            ]
+            if missing:
+                errors.append(
+                    "SunXDS head model attribution is missing required marker(s): "
+                    + ", ".join(repr(marker) for marker in missing)
                 )
 
     if errors:
