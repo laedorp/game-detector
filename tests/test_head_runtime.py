@@ -53,6 +53,7 @@ from main import (
     AUTOMATIC_HEAD_TRACKING_MINIMUM_LEASE_REMAINING_SECONDS,
     AUTOMATIC_HEAD_VELOCITY_RECONCILIATION_TIME_CONSTANT_SECONDS,
     _AutomaticHeadRuntime,
+    _AutomaticBodyFallbackGate,
     _PreparedDirectHeadLocalizer,
     _TimestampedPreparedHeadInput,
     _aim_diagnostic_head_sample,
@@ -210,6 +211,7 @@ def _result(
         700.0,
     ),
     head_box: tuple[float, float, float, float] | None = None,
+    localization_reason: HeadLocalizationReason | None = None,
 ) -> HeadWorkerResult:
     observation = (
         None
@@ -228,7 +230,67 @@ def _result(
         identity_generation=generation,
         selected_player_box=selected_player_box,
         observation=observation,
+        localization_reason=localization_reason,
     )
+
+
+class AutomaticBodyFallbackGateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.gate = _AutomaticBodyFallbackGate(
+            confidence=0.40,
+            confirmations=2,
+        )
+        self.measurement_ns = 100_000_000
+
+    def _observe(self, **changes) -> bool:
+        values = {
+            "tracker_generation": 3,
+            "runtime_generation": 7,
+            "measurement_ns": self.measurement_ns,
+            "accepted_confidence": 0.8,
+            "strict_self_safe": True,
+            "body_update_deferred": False,
+            "no_decoded_head_verified": True,
+            "direct_seen": False,
+        }
+        self.measurement_ns += 1
+        values.update(changes)
+        return self.gate.observe(**values)
+
+    def test_requires_two_strong_exact_measurements(self) -> None:
+        self.assertFalse(self._observe())
+        self.assertTrue(self._observe())
+        self.assertTrue(self._observe())
+
+    def test_every_unsafe_or_unverified_sample_withdraws_qualification(self) -> None:
+        self.assertFalse(self._observe())
+        self.assertTrue(self._observe())
+        for changes in (
+            {"accepted_confidence": None},
+            {"accepted_confidence": 0.39},
+            {"strict_self_safe": False},
+            {"body_update_deferred": True},
+            {"no_decoded_head_verified": False},
+        ):
+            self.assertFalse(self._observe(**changes))
+            self.assertFalse(self._observe())
+            self.assertTrue(self._observe())
+
+    def test_direct_seen_latches_closed_until_identity_changes(self) -> None:
+        self.assertFalse(self._observe())
+        self.assertTrue(self._observe())
+        self.assertFalse(self._observe(direct_seen=True))
+        self.assertFalse(self._observe())
+        self.assertFalse(self._observe())
+        self.assertFalse(self._observe(runtime_generation=8))
+        self.assertTrue(self._observe(runtime_generation=8))
+
+    def test_duplicate_measurement_cannot_supply_two_confirmations(self) -> None:
+        source_ns = 222_000_000
+        self.assertFalse(self._observe(measurement_ns=source_ns))
+        self.assertFalse(self._observe(measurement_ns=source_ns))
+        self.assertFalse(self._observe(measurement_ns=source_ns + 1))
+        self.assertTrue(self._observe(measurement_ns=source_ns + 2))
 
 
 class AutomaticHeadRuntimeTests(unittest.TestCase):
@@ -1160,6 +1222,89 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
                     source_timestamp_ns=recovery_ns,
                 )
             )
+
+    def test_body_fallback_proof_accepts_only_fresh_no_decoded_outcome(self) -> None:
+        first_ns = 100_000_000
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=4,
+            source_timestamp_ns=first_ns,
+        )
+        self.worker.result = _result(
+            source_ns=first_ns,
+            point=None,
+            selected_player_box=self.player.box,
+            localization_reason=(
+                HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE
+            ),
+        )
+        self.assertIsNone(self.runtime.take_latest(now_ns=first_ns + 1))
+        self.assertTrue(
+            self.runtime.body_fallback_no_decoded_verified(
+                now_ns=first_ns + 1,
+            )
+        )
+        self.assertEqual(
+            self.runtime.body_fallback_no_decoded_deadline_ns(
+                now_ns=first_ns + 1,
+            ),
+            first_ns + self.runtime.stale_after_ns,
+        )
+
+        ambiguous_ns = 120_000_000
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=4,
+            source_timestamp_ns=ambiguous_ns,
+        )
+        self.worker.result = _result(
+            source_ns=ambiguous_ns,
+            point=None,
+            selected_player_box=self.player.box,
+            localization_reason=HeadLocalizationReason.MULTIPLE_PLAUSIBLE_HEADS,
+        )
+        self.assertIsNone(self.runtime.take_latest(now_ns=ambiguous_ns + 1))
+        self.assertFalse(
+            self.runtime.body_fallback_no_decoded_verified(
+                now_ns=ambiguous_ns + 1,
+            )
+        )
+
+        decoded_miss_ns = 140_000_000
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=4,
+            source_timestamp_ns=decoded_miss_ns,
+        )
+        self.worker.result = _result(
+            source_ns=decoded_miss_ns,
+            point=None,
+            selected_player_box=self.player.box,
+            localization_reason=(
+                HeadLocalizationReason.NO_DECODED_HEAD_CANDIDATE
+            ),
+        )
+        self.assertIsNone(self.runtime.take_latest(now_ns=decoded_miss_ns + 1))
+        self.assertFalse(
+            self.runtime.body_fallback_no_decoded_verified(
+                now_ns=(
+                    decoded_miss_ns + self.runtime.stale_after_ns + 1
+                ),
+            )
+        )
+        self.assertIsNone(
+            self.runtime.body_fallback_no_decoded_deadline_ns(
+                now_ns=(
+                    decoded_miss_ns + self.runtime.stale_after_ns + 1
+                ),
+            )
+        )
 
     def test_lease_margin_pulls_maintenance_deadline_back_to_90_hz(self) -> None:
         self.assertEqual(
@@ -3076,6 +3221,7 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         plan_crop.assert_called_once_with(
             self.frame.shape,
             current,
+            crop_scale=1.25,
             model_size=(320, 320),
         )
         self.assertEqual(
@@ -3213,6 +3359,151 @@ class AutomaticHeadRuntimeTests(unittest.TestCase):
         self.runtime.accept_body(self.player.box)
         self.worker.result = _result(source_ns=112_000_000, generation=0)
         self.assertIsNone(self.runtime.take_latest(now_ns=113_000_000))
+
+    def test_same_generation_body_gap_pauses_and_resumes_verified_anchor(
+        self,
+    ) -> None:
+        generation = 7
+        direct_ns = 100_000_000
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=generation,
+            source_timestamp_ns=direct_ns,
+        )
+        self.worker.result = _result(source_ns=direct_ns)
+        direct = self.runtime.take_latest(now_ns=101_000_000)
+        assert direct is not None
+        original_deadline_ns = direct.identity_deadline_ns
+        original_point = direct.point
+
+        self.assertTrue(
+            self.runtime.suspend_body_gap(now_ns=110_000_000)
+        )
+        self.assertFalse(self.runtime.body_valid)
+        self.assertEqual(self.runtime.identity_generation, 0)
+        self.assertTrue(self.runtime.anchor.active)
+        self.assertEqual(self.runtime.anchor.track_generation, generation)
+        self.assertEqual(
+            self.runtime.anchor.identity_deadline_ns,
+            original_deadline_ns,
+        )
+        self.assertIsNone(self.runtime.visible_sample(now_ns=120_000_000))
+        self.assertTrue(
+            self.runtime.suspend_body_gap(now_ns=120_000_000)
+        )
+        self.assertTrue(self.runtime.body_gap_suspended)
+        self.assertEqual(self.runtime.identity_generation, 0)
+
+        resumed_ns = 150_000_000
+        resumed_box = tuple(value + 8.0 for value in self.player.box)
+        self.assertFalse(
+            self.runtime.accept_body(
+                resumed_box,
+                aim_box=resumed_box,
+                corroboration_box=resumed_box,
+                track_generation=generation,
+                source_timestamp_ns=resumed_ns,
+            )
+        )
+        self.assertIsNone(self.runtime.take_latest(now_ns=resumed_ns + 1))
+        resumed = self.runtime.visible_sample(now_ns=resumed_ns + 1)
+        assert resumed is not None
+        self.assertTrue(self.runtime.body_valid)
+        self.assertEqual(self.runtime.identity_generation, 0)
+        self.assertEqual(resumed.source_timestamp_ns, resumed_ns)
+        self.assertEqual(resumed.direct_source_timestamp_ns, direct_ns)
+        self.assertEqual(resumed.identity_deadline_ns, original_deadline_ns)
+        self.assertAlmostEqual(resumed.point[0], original_point[0] + 8.0)
+        self.assertAlmostEqual(resumed.point[1], original_point[1] + 8.0)
+
+    def test_suspended_anchor_cannot_cross_generation_or_unsafe_revoke(self) -> None:
+        generation = 11
+        direct_ns = 100_000_000
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=generation,
+            source_timestamp_ns=direct_ns,
+        )
+        self.worker.result = _result(source_ns=direct_ns)
+        self.assertIsNotNone(self.runtime.take_latest(now_ns=101_000_000))
+        self.assertTrue(
+            self.runtime.suspend_body_gap(now_ns=110_000_000)
+        )
+
+        self.assertTrue(
+            self.runtime.accept_body(
+                self.player.box,
+                aim_box=self.player.box,
+                corroboration_box=self.player.box,
+                track_generation=generation + 1,
+                source_timestamp_ns=120_000_000,
+            )
+        )
+        self.assertEqual(self.runtime.identity_generation, 1)
+        self.assertFalse(self.runtime.anchor.active)
+        self.assertIsNone(self.runtime.visible_sample(now_ns=120_000_001))
+
+        # Suspension is not a release/self-guard bypass. A hard revocation
+        # after a later verified anchor still erases the retained identity.
+        replacement_ns = 130_000_000
+        self.worker.result = _result(
+            source_ns=replacement_ns,
+            generation=1,
+        )
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=generation + 1,
+            source_timestamp_ns=replacement_ns,
+        )
+        self.assertIsNotNone(
+            self.runtime.take_latest(now_ns=replacement_ns + 1)
+        )
+        self.assertTrue(
+            self.runtime.suspend_body_gap(now_ns=140_000_000)
+        )
+        self.assertTrue(self.runtime.revoke_body())
+        self.assertEqual(self.runtime.identity_generation, 2)
+        self.assertFalse(self.runtime.anchor.active)
+
+    def test_body_gap_without_live_verified_anchor_cannot_suspend(self) -> None:
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=5,
+            source_timestamp_ns=100_000_000,
+        )
+
+        self.assertFalse(
+            self.runtime.suspend_body_gap(now_ns=110_000_000)
+        )
+        self.assertTrue(self.runtime.body_valid)
+
+    def test_expired_verified_anchor_cannot_suspend_body_gap(self) -> None:
+        direct_ns = 100_000_000
+        self.runtime.accept_body(
+            self.player.box,
+            aim_box=self.player.box,
+            corroboration_box=self.player.box,
+            track_generation=5,
+            source_timestamp_ns=direct_ns,
+        )
+        self.worker.result = _result(source_ns=direct_ns)
+        direct = self.runtime.take_latest(now_ns=direct_ns + 1)
+        assert direct is not None
+
+        self.assertFalse(
+            self.runtime.suspend_body_gap(
+                now_ns=direct.identity_deadline_ns,
+            )
+        )
+        self.assertTrue(self.runtime.body_valid)
 
     def test_late_result_from_geometrically_replaced_player_never_arms(self) -> None:
         self.runtime.accept_body(self.player.box)

@@ -54,6 +54,16 @@ HEAD_CLASS_NAMES = ("player", "head")
 DEFAULT_HEAD_CONFIDENCE = 0.15
 DEFAULT_NMS_IOU = 0.45
 DEFAULT_CROP_SCALE = 2.00
+# A large, close player already supplies ample context inside its primary box.
+# Keeping the 2x crop used by distant players makes that close player needlessly
+# small at the model input and admits more neighbouring/build geometry.  These
+# thresholds are resolution-normalized to the 1080p capture used for the live
+# evaluation.  A small exit hysteresis prevents detector-size jitter around the
+# boundary from alternating crop geometry frame by frame.
+DEFAULT_CLOSE_PLAYER_CROP_SCALE = 1.25
+DEFAULT_CLOSE_PLAYER_ENTER_HEIGHT_AT_1080P = 200.0
+DEFAULT_CLOSE_PLAYER_EXIT_HEIGHT_AT_1080P = 180.0
+HEAD_CROP_REFERENCE_FRAME_HEIGHT = 1080.0
 DEFAULT_MIN_CROP_SIDE = 64
 DEFAULT_MIN_HEAD_CONTAINMENT = 0.60
 DEFAULT_MIN_PLAYER_OVERLAP = 0.50
@@ -420,6 +430,60 @@ class HeadAssociationOutcome:
                 "rejected outcomes forbid one"
             )
         object.__setattr__(self, "reason", reason)
+
+
+def adaptive_head_crop_scale(
+    frame_shape: Sequence[int],
+    player_box: Sequence[float],
+    *,
+    previous_crop_scale: float | None = None,
+) -> float:
+    """Choose close-player detail or distant-player context with hysteresis.
+
+    The player-height boundary is expressed at a 1080p reference so the same
+    apparent target size selects the same crop on other capture resolutions.
+    ``previous_crop_scale`` is optional; supplying the last returned value
+    enables the 180--200 reference-pixel hysteresis band.
+    """
+
+    if len(frame_shape) < 2:
+        raise ValueError("frame_shape must contain height and width")
+    source_height = int(frame_shape[0])
+    source_width = int(frame_shape[1])
+    if source_height <= 0 or source_width <= 0:
+        raise ValueError("frame dimensions must be positive")
+    raw_x1, raw_y1, raw_x2, raw_y2 = _validated_box(
+        player_box,
+        "player_box",
+    )
+    x1 = min(max(raw_x1, 0.0), float(source_width))
+    y1 = min(max(raw_y1, 0.0), float(source_height))
+    x2 = min(max(raw_x2, 0.0), float(source_width))
+    y2 = min(max(raw_y2, 0.0), float(source_height))
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError("player_box does not intersect the source frame")
+
+    prior_scale = DEFAULT_CROP_SCALE
+    if previous_crop_scale is not None:
+        prior_scale = float(previous_crop_scale)
+        if not isfinite(prior_scale) or prior_scale < 1.0:
+            raise ValueError(
+                "previous_crop_scale must be finite and at least 1"
+            )
+    reference_height = (
+        (y2 - y1) * HEAD_CROP_REFERENCE_FRAME_HEIGHT / source_height
+    )
+    close_crop_active = prior_scale == DEFAULT_CLOSE_PLAYER_CROP_SCALE
+    threshold = (
+        DEFAULT_CLOSE_PLAYER_EXIT_HEIGHT_AT_1080P
+        if close_crop_active
+        else DEFAULT_CLOSE_PLAYER_ENTER_HEIGHT_AT_1080P
+    )
+    return (
+        DEFAULT_CLOSE_PLAYER_CROP_SCALE
+        if reference_height >= threshold
+        else DEFAULT_CROP_SCALE
+    )
 
 
 def plan_head_crop(

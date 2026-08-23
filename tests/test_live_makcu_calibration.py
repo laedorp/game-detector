@@ -1381,7 +1381,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             output,
         )
         self.assertIn(
-            "body candidates schedule head verification only; no body-box output",
+            "a fresh verified no-head decoder miss may use a position-only body proxy",
             output,
         )
         self.assertIn("predicted primary geometry remains display-only", output)
@@ -1996,6 +1996,161 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
                 for record in records
             )
         )
+
+    def test_no_decoded_head_allows_only_confirmed_position_body_fallback(
+        self,
+    ) -> None:
+        player = Detection(0, "player", 0.8, (800.0, 200.0, 1000.0, 700.0))
+        _FakeDetector.detections = [player]
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.side_effect = (
+            [False] * 6
+        )
+        head_runtime.take_latest.return_value = None
+        head_runtime.visible_sample.return_value = None
+        fallback_deadlines = []
+
+        def immutable_fallback_deadline(*, now_ns):
+            if not fallback_deadlines:
+                fallback_deadlines.append(now_ns + 100_000_000)
+            return fallback_deadlines[0]
+
+        head_runtime.body_fallback_no_decoded_deadline_ns.side_effect = (
+            immutable_fallback_deadline
+        )
+        head_runtime.stop.return_value = True
+        diagnostic_root = self.root / "body-fallback-diagnostic"
+        config = replace(
+            self.automatic_config,
+            aim_diagnostic_dir=diagnostic_root,
+            max_frames=3,
+        )
+
+        with (
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            mock.patch.object(
+                _FakeMakcuController,
+                "activation_pressed",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ),
+        ):
+            result, _output = self._run(config)
+
+        self.assertEqual(result, 0)
+        controller = _FakeMakcuController.instances[0]
+        self.assertEqual(controller.normal_updates, 3)
+        self.assertIsNone(controller.normal_update_arguments[0][0])
+        expected_point = (900.0, 260.0)
+        for arguments, keywords in zip(
+            controller.normal_update_arguments[1:],
+            controller.normal_update_keywords[1:],
+        ):
+            self.assertIsNotNone(arguments[0])
+            self.assertEqual(keywords["aim_point"], expected_point)
+            self.assertEqual(keywords["velocity_point"], expected_point)
+            self.assertFalse(keywords["body_derived_motion_permitted"])
+            self.assertNotIn("motion_corroboration_point", keywords)
+            self.assertNotIn("body_derived_motion_deadline_ns", keywords)
+            self.assertGreater(
+                keywords["identity_deadline_ns"],
+                keywords["measurement_ns"],
+            )
+            self.assertLessEqual(
+                keywords["identity_deadline_ns"]
+                - keywords["measurement_ns"],
+                110_000_000,
+            )
+        self.assertEqual(len(fallback_deadlines), 1)
+        self.assertEqual(
+            len(
+                {
+                    keywords["identity_deadline_ns"]
+                    for keywords in controller.normal_update_keywords[1:]
+                }
+            ),
+            1,
+        )
+        records = [
+            json.loads(line)
+            for line in next(diagnostic_root.iterdir())
+            .joinpath("records.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(
+            [record["control_source"] for record in records],
+            ["none", "body-fallback", "body-fallback"],
+        )
+        self.assertTrue(
+            all(
+                "position-only body proxy" in record["aim_status"]
+                for record in records[1:]
+            )
+        )
+
+    def test_body_fallback_is_revoked_on_first_prediction_only_frame(
+        self,
+    ) -> None:
+        player = Detection(0, "player", 0.8, (800.0, 200.0, 1000.0, 700.0))
+        batches = iter(([player], [player], []))
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.side_effect = (
+            [False] * 6
+        )
+        head_runtime.take_latest.return_value = None
+        head_runtime.visible_sample.return_value = None
+        proof_deadline = perf_counter_ns() + 100_000_000
+        head_runtime.body_fallback_no_decoded_deadline_ns.return_value = (
+            proof_deadline
+        )
+        head_runtime.stop.return_value = True
+        config = replace(
+            self.automatic_config,
+            crop_size=768,
+            max_frames=3,
+        )
+
+        def next_primary_batch(_detector, _raw, **_arguments):
+            return list(next(batches))
+
+        with (
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            mock.patch.object(
+                _FakeDetector,
+                "postprocess",
+                autospec=True,
+                side_effect=next_primary_batch,
+            ),
+            mock.patch.object(
+                _FakeMakcuController,
+                "activation_pressed",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ),
+        ):
+            result, _output = self._run(config)
+
+        self.assertEqual(result, 0)
+        controller = _FakeMakcuController.instances[0]
+        self.assertEqual(controller.normal_updates, 3)
+        self.assertIsNone(controller.normal_update_arguments[0][0])
+        self.assertIsNotNone(controller.normal_update_arguments[1][0])
+        self.assertIsNone(controller.normal_update_arguments[2][0])
 
     def test_automatic_mode_publishes_visible_mapped_anchor_from_new_direct_sample(
         self,

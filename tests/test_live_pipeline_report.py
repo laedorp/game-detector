@@ -430,6 +430,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         raw_activation_state: tuple[bool, bool] | None = None,
         activation_requires_release: bool = False,
         live_measured_anchor: bool = False,
+        suspend_body_gap: bool = False,
         max_frames: int = 1,
         extra_arguments: tuple[str, ...] = (),
     ) -> tuple[_FakeDetector, dict[str, object], str, mock.Mock]:
@@ -473,6 +474,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         head_runtime.take_latest.return_value = None
         head_runtime.visible_sample.return_value = None
         head_runtime.has_live_measured_anchor.return_value = live_measured_anchor
+        head_runtime.suspend_body_gap.return_value = suspend_body_gap
         head_runtime.revoke_body.return_value = False
         head_runtime.stop.return_value = True
         config = self._config(
@@ -954,6 +956,51 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(detail["mode"], "disabled")
         self.assertNotIn("Automatic MAKCU detail rescue", startup)
 
+    def test_ordinary_target_gap_suspends_anchor_without_hard_revocation(
+        self,
+    ) -> None:
+        opponent = Detection(0, "player", 0.90, (900, 438, 960, 558))
+        # Early empty samples stay inside the automatic tracker's bounded
+        # prediction bridge. The later ones pause output while its 350 ms
+        # identity memory remains live; the returning exact box therefore
+        # keeps generation 1.
+        batches = [[opponent], *([[]] * 18), [opponent]]
+        _FakeDetector.inference_delay_seconds = 0.01
+        try:
+            detector, _report, _startup, head_runtime = (
+                self._run_automatic_detail_case(
+                    "same-identity-primary-gap",
+                    batches,
+                    max_frames=len(batches),
+                    # Disable the independent detail rescue so one scripted
+                    # batch corresponds to exactly one primary detector frame.
+                    extra_arguments=("--crop-size", "768"),
+                    suspend_body_gap=True,
+                )
+            )
+        finally:
+            _FakeDetector.inference_delay_seconds = 0.0
+
+        self.assertEqual(detector.infer_calls, len(batches))
+        self.assertGreaterEqual(
+            head_runtime.suspend_body_gap.call_count,
+            1,
+        )
+        for suspended_call in head_runtime.suspend_body_gap.call_args_list:
+            self.assertEqual(suspended_call.args, ())
+            self.assertIsInstance(suspended_call.kwargs.get("now_ns"), int)
+            self.assertGreaterEqual(suspended_call.kwargs["now_ns"], 0)
+        head_runtime.revoke_body.assert_not_called()
+        accepted_calls = head_runtime.accept_body.call_args_list
+        self.assertGreaterEqual(len(accepted_calls), 2)
+        self.assertEqual(
+            accepted_calls[0].kwargs["track_generation"],
+            accepted_calls[-1].kwargs["track_generation"],
+        )
+        self.assertIsNotNone(
+            accepted_calls[-1].kwargs["corroboration_box"]
+        )
+
     def test_automatic_detail_does_not_leak_into_detector_only_mode(self) -> None:
         report_path = self.root / "automatic-detail-no-mode-leak.json"
         source = _FakeSource(shape=(1080, 1920, 3))
@@ -1363,7 +1410,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             startup,
         )
         self.assertIn(
-            "body candidates schedule head verification only; no body-box output",
+            "a fresh verified no-head decoder miss may use a position-only body proxy",
             startup,
         )
         self.assertIn("predicted primary geometry remains display-only", startup)

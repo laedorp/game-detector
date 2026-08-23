@@ -174,6 +174,15 @@ AUTOMATIC_MEASURED_MAKCU_MAX_BODY_DERIVED_PURSUIT_FEEDFORWARD_FRACTION = 0.82
 # and detector-jitter tails.
 AUTOMATIC_MAKCU_MAX_RESIDUAL_PURSUIT_FEEDFORWARD_FRACTION = 0.65
 AUTOMATIC_DIRECT_HEAD_ACQUISITION_CONFIDENCE_FLOOR = 0.15
+# A direct-head decoder miss is different from an ambiguous localization: the
+# former says that this exact crop produced no head candidate, while the latter
+# may contain multiple people or contradictory geometry.  After two strong,
+# exact primary measurements agree on one tracker/runtime identity, permit a
+# short position-only body proxy only for the decoder-miss case.  It cannot
+# create a DirectHeadAnchor, grant feed-forward, survive a measurement gap, or
+# return after a real direct head has been seen in that identity.
+AUTOMATIC_BODY_FALLBACK_CONFIDENCE = 0.40
+AUTOMATIC_BODY_FALLBACK_CONFIRMATIONS = 2
 AUTOMATIC_DIRECT_HEAD_AGGRESSIVE_ACQUISITION_MODE = False
 AUTOMATIC_DETAIL_RESCUE_CROP_SIZE = 640
 AUTOMATIC_DETAIL_REFERENCE_HEIGHT = 1080.0
@@ -183,6 +192,123 @@ AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS = 4.0
 # it no longer than the existing direct-result freshness window so a missing
 # full pass cannot make the rescue crop chase old screen coordinates.
 AUTOMATIC_DETAIL_TARGET_HINT_MAX_AGE_SECONDS = AUTOMATIC_HEAD_STALE_AFTER_SECONDS
+
+
+class _AutomaticBodyFallbackGate:
+    """Qualify a bounded position-only acquisition proxy for one identity."""
+
+    def __init__(
+        self,
+        *,
+        confidence: float = AUTOMATIC_BODY_FALLBACK_CONFIDENCE,
+        confirmations: int = AUTOMATIC_BODY_FALLBACK_CONFIRMATIONS,
+    ) -> None:
+        threshold = float(confidence)
+        if not math.isfinite(threshold) or not 0.0 <= threshold <= 1.0:
+            raise ValueError("body fallback confidence must be finite and in [0, 1]")
+        if (
+            isinstance(confirmations, bool)
+            or not isinstance(confirmations, int)
+            or confirmations <= 0
+        ):
+            raise ValueError("body fallback confirmations must be positive")
+        self.confidence = threshold
+        self.confirmations = confirmations
+        self._identity: tuple[int, int] | None = None
+        self._strong_measurements = 0
+        self._qualified = False
+        self._direct_seen = False
+        self._last_measurement_ns: int | None = None
+
+    @staticmethod
+    def _generation(value: int, description: str) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{description} must be a non-negative integer")
+        return value
+
+    def reset(self) -> None:
+        self._identity = None
+        self._strong_measurements = 0
+        self._qualified = False
+        self._direct_seen = False
+        self._last_measurement_ns = None
+
+    def pause(self) -> None:
+        """Withdraw qualification without forgetting a direct-seen latch."""
+
+        self._strong_measurements = 0
+        self._qualified = False
+
+    def observe(
+        self,
+        *,
+        tracker_generation: int,
+        runtime_generation: int,
+        measurement_ns: int,
+        accepted_confidence: float | None,
+        strict_self_safe: bool,
+        body_update_deferred: bool,
+        no_decoded_head_verified: bool,
+        direct_seen: bool,
+    ) -> bool:
+        """Return whether this exact measured frame may publish the proxy."""
+
+        if not isinstance(strict_self_safe, bool):
+            raise TypeError("strict_self_safe must be bool")
+        if not isinstance(body_update_deferred, bool):
+            raise TypeError("body_update_deferred must be bool")
+        if not isinstance(no_decoded_head_verified, bool):
+            raise TypeError("no_decoded_head_verified must be bool")
+        if not isinstance(direct_seen, bool):
+            raise TypeError("direct_seen must be bool")
+        if (
+            isinstance(measurement_ns, bool)
+            or not isinstance(measurement_ns, int)
+            or measurement_ns < 0
+        ):
+            raise ValueError("body fallback measurement timestamp must be non-negative")
+        identity = (
+            self._generation(runtime_generation, "runtime generation"),
+            self._generation(tracker_generation, "tracker generation"),
+        )
+        if identity != self._identity:
+            self._identity = identity
+            self._strong_measurements = 0
+            self._qualified = False
+            self._direct_seen = False
+            self._last_measurement_ns = None
+        if direct_seen:
+            self._direct_seen = True
+            self._last_measurement_ns = measurement_ns
+            self.pause()
+            return False
+        if self._direct_seen:
+            self.pause()
+            return False
+        if (
+            self._last_measurement_ns is not None
+            and measurement_ns <= self._last_measurement_ns
+        ):
+            # A duplicated adapter call cannot manufacture the required two
+            # exact-frame confirmations.
+            self.pause()
+            return False
+        self._last_measurement_ns = measurement_ns
+        if (
+            accepted_confidence is None
+            or not strict_self_safe
+            or body_update_deferred
+            or not no_decoded_head_verified
+        ):
+            self.pause()
+            return False
+        confidence = float(accepted_confidence)
+        if not math.isfinite(confidence) or confidence < self.confidence:
+            self.pause()
+            return False
+        self._strong_measurements += 1
+        self._qualified = self._strong_measurements >= self.confirmations
+        return self._qualified
 
 
 @dataclass(frozen=True, slots=True)
@@ -754,6 +880,15 @@ class _AutomaticHeadRuntime:
         # result still needs for ordinary 2400 px/s validation.
         self._exact_measured_chain_start_ns: int | None = None
         self._current_body_observed = False
+        # A normal detector-empty interval may outlast TargetTracker's short
+        # prediction bridge while its logical identity memory is still live.
+        # In that interval control must stay revoked, but erasing an already
+        # verified direct-head lease forces an unnecessary model reacquisition
+        # when the exact same tracker generation returns. Suspension keeps
+        # only the immutable anchor/identity binding and last trusted body
+        # geometry needed to validate that return; it never makes stale
+        # geometry publishable.
+        self._body_gap_suspended = False
         self._motion_corroboration_revocation_pending = False
         # One same-tracker-generation body box which is incompatible with the
         # established geometry is ambiguous: it can be a detector mode flip,
@@ -793,6 +928,10 @@ class _AutomaticHeadRuntime:
         self._tracking_flow_failure_streak = 0
         self._tracking_flow_last_success_timestamp_ns: int | None = None
         self._tracking_consecutive_head_misses = 0
+        self._head_crop_scale: float | None = None
+        self._latest_localization_reason: str | None = None
+        self._latest_localization_source_timestamp_ns: int | None = None
+        self._latest_localization_track_generation: int | None = None
         self._latest_phase_frame_timestamp_ns: int | None = None
         self._capture_phase_body_timestamp_ns: int | None = None
         self._mapped_filter_point: tuple[float, float] | None = None
@@ -821,6 +960,10 @@ class _AutomaticHeadRuntime:
         self._scheduled_submission_interval_ns = self.submission_interval_ns
         self._tracking_cadence_requires_direct_refresh = True
         self._tracking_consecutive_head_misses = 0
+        self._head_crop_scale = None
+        self._latest_localization_reason = None
+        self._latest_localization_source_timestamp_ns = None
+        self._latest_localization_track_generation = None
         self.anchor.reset()
         self._visible_sample = None
         self._current_player_box = None
@@ -833,6 +976,7 @@ class _AutomaticHeadRuntime:
         self._rejected_body_outlier_source_timestamps.clear()
         self._exact_measured_chain_start_ns = None
         self._current_body_observed = False
+        self._body_gap_suspended = False
         self._motion_corroboration_revocation_pending = False
         self._body_update_deferred = False
         self._pending_unassociated_player_box = None
@@ -1931,8 +2075,7 @@ class _AutomaticHeadRuntime:
             ):
                 raise ValueError("track_generation must be a non-negative integer")
             if (
-                self.body_valid
-                and self._tracker_generation is not None
+                self._tracker_generation is not None
                 and track_generation != self._tracker_generation
             ):
                 self.advance_identity()
@@ -2042,7 +2185,7 @@ class _AutomaticHeadRuntime:
                 # exact measured binding chain.
                 self._confirmed_disjoint_trajectory_endpoint_ns = None
             if (
-                self.body_valid
+                (self.body_valid or self._body_gap_suspended)
                 and self._current_player_box is not None
                 and not ordinary_body_association
                 and not same_generation_measured_motion
@@ -2303,12 +2446,67 @@ class _AutomaticHeadRuntime:
             # generation; the live path always supplies TargetTracker's value.
             self._tracker_generation = self.identity_generation
         self.body_valid = True
+        self._body_gap_suspended = False
         return replacement
 
-    def revoke_body(self) -> bool:
-        """Revoke on the first missing/unsafe body sample; return if state changed."""
+    def suspend_body_gap(self, *, now_ns: int) -> bool:
+        """Pause output across an ordinary missing-primary identity gap.
 
-        if not self.body_valid:
+        Unlike :meth:`revoke_body`, this does not begin a new worker identity
+        epoch or delete the direct-head anchor. It is valid only for the live
+        tracker's ordinary detector-empty/reacquisition interval, where the
+        track generation remains the identity authority. No coordinate is
+        visible while suspended. A returning measured primary must carry the
+        exact same generation and pass the normal body association checks;
+        otherwise :meth:`accept_body` advances identity before accepting it.
+        The direct observation's original deadline is never renewed. Return
+        true while an existing or newly entered suspension remains valid.
+        """
+
+        current_ns = int(now_ns)
+        if current_ns < 0:
+            raise ValueError("body-gap suspension timestamp cannot be negative")
+        anchor_deadline_ns = self.anchor.identity_deadline_ns
+        live_anchor = bool(
+            self.anchor.active
+            and anchor_deadline_ns is not None
+            and current_ns < anchor_deadline_ns
+            and self.anchor.track_generation == self._tracker_generation
+        )
+        if self._body_gap_suspended:
+            return live_anchor
+        if not self.body_valid or not live_anchor:
+            return False
+        self.body_valid = False
+        self._body_gap_suspended = True
+        self.next_submission_ns = None
+        self._last_submission_ns = None
+        self._scheduled_submission_interval_ns = self.submission_interval_ns
+        self._tracking_cadence_requires_direct_refresh = True
+        self._visible_sample = None
+        self._current_body_observed = False
+        self._body_update_deferred = False
+        self._pending_unassociated_player_box = None
+        self._pending_unassociated_timestamp_ns = None
+        self._pending_unassociated_chain_start_ns = None
+        self._pending_unassociated_exact_measured = False
+        self._confirmed_disjoint_trajectory_endpoint_ns = None
+        self._exact_measured_chain_start_ns = None
+        self._motion_corroboration_revocation_pending = True
+        self._clear_live_flow()
+        self._clear_phase_history()
+        self._capture_phase_body_timestamp_ns = None
+        self._reset_mapped_filter()
+        return True
+
+    @property
+    def body_gap_suspended(self) -> bool:
+        return self._body_gap_suspended
+
+    def revoke_body(self) -> bool:
+        """Hard-revoke an unsafe body epoch; return whether state changed."""
+
+        if not self.body_valid and not self._body_gap_suspended:
             return False
         self.advance_identity()
         return True
@@ -2365,11 +2563,22 @@ class _AutomaticHeadRuntime:
         if deadline is not None and timestamp < deadline:
             return False
 
-        from detection.head_detector import plan_head_crop, prepare_head_input
+        from detection.head_detector import (
+            adaptive_head_crop_scale,
+            plan_head_crop,
+            prepare_head_input,
+        )
+
+        self._head_crop_scale = adaptive_head_crop_scale(
+            frame.shape,
+            selected_player_box,
+            previous_crop_scale=self._head_crop_scale,
+        )
 
         transform = plan_head_crop(
             frame.shape,
             selected_player_box,
+            crop_scale=self._head_crop_scale,
             model_size=self.model_size,
         )
         prepared = prepare_head_input(frame, transform)
@@ -2883,6 +3092,20 @@ class _AutomaticHeadRuntime:
                     return None
                 self.advance_identity()
                 return None
+            localization_reason = getattr(result, "localization_reason", None)
+            self._latest_localization_reason = (
+                None
+                if localization_reason is None
+                else str(
+                    getattr(localization_reason, "value", localization_reason)
+                )
+            )
+            self._latest_localization_source_timestamp_ns = (
+                result.source_timestamp_ns
+            )
+            self._latest_localization_track_generation = (
+                source_track_generation
+            )
             observation = result.observation
             if observation is None:
                 # A decoder miss contains no contradictory spatial evidence.
@@ -3814,6 +4037,49 @@ class _AutomaticHeadRuntime:
             and self._tracker_generation is not None
             and anchor_generation == self._tracker_generation
         )
+
+    def body_fallback_no_decoded_deadline_ns(self, *, now_ns: int) -> int | None:
+        """Return the immutable deadline for one clean head-decoder miss.
+
+        This signal owns no coordinate and never changes the direct anchor. It
+        merely distinguishes a clean decoder miss from ambiguous/mismatched
+        localization outcomes before the live adapter considers its separately
+        qualified, position-only acquisition proxy.  The deadline is rooted at
+        the worker result's source frame, so newer body measurements cannot
+        extend authority from an old decoder miss.
+        """
+
+        current_ns = int(now_ns)
+        if current_ns < 0:
+            raise ValueError("head fallback query timestamp cannot be negative")
+        source_ns = self._latest_localization_source_timestamp_ns
+        source_generation = self._latest_localization_track_generation
+        current_generation = self._tracker_generation
+        current_body_ns = self._current_player_timestamp_ns
+        if (
+            not self.body_valid
+            or self._body_gap_suspended
+            or self._body_update_deferred
+            or not self._current_body_observed
+            or self._latest_localization_reason
+            != "no_decoded_head_candidate"
+            or source_ns is None
+            or source_generation is None
+            or current_generation is None
+            or source_generation != current_generation
+            or current_body_ns is None
+            or current_body_ns < source_ns
+        ):
+            return None
+        age_ns = max(current_ns, current_body_ns) - source_ns
+        if not 0 <= age_ns < self.stale_after_ns:
+            return None
+        return source_ns + self.stale_after_ns
+
+    def body_fallback_no_decoded_verified(self, *, now_ns: int) -> bool:
+        """Whether one fresh, accepted crop failed only at head decoding."""
+
+        return self.body_fallback_no_decoded_deadline_ns(now_ns=now_ns) is not None
 
     def raise_if_failed(self) -> None:
         self.worker.raise_if_failed()
@@ -6366,6 +6632,12 @@ def run(config: AppConfig) -> int:
     aim_control_description = "gated output"
     automatic_head_runtime: _AutomaticHeadRuntime | None = None
     automatic_last_controller_source_ns: int | None = None
+    automatic_body_fallback_gate = (
+        _AutomaticBodyFallbackGate()
+        if automatic_direct_head_requested
+        else None
+    )
+    automatic_body_fallback_controller_active = False
     aim_diagnostic_recorder = None
     aim_diagnostic_warning_printed = False
     automatic_plant_calibrated_delay_seconds: float | None = None
@@ -6736,8 +7008,8 @@ def run(config: AppConfig) -> int:
         if aggressive_direct_head_mode:
             print(
                 "Automatic direct-head aggressive acquisition: enabled | self-filter "
-                "target-block bypassed for lock acquisition | body candidates remain "
-                "identity-only while direct anchors are pending"
+                "target-block bypassed for lock acquisition | any position-only body "
+                "fallback still requires strict self safety and decoder-miss proof"
             )
         if calibration_requested and not isinstance(
             aim_controller, MakcuAimingController
@@ -6894,7 +7166,11 @@ def run(config: AppConfig) -> int:
                 "direct results establish the head anchor | "
                 "current measured primary geometry carries position for at most "
                 f"{DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS * 1000.0:.0f} ms | "
-                "body candidates schedule head verification only; no body-box output | "
+                "body candidates schedule head verification; after "
+                f"{AUTOMATIC_BODY_FALLBACK_CONFIRMATIONS} exact measurements >= "
+                f"{AUTOMATIC_BODY_FALLBACK_CONFIDENCE:g}, a fresh verified no-head "
+                "decoder miss may use a position-only body proxy (no feed-forward, "
+                "revoked on any gap/ambiguity, disabled after direct lock) | "
                 "predicted primary geometry remains display-only | "
                 "raw primary box remains identity/safety authority | "
                 "verified mapped-motion source-age projection "
@@ -7690,6 +7966,9 @@ def run(config: AppConfig) -> int:
                         source_timestamp_ns=packet.read_started_ns,
                         already_published=automatic_revoked_this_frame,
                     )
+                    assert automatic_body_fallback_gate is not None
+                    automatic_body_fallback_gate.reset()
+                    automatic_body_fallback_controller_active = False
                 aim_activation_was_active = tracking_activation_active
 
                 selected_aim_target = _update_aim_target(
@@ -7806,6 +8085,7 @@ def run(config: AppConfig) -> int:
                                         ),
                                         )
                                     )
+                                automatic_body_fallback_controller_active = False
                             automatic_head_runtime.remember_frame(
                                 packet.image,
                                 source_timestamp_ns=packet.read_started_ns,
@@ -7842,6 +8122,7 @@ def run(config: AppConfig) -> int:
                                             ),
                                         )
                                     )
+                                automatic_body_fallback_controller_active = False
                                 automatic_head_runtime.accept_body(
                                     association_player.box,
                                     aim_box=association_player.box,
@@ -7932,7 +8213,8 @@ def run(config: AppConfig) -> int:
                                                 automatic_revoked_this_frame
                                             ),
                                         )
-                                    )
+                                        )
+                                automatic_body_fallback_controller_active = False
                                 automatic_head_runtime.accept_body(
                                     association_player.box,
                                     aim_box=association_player.box,
@@ -7945,6 +8227,49 @@ def run(config: AppConfig) -> int:
                                     source_timestamp_ns=packet.read_started_ns,
                                 )
                                 direct_head_sample = None
+                            assert automatic_body_fallback_gate is not None
+                            fallback_query_ns = perf_counter_ns()
+                            fallback_deadline_candidate = (
+                                automatic_head_runtime.body_fallback_no_decoded_deadline_ns(
+                                    now_ns=fallback_query_ns
+                                )
+                            )
+                            body_fallback_identity_deadline_ns = (
+                                fallback_deadline_candidate
+                                if isinstance(fallback_deadline_candidate, int)
+                                and not isinstance(fallback_deadline_candidate, bool)
+                                else None
+                            )
+                            body_fallback_ready = (
+                                automatic_body_fallback_gate.observe(
+                                    tracker_generation=(
+                                        target_tracker.track_generation
+                                    ),
+                                    runtime_generation=(
+                                        automatic_head_runtime.identity_generation
+                                    ),
+                                    measurement_ns=packet.read_started_ns,
+                                    accepted_confidence=(
+                                        float(accepted_player.confidence)
+                                        if accepted_player is not None
+                                        else None
+                                    ),
+                                    # Aggressive direct-head acquisition may
+                                    # schedule verification before the heuristic
+                                    # self filter has locked. A body proxy never
+                                    # inherits that bypass.
+                                    strict_self_safe=aim_self_exclusion_safe,
+                                    body_update_deferred=body_update_deferred,
+                                    no_decoded_head_verified=(
+                                        body_fallback_identity_deadline_ns
+                                        is not None
+                                    ),
+                                    direct_seen=bool(
+                                        new_head_sample is not None
+                                        or direct_head_sample is not None
+                                    ),
+                                )
+                            )
                             if (
                                 direct_head_sample is not None
                                 and accepted_player is not None
@@ -8088,6 +8413,7 @@ def run(config: AppConfig) -> int:
                                     automatic_last_controller_source_ns = (
                                         sample_source_ns
                                     )
+                                    automatic_body_fallback_controller_active = False
                                     controller_input_source = (
                                         "capture-phase-correlated"
                                         if sample_source_ns
@@ -8111,17 +8437,64 @@ def run(config: AppConfig) -> int:
                             elif (
                                 accepted_player is not None
                                 and not body_update_deferred
+                                and body_fallback_ready
+                            ):
+                                # A fresh, same-identity head crop has already
+                                # completed with exactly "no decoded head" (not
+                                # ambiguous geometry), and two strong exact body
+                                # measurements have agreed. Move only toward the
+                                # tracker's smoothed head-ratio point while the
+                                # direct model reacquires. This paired sample has
+                                # no corroboration/body-motion grant, never
+                                # touches DirectHeadAnchor, and expires on the
+                                # same short lease as a worker result.
+                                assert (
+                                    body_fallback_identity_deadline_ns
+                                    is not None
+                                )
+                                fallback_source_ns = packet.read_started_ns
+                                if (
+                                    automatic_last_controller_source_ns is None
+                                    or fallback_source_ns
+                                    > automatic_last_controller_source_ns
+                                ):
+                                    fallback_point = head_target_point(
+                                        selected_aim_target,
+                                        config.aim_head_ratio,
+                                    )
+                                    aim_controller.update(
+                                        selected_aim_target,
+                                        packet.image.shape,
+                                        active=True,
+                                        measurement_ns=fallback_source_ns,
+                                        measurement_observed=True,
+                                        aim_point=fallback_point,
+                                        velocity_point=fallback_point,
+                                        body_derived_motion_permitted=False,
+                                        identity_deadline_ns=(
+                                            body_fallback_identity_deadline_ns
+                                        ),
+                                    )
+                                    automatic_last_controller_source_ns = (
+                                        fallback_source_ns
+                                    )
+                                    automatic_body_fallback_controller_active = True
+                                    controller_input_source = "body-fallback"
+                                else:
+                                    controller_input_source = "phase-hold"
+                            elif (
+                                accepted_player is not None
+                                and not body_update_deferred
                             ):
                                 # Direct-head acquisition intentionally admits
                                 # low-confidence body candidates so the head
                                 # model can verify small/distant players.  A
                                 # body box is therefore scheduling and identity
-                                # evidence only; it must never become a physical
-                                # aim coordinate before a verified head anchor
-                                # exists. Live diagnostics showed that these
-                                # unverified boxes can jump hundreds of pixels
-                                # between observations. Fail closed here and
-                                # keep submitting crops below.
+                                # evidence only unless the narrow decoder-miss
+                                # acquisition fallback above has independently
+                                # qualified. Live diagnostics showed that weak
+                                # or ambiguous boxes can jump hundreds of pixels;
+                                # fail closed here and keep submitting crops.
                                 if not automatic_revoked_this_frame:
                                     automatic_revoked_this_frame = (
                                         _publish_automatic_head_loss_once(
@@ -8134,7 +8507,8 @@ def run(config: AppConfig) -> int:
                                                 automatic_revoked_this_frame
                                             ),
                                         )
-                                    )
+                                        )
+                                automatic_body_fallback_controller_active = False
                                 controller_input_source = "none"
                             elif accepted_player is not None:
                                 # The first same-generation geometry conflict
@@ -8142,12 +8516,46 @@ def run(config: AppConfig) -> int:
                                 # publishes neither a new point nor an explicit
                                 # loss, so the numeric core may retain only its
                                 # already-bounded prior observation.
+                                if (
+                                    automatic_body_fallback_controller_active
+                                    and not automatic_revoked_this_frame
+                                ):
+                                    automatic_revoked_this_frame = (
+                                        _publish_automatic_head_loss_once(
+                                            aim_controller,
+                                            packet.image.shape,
+                                            source_timestamp_ns=(
+                                                packet.read_started_ns
+                                            ),
+                                            already_published=(
+                                                automatic_revoked_this_frame
+                                            ),
+                                        )
+                                    )
+                                automatic_body_fallback_controller_active = False
                                 controller_input_source = "none"
                             elif selected_aim_target is not None:
                                 # No controller publication occurs here.  The
                                 # numeric core may retain only its already-
                                 # bounded prior observation; the tracker's
                                 # synthetic box is diagnostic/display state.
+                                if (
+                                    automatic_body_fallback_controller_active
+                                    and not automatic_revoked_this_frame
+                                ):
+                                    automatic_revoked_this_frame = (
+                                        _publish_automatic_head_loss_once(
+                                            aim_controller,
+                                            packet.image.shape,
+                                            source_timestamp_ns=(
+                                                packet.read_started_ns
+                                            ),
+                                            already_published=(
+                                                automatic_revoked_this_frame
+                                            ),
+                                        )
+                                    )
+                                automatic_body_fallback_controller_active = False
                                 controller_input_source = "none"
                             if (
                                 accepted_player is not None
@@ -8164,12 +8572,56 @@ def run(config: AppConfig) -> int:
                                     source_timestamp_ns=packet.read_started_ns,
                                 )
                         else:
-                            # Unsafe/guarded/expired body selection and inactive
-                            # output revoke immediately. A tracker prediction
-                            # remains bounded by its pre-existing empty-only
-                            # grace and can never create a new head observation.
+                            assert automatic_body_fallback_gate is not None
+                            if automatic_detail_tracker_update_safe:
+                                automatic_body_fallback_gate.pause()
+                            else:
+                                automatic_body_fallback_gate.reset()
+                            # A normal target-empty interval may outlast the
+                            # tracker's short prediction bridge while its same
+                            # logical identity remains recoverable. Pause all
+                            # output but retain an unexpired verified anchor so
+                            # that exact same generation can resume immediately.
+                            # Guard, self, runtime, and button failures remain
+                            # hard identity revocations and can never inherit it.
+                            ordinary_same_identity_gap = bool(
+                                automatic_detail_tracker_update_safe
+                                and aim_self_exclusion_safe
+                                and selected_aim_target is None
+                                and not aim_detections
+                                and not aim_continuation_detections
+                            )
+                            if ordinary_same_identity_gap:
+                                body_gap_was_suspended = (
+                                    getattr(
+                                        automatic_head_runtime,
+                                        "body_gap_suspended",
+                                        False,
+                                    )
+                                    is True
+                                )
+                                body_gap_suspension_valid = (
+                                    automatic_head_runtime.suspend_body_gap(
+                                        now_ns=perf_counter_ns()
+                                    )
+                                )
+                                if body_gap_suspension_valid:
+                                    body_state_changed = (
+                                        not body_gap_was_suspended
+                                    )
+                                else:
+                                    body_state_changed = (
+                                        automatic_head_runtime.revoke_body()
+                                    )
+                            else:
+                                body_state_changed = (
+                                    automatic_head_runtime.revoke_body()
+                                )
                             if (
-                                automatic_head_runtime.revoke_body()
+                                (
+                                    body_state_changed
+                                    or automatic_body_fallback_controller_active
+                                )
                                 and not automatic_revoked_this_frame
                             ):
                                 automatic_revoked_this_frame = (
@@ -8182,6 +8634,7 @@ def run(config: AppConfig) -> int:
                                         ),
                                     )
                                 )
+                            automatic_body_fallback_controller_active = False
                             automatic_head_runtime.raise_if_failed()
                     else:
                         aim_controller.update(
@@ -8245,6 +8698,11 @@ def run(config: AppConfig) -> int:
                         aim_status = (
                             f"aim ready: hold {aim_activation_name} to run "
                             "direct-head tracking"
+                        )
+                    elif controller_input_source == "body-fallback":
+                        aim_status = (
+                            "aim acquiring: strong measured player + verified "
+                            "no-head decoder miss | position-only body proxy"
                         )
                     elif selected_aim_target is not None and direct_head_sample is None:
                         aim_status = (

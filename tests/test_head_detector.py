@@ -12,6 +12,8 @@ import numpy as np
 from detection.base import OutputDecodeError
 from detection.head_detector import (
     DIRECT_HEAD_RUNTIME_MANIFEST_ENV,
+    DEFAULT_CLOSE_PLAYER_CROP_SCALE,
+    DEFAULT_CROP_SCALE,
     DEFAULT_HEAD_CONFIDENCE,
     HEAD_CLASS_ID,
     HEAD_OUTPUT_CANDIDATES,
@@ -24,6 +26,7 @@ from detection.head_detector import (
     HeadAssociationOutcome,
     HeadCandidate,
     HeadCropTransform,
+    adaptive_head_crop_scale,
     associate_head_to_player,
     associate_head_to_player_outcome,
     decode_head_output,
@@ -76,6 +79,49 @@ def candidate(
 
 
 class HeadCropTests(unittest.TestCase):
+    def test_adaptive_crop_uses_detail_only_for_close_player(self) -> None:
+        self.assertEqual(
+            adaptive_head_crop_scale(
+                (1080, 1920, 3),
+                (100.0, 100.0, 200.0, 299.0),
+            ),
+            DEFAULT_CROP_SCALE,
+        )
+        self.assertEqual(
+            adaptive_head_crop_scale(
+                (1080, 1920, 3),
+                (100.0, 100.0, 200.0, 300.0),
+            ),
+            DEFAULT_CLOSE_PLAYER_CROP_SCALE,
+        )
+
+    def test_adaptive_crop_threshold_scales_with_frame_height(self) -> None:
+        self.assertEqual(
+            adaptive_head_crop_scale(
+                (540, 960, 3),
+                (100.0, 100.0, 200.0, 200.0),
+            ),
+            DEFAULT_CLOSE_PLAYER_CROP_SCALE,
+        )
+
+    def test_adaptive_crop_hysteresis_prevents_boundary_flapping(self) -> None:
+        self.assertEqual(
+            adaptive_head_crop_scale(
+                (1080, 1920, 3),
+                (100.0, 100.0, 200.0, 285.0),
+                previous_crop_scale=DEFAULT_CLOSE_PLAYER_CROP_SCALE,
+            ),
+            DEFAULT_CLOSE_PLAYER_CROP_SCALE,
+        )
+        self.assertEqual(
+            adaptive_head_crop_scale(
+                (1080, 1920, 3),
+                (100.0, 100.0, 200.0, 279.0),
+                previous_crop_scale=DEFAULT_CLOSE_PLAYER_CROP_SCALE,
+            ),
+            DEFAULT_CROP_SCALE,
+        )
+
     def test_crop_is_square_in_bounds_and_keeps_edge_player(self) -> None:
         crop = plan_head_crop(
             (720, 1280, 3),
