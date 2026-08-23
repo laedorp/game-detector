@@ -23,8 +23,10 @@ from __future__ import annotations
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
+import json
 from math import ceil, hypot, isfinite
 from numbers import Integral
+import os
 from pathlib import Path
 from typing import TypeAlias
 
@@ -46,11 +48,10 @@ PLAYER_CLASS_ID = 0
 HEAD_CLASS_ID = 1
 HEAD_CLASS_NAMES = ("player", "head")
 
-# Exact-model replay selected 0.25 as the conservative threshold that improved
-# direct-head recall while keeping every accepted center inside its annotation.
-# The next lower candidate (0.20) crossed a crowded sample's annotation edge,
-# so 0.25 remains the bounded default pending representative live evidence.
-DEFAULT_HEAD_CONFIDENCE = 0.25
+# Exact-runtime held-out evaluation selected 0.15 as the lowest threshold that
+# retained 100% accepted-point precision while improving direct-head recall from
+# 54.1% at 0.25 to 64.9%. The lower 0.10 candidate introduced a false location.
+DEFAULT_HEAD_CONFIDENCE = 0.15
 DEFAULT_NMS_IOU = 0.45
 DEFAULT_CROP_SCALE = 2.00
 DEFAULT_MIN_CROP_SIDE = 64
@@ -60,6 +61,15 @@ DEFAULT_MAX_PLAYER_CENTER_DISPLACEMENT_RATIO = 0.35
 DEFAULT_PLAYER_BOX_MARGIN = 0.08
 DEFAULT_MAX_HEAD_AREA_RATIO = 0.50
 DEFAULT_MAX_HEAD_CENTER_Y_RATIO = 0.45
+# The head export can retain a tight, fully nested pair of differently scaled
+# player boxes just below its class-aware NMS threshold. This is not permission
+# to choose between people: only the exact two-box geometry below, with one
+# sole head supported by both boxes, is treated as duplicate evidence.
+NESTED_PLAYER_DUPLICATE_MIN_IOU = 0.36
+NESTED_PLAYER_DUPLICATE_MIN_SMALLER_OVERLAP = 0.99
+NESTED_PLAYER_DUPLICATE_MAX_CENTER_DISPLACEMENT_RATIO = 0.15
+NESTED_PLAYER_DUPLICATE_MIN_PRIMARY_OVERLAP = 0.90
+NESTED_PLAYER_DUPLICATE_MAX_PRIMARY_TOP_DELTA_RATIO = 0.18
 MAX_HEAD_NMS_CANDIDATES = 128
 MAX_HEAD_DETECTIONS = 32
 
@@ -70,6 +80,202 @@ PINNED_HEAD_MODEL_SIZE_BYTES = 10_392_860
 PINNED_HEAD_MODEL_SHA256 = (
     "93264ec61b86b8459ef64c85a31ab3da294327ee1f95337076e57d8af24bb192"
 )
+DIRECT_HEAD_RUNTIME_MANIFEST_ENV = "PROAIM_DIRECT_HEAD_RUNTIME_MANIFEST"
+
+
+@dataclass(frozen=True, slots=True)
+class HeadModelSpec:
+    path: Path
+    input_height: int
+    input_width: int
+    output_attributes: int
+    output_candidates: int
+    model_name: str
+    evidence_label: str
+    confidence_threshold: float = DEFAULT_HEAD_CONFIDENCE
+
+    def __post_init__(self) -> None:
+        path = Path(self.path)
+        if not path.is_file():
+            raise FileNotFoundError(f"head model not found: {path}")
+        input_height = _non_negative_integer(self.input_height, "input_height")
+        input_width = _non_negative_integer(self.input_width, "input_width")
+        output_attributes = _non_negative_integer(
+            self.output_attributes,
+            "output_attributes",
+        )
+        output_candidates = _non_negative_integer(
+            self.output_candidates,
+            "output_candidates",
+        )
+        if input_height <= 0 or input_width <= 0:
+            raise ValueError("head model input dimensions must be positive")
+        if output_attributes != HEAD_OUTPUT_ATTRIBUTES:
+            raise ValueError(
+                "head model output_attributes must be exactly "
+                f"{HEAD_OUTPUT_ATTRIBUTES}"
+            )
+        if output_candidates <= 0:
+            raise ValueError("head model output_candidates must be positive")
+        model_name = str(self.model_name).strip()
+        if not model_name:
+            raise ValueError("head model name must not be empty")
+        evidence_label = str(self.evidence_label).strip()
+        if not evidence_label:
+            raise ValueError("head model evidence label must not be empty")
+        confidence_threshold = _finite_threshold(
+            self.confidence_threshold,
+            "confidence_threshold",
+        )
+        object.__setattr__(self, "path", path)
+        object.__setattr__(self, "input_height", input_height)
+        object.__setattr__(self, "input_width", input_width)
+        object.__setattr__(self, "output_attributes", output_attributes)
+        object.__setattr__(self, "output_candidates", output_candidates)
+        object.__setattr__(self, "model_name", model_name)
+        object.__setattr__(self, "evidence_label", evidence_label)
+        object.__setattr__(self, "confidence_threshold", confidence_threshold)
+
+    @property
+    def input_shape(self) -> tuple[int, int, int, int]:
+        return (1, 3, self.input_height, self.input_width)
+
+    @property
+    def output_shape(self) -> tuple[int, int, int]:
+        return (1, self.output_attributes, self.output_candidates)
+
+
+def _project_root(project_root: str | Path | None = None) -> Path:
+    return (
+        Path(__file__).resolve().parents[1]
+        if project_root is None
+        else Path(project_root).expanduser().resolve()
+    )
+
+
+def _verify_model_file(
+    model_path: Path,
+    *,
+    expected_size_bytes: int | None,
+    expected_sha256: str | None,
+    description: str,
+) -> Path:
+    if not model_path.is_file():
+        raise FileNotFoundError(f"{description} not found: {model_path}")
+    size = model_path.stat().st_size
+    if expected_size_bytes is not None and size != int(expected_size_bytes):
+        raise ValueError(
+            f"{description} size mismatch: expected {expected_size_bytes}, got {size}"
+        )
+    if expected_sha256 is not None:
+        digest = sha256()
+        with model_path.open("rb") as model_file:
+            for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
+                digest.update(chunk)
+        actual = digest.hexdigest()
+        if actual != str(expected_sha256):
+            raise ValueError(
+                f"{description} SHA-256 mismatch: expected {expected_sha256}, got {actual}"
+            )
+    return model_path
+
+
+def _default_head_model_spec(project_root: str | Path | None = None) -> HeadModelSpec:
+    root = _project_root(project_root)
+    return HeadModelSpec(
+        path=_verify_model_file(
+            root / PINNED_HEAD_MODEL_RELATIVE_PATH,
+            expected_size_bytes=PINNED_HEAD_MODEL_SIZE_BYTES,
+            expected_sha256=PINNED_HEAD_MODEL_SHA256,
+            description="Pinned head model",
+        ),
+        input_height=HEAD_INPUT_HEIGHT,
+        input_width=HEAD_INPUT_WIDTH,
+        output_attributes=HEAD_OUTPUT_ATTRIBUTES,
+        output_candidates=HEAD_OUTPUT_CANDIDATES,
+        model_name="SunXDS 0.8.0",
+        evidence_label="SunXDS 0.8.0 direct head box",
+        confidence_threshold=DEFAULT_HEAD_CONFIDENCE,
+    )
+
+
+def runtime_head_model_spec(project_root: str | Path | None = None) -> HeadModelSpec:
+    """Resolve the runtime direct-head model, optionally from a local manifest."""
+
+    root = _project_root(project_root)
+    manifest_value = str(os.environ.get(DIRECT_HEAD_RUNTIME_MANIFEST_ENV, "")).strip()
+    if not manifest_value:
+        return _default_head_model_spec(root)
+    manifest_path = Path(manifest_value).expanduser()
+    if not manifest_path.is_absolute():
+        manifest_path = root / manifest_path
+    if not manifest_path.is_file():
+        raise FileNotFoundError(
+            f"Direct-head runtime manifest not found: {manifest_path}"
+        )
+    payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        raise ValueError("direct-head runtime manifest must be a JSON object")
+    model_value = payload.get("model") or payload.get("onnx")
+    if not isinstance(model_value, str) or not model_value.strip():
+        raise ValueError("direct-head runtime manifest must declare model/onnx")
+    model_path = Path(model_value).expanduser()
+    if not model_path.is_absolute():
+        model_path = root / model_path
+    input_shape = payload.get("input_shape_nchw")
+    output_shape = payload.get("output_shape")
+    if not isinstance(input_shape, list) or len(input_shape) != 4:
+        raise ValueError(
+            "direct-head runtime manifest input_shape_nchw must be [1, 3, H, W]"
+        )
+    if not isinstance(output_shape, list) or len(output_shape) != 3:
+        raise ValueError(
+            "direct-head runtime manifest output_shape must be [1, 6, N]"
+        )
+    input_shape = [int(value) for value in input_shape]
+    output_shape = [int(value) for value in output_shape]
+    if input_shape[0:2] != [1, 3]:
+        raise ValueError(
+            "direct-head runtime manifest input_shape_nchw must begin with [1, 3]"
+        )
+    if output_shape[0:2] != [1, HEAD_OUTPUT_ATTRIBUTES]:
+        raise ValueError(
+            "direct-head runtime manifest output_shape must begin with "
+            f"[1, {HEAD_OUTPUT_ATTRIBUTES}]"
+        )
+    return HeadModelSpec(
+        path=_verify_model_file(
+            model_path.resolve(),
+            expected_size_bytes=(
+                int(payload["model_size_bytes"])
+                if payload.get("model_size_bytes") is not None
+                else None
+            ),
+            expected_sha256=(
+                str(payload.get("model_sha256") or payload.get("onnx_sha256"))
+                if payload.get("model_sha256") is not None
+                or payload.get("onnx_sha256") is not None
+                else None
+            ),
+            description="Direct-head runtime override model",
+        ),
+        input_height=input_shape[2],
+        input_width=input_shape[3],
+        output_attributes=output_shape[1],
+        output_candidates=output_shape[2],
+        model_name=str(payload.get("model_name") or payload.get("name") or model_path.stem),
+        evidence_label=str(
+            payload.get("evidence_label")
+            or f"{payload.get('model_name') or payload.get('name') or model_path.stem} direct head box"
+        ),
+        confidence_threshold=float(
+            payload.get("confidence_threshold")
+            if payload.get("confidence_threshold") is not None
+            else payload.get("confidence")
+            if payload.get("confidence") is not None
+            else DEFAULT_HEAD_CONFIDENCE
+        ),
+    )
 
 
 def _finite_threshold(value: float, name: str) -> float:
@@ -103,11 +309,7 @@ def _non_negative_integer(value: int, name: str) -> int:
 def pinned_head_model_path(project_root: str | Path | None = None) -> Path:
     """Return the repository/package path of the pinned direct-head model."""
 
-    root = (
-        Path(__file__).resolve().parents[1]
-        if project_root is None
-        else Path(project_root).expanduser()
-    )
+    root = _project_root(project_root)
     return root / PINNED_HEAD_MODEL_RELATIVE_PATH
 
 
@@ -115,25 +317,12 @@ def verify_pinned_head_model(path: str | Path | None = None) -> Path:
     """Verify exact size and SHA-256 before a runtime session loads the model."""
 
     model_path = pinned_head_model_path() if path is None else Path(path).expanduser()
-    if not model_path.is_file():
-        raise FileNotFoundError(f"Pinned head model not found: {model_path}")
-    size = model_path.stat().st_size
-    if size != PINNED_HEAD_MODEL_SIZE_BYTES:
-        raise ValueError(
-            "Pinned head model size mismatch: "
-            f"expected {PINNED_HEAD_MODEL_SIZE_BYTES}, got {size}"
-        )
-    digest = sha256()
-    with model_path.open("rb") as model_file:
-        for chunk in iter(lambda: model_file.read(1024 * 1024), b""):
-            digest.update(chunk)
-    actual = digest.hexdigest()
-    if actual != PINNED_HEAD_MODEL_SHA256:
-        raise ValueError(
-            "Pinned head model SHA-256 mismatch: "
-            f"expected {PINNED_HEAD_MODEL_SHA256}, got {actual}"
-        )
-    return model_path
+    return _verify_model_file(
+        model_path,
+        expected_size_bytes=PINNED_HEAD_MODEL_SIZE_BYTES,
+        expected_sha256=PINNED_HEAD_MODEL_SHA256,
+        description="Pinned head model",
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -361,10 +550,15 @@ def prepare_head_input(
 
 def _head_rows(output: np.ndarray) -> np.ndarray:
     array = np.asarray(output)
-    expected = (1, HEAD_OUTPUT_ATTRIBUTES, HEAD_OUTPUT_CANDIDATES)
-    if array.shape != expected:
+    if (
+        array.ndim != 3
+        or array.shape[0] != 1
+        or array.shape[1] != HEAD_OUTPUT_ATTRIBUTES
+        or array.shape[2] <= 0
+    ):
         raise OutputDecodeError(
-            f"direct head output must have exact shape {expected}, got {array.shape}"
+            "direct head output must have exact shape [1, "
+            f"{HEAD_OUTPUT_ATTRIBUTES}, N], got {array.shape}"
         )
     if not np.issubdtype(array.dtype, np.number):
         raise OutputDecodeError(
@@ -401,8 +595,19 @@ def decode_head_output(
     )
     if not len(eligible):
         return []
-    order = eligible[np.argsort(-scores[eligible], kind="stable")]
-    order = order[:MAX_HEAD_NMS_CANDIDATES]
+    per_class_limit = max(
+        1,
+        MAX_HEAD_NMS_CANDIDATES // len(HEAD_CLASS_NAMES),
+    )
+    class_orders = []
+    for class_id in range(len(HEAD_CLASS_NAMES)):
+        class_eligible = eligible[class_ids[eligible] == class_id]
+        class_order = class_eligible[
+            np.argsort(-scores[class_eligible], kind="stable")
+        ]
+        class_orders.append(class_order[:per_class_limit])
+    order = np.concatenate(class_orders)
+    order = order[np.argsort(-scores[order], kind="stable")]
 
     candidates: list[HeadCandidate] = []
     boxes: list[Box] = []
@@ -445,9 +650,38 @@ def decode_head_output(
         np.asarray(kept_classes, dtype=np.int64),
         nms_iou,
     )
+    kept_indices = [int(index) for index in kept]
+    present_classes = {
+        candidates[index].class_id for index in kept_indices
+    }
+    if len(present_classes) > 1:
+        reserved_per_class = max(1, int(max_detections) // len(present_classes))
+        selected: list[int] = []
+        for class_id in sorted(present_classes):
+            selected.extend(
+                [
+                    index
+                    for index in kept_indices
+                    if candidates[index].class_id == class_id
+                ][:reserved_per_class]
+            )
+        selected_set = set(selected)
+        remaining_slots = max(0, int(max_detections) - len(selected))
+        selected.extend(
+            [
+                index
+                for index in kept_indices
+                if index not in selected_set
+            ][:remaining_slots]
+        )
+        selected.sort(
+            key=lambda index: candidates[index].confidence,
+            reverse=True,
+        )
+        kept_indices = selected
     return [
-        candidates[int(index)]
-        for index in kept[: int(max_detections)]
+        candidates[index]
+        for index in kept_indices[: int(max_detections)]
     ]
 
 
@@ -460,6 +694,81 @@ def _intersection_area(first: Box, second: Box) -> float:
         0.0,
         min(first[3], second[3]) - max(first[1], second[1]),
     )
+
+
+def _strict_nested_player_duplicate_pair(
+    matching_players: Sequence[tuple[int, Box]],
+    target: Box,
+    *,
+    head_box: Box,
+    head_center: Point,
+    min_head_containment: float,
+) -> bool:
+    """Recognize only a fully corroborated two-box multiscale duplicate."""
+
+    if len(matching_players) != 2:
+        return False
+    first = matching_players[0][1]
+    second = matching_players[1][1]
+    first_area = _box_area(first)
+    second_area = _box_area(second)
+    target_area = _box_area(target)
+    head_area = _box_area(head_box)
+    if min(first_area, second_area, target_area, head_area) <= 0.0:
+        return False
+
+    pair_intersection = _intersection_area(first, second)
+    pair_union = first_area + second_area - pair_intersection
+    if (
+        pair_union <= 0.0
+        or pair_intersection / pair_union < NESTED_PLAYER_DUPLICATE_MIN_IOU
+        or pair_intersection / min(first_area, second_area)
+        < NESTED_PLAYER_DUPLICATE_MIN_SMALLER_OVERLAP
+    ):
+        return False
+
+    target_width = target[2] - target[0]
+    target_height = target[3] - target[1]
+    first_center = (
+        (first[0] + first[2]) * 0.5,
+        (first[1] + first[3]) * 0.5,
+    )
+    second_center = (
+        (second[0] + second[2]) * 0.5,
+        (second[1] + second[3]) * 0.5,
+    )
+    if hypot(
+        (first_center[0] - second_center[0]) / target_width,
+        (first_center[1] - second_center[1]) / target_height,
+    ) > NESTED_PLAYER_DUPLICATE_MAX_CENTER_DISPLACEMENT_RATIO:
+        return False
+
+    for secondary, secondary_area in (
+        (first, first_area),
+        (second, second_area),
+    ):
+        target_overlap = _intersection_area(target, secondary) / min(
+            target_area,
+            secondary_area,
+        )
+        if target_overlap < NESTED_PLAYER_DUPLICATE_MIN_PRIMARY_OVERLAP:
+            return False
+        if (
+            abs(secondary[1] - target[1]) / target_height
+            > NESTED_PLAYER_DUPLICATE_MAX_PRIMARY_TOP_DELTA_RATIO
+        ):
+            return False
+        if not (
+            secondary[0] <= head_center[0] <= secondary[2]
+            and secondary[1] <= head_center[1] <= secondary[3]
+        ):
+            return False
+        if (
+            _intersection_area(head_box, secondary) / head_area
+            < min_head_containment
+        ):
+            return False
+    return True
 
 
 def associate_head_to_player_outcome(
@@ -623,10 +932,22 @@ def associate_head_to_player_outcome(
             None,
         )
     if len(matching_players) > 1:
-        return HeadAssociationOutcome(
-            HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
-            None,
-        )
+        # Never rank competing secondary players. The only exception is an
+        # exact pair of nearly fully nested multiscale duplicates, and even
+        # that pair must independently support the sole plausible head. Any
+        # shifted pair, partial support, or three-way ambiguity stays closed.
+        sole_head = plausible_heads[0]
+        if not _strict_nested_player_duplicate_pair(
+            matching_players,
+            target,
+            head_box=sole_head[2],
+            head_center=sole_head[4],
+            min_head_containment=min_containment,
+        ):
+            return HeadAssociationOutcome(
+                HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
+                None,
+            )
 
     supporting_player_index, supporting_box = matching_players[0]
     supporting_area = _box_area(supporting_box)

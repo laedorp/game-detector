@@ -111,6 +111,10 @@ class _StubCapture(CaptureSource):
         self._require_started()
         return self.packet
 
+    def peek_latest(self):
+        self._require_started()
+        return self.packet
+
     def close(self) -> None:
         self.closed = True
         self._mark_closed()
@@ -188,6 +192,13 @@ class DXCamCaptureTests(unittest.TestCase):
             deadline = monotonic() + 1.0
             while source.stats.frames_read < 3 and monotonic() < deadline:
                 camera.drained.wait(0.01)
+            stats_before_peek = source.stats
+            peeked = source.peek_latest()
+            self.assertIsNotNone(peeked)
+            assert peeked is not None
+            self.assertEqual(peeked.sequence, 2)
+            self.assertEqual(int(peeked.image[0, 0, 0]), 3)
+            self.assertEqual(source.stats, stats_before_peek)
             packet = source.read(timeout=1.0)
             self.assertIsNotNone(packet)
             assert packet is not None
@@ -361,6 +372,7 @@ class PreferredDesktopCaptureTests(unittest.TestCase):
             self.assertEqual(source.actual_settings["preferred_backend"], "dxcam-dxgi")
             self.assertIn("DXGI unavailable", source.actual_settings["fallback_reason"])
             self.assertIs(source.read(timeout=0), created[1].packet)
+            self.assertIs(source.peek_latest(), created[1].packet)
             self.assertTrue(created[0].closed)
         finally:
             source.close()

@@ -39,6 +39,7 @@ class _FakeDetector:
         self.infer_calls = 0
         self.postprocess_calls = 0
         self.postprocess_confidences: list[float | None] = []
+        self.transforms: list[object] = []
         self.tensor_shapes: list[tuple[int, ...]] = []
         self.runtime_summary = {
             "runtime": "test-runtime",
@@ -63,7 +64,8 @@ class _FakeDetector:
         return np.zeros((1, 0, 6), dtype=np.float32)
 
     def postprocess(self, _raw, *, transform, frame_shape, confidence=None):
-        del transform, frame_shape
+        del frame_shape
+        self.transforms.append(transform)
         self.postprocess_confidences.append(confidence)
         index = self.postprocess_calls
         self.postprocess_calls += 1
@@ -425,6 +427,9 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         detection_batches: list[list[Detection]],
         *,
         activation_pressed: bool = True,
+        raw_activation_state: tuple[bool, bool] | None = None,
+        activation_requires_release: bool = False,
+        live_measured_anchor: bool = False,
         max_frames: int = 1,
         extra_arguments: tuple[str, ...] = (),
     ) -> tuple[_FakeDetector, dict[str, object], str, mock.Mock]:
@@ -437,6 +442,11 @@ class LivePipelineIntegrationTests(unittest.TestCase):
                 self.config = config
                 self.calibrated_controller = calibrated_controller
                 self.activation_pressed = activation_pressed
+                self.raw_activation_state = raw_activation_state or (
+                    True,
+                    activation_pressed,
+                )
+                self.activation_requires_release = activation_requires_release
                 self.updates: list[tuple[Detection | None, dict[str, object]]] = []
 
             def start(self) -> None:
@@ -462,6 +472,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         head_runtime.consume_motion_corroboration_revocation.return_value = False
         head_runtime.take_latest.return_value = None
         head_runtime.visible_sample.return_value = None
+        head_runtime.has_live_measured_anchor.return_value = live_measured_anchor
         head_runtime.revoke_body.return_value = False
         head_runtime.stop.return_value = True
         config = self._config(
@@ -481,6 +492,8 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             "makcu",
             "--aim-makcu-port",
             "/dev/serial/by-id/test-makcu",
+            "--aim-makcu-tracking-mode",
+            "direct-head",
             *extra_arguments,
         )
         output = io.StringIO()
@@ -543,15 +556,133 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         detail = report["detail_pass"]
         self.assertEqual(detail["mode"], "automatic_activation_need_gated")
         self.assertIsNone(detail["configured_crop_size"])
-        self.assertEqual(detail["effective_crop_size"], 768)
+        self.assertEqual(detail["effective_crop_size"], 640)
         self.assertEqual(detail["frames_applied"], 1)
         self.assertEqual(detail["unmatched_detail_accepted"], 1)
+        self.assertEqual(
+            (detector.transforms[1].crop_x, detector.transforms[1].crop_y),
+            (640, 220),
+        )
+        self.assertEqual(
+            detail["last_plan"]["crop_policy"],
+            "centered_model_aspect_roi",
+        )
         self.assertEqual(
             detail["automatic_frames_triggered_no_exact_target"],
             1,
         )
         self.assertIn("activation/need gated", startup)
         self.assertIn("released preview skip", startup)
+
+    def test_missing_primary_detail_follows_recent_accepted_target(self) -> None:
+        # This first exact target is outside the ordinary centered 640 ROI, so
+        # its full-primary acceptance is the only safe source for the next
+        # frame's crop location. The detail-only rescue cannot renew the hint.
+        primary = Detection(0, "player", 0.88, (300, 500, 400, 580))
+        rescued = Detection(0, "player", 0.90, (302, 500, 402, 580))
+
+        detector, report, _startup, _head_runtime = (
+            self._run_automatic_detail_case(
+                "recent-target-roi",
+                [[primary], [], [rescued]],
+                max_frames=2,
+            )
+        )
+
+        self.assertEqual(detector.infer_calls, 3)
+        self.assertEqual(len(detector.transforms), 3)
+        detail_transform = detector.transforms[2]
+        self.assertEqual(
+            (detail_transform.crop_x, detail_transform.crop_y),
+            (30, 220),
+        )
+        detail = report["detail_pass"]
+        self.assertEqual(detail["frames_applied"], 1)
+        self.assertEqual(
+            detail["last_plan"]["crop_policy"],
+            "target_centered_model_aspect_roi",
+        )
+        self.assertEqual(
+            (detail["last_plan"]["crop_x"], detail["last_plan"]["crop_y"]),
+            (30, 220),
+        )
+
+    def test_stable_body_mode_skips_head_worker_and_detail_inference(self) -> None:
+        target = Detection(0, "player", 0.88, (830, 260, 1030, 860))
+        diagnostic_root = self.root / "stable-body-diagnostics"
+
+        detector, report, startup, head_runtime = self._run_automatic_detail_case(
+            "stable-body",
+            [[target]],
+            extra_arguments=(
+                "--aim-makcu-tracking-mode",
+                "stable-body",
+                "--aim-diagnostic-dir",
+                str(diagnostic_root),
+            ),
+        )
+
+        self.assertEqual(detector.infer_calls, 1)
+        self.assertEqual(report["detail_pass"]["mode"], "disabled")
+        self.assertFalse(report["detail_pass"]["enabled"])
+        head_runtime.start.assert_not_called()
+        self.assertIn("stable measured-body tracking", startup)
+        sessions = list(diagnostic_root.iterdir())
+        self.assertEqual(len(sessions), 1)
+        manifest = json.loads(
+            (sessions[0] / "manifest.json").read_text(encoding="utf-8")
+        )
+        metadata = manifest["metadata"]
+        self.assertIsNone(metadata["plant_calibrated_delay_seconds"])
+        self.assertEqual(metadata["plant_effective_delay_seconds"], 0.006)
+        self.assertIsNone(metadata["plant_delay_upper_seconds"])
+        self.assertEqual(metadata["plant_delay_seconds"], 0.006)
+        replay = json.loads(
+            (sessions[0] / "replay-report.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(replay["status"], "insufficient-data")
+        self.assertEqual(replay["records"], 1)
+
+    def test_expired_continuous_hold_reports_latch_and_release_instruction(self) -> None:
+        diagnostic_root = self.root / "expired-hold-diagnostics"
+
+        _detector, _report, _startup, _head_runtime = (
+            self._run_automatic_detail_case(
+                "expired-hold",
+                [[]],
+                activation_pressed=False,
+                raw_activation_state=(True, True),
+                activation_requires_release=True,
+                extra_arguments=(
+                    "--aim-diagnostic-dir",
+                    str(diagnostic_root),
+                ),
+            )
+        )
+
+        sessions = list(diagnostic_root.iterdir())
+        self.assertEqual(len(sessions), 1)
+        records = [
+            json.loads(line)
+            for line in (sessions[0] / "records.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(len(records), 1)
+        record = records[0]
+        self.assertFalse(record["activation_pressed"])
+        self.assertTrue(record["raw_activation_known"])
+        self.assertTrue(record["raw_activation_pressed"])
+        self.assertTrue(record["activation_requires_release"])
+        self.assertEqual(
+            record["activation_denial_reason"],
+            "continuous-hold-expired",
+        )
+        self.assertEqual(
+            record["aim_status"],
+            "aim paused: continuous hold safety limit reached; "
+            "release Right, then press it again",
+        )
 
     def test_visible_full_pass_self_cannot_suppress_opponent_rescue(self) -> None:
         visible_self = Detection(
@@ -698,6 +829,49 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(detail["cross_pass_matches"], 1)
         self.assertEqual(detail["detail_replacements"], 1)
 
+    def test_live_verified_anchor_skips_redundant_small_target_detail_pass(
+        self,
+    ) -> None:
+        primary = Detection(0, "player", 0.60, (930, 500, 990, 580))
+
+        detector, report, startup, _head_runtime = (
+            self._run_automatic_detail_case(
+                "verified-anchor-carry",
+                [[primary]],
+                live_measured_anchor=True,
+            )
+        )
+
+        self.assertEqual(detector.infer_calls, 1)
+        detail = report["detail_pass"]
+        self.assertEqual(detail["automatic_frames_triggered"], 0)
+        self.assertEqual(
+            detail["automatic_frames_skipped_verified_anchor"],
+            1,
+        )
+        self.assertIn("live verified head", startup)
+
+    def test_live_anchor_still_runs_detail_when_full_pass_target_is_missing(
+        self,
+    ) -> None:
+        rescued = Detection(0, "player", 0.88, (930, 500, 990, 580))
+
+        detector, report, _startup, _head_runtime = (
+            self._run_automatic_detail_case(
+                "verified-anchor-missing-primary",
+                [[], [rescued]],
+                live_measured_anchor=True,
+            )
+        )
+
+        self.assertEqual(detector.infer_calls, 2)
+        self.assertEqual(
+            report["detail_pass"][
+                "automatic_frames_triggered_no_exact_target"
+            ],
+            1,
+        )
+
     def test_automatic_detail_skips_close_and_off_center_targets(self) -> None:
         cases = {
             "close": Detection(0, "player", 0.90, (900, 440, 1020, 640)),
@@ -717,6 +891,29 @@ class LivePipelineIntegrationTests(unittest.TestCase):
                 self.assertEqual(detail["frames_applied"], 0)
                 self.assertEqual(detail["automatic_frames_triggered"], 0)
                 self.assertEqual(detail["automatic_frames_skipped_not_needed"], 1)
+
+    def test_automatic_detail_uses_direct_acquisition_threshold_not_ui_threshold(
+        self,
+    ) -> None:
+        # Direct-head body evidence is deliberately admitted at 0.15 for head
+        # verification.  A high UI display/aim threshold must not turn the
+        # conditional detail rescue into an unconditional second inference on
+        # every held frame when a large, usable primary target already exists.
+        primary = Detection(0, "player", 0.40, (900, 440, 1020, 640))
+
+        detector, report, _startup, _head_runtime = (
+            self._run_automatic_detail_case(
+                "acquisition-threshold",
+                [[primary]],
+                extra_arguments=("--confidence", "0.95"),
+            )
+        )
+
+        self.assertEqual(detector.infer_calls, 1)
+        detail = report["detail_pass"]
+        self.assertEqual(detail["automatic_need_confidence"], 0.15)
+        self.assertEqual(detail["automatic_frames_triggered"], 0)
+        self.assertEqual(detail["automatic_frames_skipped_not_needed"], 1)
 
     def test_automatic_detail_skips_released_preview(self) -> None:
         detector, report, _startup, _head_runtime = self._run_automatic_detail_case(
@@ -776,6 +973,75 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertEqual(detail["mode"], "disabled")
         self.assertIsNone(detail["effective_crop_size"])
 
+    def test_local_aim_uses_longer_loss_grace_than_single_frame(self) -> None:
+        from aiming.controller import TargetTracker as RealTargetTracker
+
+        source = _FakeSource(shape=(1080, 1920, 3))
+        tracker_options: list[dict[str, object]] = []
+
+        def recording_tracker(**options):
+            tracker_options.append(options)
+            return RealTargetTracker(**options)
+
+        class FakeController:
+            def __init__(self, _config) -> None:
+                pass
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, _target, _frame_shape, *, active=True) -> None:
+                return None
+
+        class FakeSensor:
+            def __init__(self, *_args, **_kwargs) -> None:
+                pass
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def read(self) -> bool:
+                return True
+
+        config = self._config(
+            self.root / "local-aim-grace.json",
+            "--backend",
+            "onnxruntime",
+            "--device",
+            "MIGRAPHX",
+            "--require-full-provider",
+            "--max-frames",
+            "1",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "local",
+            "--aim-activate-path",
+            "/tmp/test-aim-activation",
+        )
+
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
+            mock.patch("aiming.AimingController", FakeController),
+            mock.patch("aiming.AimActivationSensor", FakeSensor),
+            mock.patch("aiming.TargetTracker", side_effect=recording_tracker),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        self.assertEqual(len(tracker_options), 1)
+        self.assertEqual(tracker_options[0]["lost_grace_frames"], 6)
+
     def test_makcu_automatic_startup_uses_equal_axis_caps(self) -> None:
         from aiming.controller import TargetTracker as RealTargetTracker
 
@@ -799,7 +1065,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
 
         source = TimestampedSource()
         raw_target = Detection(0, "player", 0.90, (20, 2, 28, 22))
-        _FakeDetector.detection_batches = [[raw_target], []]
+        _FakeDetector.detection_batches = [[raw_target], [raw_target]]
         tracker_options: list[dict[str, object]] = []
         cleanup_order: list[str] = []
 
@@ -857,6 +1123,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
 
         direct_sample = SimpleNamespace(
             point=(24.0, 5.0),
+            velocity_point=(24.0, 5.0),
             source_timestamp_ns=source.base_ns,
             direct_source_timestamp_ns=source.base_ns,
             identity_deadline_ns=source.base_ns + 180_000_000,
@@ -869,9 +1136,10 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             body_derived_motion_deadline_ns=None,
             corroboration_point=(16.0, 16.0),
         )
-        display_only_body_jitter = SimpleNamespace(
-            point=(29.0, 9.0),
-            source_timestamp_ns=source.base_ns + 8_000_000,
+        measured_head_anchor = SimpleNamespace(
+            point=(24.0, 5.0),
+            velocity_point=(26.0, 6.0),
+            source_timestamp_ns=source.base_ns,
             direct_source_timestamp_ns=source.base_ns,
             identity_deadline_ns=source.base_ns + 180_000_000,
             track_generation=1,
@@ -879,8 +1147,23 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             confidence=0.9,
             evidence="filtered direct-head anchor",
             bridging=False,
-            body_derived_motion_permitted=False,
-            body_derived_motion_deadline_ns=None,
+            body_derived_motion_permitted=True,
+            body_derived_motion_deadline_ns=source.base_ns + 180_000_000,
+            corroboration_point=None,
+        )
+        continued_head_anchor = SimpleNamespace(
+            point=(29.0, 9.0),
+            velocity_point=(34.0, 11.0),
+            source_timestamp_ns=source.base_ns + 8_000_000,
+            direct_source_timestamp_ns=source.base_ns,
+            identity_deadline_ns=source.base_ns + 180_000_000,
+            track_generation=1,
+            provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+            confidence=0.86,
+            evidence="filtered direct-head anchor",
+            bridging=False,
+            body_derived_motion_permitted=True,
+            body_derived_motion_deadline_ns=source.base_ns + 180_000_000,
             corroboration_point=None,
         )
         head_runtime = mock.Mock()
@@ -891,11 +1174,14 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         head_runtime.consume_motion_corroboration_revocation.side_effect = [
             False,
             False,
-            True,
+            False,
             False,
         ]
         head_runtime.take_latest.side_effect = [direct_sample, None]
-        head_runtime.visible_sample.return_value = display_only_body_jitter
+        head_runtime.visible_sample.side_effect = [
+            measured_head_anchor,
+            continued_head_anchor,
+        ]
         head_runtime.stop.side_effect = lambda: cleanup_order.append("head") or True
 
         config = self._config(
@@ -915,6 +1201,8 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             "makcu",
             "--aim-makcu-port",
             "/dev/serial/by-id/test-makcu",
+            "--aim-makcu-tracking-mode",
+            "direct-head",
             "--aim-makcu-vertical-rate-ratio",
             "0.63",
         )
@@ -939,84 +1227,126 @@ class LivePipelineIntegrationTests(unittest.TestCase):
         self.assertTrue(controller.stopped)
         self.assertEqual(controller.config.vertical_rate_ratio, 1.0)
         self.assertEqual(len(tracker_options), 1)
-        self.assertEqual(tracker_options[0]["lost_grace_frames"], 3)
+        self.assertEqual(tracker_options[0]["lost_grace_frames"], 8)
         numeric = controller.calibrated_controller
         self.assertIsNotNone(numeric)
         self.assertEqual(
             numeric.config.maximum_rate_x_counts_per_second,
             numeric.config.maximum_rate_y_counts_per_second,
         )
-        self.assertEqual(numeric.config.velocity_median_window, 5)
+        self.assertEqual(numeric.config.velocity_median_window, 3)
         self.assertEqual(
             numeric.config.velocity_filter_time_constant_seconds,
-            0.018,
+            0.014,
         )
         self.assertEqual(
             numeric.config.maximum_target_acceleration_pixels_per_second_squared,
-            20_000.0,
+            40_000.0,
         )
-        self.assertEqual(numeric.config.stale_after_seconds, 0.065)
+        self.assertEqual(numeric.config.stale_after_seconds, 0.110)
         self.assertEqual(
             numeric.config.maximum_observation_interval_seconds,
             0.040,
         )
-        self.assertEqual(numeric.config.position_time_constant_seconds, 0.012)
-        self.assertEqual(numeric.config.feedback_deadzone_pixels, 4.0)
-        self.assertEqual(numeric.config.maximum_velocity_feedforward_fraction, 0.95)
+        self.assertEqual(numeric.config.position_time_constant_seconds, 0.028)
+        self.assertEqual(numeric.config.feedback_deadzone_pixels, 4.5)
+        self.assertTrue(numeric.config.continuous_feedback_deadband)
+        self.assertEqual(
+            numeric.config.continuous_feedback_shoulder_pixels,
+            6.0,
+        )
+        self.assertEqual(numeric.config.velocity_median_window, 3)
+        self.assertEqual(numeric.config.maximum_velocity_feedforward_fraction, 1.0)
         self.assertTrue(
             numeric.config.require_motion_corroboration_for_feedforward
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_projection_fraction,
-            0.0,
+            1.0,
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_feedforward_fraction,
+            0.50,
+        )
+        self.assertEqual(
+            numeric.config.maximum_body_derived_pursuit_feedforward_fraction,
+            0.82,
+        )
+        self.assertEqual(
+            numeric.config.maximum_residual_pursuit_feedforward_fraction,
+            0.65,
+        )
+        self.assertEqual(
+            numeric.config.maximum_correlated_lookahead_pursuit_feedforward_fraction,
+            0.60,
+        )
+        self.assertEqual(
+            numeric.config.maximum_verified_flow_pursuit_feedforward_fraction,
             0.0,
         )
-        self.assertEqual(len(controller.updates), 2)
+        self.assertEqual(len(controller.updates), 3)
         first_target, _shape, _active, first_keywords = controller.updates[0]
         self.assertIsNone(first_target)
         self.assertNotIn("aim_point", first_keywords)
-        direct_target, _shape, _active, direct_keywords = controller.updates[1]
-        self.assertIs(direct_target, raw_target)
-        self.assertEqual(direct_keywords["aim_point"], direct_sample.point)
+        mapped_target, _shape, _active, mapped_keywords = controller.updates[1]
+        self.assertIs(mapped_target, raw_target)
+        self.assertEqual(mapped_keywords["aim_point"], measured_head_anchor.point)
         self.assertEqual(
-            direct_keywords["measurement_ns"],
-            direct_sample.source_timestamp_ns,
+            mapped_keywords["measurement_ns"],
+            measured_head_anchor.source_timestamp_ns,
         )
-        self.assertNotIn("velocity_target", direct_keywords)
-        self.assertEqual(direct_keywords["velocity_point"], direct_sample.point)
-        self.assertNotIn("body_derived_motion_permitted", direct_keywords)
-        self.assertNotIn("body_derived_motion_deadline_ns", direct_keywords)
+        self.assertNotIn("velocity_target", mapped_keywords)
         self.assertEqual(
-            direct_keywords["identity_deadline_ns"],
-            direct_sample.identity_deadline_ns,
+            mapped_keywords["velocity_point"],
+            measured_head_anchor.velocity_point,
         )
-        self.assertTrue(direct_keywords["measurement_observed"])
+        self.assertTrue(mapped_keywords["body_derived_motion_permitted"])
         self.assertEqual(
-            direct_keywords["motion_corroboration_point"],
-            direct_sample.corroboration_point,
+            mapped_keywords["body_derived_motion_deadline_ns"],
+            measured_head_anchor.identity_deadline_ns,
         )
-        self.assertNotEqual(
-            direct_keywords["aim_point"],
-            display_only_body_jitter.point,
+        self.assertEqual(
+            mapped_keywords["identity_deadline_ns"],
+            measured_head_anchor.identity_deadline_ns,
         )
-        self.assertFalse(
-            any(
-                keywords.get("aim_point") == display_only_body_jitter.point
-                for _target, _shape, _active, keywords in controller.updates
-            )
+        self.assertTrue(mapped_keywords["measurement_observed"])
+        self.assertNotIn("motion_corroboration_point", mapped_keywords)
+
+        continued_target, _shape, _active, continued_keywords = controller.updates[2]
+        self.assertEqual(continued_target, raw_target)
+        self.assertEqual(
+            continued_keywords["aim_point"],
+            continued_head_anchor.point,
         )
+        self.assertEqual(
+            continued_keywords["measurement_ns"],
+            continued_head_anchor.source_timestamp_ns,
+        )
+        self.assertEqual(
+            continued_keywords["velocity_point"],
+            continued_head_anchor.velocity_point,
+        )
+        self.assertTrue(continued_keywords["body_derived_motion_permitted"])
+        self.assertEqual(
+            continued_keywords["body_derived_motion_deadline_ns"],
+            continued_head_anchor.identity_deadline_ns,
+        )
+        self.assertEqual(
+            continued_keywords["identity_deadline_ns"],
+            continued_head_anchor.identity_deadline_ns,
+        )
+        self.assertTrue(continued_keywords["measurement_observed"])
+        self.assertNotIn("velocity_target", continued_keywords)
+        self.assertNotIn("motion_corroboration_point", continued_keywords)
         self.assertEqual(
             controller.control_events,
             [
                 "update",
                 "update",
-                "revoke_motion_corroboration",
+                "update",
             ],
         )
-        head_runtime.submit.assert_called_once()
+        self.assertEqual(head_runtime.submit.call_count, 2)
         self.assertEqual(cleanup_order, ["aim", "head"])
         startup = output.getvalue()
         self.assertIn("control automatic command-aware observer", startup)
@@ -1025,14 +1355,812 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             "MIGraphXExecutionProvider GPU-only (CPU fallback disabled)",
             startup,
         )
-        self.assertIn("direct-head confidence >= 0.25", startup)
-        self.assertIn("physical position/velocity updates direct-head-only", startup)
+        self.assertIn("direct-head confidence >= 0.15", startup)
+        self.assertIn("direct results establish the head anchor", startup)
+        self.assertIn("already-qualified fast pursuit <= 60%", startup)
         self.assertIn(
-            "same-source accepted primary center corroborates motion only",
+            "current measured primary geometry carries position for at most 750 ms",
             startup,
         )
-        self.assertIn("no body-mapped physical projection/feed-forward", startup)
-        self.assertIn("latest-only 90 Hz", startup)
+        self.assertIn(
+            "body candidates schedule head verification only; no body-box output",
+            startup,
+        )
+        self.assertIn("predicted primary geometry remains display-only", startup)
+        self.assertIn(
+            "verified mapped-motion source-age projection 100% | "
+            "feed-forward baseline/aligned/fast max 25%/50%/82%",
+            startup,
+        )
+        self.assertIn("closed-loop trailing-residual max 65%", startup)
+        self.assertIn(
+            "latest-only 90 Hz acquisition / 24 Hz anchored maintenance "
+            "(acquisition recovery on stale/repeated model misses or within "
+            "300 ms of lease expiry)",
+            startup,
+        )
+
+    def test_capture_phase_lookahead_is_atomic_and_uncorroborated_falls_back(
+        self,
+    ) -> None:
+        def run_case(
+            name: str,
+            *,
+            root_corroboration_point: tuple[float, float] | None,
+        ):
+            report_path = self.root / f"capture-phase-{name}.json"
+            diagnostic_root = self.root / f"capture-phase-{name}-diagnostics"
+
+            class PeekSource(_FakeSource):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.base_ns = perf_counter_ns() - 20_000_000
+                    self.current_image = np.zeros(self.shape, dtype=np.uint8)
+                    self.newest_image = np.ones(self.shape, dtype=np.uint8)
+                    self.newest_packet = FramePacket(
+                        image=self.newest_image,
+                        sequence=1,
+                        read_started_ns=self.base_ns + 8_000_000,
+                        read_completed_ns=self.base_ns + 8_100_000,
+                    )
+
+                def read(self, timeout: float | None = None):
+                    self.read_calls += 1
+                    self.read_timeouts.append(timeout)
+                    return FramePacket(
+                        image=self.current_image,
+                        sequence=0,
+                        read_started_ns=self.base_ns,
+                        read_completed_ns=self.base_ns + 100_000,
+                    )
+
+                def peek_latest(self):
+                    return self.newest_packet
+
+            class RecordingMakcuController:
+                instances: list["RecordingMakcuController"] = []
+
+                def __init__(self, config, *, calibrated_controller=None) -> None:
+                    self.config = config
+                    self.calibrated_controller = calibrated_controller
+                    self.activation_pressed = True
+                    self.raw_activation_state = (True, True)
+                    self.activation_requires_release = False
+                    self.updates: list[
+                        tuple[
+                            Detection | None,
+                            tuple[int, int, int],
+                            bool,
+                            dict[str, object],
+                        ]
+                    ] = []
+                    self.correlated_updates: list[
+                        tuple[
+                            Detection,
+                            tuple[int, int, int],
+                            bool,
+                            dict[str, object],
+                        ]
+                    ] = []
+                    self.__class__.instances.append(self)
+
+                def start(self) -> None:
+                    return None
+
+                def stop(self) -> None:
+                    return None
+
+                def update(
+                    self,
+                    target,
+                    frame_shape,
+                    *,
+                    active=True,
+                    **keywords,
+                ) -> None:
+                    self.updates.append(
+                        (target, frame_shape, active, dict(keywords))
+                    )
+
+                def update_correlated_lookahead(
+                    self,
+                    target,
+                    frame_shape,
+                    *,
+                    active=True,
+                    **keywords,
+                ) -> None:
+                    self.correlated_updates.append(
+                        (target, frame_shape, active, dict(keywords))
+                    )
+
+                def revoke_motion_corroboration(self) -> None:
+                    return None
+
+                def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
+                    return MakcuTelemetrySnapshot()
+
+            source = PeekSource()
+            target = Detection(0, "player", 0.90, (20, 2, 28, 22))
+            _FakeDetector.detection_batches = [[target]]
+            identity_deadline_ns = source.base_ns + 750_000_000
+            root_sample = SimpleNamespace(
+                point=(23.0, 5.0),
+                velocity_point=(24.0, 5.0),
+                source_timestamp_ns=source.base_ns,
+                direct_source_timestamp_ns=source.base_ns - 10_000_000,
+                identity_deadline_ns=identity_deadline_ns,
+                track_generation=3,
+                provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+                confidence=0.90,
+                evidence="same-frame mapped head",
+                bridging=False,
+                body_derived_motion_permitted=True,
+                body_derived_motion_deadline_ns=identity_deadline_ns,
+                corroboration_point=root_corroboration_point,
+                phase_advanced=False,
+                phase_hops=0,
+            )
+            lookahead_sample = SimpleNamespace(
+                point=(25.0, 5.0),
+                velocity_point=(26.0, 5.0),
+                source_timestamp_ns=source.newest_packet.read_started_ns,
+                direct_source_timestamp_ns=root_sample.direct_source_timestamp_ns,
+                identity_deadline_ns=identity_deadline_ns,
+                track_generation=3,
+                provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+                confidence=0.90,
+                evidence="capture-phase LK endpoint",
+                bridging=False,
+                body_derived_motion_permitted=False,
+                body_derived_motion_deadline_ns=None,
+                corroboration_point=None,
+                phase_advanced=True,
+                phase_hops=1,
+            )
+            head_runtime = mock.Mock()
+            head_runtime.provider = "MIGraphXExecutionProvider"
+            head_runtime.status = SimpleNamespace()
+            head_runtime.identity_generation = 7
+            head_runtime.accept_body.return_value = False
+            head_runtime.consume_motion_corroboration_revocation.return_value = False
+            head_runtime.take_latest.return_value = None
+            head_runtime.visible_sample.side_effect = [
+                root_sample,
+                lookahead_sample,
+            ]
+            head_runtime.has_live_measured_anchor.return_value = True
+            head_runtime.revoke_body.return_value = False
+            head_runtime.stop.return_value = True
+
+            config = self._config(
+                report_path,
+                "--backend",
+                "onnxruntime",
+                "--device",
+                "MIGRAPHX",
+                "--require-full-provider",
+                "--max-frames",
+                "1",
+                "--aim",
+                "--aim-label",
+                "player",
+                "--ignore-self",
+                "--aim-output",
+                "makcu",
+                "--aim-makcu-port",
+                "/dev/serial/by-id/test-makcu",
+                "--aim-makcu-tracking-mode",
+                "direct-head",
+                "--aim-diagnostic-dir",
+                str(diagnostic_root),
+            )
+            with (
+                mock.patch("main._build_capture", return_value=source),
+                mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+                mock.patch(
+                    "detection.onnx_yolo.OnnxRuntimeYoloDetector",
+                    _FakeDetector,
+                ),
+                mock.patch(
+                    "aiming.MakcuAimingController",
+                    RecordingMakcuController,
+                ),
+                mock.patch(
+                    "main._build_automatic_head_runtime",
+                    return_value=head_runtime,
+                ),
+            ):
+                self.assertEqual(run(config), 0)
+
+            sessions = list(diagnostic_root.iterdir())
+            self.assertEqual(len(sessions), 1)
+            records = [
+                json.loads(line)
+                for line in (sessions[0] / "records.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()
+            ]
+            self.assertEqual(len(records), 1)
+            return (
+                RecordingMakcuController.instances[0],
+                head_runtime,
+                source,
+                target,
+                root_sample,
+                lookahead_sample,
+                records[0],
+            )
+
+        (
+            controller,
+            head_runtime,
+            source,
+            target,
+            root_sample,
+            lookahead_sample,
+            record,
+        ) = run_case(
+            "correlated",
+            root_corroboration_point=(16.0, 16.0),
+        )
+        self.assertEqual(len(controller.correlated_updates), 1)
+        published_target, shape, active, keywords = (
+            controller.correlated_updates[0]
+        )
+        self.assertIs(published_target, target)
+        self.assertEqual(shape, source.shape)
+        self.assertTrue(active)
+        self.assertEqual(
+            keywords,
+            {
+                "primary_measurement_ns": root_sample.source_timestamp_ns,
+                "primary_aim_point": root_sample.point,
+                "primary_velocity_point": root_sample.velocity_point,
+                "primary_motion_corroboration_point": (
+                    root_sample.corroboration_point
+                ),
+                "lookahead_measurement_ns": (
+                    lookahead_sample.source_timestamp_ns
+                ),
+                "lookahead_aim_point": lookahead_sample.point,
+                "lookahead_velocity_point": lookahead_sample.velocity_point,
+                "identity_deadline_ns": root_sample.identity_deadline_ns,
+                "runtime_identity_generation": 7,
+                "track_generation": root_sample.track_generation,
+                "verified_flow_motion": False,
+            },
+        )
+        self.assertFalse(any(update[0] is not None for update in controller.updates))
+        phase_events = [
+            call[0]
+            for call in head_runtime.method_calls
+            if call[0]
+            in {"visible_sample", "remember_newer_capture_frame"}
+        ]
+        self.assertEqual(
+            phase_events,
+            [
+                "visible_sample",
+                "remember_newer_capture_frame",
+                "visible_sample",
+            ],
+        )
+        remember_call = head_runtime.remember_newer_capture_frame.call_args
+        assert remember_call is not None
+        self.assertIs(remember_call.args[0], source.newest_image)
+        self.assertEqual(
+            remember_call.kwargs["source_timestamp_ns"],
+            lookahead_sample.source_timestamp_ns,
+        )
+        self.assertEqual(record["control_source"], "capture-phase-correlated")
+        self.assertEqual(
+            record["correlated_root_sample"]["source_timestamp_ns"],
+            root_sample.source_timestamp_ns,
+        )
+
+        (
+            fallback_controller,
+            _fallback_runtime,
+            _fallback_source,
+            fallback_target,
+            _fallback_root,
+            fallback_lookahead,
+            fallback_record,
+        ) = run_case(
+            "uncorroborated",
+            root_corroboration_point=None,
+        )
+        self.assertEqual(fallback_controller.correlated_updates, [])
+        target_updates = [
+            update
+            for update in fallback_controller.updates
+            if update[0] is not None
+        ]
+        self.assertEqual(len(target_updates), 1)
+        ordinary_target, _shape, _active, ordinary_keywords = target_updates[0]
+        self.assertIs(ordinary_target, fallback_target)
+        self.assertEqual(
+            ordinary_keywords["measurement_ns"],
+            fallback_lookahead.source_timestamp_ns,
+        )
+        self.assertEqual(
+            ordinary_keywords["aim_point"],
+            fallback_lookahead.point,
+        )
+        self.assertNotIn("motion_corroboration_point", ordinary_keywords)
+        self.assertEqual(fallback_record["control_source"], "capture-phase")
+        self.assertIsNone(fallback_record["correlated_root_sample"])
+
+    def test_uncertain_wide_self_keeps_only_distinct_mapped_opponent(self) -> None:
+        from aiming.controller import TargetTracker as RealTargetTracker
+        from utils.self_filter import SelfAvatarFilter as RealSelfAvatarFilter
+
+        report_path = self.root / "uncertain-wide-self-direct-head.json"
+
+        class TimestampedSource(_FakeSource):
+            def __init__(self) -> None:
+                super().__init__(shape=(1080, 1920, 3))
+                self.base_ns = perf_counter_ns() - 20_000_000
+
+            def read(self, timeout: float | None = None):
+                self.read_calls += 1
+                self.read_timeouts.append(timeout)
+                started_ns = self.base_ns + (self.read_calls - 1) * 8_000_000
+                return FramePacket(
+                    image=np.zeros(self.shape, dtype=np.uint8),
+                    sequence=self.read_calls - 1,
+                    read_started_ns=started_ns,
+                    read_completed_ns=started_ns + 100_000,
+                )
+
+        source = TimestampedSource()
+        narrow_self = Detection(
+            0,
+            "player",
+            0.90,
+            (430, 560, 850, 1080),
+        )
+        wide_self = Detection(
+            0,
+            "player",
+            0.90,
+            (4, 370, 750, 1080),
+        )
+        wide_self_duplicate = Detection(
+            0,
+            "player",
+            0.82,
+            (8, 388, 744, 1076),
+        )
+        opponent = Detection(
+            0,
+            "player",
+            0.90,
+            (900, 438, 960, 558),
+        )
+        _FakeDetector.detection_batches = [
+            [narrow_self, opponent],
+            [narrow_self, opponent],
+            [narrow_self, opponent],
+            [wide_self, wide_self_duplicate, opponent],
+        ]
+
+        class RecordingSelfAvatarFilter(RealSelfAvatarFilter):
+            instances: list["RecordingSelfAvatarFilter"] = []
+
+            def __init__(self, zone) -> None:
+                super().__init__(zone)
+                self.results = []
+                self.__class__.instances.append(self)
+
+            def apply(self, detections, frame_shape):
+                result = super().apply(detections, frame_shape)
+                self.results.append(result)
+                return result
+
+        class RecordingTracker(RealTargetTracker):
+            instances: list["RecordingTracker"] = []
+
+            def __init__(self, **options) -> None:
+                super().__init__(**options)
+                self.detection_inputs: list[tuple[Detection, ...]] = []
+                self.continuation_inputs: list[tuple[Detection, ...]] = []
+                self.__class__.instances.append(self)
+
+            def update(
+                self,
+                detections,
+                frame_shape,
+                *,
+                continuation_detections=(),
+                **keywords,
+            ):
+                self.detection_inputs.append(tuple(detections))
+                self.continuation_inputs.append(tuple(continuation_detections))
+                return super().update(
+                    detections,
+                    frame_shape,
+                    continuation_detections=continuation_detections,
+                    **keywords,
+                )
+
+        class RecordingMakcuController:
+            instances: list["RecordingMakcuController"] = []
+
+            def __init__(self, config, *, calibrated_controller=None) -> None:
+                self.config = config
+                self.calibrated_controller = calibrated_controller
+                self.activation_pressed = True
+                self.updates: list[
+                    tuple[Detection | None, dict[str, object]]
+                ] = []
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, target, _frame_shape, **keywords) -> None:
+                self.updates.append((target, dict(keywords)))
+
+            def revoke_motion_corroboration(self) -> None:
+                return None
+
+            def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
+                return MakcuTelemetrySnapshot()
+
+        identity_deadline_ns = source.base_ns + 180_000_000
+        direct_sample = SimpleNamespace(
+            point=(930.0, 450.0),
+            source_timestamp_ns=source.base_ns,
+            direct_source_timestamp_ns=source.base_ns,
+            identity_deadline_ns=identity_deadline_ns,
+            track_generation=1,
+            provenance=DirectHeadProvenance.DIRECT,
+            confidence=0.9,
+            evidence="direct test head box",
+            bridging=False,
+            body_derived_motion_permitted=False,
+            body_derived_motion_deadline_ns=None,
+            corroboration_point=(930.0, 498.0),
+        )
+        mapped_samples = [
+            SimpleNamespace(
+                point=(930.0 + index, 450.0 + index),
+                source_timestamp_ns=source.base_ns + index * 8_000_000,
+                direct_source_timestamp_ns=source.base_ns,
+                identity_deadline_ns=identity_deadline_ns,
+                track_generation=1,
+                provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+                confidence=0.90 - index * 0.02,
+                evidence="filtered direct-head anchor",
+                bridging=False,
+                body_derived_motion_permitted=True,
+                body_derived_motion_deadline_ns=identity_deadline_ns,
+                corroboration_point=None,
+            )
+            for index in range(4)
+        ]
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.return_value = False
+        head_runtime.take_latest.side_effect = [direct_sample, None, None, None]
+        head_runtime.visible_sample.side_effect = mapped_samples
+        head_runtime.revoke_body.return_value = False
+        head_runtime.stop.return_value = True
+
+        config = self._config(
+            report_path,
+            "--backend",
+            "onnxruntime",
+            "--device",
+            "MIGRAPHX",
+            "--require-full-provider",
+            "--max-frames",
+            "4",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "makcu",
+            "--aim-makcu-port",
+            "/dev/serial/by-id/test-makcu",
+            "--aim-makcu-tracking-mode",
+            "direct-head",
+        )
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
+            mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
+            mock.patch("aiming.TargetTracker", RecordingTracker),
+            mock.patch(
+                "utils.self_filter.SelfAvatarFilter",
+                RecordingSelfAvatarFilter,
+            ),
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        exclusion_results = RecordingSelfAvatarFilter.instances[0].results
+        self.assertEqual(len(exclusion_results), 4)
+        self.assertFalse(exclusion_results[-1].aim_safe)
+        self.assertEqual(
+            exclusion_results[-1].uncertain_self_detections,
+            (wide_self, wide_self_duplicate),
+        )
+
+        tracker = RecordingTracker.instances[0]
+        self.assertEqual(
+            tracker.detection_inputs,
+            [(opponent,), (opponent,), (opponent,), (opponent,)],
+        )
+        self.assertEqual(tracker.continuation_inputs, [(), (), (), ()])
+
+        self.assertEqual(head_runtime.accept_body.call_count, 4)
+        for accepted_call in head_runtime.accept_body.call_args_list:
+            self.assertEqual(accepted_call.args[0], opponent.box)
+            self.assertEqual(accepted_call.kwargs["aim_box"], opponent.box)
+            self.assertEqual(
+                accepted_call.kwargs["corroboration_box"],
+                opponent.box,
+            )
+        self.assertEqual(head_runtime.submit.call_count, 4)
+        for submit_call in head_runtime.submit.call_args_list:
+            self.assertIs(submit_call.args[1], opponent)
+        head_runtime.revoke_body.assert_not_called()
+
+        controller = RecordingMakcuController.instances[0]
+        self.assertEqual(len(controller.updates), 5)
+        self.assertIsNone(controller.updates[0][0])
+        mapped_updates = controller.updates[1:]
+        self.assertEqual(len(mapped_updates), 4)
+        for index, (target, keywords) in enumerate(mapped_updates):
+            self.assertIsNotNone(target)
+            assert target is not None
+            self.assertGreater(float(target.x1), float(wide_self.x2))
+            self.assertEqual(keywords["aim_point"], mapped_samples[index].point)
+            self.assertTrue(keywords["measurement_observed"])
+            self.assertTrue(keywords["body_derived_motion_permitted"])
+            self.assertEqual(
+                keywords["identity_deadline_ns"],
+                identity_deadline_ns,
+            )
+
+    def test_obvious_wide_self_guard_preserves_opponent_then_revokes_alone(
+        self,
+    ) -> None:
+        from aiming.controller import TargetTracker as RealTargetTracker
+        from utils.self_filter import SelfAvatarFilter as RealSelfAvatarFilter
+
+        report_path = self.root / "obvious-wide-self-direct-head.json"
+
+        class TimestampedSource(_FakeSource):
+            def __init__(self) -> None:
+                super().__init__(shape=(1080, 1920, 3))
+                self.base_ns = perf_counter_ns() - 20_000_000
+
+            def read(self, timeout: float | None = None):
+                self.read_calls += 1
+                self.read_timeouts.append(timeout)
+                started_ns = self.base_ns + (self.read_calls - 1) * 8_000_000
+                return FramePacket(
+                    image=np.zeros(self.shape, dtype=np.uint8),
+                    sequence=self.read_calls - 1,
+                    read_started_ns=started_ns,
+                    read_completed_ns=started_ns + 100_000,
+                )
+
+        source = TimestampedSource()
+        # Normalized width/height is about 0.65, intentionally above the
+        # temporal filter's 0.60 acquisition ceiling.  Its bottom, height, and
+        # configured-shoulder anchor satisfy the automatic obvious-self guard.
+        wide_self = Detection(
+            0,
+            "player",
+            0.90,
+            (0, 370, 820, 1080),
+        )
+        opponent = Detection(
+            0,
+            "player",
+            0.90,
+            (900, 438, 960, 558),
+        )
+        _FakeDetector.detection_batches = [
+            [wide_self, opponent],
+            [wide_self],
+        ]
+        normalized_self_width = (wide_self.x2 - wide_self.x1) / source.shape[1]
+        normalized_self_height = (wide_self.y2 - wide_self.y1) / source.shape[0]
+        self.assertGreater(normalized_self_width / normalized_self_height, 0.60)
+        self.assertGreaterEqual(wide_self.y2 / source.shape[0], 0.985)
+        self.assertGreaterEqual(normalized_self_height, 0.25)
+
+        class RecordingSelfAvatarFilter(RealSelfAvatarFilter):
+            instances: list["RecordingSelfAvatarFilter"] = []
+
+            def __init__(self, zone) -> None:
+                super().__init__(zone)
+                self.results = []
+                self.__class__.instances.append(self)
+
+            def apply(self, detections, frame_shape):
+                result = super().apply(detections, frame_shape)
+                self.results.append(result)
+                return result
+
+        class RecordingTracker(RealTargetTracker):
+            instances: list["RecordingTracker"] = []
+
+            def __init__(self, **options) -> None:
+                super().__init__(**options)
+                self.detection_inputs: list[tuple[Detection, ...]] = []
+                self.reset_calls = 0
+                self.__class__.instances.append(self)
+
+            def reset(self) -> None:
+                self.reset_calls += 1
+                super().reset()
+
+            def update(self, detections, frame_shape, **keywords):
+                self.detection_inputs.append(tuple(detections))
+                return super().update(detections, frame_shape, **keywords)
+
+        class RecordingMakcuController:
+            instances: list["RecordingMakcuController"] = []
+
+            def __init__(self, config, *, calibrated_controller=None) -> None:
+                self.config = config
+                self.calibrated_controller = calibrated_controller
+                self.activation_pressed = True
+                self.updates: list[
+                    tuple[Detection | None, dict[str, object]]
+                ] = []
+                self.__class__.instances.append(self)
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+            def update(self, target, _frame_shape, **keywords) -> None:
+                self.updates.append((target, dict(keywords)))
+
+            def revoke_motion_corroboration(self) -> None:
+                return None
+
+            def telemetry_snapshot(self) -> MakcuTelemetrySnapshot:
+                return MakcuTelemetrySnapshot()
+
+        identity_deadline_ns = source.base_ns + 180_000_000
+        direct_sample = SimpleNamespace(
+            point=(930.0, 450.0),
+            source_timestamp_ns=source.base_ns,
+            direct_source_timestamp_ns=source.base_ns,
+            identity_deadline_ns=identity_deadline_ns,
+            track_generation=1,
+            provenance=DirectHeadProvenance.DIRECT,
+            confidence=0.9,
+            evidence="direct test head box",
+            bridging=False,
+            body_derived_motion_permitted=False,
+            body_derived_motion_deadline_ns=None,
+            corroboration_point=(930.0, 498.0),
+        )
+        mapped_sample = SimpleNamespace(
+            point=(930.0, 450.0),
+            source_timestamp_ns=source.base_ns,
+            direct_source_timestamp_ns=source.base_ns,
+            identity_deadline_ns=identity_deadline_ns,
+            track_generation=1,
+            provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+            confidence=0.9,
+            evidence="filtered direct-head anchor",
+            bridging=False,
+            body_derived_motion_permitted=True,
+            body_derived_motion_deadline_ns=identity_deadline_ns,
+            corroboration_point=None,
+        )
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.return_value = False
+        head_runtime.take_latest.return_value = direct_sample
+        head_runtime.visible_sample.return_value = mapped_sample
+        head_runtime.revoke_body.return_value = True
+        head_runtime.stop.return_value = True
+
+        config = self._config(
+            report_path,
+            "--backend",
+            "onnxruntime",
+            "--device",
+            "MIGRAPHX",
+            "--require-full-provider",
+            "--max-frames",
+            "2",
+            "--aim",
+            "--aim-label",
+            "player",
+            "--ignore-self",
+            "--aim-output",
+            "makcu",
+            "--aim-makcu-port",
+            "/dev/serial/by-id/test-makcu",
+            "--aim-makcu-tracking-mode",
+            "direct-head",
+        )
+        with (
+            mock.patch("main._build_capture", return_value=source),
+            mock.patch("detection.OpenVINOYoloDetector", _FakeDetector),
+            mock.patch("detection.onnx_yolo.OnnxRuntimeYoloDetector", _FakeDetector),
+            mock.patch("aiming.MakcuAimingController", RecordingMakcuController),
+            mock.patch("aiming.TargetTracker", RecordingTracker),
+            mock.patch(
+                "utils.self_filter.SelfAvatarFilter",
+                RecordingSelfAvatarFilter,
+            ),
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+        ):
+            result = run(config)
+
+        self.assertEqual(result, 0)
+        exclusion_results = RecordingSelfAvatarFilter.instances[0].results
+        self.assertEqual(len(exclusion_results), 2)
+        for exclusion in exclusion_results:
+            self.assertTrue(exclusion.aim_safe)
+            self.assertEqual(exclusion.ignored_count, 0)
+            self.assertEqual(exclusion.uncertain_self_detections, ())
+
+        tracker = RecordingTracker.instances[0]
+        self.assertEqual(tracker.detection_inputs, [(opponent,)])
+        # One reset establishes the physical hold epoch; the second proves the
+        # guarded exact self-only frame cannot borrow tracker prediction grace.
+        self.assertEqual(tracker.reset_calls, 2)
+
+        head_runtime.accept_body.assert_called_once()
+        accepted_call = head_runtime.accept_body.call_args
+        assert accepted_call is not None
+        self.assertEqual(accepted_call.args[0], opponent.box)
+        self.assertEqual(accepted_call.kwargs["aim_box"], opponent.box)
+        self.assertEqual(
+            accepted_call.kwargs["corroboration_box"],
+            opponent.box,
+        )
+        head_runtime.submit.assert_called_once()
+        self.assertIs(head_runtime.submit.call_args.args[1], opponent)
+        head_runtime.take_latest.assert_called_once()
+        head_runtime.visible_sample.assert_called_once()
+        head_runtime.revoke_body.assert_called_once()
+
+        controller = RecordingMakcuController.instances[0]
+        self.assertEqual(len(controller.updates), 3)
+        self.assertIsNone(controller.updates[0][0])
+        mapped_target, mapped_keywords = controller.updates[1]
+        self.assertIsNotNone(mapped_target)
+        assert mapped_target is not None
+        self.assertGreater(float(mapped_target.x1), float(wide_self.x2))
+        self.assertEqual(mapped_keywords["aim_point"], mapped_sample.point)
+        self.assertTrue(mapped_keywords["body_derived_motion_permitted"])
+        self.assertIsNone(controller.updates[2][0])
 
     def test_capture_starvation_surfaces_automatic_head_worker_failure(self) -> None:
         report_path = self.root / "head-worker-starvation.json"
@@ -1082,6 +2210,8 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             "makcu",
             "--aim-makcu-port",
             "/dev/serial/by-id/test-makcu",
+            "--aim-makcu-tracking-mode",
+            "direct-head",
         )
 
         with (
@@ -1252,6 +2382,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
                 self.options = options
                 self.updates: list[list[Detection]] = []
                 self.continuation_updates: list[list[Detection]] = []
+                self.output_is_prediction = False
                 self.__class__.instances.append(self)
 
             def update(
@@ -1346,7 +2477,7 @@ class LivePipelineIntegrationTests(unittest.TestCase):
             FakeSelfFilter.instances[0].calls,
             [[detail, low_continuation, guarded_low]],
         )
-        self.assertEqual(FakeTracker.instances[0].options["lost_grace_frames"], 1)
+        self.assertEqual(FakeTracker.instances[0].options["lost_grace_frames"], 6)
         self.assertEqual(FakeTracker.instances[0].updates, [[detail]])
         self.assertEqual(
             FakeTracker.instances[0].continuation_updates,

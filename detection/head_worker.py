@@ -61,11 +61,18 @@ def _box(value: Sequence[float], name: str = "selected_player_box") -> Box:
 
 @dataclass(frozen=True, slots=True)
 class HeadObservation:
-    """One model-observed absolute head point in the source frame."""
+    """One model-observed absolute head point in the source frame.
+
+    ``head_box`` is optional worker metadata for consumers which can replay
+    the exact localization through newer captured pixels.  Older/localizer-
+    agnostic callers remain point-only; an absent box grants no extra motion
+    authority.
+    """
 
     point: Point
     confidence: float
     evidence: str
+    head_box: Box | None = None
 
     def __post_init__(self) -> None:
         point = tuple(float(value) for value in self.point)
@@ -77,9 +84,13 @@ class HeadObservation:
         evidence = str(self.evidence).strip()
         if not evidence:
             raise ValueError("head evidence must be a non-empty string")
+        head_box = self.head_box
+        if head_box is not None:
+            head_box = _box(head_box, "head_box")
         object.__setattr__(self, "point", point)
         object.__setattr__(self, "confidence", confidence)
         object.__setattr__(self, "evidence", evidence)
+        object.__setattr__(self, "head_box", head_box)
 
 
 class HeadLocalizationReason(str, Enum):

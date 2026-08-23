@@ -26,7 +26,13 @@ from typing import TypeAlias
 Box: TypeAlias = tuple[float, float, float, float]
 Point: TypeAlias = tuple[float, float]
 
-DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS = 0.200
+# Live direct-head inference can produce clustered no-decoded gaps even while
+# the primary detector continues to measure the same tracked player. Retain
+# the verified normalized head offset across the measured 0.63 s p95 / 0.73 s
+# maximum gap. This remains an immutable identity lease: only fresh measured
+# geometry in the same tracker generation may publish it, and prediction-only
+# geometry remains non-authoritative.
+DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS = 0.750
 DIRECT_HEAD_ANCHOR_FILTER_SAMPLES = 5
 _NS_PER_SECOND = 1_000_000_000
 _NORMALIZED_SIDE_MARGIN = 0.12

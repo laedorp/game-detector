@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 import errno
@@ -17,6 +18,8 @@ from detection.types import Detection
 from .controller import DEFAULT_HEAD_RATIO, head_target_point
 from .makcu_calibrated_control import (
     CalibratedControlOutput,
+    CORRELATED_LOOKAHEAD_MAX_LEAD_SECONDS,
+    CorrelatedLookaheadObservation,
     EmittedMouseCommand,
     MakcuCalibratedController,
     ScreenErrorObservation,
@@ -47,16 +50,29 @@ REFERENCE_CONTROL_HZ = 60.0
 REFERENCE_FRAME_WIDTH = 1920.0
 REFERENCE_FRAME_HEIGHT = 1080.0
 TARGET_STALE_SECONDS = 0.15
-# MAKCU button telemetry is edge-driven: the board sends a frame when the
-# physical state changes, not as a heartbeat.  The one-argument command is
-# supported by both older field firmware and the current protocol.
+# MAKCU raw mouse telemetry is event-driven: the board sends a frame when the
+# physical mouse produces one, not as a heartbeat.  Unlike ``km.buttons``, the
+# full frame preserves physical X/Y deltas so calibrated control can distinguish
+# a user's correction from apparent target motion in the captured image.  Some
+# field firmware accepts this command but emits no compatible frames, so it is
+# optional telemetry and must never be the sole activation source.
+MOUSE_STREAM_COMMAND = "km.mouse(1,1)"
+# The one-argument button stream is the compatibility authority proven by the
+# existing hardware path.  Enable it independently of raw-mouse telemetry so a
+# silent or unsupported ``km.mouse`` implementation cannot disable all output.
 BUTTON_STREAM_COMMAND = "km.buttons(1)"
-# The button stream is event-driven, so silence normally means "still held".
+# Both input streams are event-driven, so silence normally means "still held".
 # Bound that authority anyway: after an unusually long uninterrupted hold the
-# user must release and press again. This prevents a lost release byte from
-# authorizing movement indefinitely.
-MAX_CONTINUOUS_ACTIVATION_SECONDS = 10.0
+# user must release and press again. Ten seconds was short enough to interrupt
+# ordinary sustained tracking in live use; one minute keeps a finite lost-
+# release bound without turning normal holds into periodic dropouts.
+MAX_CONTINUOUS_ACTIVATION_SECONDS = 60.0
 THREADED_RATE_SMOOTHING_ALPHA = 0.82
+# The fast-pursuit reserve is already covariance-, direction-, and fresh-motion
+# gated. Give only that incremental rate a prompt rise, while making its fall
+# immediate so the ordinary 11 ms anti-quantization EMA cannot carry it through
+# a stop or reversal. The ordinary feedback/base feed-forward path is unchanged.
+PURSUIT_RESERVE_RISE_TIME_CONSTANT_SECONDS = 0.003
 PREDICTION_LEAD_SECONDS = 0.028
 DERIVATIVE_DAMPING_SECONDS = 0.016
 MAX_SAMPLE_AGE_LEAD_SECONDS = 0.055
@@ -80,8 +96,15 @@ MAX_VERTICAL_RATE_RATIO = 0.48
 # The detector renews a short physical-evidence lease while a bounded pulse is
 # in flight; the 1 kHz worker independently checks that lease and the selected
 # mouse button before every command.
+#
+# Lease age must cover the detector's own capture-to-result lag (~12 ms) plus
+# a couple of motion-blurred or busy frames during a pulse.  At a 160-235 Hz
+# detector cadence one dropped frame is ~4-8 ms; two consecutive blur drops
+# during a fast pulse reversal can reach ~25 ms and were expiring the lease
+# mid-pulse (aborting otherwise-valid sessions).  60 ms keeps the worker
+# fail-safe against a genuinely stalled detector while tolerating brief blur.
 CALIBRATION_OUTPUT_HZ = 1000
-CALIBRATION_LEASE_MAX_AGE_SECONDS = 0.025
+CALIBRATION_LEASE_MAX_AGE_SECONDS = 0.060
 CALIBRATION_MAX_EXCURSION_COUNTS = 200
 CALIBRATION_MAX_SESSION_ABS_COUNTS = 2400
 CALIBRATION_MAX_RATE_COUNTS_PER_SECOND = 2400.0
@@ -95,18 +118,40 @@ CALIBRATION_MAX_STEP_COUNTS = math.ceil(
 # threads keep even a pathological native ``close()`` call inside this bound.
 MAKCU_STOP_TIMEOUT_SECONDS = 0.75
 MAKCU_STOP_PHASE_GRACE_SECONDS = 0.10
+# Retain enough successful normal-output commands to bridge several ordinary
+# diagnostic collection intervals without permitting an unattended controller
+# to grow memory forever. Cumulative counters below remain exact after this
+# tail starts evicting its oldest records.
+NORMAL_COMMAND_LEDGER_LIMIT = 4096
 
 
 class MakcuError(RuntimeError):
     """User-facing MAKCU discovery, connection, or command failure."""
 
 
-_BUTTON_FRAME_PREFIX = b"km."
-_BUTTON_LONG_SUFFIX = b"buttons"
+_INPUT_FRAME_PREFIX = b"km."
+_MOUSE_FRAME_SUFFIX = b"mouse"
+_BUTTON_FRAME_SUFFIX = b"buttons"
+_MOUSE_PAYLOAD_SIZE = 8
+_INPUT_FRAME_TERMINATOR = b"\r\n>>> "
 
 
-class _ButtonStreamParser:
-    """Decode framed and legacy MAKCU button-state events across reads."""
+@dataclass(frozen=True, slots=True)
+class _MakcuInputReport:
+    """One decoded physical-input report from the MAKCU serial stream."""
+
+    button_mask: int
+    delta_x_counts: int = 0
+    delta_y_counts: int = 0
+    wheel: int = 0
+    pan: int = 0
+    tilt: int = 0
+    is_framed: bool = True
+    is_mouse_frame: bool = False
+
+
+class _MakcuInputStreamParser:
+    """Decode full mouse frames and legacy button events across serial reads."""
 
     def __init__(self) -> None:
         self._pending = bytearray()
@@ -120,13 +165,17 @@ class _ButtonStreamParser:
     def _prefix_tail_length(data: bytes | bytearray) -> int:
         """Return the longest suffix which can begin the next ``km.`` frame."""
 
-        maximum = min(len(data), len(_BUTTON_FRAME_PREFIX) - 1)
+        maximum = min(len(data), len(_INPUT_FRAME_PREFIX) - 1)
         for length in range(maximum, 0, -1):
-            if data[-length:] == _BUTTON_FRAME_PREFIX[:length]:
+            if data[-length:] == _INPUT_FRAME_PREFIX[:length]:
                 return length
         return 0
 
-    def feed(self, data: bytes) -> tuple[tuple[int, bool], ...]:
+    @staticmethod
+    def _signed_byte(value: int) -> int:
+        return value - 256 if value >= 128 else value
+
+    def feed(self, data: bytes) -> tuple[_MakcuInputReport, ...]:
         bare_mask = (
             not self._framed_mode
             and not self._pending
@@ -135,16 +184,21 @@ class _ButtonStreamParser:
         )
         if data:
             self._pending.extend(data)
-        reports: list[tuple[int, bool]] = []
+        reports: list[_MakcuInputReport] = []
         while self._pending:
-            index = self._pending.find(_BUTTON_FRAME_PREFIX)
+            index = self._pending.find(_INPUT_FRAME_PREFIX)
             if index < 0:
                 # Field firmware can emit a naked one-byte five-bit mask. Only
                 # accept a standalone byte received before any framed traffic.
                 # Once a framed stream is observed, split CR/LF/prompt bytes
                 # must never be reclassified as physical mouse state.
                 if bare_mask and len(self._pending) == 1:
-                    reports.append((self._pending[0], False))
+                    reports.append(
+                        _MakcuInputReport(
+                            button_mask=self._pending[0],
+                            is_framed=False,
+                        )
+                    )
                     self._pending.clear()
                     break
                 tail_length = self._prefix_tail_length(self._pending)
@@ -160,39 +214,89 @@ class _ButtonStreamParser:
                 del self._pending[:index]
             self._framed_mode = True
 
-            after_prefix = bytes(self._pending[len(_BUTTON_FRAME_PREFIX) :])
+            after_prefix = bytes(self._pending[len(_INPUT_FRAME_PREFIX) :])
             if not after_prefix:
                 break
 
-            # ``km.`` is itself a valid short frame prefix, but it is also the
-            # beginning of ``km.buttons``. Wait across arbitrary serial-read
-            # boundaries while the available suffix can still become the long
-            # form; otherwise a split such as ``km.but`` would lose the frame.
-            if _BUTTON_LONG_SUFFIX.startswith(after_prefix):
+            # ``km.`` is itself a valid legacy short frame prefix, but it is
+            # also the beginning of both structured forms. Wait across
+            # arbitrary serial-read boundaries while the available suffix can
+            # still become either long form.
+            if _MOUSE_FRAME_SUFFIX.startswith(
+                after_prefix
+            ) or _BUTTON_FRAME_SUFFIX.startswith(after_prefix):
                 break
 
-            if after_prefix.startswith(_BUTTON_LONG_SUFFIX):
-                value_index = len(_BUTTON_FRAME_PREFIX) + len(_BUTTON_LONG_SUFFIX)
+            if after_prefix.startswith(_MOUSE_FRAME_SUFFIX):
+                value_index = len(_INPUT_FRAME_PREFIX) + len(_MOUSE_FRAME_SUFFIX)
+                if value_index >= len(self._pending):
+                    break
+                # Setter/query responses begin with ``(``; a binary mouse frame
+                # begins with the five-bit physical button mask. Reject text
+                # before waiting for a fictitious eight-byte binary payload.
+                if self._pending[value_index] > 0x1F:
+                    del self._pending[: len(_INPUT_FRAME_PREFIX)]
+                    continue
+                payload_end = value_index + _MOUSE_PAYLOAD_SIZE
+                frame_end = payload_end + len(_INPUT_FRAME_TERMINATOR)
+                if frame_end > len(self._pending):
+                    break
+                if (
+                    self._pending[payload_end:frame_end]
+                    != _INPUT_FRAME_TERMINATOR
+                ):
+                    # A dropped/corrupt binary byte must not borrow bytes from
+                    # the following frame and silently fabricate physical
+                    # motion. Discard this candidate and resynchronize on a
+                    # later complete ``km.`` prefix.
+                    del self._pending[: len(_INPUT_FRAME_PREFIX)]
+                    continue
+                payload = bytes(self._pending[value_index:payload_end])
+                reports.append(
+                    _MakcuInputReport(
+                        button_mask=payload[0],
+                        delta_x_counts=int.from_bytes(
+                            payload[1:3], "little", signed=True
+                        ),
+                        delta_y_counts=int.from_bytes(
+                            payload[3:5], "little", signed=True
+                        ),
+                        wheel=self._signed_byte(payload[5]),
+                        pan=self._signed_byte(payload[6]),
+                        tilt=self._signed_byte(payload[7]),
+                        is_mouse_frame=True,
+                    )
+                )
+                del self._pending[:frame_end]
+                continue
+
+            if after_prefix.startswith(_BUTTON_FRAME_SUFFIX):
+                value_index = len(_INPUT_FRAME_PREFIX) + len(_BUTTON_FRAME_SUFFIX)
             else:
-                value_index = len(_BUTTON_FRAME_PREFIX)
+                value_index = len(_INPUT_FRAME_PREFIX)
 
             if value_index >= len(self._pending):
                 break
             value = self._pending[value_index]
             if value <= 0x1F:
-                reports.append((value, True))
+                reports.append(_MakcuInputReport(button_mask=value))
                 del self._pending[: value_index + 1]
                 continue
 
             # Textual command response (for example ``km.buttons(1)``) or an
             # unrelated ``km.*`` message. Drop this prefix and search for the
             # next structured event without interpreting its control bytes.
-            del self._pending[: len(_BUTTON_FRAME_PREFIX)]
+            del self._pending[: len(_INPUT_FRAME_PREFIX)]
 
         if len(self._pending) > 256:
             # A malformed/noisy device must not grow this buffer forever.
             del self._pending[:-32]
         return tuple(reports)
+
+
+# Keep the historical private import available for downstream tests/tools. Its
+# ``feed`` result now carries the additional raw mouse fields.
+_ButtonStreamParser = _MakcuInputStreamParser
 
 
 def _canonical_port(path: str) -> str:
@@ -370,11 +474,12 @@ class MakcuAimConfig:
 
 @dataclass(frozen=True, slots=True)
 class MakcuTelemetrySnapshot:
-    """Monotonic counters describing commands written by the output loop.
+    """Monotonic counters describing injected output and raw physical input.
 
     These counters observe the existing control path; collecting a snapshot
     never polls the board or sends a serial command. Signed totals expose net
     direction while absolute totals remain meaningful when motion reverses.
+    Physical-input fields never contribute to injected-command totals.
     """
 
     output_ticks: int = 0
@@ -388,6 +493,11 @@ class MakcuTelemetrySnapshot:
     emitted_y: int = 0
     emitted_abs_x: int = 0
     emitted_abs_y: int = 0
+    physical_input_reports: int = 0
+    physical_input_x: int = 0
+    physical_input_y: int = 0
+    physical_input_abs_x: int = 0
+    physical_input_abs_y: int = 0
     control_samples: int = 0
     control_error_x: float = 0.0
     control_error_y: float = 0.0
@@ -397,10 +507,67 @@ class MakcuTelemetrySnapshot:
     pursuit_y: float = 0.0
     pursuit_abs_x: float = 0.0
     pursuit_abs_y: float = 0.0
+    target_velocity_abs_x_pixels_per_second: float = 0.0
+    target_velocity_abs_y_pixels_per_second: float = 0.0
+    velocity_feedforward_confidence_x: float = 0.0
+    velocity_feedforward_confidence_y: float = 0.0
+    pursuit_reserve_abs_x_counts_per_second: float = 0.0
+    pursuit_reserve_abs_y_counts_per_second: float = 0.0
+    pursuit_reserve_active_x_samples: int = 0
+    pursuit_reserve_active_y_samples: int = 0
     saturated_x_samples: int = 0
     saturated_y_samples: int = 0
     pursuit_resets: int = 0
     motion_corroboration_confidence: float = 0.0
+    body_derived_motion_confidence_x: float = 0.0
+    body_derived_motion_confidence_y: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class MakcuNormalCommandRecord:
+    """One successfully written normal-mode command in connection order."""
+
+    sequence: int
+    timestamp_ns: int
+    delta_x_counts: int
+    delta_y_counts: int
+
+
+@dataclass(frozen=True, slots=True)
+class MakcuNormalControlSnapshot:
+    """Passive diagnostics for the current/most-recent MAKCU connection.
+
+    ``calibrated_output`` atomically mirrors the last immutable calibrated
+    decision exposed by :attr:`calibrated_control_output`; broad tracking and
+    lifecycle resets clear it. The command facts survive normal-control
+    revocations and ``stop()`` so post-run diagnostics can collect them.
+    A successfully verified subsequent ``start()`` begins a new
+    ``connection_epoch``, installs its opaque ``identity_token``, and resets
+    command sequence numbers and cumulative totals. The epoch changes even
+    when the same physical identity reconnects, so ``(connection_epoch,
+    sequence)`` is unique for this controller instance.
+
+    Only successful normal-mode ``km.move`` writes are counted; calibration
+    pulses and failed writes are excluded. ``commands`` is the newest bounded
+    tail, while the counters cover the entire connection epoch. Once the hard
+    tail limit is exceeded, ``dropped_commands`` makes the missing prefix
+    explicit. Taking a snapshot only reads in-process state and never polls or
+    commands the board.
+    """
+
+    captured_ns: int = field(default=0, compare=False)
+    connection_epoch: int = 0
+    identity_token: str | None = None
+    calibrated_output: CalibratedControlOutput | None = None
+    successful_commands: int = 0
+    emitted_x: int = 0
+    emitted_y: int = 0
+    emitted_abs_x: int = 0
+    emitted_abs_y: int = 0
+    first_emitted_ns: int | None = None
+    last_emitted_ns: int | None = None
+    dropped_commands: int = 0
+    commands: tuple[MakcuNormalCommandRecord, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -804,7 +971,11 @@ class MakcuAimingController:
         self._calibration_completed_press_ns: int | None = None
         self._calibration_completed_press_report_sequence: int | None = None
         self._calibration_completed_press_transition_sequence: int | None = None
-        self._button_parser = _ButtonStreamParser()
+        self._input_parser = _MakcuInputStreamParser()
+        self._physical_input_last_report_ns = -1
+        # ``poll_*`` callers can overlap the output worker. Serialize the
+        # stateful byte parser and physical-input handoff as one ordered unit.
+        self._input_lock = threading.Lock()
         self._serial_lock = threading.Lock()
         self._connection_close_lock = threading.Lock()
         self._state_lock = threading.Lock()
@@ -813,6 +984,11 @@ class MakcuAimingController:
         # able to invalidate it synchronously.  Keep this lock separate from
         # _state_lock and always acquire it first when both are needed.
         self._calibrated_lock = threading.Lock()
+        # Snapshot-facing state has its own leaf lock. Writers may acquire it
+        # while holding _calibrated_lock or _state_lock; snapshot readers never
+        # acquire either parent lock, preventing a diagnostic read from
+        # participating in control-path lock ordering.
+        self._normal_diagnostic_lock = threading.Lock()
         self._telemetry_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._output_thread: threading.Thread | None = None
@@ -827,6 +1003,12 @@ class MakcuAimingController:
         self._fractional_y = 0.0
         self._smoothed_rate_x = 0.0
         self._smoothed_rate_y = 0.0
+        # Calibrated-path output-rate smoothing state, separate from the legacy
+        # ``_smoothed_rate_*`` pair so the legacy idle-zero contract is intact.
+        self._calibrated_smooth_rate_x = 0.0
+        self._calibrated_smooth_rate_y = 0.0
+        self._calibrated_smooth_pursuit_reserve_rate_x = 0.0
+        self._calibrated_smooth_pursuit_reserve_rate_y = 0.0
         self._latest_measurement_ns = 0
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
@@ -835,6 +1017,9 @@ class MakcuAimingController:
         self._latest_body_derived_motion_permitted = False
         self._latest_body_derived_motion_deadline_ns: int | None = None
         self._latest_identity_deadline_ns: int | None = None
+        self._latest_correlated_lookahead: (
+            CorrelatedLookaheadObservation | None
+        ) = None
         self._body_derived_motion_revocation_pending = False
         self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
@@ -879,6 +1064,11 @@ class MakcuAimingController:
         self._telemetry_emitted_y = 0
         self._telemetry_emitted_abs_x = 0
         self._telemetry_emitted_abs_y = 0
+        self._telemetry_physical_input_reports = 0
+        self._telemetry_physical_input_x = 0
+        self._telemetry_physical_input_y = 0
+        self._telemetry_physical_input_abs_x = 0
+        self._telemetry_physical_input_abs_y = 0
         self._telemetry_control_samples = 0
         self._telemetry_control_error_x = 0.0
         self._telemetry_control_error_y = 0.0
@@ -888,10 +1078,35 @@ class MakcuAimingController:
         self._telemetry_pursuit_y = 0.0
         self._telemetry_pursuit_abs_x = 0.0
         self._telemetry_pursuit_abs_y = 0.0
+        self._telemetry_target_velocity_abs_x_pixels_per_second = 0.0
+        self._telemetry_target_velocity_abs_y_pixels_per_second = 0.0
+        self._telemetry_velocity_feedforward_confidence_x = 0.0
+        self._telemetry_velocity_feedforward_confidence_y = 0.0
+        self._telemetry_pursuit_reserve_abs_x_counts_per_second = 0.0
+        self._telemetry_pursuit_reserve_abs_y_counts_per_second = 0.0
+        self._telemetry_pursuit_reserve_active_x_samples = 0
+        self._telemetry_pursuit_reserve_active_y_samples = 0
         self._telemetry_saturated_x_samples = 0
         self._telemetry_saturated_y_samples = 0
         self._telemetry_pursuit_resets = 0
         self._telemetry_motion_corroboration_confidence = 0.0
+        self._telemetry_body_derived_motion_confidence_x = 0.0
+        self._telemetry_body_derived_motion_confidence_y = 0.0
+        self._normal_diagnostic_calibrated_output: CalibratedControlOutput | None = (
+            None
+        )
+        self._normal_diagnostic_connection_epoch = 0
+        self._normal_diagnostic_identity_token: str | None = None
+        self._normal_diagnostic_command_sequence = 0
+        self._normal_diagnostic_emitted_x = 0
+        self._normal_diagnostic_emitted_y = 0
+        self._normal_diagnostic_emitted_abs_x = 0
+        self._normal_diagnostic_emitted_abs_y = 0
+        self._normal_diagnostic_first_emitted_ns: int | None = None
+        self._normal_diagnostic_last_emitted_ns: int | None = None
+        self._normal_diagnostic_commands: deque[MakcuNormalCommandRecord] = deque(
+            maxlen=NORMAL_COMMAND_LEDGER_LIMIT
+        )
         self.connected_port: str | None = None
         self._identity_token: str | None = None
 
@@ -915,19 +1130,104 @@ class MakcuAimingController:
         with self._calibrated_lock:
             return self._calibrated_last_output
 
+    def normal_control_snapshot(self) -> MakcuNormalControlSnapshot:
+        """Return immutable normal-control diagnostics without device I/O."""
+
+        with self._normal_diagnostic_lock:
+            commands = tuple(self._normal_diagnostic_commands)
+            successful_commands = self._normal_diagnostic_command_sequence
+            return MakcuNormalControlSnapshot(
+                captured_ns=time.perf_counter_ns(),
+                connection_epoch=self._normal_diagnostic_connection_epoch,
+                identity_token=self._normal_diagnostic_identity_token,
+                calibrated_output=self._normal_diagnostic_calibrated_output,
+                successful_commands=successful_commands,
+                emitted_x=self._normal_diagnostic_emitted_x,
+                emitted_y=self._normal_diagnostic_emitted_y,
+                emitted_abs_x=self._normal_diagnostic_emitted_abs_x,
+                emitted_abs_y=self._normal_diagnostic_emitted_abs_y,
+                first_emitted_ns=self._normal_diagnostic_first_emitted_ns,
+                last_emitted_ns=self._normal_diagnostic_last_emitted_ns,
+                dropped_commands=successful_commands - len(commands),
+                commands=commands,
+            )
+
+    def _publish_calibrated_output_locked(
+        self,
+        output: CalibratedControlOutput | None,
+    ) -> None:
+        """Publish one immutable decision while owning _calibrated_lock."""
+
+        self._calibrated_last_output = output
+        with self._normal_diagnostic_lock:
+            self._normal_diagnostic_calibrated_output = output
+
+    def _begin_normal_diagnostic_epoch(self, identity_token: str) -> None:
+        """Reset the bounded ledger after a new connection is fully started."""
+
+        with self._normal_diagnostic_lock:
+            self._normal_diagnostic_connection_epoch += 1
+            self._normal_diagnostic_identity_token = identity_token
+            self._normal_diagnostic_calibrated_output = None
+            self._normal_diagnostic_command_sequence = 0
+            self._normal_diagnostic_emitted_x = 0
+            self._normal_diagnostic_emitted_y = 0
+            self._normal_diagnostic_emitted_abs_x = 0
+            self._normal_diagnostic_emitted_abs_y = 0
+            self._normal_diagnostic_first_emitted_ns = None
+            self._normal_diagnostic_last_emitted_ns = None
+            self._normal_diagnostic_commands.clear()
+
+    def _record_successful_normal_command(
+        self,
+        command: EmittedMouseCommand,
+    ) -> None:
+        """Record a physical normal-mode write after the serial call succeeds."""
+
+        with self._normal_diagnostic_lock:
+            sequence = self._normal_diagnostic_command_sequence + 1
+            self._normal_diagnostic_command_sequence = sequence
+            if self._normal_diagnostic_first_emitted_ns is None:
+                self._normal_diagnostic_first_emitted_ns = command.timestamp_ns
+            self._normal_diagnostic_last_emitted_ns = command.timestamp_ns
+            self._normal_diagnostic_emitted_x += command.delta_x_counts
+            self._normal_diagnostic_emitted_y += command.delta_y_counts
+            self._normal_diagnostic_emitted_abs_x += abs(command.delta_x_counts)
+            self._normal_diagnostic_emitted_abs_y += abs(command.delta_y_counts)
+            self._normal_diagnostic_commands.append(
+                MakcuNormalCommandRecord(
+                    sequence=sequence,
+                    timestamp_ns=command.timestamp_ns,
+                    delta_x_counts=command.delta_x_counts,
+                    delta_y_counts=command.delta_y_counts,
+                )
+            )
+
+    def _clear_calibrated_output_motion_locked(self) -> None:
+        """Discard uncommitted calibrated motion while owning _calibrated_lock."""
+
+        self._fractional_x = 0.0
+        self._fractional_y = 0.0
+        self._calibrated_smooth_rate_x = 0.0
+        self._calibrated_smooth_rate_y = 0.0
+        self._calibrated_smooth_pursuit_reserve_rate_x = 0.0
+        self._calibrated_smooth_pursuit_reserve_rate_y = 0.0
+
     def _reset_calibrated_control_locked(self) -> None:
         """Reset calibrated state while the caller owns _calibrated_lock."""
 
+        self._clear_calibrated_output_motion_locked()
         self._calibrated_processed_sample_id = 0
-        self._calibrated_last_output = None
+        self._publish_calibrated_output_locked(None)
         if self._calibrated_controller is not None:
             self._calibrated_controller.reset()
 
     def _reset_calibrated_tracking_locked(self) -> None:
         """Revoke learned pursuit without erasing successful physical facts."""
 
+        self._clear_calibrated_output_motion_locked()
         self._calibrated_processed_sample_id = 0
-        self._calibrated_last_output = None
+        self._publish_calibrated_output_locked(None)
         if self._calibrated_controller is not None:
             self._calibrated_controller.reset(clear_command_history=False)
 
@@ -953,6 +1253,13 @@ class MakcuAimingController:
                 emitted_y=self._telemetry_emitted_y,
                 emitted_abs_x=self._telemetry_emitted_abs_x,
                 emitted_abs_y=self._telemetry_emitted_abs_y,
+                physical_input_reports=(
+                    self._telemetry_physical_input_reports
+                ),
+                physical_input_x=self._telemetry_physical_input_x,
+                physical_input_y=self._telemetry_physical_input_y,
+                physical_input_abs_x=self._telemetry_physical_input_abs_x,
+                physical_input_abs_y=self._telemetry_physical_input_abs_y,
                 control_samples=self._telemetry_control_samples,
                 control_error_x=self._telemetry_control_error_x,
                 control_error_y=self._telemetry_control_error_y,
@@ -962,11 +1269,41 @@ class MakcuAimingController:
                 pursuit_y=self._telemetry_pursuit_y,
                 pursuit_abs_x=self._telemetry_pursuit_abs_x,
                 pursuit_abs_y=self._telemetry_pursuit_abs_y,
+                target_velocity_abs_x_pixels_per_second=(
+                    self._telemetry_target_velocity_abs_x_pixels_per_second
+                ),
+                target_velocity_abs_y_pixels_per_second=(
+                    self._telemetry_target_velocity_abs_y_pixels_per_second
+                ),
+                velocity_feedforward_confidence_x=(
+                    self._telemetry_velocity_feedforward_confidence_x
+                ),
+                velocity_feedforward_confidence_y=(
+                    self._telemetry_velocity_feedforward_confidence_y
+                ),
+                pursuit_reserve_abs_x_counts_per_second=(
+                    self._telemetry_pursuit_reserve_abs_x_counts_per_second
+                ),
+                pursuit_reserve_abs_y_counts_per_second=(
+                    self._telemetry_pursuit_reserve_abs_y_counts_per_second
+                ),
+                pursuit_reserve_active_x_samples=(
+                    self._telemetry_pursuit_reserve_active_x_samples
+                ),
+                pursuit_reserve_active_y_samples=(
+                    self._telemetry_pursuit_reserve_active_y_samples
+                ),
                 saturated_x_samples=self._telemetry_saturated_x_samples,
                 saturated_y_samples=self._telemetry_saturated_y_samples,
                 pursuit_resets=self._telemetry_pursuit_resets,
                 motion_corroboration_confidence=(
                     self._telemetry_motion_corroboration_confidence
+                ),
+                body_derived_motion_confidence_x=(
+                    self._telemetry_body_derived_motion_confidence_x
+                ),
+                body_derived_motion_confidence_y=(
+                    self._telemetry_body_derived_motion_confidence_y
                 ),
             )
 
@@ -1002,6 +1339,10 @@ class MakcuAimingController:
         self._fractional_y = 0.0
         self._smoothed_rate_x = 0.0
         self._smoothed_rate_y = 0.0
+        self._calibrated_smooth_rate_x = 0.0
+        self._calibrated_smooth_rate_y = 0.0
+        self._calibrated_smooth_pursuit_reserve_rate_x = 0.0
+        self._calibrated_smooth_pursuit_reserve_rate_y = 0.0
         self._latest_measurement_ns = 0
         self._latest_source_ns = 0
         self._latest_measurement_observed = True
@@ -1010,6 +1351,7 @@ class MakcuAimingController:
         self._latest_body_derived_motion_permitted = False
         self._latest_body_derived_motion_deadline_ns = None
         self._latest_identity_deadline_ns = None
+        self._latest_correlated_lookahead = None
         self._body_derived_motion_revocation_pending = False
         self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
@@ -1381,6 +1723,11 @@ class MakcuAimingController:
             self._telemetry_emitted_y = 0
             self._telemetry_emitted_abs_x = 0
             self._telemetry_emitted_abs_y = 0
+            self._telemetry_physical_input_reports = 0
+            self._telemetry_physical_input_x = 0
+            self._telemetry_physical_input_y = 0
+            self._telemetry_physical_input_abs_x = 0
+            self._telemetry_physical_input_abs_y = 0
             self._telemetry_control_samples = 0
             self._telemetry_control_error_x = 0.0
             self._telemetry_control_error_y = 0.0
@@ -1390,10 +1737,20 @@ class MakcuAimingController:
             self._telemetry_pursuit_y = 0.0
             self._telemetry_pursuit_abs_x = 0.0
             self._telemetry_pursuit_abs_y = 0.0
+            self._telemetry_target_velocity_abs_x_pixels_per_second = 0.0
+            self._telemetry_target_velocity_abs_y_pixels_per_second = 0.0
+            self._telemetry_velocity_feedforward_confidence_x = 0.0
+            self._telemetry_velocity_feedforward_confidence_y = 0.0
+            self._telemetry_pursuit_reserve_abs_x_counts_per_second = 0.0
+            self._telemetry_pursuit_reserve_abs_y_counts_per_second = 0.0
+            self._telemetry_pursuit_reserve_active_x_samples = 0
+            self._telemetry_pursuit_reserve_active_y_samples = 0
             self._telemetry_saturated_x_samples = 0
             self._telemetry_saturated_y_samples = 0
             self._telemetry_pursuit_resets = 0
             self._telemetry_motion_corroboration_confidence = 0.0
+            self._telemetry_body_derived_motion_confidence_x = 0.0
+            self._telemetry_body_derived_motion_confidence_y = 0.0
 
     def _record_pursuit_reset(self, *, reset_x: bool = True, reset_y: bool = True) -> None:
         """Count an actual accumulator clear, never a repeated empty tick."""
@@ -1418,6 +1775,14 @@ class MakcuAimingController:
         limit_x: float,
         limit_y: float,
         motion_corroboration_confidence: float = 0.0,
+        body_derived_motion_confidence_x: float = 0.0,
+        body_derived_motion_confidence_y: float = 0.0,
+        target_velocity_x_pixels_per_second: float = 0.0,
+        target_velocity_y_pixels_per_second: float = 0.0,
+        velocity_feedforward_confidence_x: float = 0.0,
+        velocity_feedforward_confidence_y: float = 0.0,
+        pursuit_reserve_rate_x_counts_per_second: float = 0.0,
+        pursuit_reserve_rate_y_counts_per_second: float = 0.0,
     ) -> None:
         """Aggregate one new authorized detector sample without device I/O."""
 
@@ -1431,10 +1796,42 @@ class MakcuAimingController:
             self._telemetry_pursuit_y += pursuit_y
             self._telemetry_pursuit_abs_x += abs(pursuit_x)
             self._telemetry_pursuit_abs_y += abs(pursuit_y)
+            self._telemetry_target_velocity_abs_x_pixels_per_second += abs(
+                target_velocity_x_pixels_per_second
+            )
+            self._telemetry_target_velocity_abs_y_pixels_per_second += abs(
+                target_velocity_y_pixels_per_second
+            )
+            self._telemetry_velocity_feedforward_confidence_x += min(
+                max(float(velocity_feedforward_confidence_x), 0.0),
+                1.0,
+            )
+            self._telemetry_velocity_feedforward_confidence_y += min(
+                max(float(velocity_feedforward_confidence_y), 0.0),
+                1.0,
+            )
+            reserve_x = abs(float(pursuit_reserve_rate_x_counts_per_second))
+            reserve_y = abs(float(pursuit_reserve_rate_y_counts_per_second))
+            self._telemetry_pursuit_reserve_abs_x_counts_per_second += reserve_x
+            self._telemetry_pursuit_reserve_abs_y_counts_per_second += reserve_y
+            self._telemetry_pursuit_reserve_active_x_samples += int(
+                reserve_x > 1e-9
+            )
+            self._telemetry_pursuit_reserve_active_y_samples += int(
+                reserve_y > 1e-9
+            )
             self._telemetry_saturated_x_samples += int(abs(correction_x) >= limit_x)
             self._telemetry_saturated_y_samples += int(abs(correction_y) >= limit_y)
             self._telemetry_motion_corroboration_confidence += min(
                 max(float(motion_corroboration_confidence), 0.0),
+                1.0,
+            )
+            self._telemetry_body_derived_motion_confidence_x += min(
+                max(float(body_derived_motion_confidence_x), 0.0),
+                1.0,
+            )
+            self._telemetry_body_derived_motion_confidence_y += min(
+                max(float(body_derived_motion_confidence_y), 0.0),
                 1.0,
             )
 
@@ -1584,7 +1981,8 @@ class MakcuAimingController:
         self._calibration_completed_press_report_sequence = None
         self._calibration_completed_press_transition_sequence = None
         self._calibration_hold_transition_sequence = None
-        self._button_parser.reset()
+        self._input_parser.reset()
+        self._physical_input_last_report_ns = -1
         self._worker_error = None
         self._latest_target = None
         self._latest_active = False
@@ -1601,6 +1999,7 @@ class MakcuAimingController:
         self._latest_body_derived_motion_permitted = False
         self._latest_body_derived_motion_deadline_ns = None
         self._latest_identity_deadline_ns = None
+        self._latest_correlated_lookahead = None
         self._body_derived_motion_revocation_pending = False
         self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
@@ -1621,7 +2020,14 @@ class MakcuAimingController:
         self._reset_calibrated_control()
         self._reset_telemetry()
         self._stop_event.clear()
+        # Raw X/Y is an optional aid for cooperative manual input.  Keep the
+        # proven button stream as an independent, last-enabled compatibility
+        # authority: field firmware has been observed to accept ``km.mouse``
+        # while producing no usable reports at all.
+        self._command(MOUSE_STREAM_COMMAND)
         self._command(BUTTON_STREAM_COMMAND)
+        assert self._identity_token is not None
+        self._begin_normal_diagnostic_epoch(self._identity_token)
         should_start_output = self._threaded_output if output_loop is None else output_loop
         if should_start_output:
             self._output_thread = threading.Thread(
@@ -1632,23 +2038,32 @@ class MakcuAimingController:
             self._output_thread.start()
 
     def _read_buttons(self, *, now_ns: int | None = None) -> None:
+        current_ns = time.perf_counter_ns() if now_ns is None else now_ns
+        with self._input_lock:
+            self._read_input_locked(current_ns)
+
+    def _read_input_locked(self, current_ns: int) -> None:
+        """Read and apply input while the caller owns ``_input_lock``."""
+
         if self._serial is None:
             raise MakcuError("MAKCU serial connection is not open")
-        current_ns = time.perf_counter_ns() if now_ns is None else now_ns
         try:
             with self._serial_lock:
                 available = int(getattr(self._serial, "in_waiting", 0))
                 data = self._serial.read(available) if available else b""
         except (OSError, ValueError) as exc:
-            raise MakcuError(f"MAKCU button read failed: {exc}") from exc
-        reports = self._button_parser.feed(data)
+            raise MakcuError(f"MAKCU physical-input read failed: {exc}") from exc
+        reports = self._input_parser.feed(data)
         if not reports:
             return
+        physical_inputs: list[tuple[int, int, int]] = []
         # Apply one serial read atomically to controller state. In particular,
         # a coalesced release/repress pair must latch the release before its
         # final pressed level can be considered by the pulse worker.
         with self._state_lock:
-            for value, is_framed in reports:
+            for report in reports:
+                value = report.button_mask
+                is_framed = report.is_framed
                 event_ns = max(
                     current_ns,
                     self._activation_last_report_ns,
@@ -1749,6 +2164,67 @@ class MakcuAimingController:
                 # A valid release report is authoritative. Do not keep movement
                 # active after the physical button is released.
 
+                if report.is_mouse_frame and (
+                    report.delta_x_counts or report.delta_y_counts
+                ):
+                    physical_event_ns = max(
+                        current_ns,
+                        self._physical_input_last_report_ns + 1,
+                    )
+                    self._physical_input_last_report_ns = physical_event_ns
+                    physical_inputs.append(
+                        (
+                            physical_event_ns,
+                            report.delta_x_counts,
+                            report.delta_y_counts,
+                        )
+                    )
+
+        mouse_reports = tuple(report for report in reports if report.is_mouse_frame)
+        if mouse_reports:
+            # Passive input facts are intentionally separate from successful
+            # injected-command accounting. They remain useful even if the
+            # calibrated ledger subsequently rejects an event and disarms.
+            with self._telemetry_lock:
+                self._telemetry_physical_input_reports += len(mouse_reports)
+                self._telemetry_physical_input_x += sum(
+                    report.delta_x_counts for report in mouse_reports
+                )
+                self._telemetry_physical_input_y += sum(
+                    report.delta_y_counts for report in mouse_reports
+                )
+                self._telemetry_physical_input_abs_x += sum(
+                    abs(report.delta_x_counts) for report in mouse_reports
+                )
+                self._telemetry_physical_input_abs_y += sum(
+                    abs(report.delta_y_counts) for report in mouse_reports
+                )
+
+        controller = self._calibrated_controller
+        if controller is None or not physical_inputs:
+            return
+        try:
+            with self._calibrated_lock:
+                for event_ns, delta_x, delta_y in physical_inputs:
+                    controller.record_physical_input(event_ns, delta_x, delta_y)
+        except (RuntimeError, TypeError, ValueError) as exc:
+            # Raw physical input is part of the calibrated plant accounting. If
+            # that accounting cannot accept an event, continuing would again
+            # mistake the user's camera motion for target motion. Revoke output
+            # and require fresh physical authorization before retrying.
+            with self._calibrated_lock:
+                self._reset_calibrated_control_locked()
+                with self._state_lock:
+                    self._button_mask = 0
+                    self._button_state_known = False
+                    self._activation_started_ns = 0
+                    self._activation_requires_release = True
+                    self._normal_motion_generation += 1
+            raise MakcuError(
+                "calibrated MAKCU physical-input accounting failed closed: "
+                f"{exc}"
+            ) from exc
+
     def _activation_pressed_locked(self, now_ns: int) -> bool:
         """Return live authorization while the caller owns _state_lock."""
 
@@ -1775,6 +2251,13 @@ class MakcuAimingController:
     @property
     def activation_pressed(self) -> bool:
         return self._activation_pressed_at(time.perf_counter_ns())
+
+    @property
+    def activation_requires_release(self) -> bool:
+        """Whether the continuous-hold safety latch needs a physical release."""
+
+        with self._state_lock:
+            return bool(self._activation_requires_release)
 
     @property
     def raw_activation_state(self) -> tuple[bool, bool]:
@@ -2145,6 +2628,7 @@ class MakcuAimingController:
                 body_derived_motion_deadline_ns
             )
             self._latest_identity_deadline_ns = identity_deadline_ns
+            self._latest_correlated_lookahead = None
             if measurement_observed:
                 self._latest_measurement_ns = source_ns
                 self._measurement_target_present = target is not None
@@ -2156,21 +2640,200 @@ class MakcuAimingController:
         if self._output_thread is None:
             self._output_tick(1.0 / REFERENCE_CONTROL_HZ)
 
+    def update_correlated_lookahead(
+        self,
+        target: Detection,
+        frame_shape: tuple[int, int, int],
+        active: bool = True,
+        *,
+        primary_measurement_ns: int,
+        primary_aim_point: tuple[float, float],
+        primary_velocity_point: tuple[float, float],
+        primary_motion_corroboration_point: tuple[float, float],
+        lookahead_measurement_ns: int,
+        lookahead_aim_point: tuple[float, float],
+        lookahead_velocity_point: tuple[float, float],
+        identity_deadline_ns: int,
+        runtime_identity_generation: int,
+        track_generation: int,
+        verified_flow_motion: bool = False,
+    ) -> None:
+        """Atomically publish measured motion evidence plus a newer point.
+
+        This is the direct-head capture-phase seam.  The inferred-frame sample
+        owns all independent motion authority; the one-frame LK endpoint owns
+        only the newest position. Publishing them as one immutable batch keeps
+        the 1 kHz latest-only worker from observing or overwriting either half
+        independently.
+        """
+
+        if self._serial is None:
+            raise MakcuError("MAKCU serial connection is not open")
+        if self._worker_error is not None:
+            raise self._worker_error
+        if self._calibrated_controller is None:
+            raise MakcuError("correlated lookahead requires calibrated control")
+        if not (
+            self._calibrated_controller.config
+            .require_motion_corroboration_for_feedforward
+        ):
+            raise MakcuError(
+                "correlated lookahead requires corroboration-gated control"
+            )
+        if target is None:
+            raise ValueError("correlated lookahead requires a safety target")
+        if not isinstance(active, bool):
+            raise TypeError("active must be bool")
+        if not isinstance(verified_flow_motion, bool):
+            raise TypeError("verified_flow_motion must be bool")
+        for name, timestamp_ns in (
+            ("primary_measurement_ns", primary_measurement_ns),
+            ("lookahead_measurement_ns", lookahead_measurement_ns),
+            ("identity_deadline_ns", identity_deadline_ns),
+        ):
+            if isinstance(timestamp_ns, bool) or not isinstance(timestamp_ns, int):
+                raise TypeError(f"{name} must be an integer monotonic timestamp")
+            if timestamp_ns < 0:
+                raise ValueError(f"{name} cannot be negative")
+        primary_error = _explicit_point_error_pixels(
+            primary_aim_point,
+            frame_shape,
+            self.config,
+            name="primary_aim_point",
+        )
+        primary_velocity_error = _explicit_point_error_pixels(
+            primary_velocity_point,
+            frame_shape,
+            self.config,
+            name="primary_velocity_point",
+        )
+        primary_corroboration_error = _explicit_point_error_pixels(
+            primary_motion_corroboration_point,
+            frame_shape,
+            self.config,
+            name="primary_motion_corroboration_point",
+        )
+        lookahead_error = _explicit_point_error_pixels(
+            lookahead_aim_point,
+            frame_shape,
+            self.config,
+            name="lookahead_aim_point",
+        )
+        lookahead_velocity_error = _explicit_point_error_pixels(
+            lookahead_velocity_point,
+            frame_shape,
+            self.config,
+            name="lookahead_velocity_point",
+        )
+        primary_observation = ScreenErrorObservation(
+            primary_measurement_ns,
+            primary_error[0],
+            primary_error[1],
+            velocity_error_x_pixels=primary_velocity_error[0],
+            velocity_error_y_pixels=primary_velocity_error[1],
+            corroboration_error_x_pixels=primary_corroboration_error[0],
+            corroboration_error_y_pixels=primary_corroboration_error[1],
+            identity_deadline_ns=identity_deadline_ns,
+        )
+        lookahead_observation = ScreenErrorObservation(
+            lookahead_measurement_ns,
+            lookahead_error[0],
+            lookahead_error[1],
+            velocity_error_x_pixels=lookahead_velocity_error[0],
+            velocity_error_y_pixels=lookahead_velocity_error[1],
+            identity_deadline_ns=identity_deadline_ns,
+        )
+        batch = CorrelatedLookaheadObservation(
+            primary_observation,
+            lookahead_observation,
+            runtime_identity_generation,
+            track_generation,
+            verified_flow_motion,
+        )
+        published_ns = time.perf_counter_ns()
+        with self._state_lock:
+            if self._calibration_token is not None:
+                raise MakcuError(
+                    "normal MAKCU aiming is unavailable during calibration"
+                )
+            if self._latest_source_ns and (
+                primary_measurement_ns < self._latest_source_ns
+            ):
+                raise ValueError(
+                    "correlated primary measurement cannot precede the latest "
+                    "published source"
+                )
+            if self._latest_source_ns and (
+                lookahead_measurement_ns <= self._latest_source_ns
+            ):
+                raise ValueError(
+                    "correlated lookahead must advance the latest published source"
+                )
+            velocity_x = self._latest_velocity_x
+            velocity_y = self._latest_velocity_y
+            if (
+                self._measurement_target_present
+                and self._latest_measurement_ns
+                and lookahead_measurement_ns > self._latest_measurement_ns
+            ):
+                delta_t = (
+                    lookahead_measurement_ns - self._latest_measurement_ns
+                ) / 1_000_000_000
+                delta_x = lookahead_error[0] - self._measurement_error_x
+                delta_y = lookahead_error[1] - self._measurement_error_y
+                if (
+                    delta_t > TARGET_STALE_SECONDS
+                    or abs(delta_x) > ERROR_JUMP_RESET_PIXELS
+                    or abs(delta_y) > ERROR_JUMP_RESET_PIXELS
+                ):
+                    velocity_x = 0.0
+                    velocity_y = 0.0
+                else:
+                    velocity_x = min(
+                        max(delta_x / delta_t, -MAX_TRACKED_VELOCITY_PX_PER_SEC),
+                        MAX_TRACKED_VELOCITY_PX_PER_SEC,
+                    )
+                    velocity_y = min(
+                        max(delta_y / delta_t, -MAX_TRACKED_VELOCITY_PX_PER_SEC),
+                        MAX_TRACKED_VELOCITY_PX_PER_SEC,
+                    )
+            else:
+                velocity_x = 0.0
+                velocity_y = 0.0
+            self._normal_motion_generation += 1
+            self._latest_target = target
+            self._latest_frame_shape = frame_shape
+            self._latest_active = active
+            self._latest_update_ns = published_ns
+            self._latest_source_ns = lookahead_measurement_ns
+            self._latest_measurement_ns = lookahead_measurement_ns
+            self._latest_measurement_observed = True
+            self._latest_velocity_error = lookahead_velocity_error
+            self._latest_motion_corroboration_error = None
+            self._latest_body_derived_motion_permitted = False
+            self._latest_body_derived_motion_deadline_ns = None
+            self._latest_identity_deadline_ns = identity_deadline_ns
+            self._latest_correlated_lookahead = batch
+            self._measurement_target_present = True
+            self._measurement_error_x = lookahead_error[0]
+            self._measurement_error_y = lookahead_error[1]
+            self._latest_velocity_x = velocity_x
+            self._latest_velocity_y = velocity_y
+            self._latest_sample_id += 1
+        if self._output_thread is None:
+            self._output_tick(1.0 / REFERENCE_CONTROL_HZ)
+
     def revoke_motion_corroboration(self) -> None:
         """Synchronously withdraw automatic feed-forward evidence only.
 
         The accepted direct-head position/velocity lease and landed-command
-        ledger remain intact. This operation is enabled only for a calibrated
-        controller whose profile explicitly requires independent motion
-        corroboration, so explicit user profiles keep their existing sample
-        semantics.
+        ledger remain intact. When corroboration is disabled in numeric config,
+        this still clears queued wrapper evidence so stale corroboration/body-
+        derived state cannot be replayed by a later worker tick.
         """
 
         controller = self._calibrated_controller
-        if (
-            controller is None
-            or not controller.config.require_motion_corroboration_for_feedforward
-        ):
+        if controller is None:
             return
         # Lock order is calibrated -> state everywhere these domains meet.
         # Owning the calibrated lock means any already-authorized serial write
@@ -2180,11 +2843,12 @@ class MakcuAimingController:
         with self._calibrated_lock:
             controller.revoke_motion_corroboration()
             # A sub-count remainder may contain the old feed-forward term; it
-            # must not leak into the next otherwise position-only command.
-            self._fractional_x = 0.0
-            self._fractional_y = 0.0
+            # and the output EMA must not leak into the next otherwise
+            # position-only command.
+            self._clear_calibrated_output_motion_locked()
             with self._state_lock:
                 self._latest_motion_corroboration_error = None
+                self._latest_correlated_lookahead = None
                 self._latest_body_derived_motion_permitted = False
                 self._latest_body_derived_motion_deadline_ns = None
                 self._body_derived_motion_revocation_pending = False
@@ -2208,6 +2872,10 @@ class MakcuAimingController:
                 controller.config.maximum_body_derived_projection_fraction <= 0.0
                 and controller.config.maximum_body_derived_feedforward_fraction
                 <= 0.0
+                and (
+                    controller.config.maximum_body_derived_pursuit_feedforward_fraction
+                    <= 0.0
+                )
             )
         ):
             return
@@ -2216,8 +2884,7 @@ class MakcuAimingController:
         # from being reconstructed after this method returns.
         with self._calibrated_lock:
             controller.revoke_body_derived_motion()
-            self._fractional_x = 0.0
-            self._fractional_y = 0.0
+            self._clear_calibrated_output_motion_locked()
             with self._state_lock:
                 if self._latest_body_derived_motion_permitted:
                     self._calibrated_processed_sample_id = self._latest_sample_id
@@ -2244,8 +2911,8 @@ class MakcuAimingController:
         with self._calibrated_lock:
             if self._calibrated_controller is not None:
                 self._reset_calibrated_tracking_locked()
-            self._fractional_x = 0.0
-            self._fractional_y = 0.0
+            else:
+                self._clear_calibrated_output_motion_locked()
             with self._state_lock:
                 # A queued sample from before the boundary cannot re-arm the
                 # core after this synchronous revoke returns.
@@ -2253,6 +2920,7 @@ class MakcuAimingController:
                 self._latest_body_derived_motion_permitted = False
                 self._latest_body_derived_motion_deadline_ns = None
                 self._latest_identity_deadline_ns = None
+                self._latest_correlated_lookahead = None
                 self._body_derived_motion_revocation_pending = False
                 self._identity_deadline_revocation_pending = False
 
@@ -2410,6 +3078,7 @@ class MakcuAimingController:
         body_derived_motion_permitted: bool,
         body_derived_motion_deadline_ns: int | None,
         identity_deadline_ns: int | None,
+        correlated_lookahead: CorrelatedLookaheadObservation | None,
         source_ns: int,
         sample_id: int,
         generation: int,
@@ -2430,23 +3099,24 @@ class MakcuAimingController:
                 # the queued numeric observation before the core saw it.
                 self._reset_calibrated_tracking_locked()
                 self._calibrated_processed_sample_id = sample_id
-                self._fractional_x = 0.0
-                self._fractional_y = 0.0
                 with self._state_lock:
                     if self._latest_sample_id == sample_id:
                         self._latest_body_derived_motion_permitted = False
                         self._latest_body_derived_motion_deadline_ns = None
                         self._latest_identity_deadline_ns = None
-                self._calibrated_last_output = CalibratedControlOutput(
-                    timestamp_ns=current_ns,
-                    rate_x_counts_per_second=0.0,
-                    rate_y_counts_per_second=0.0,
-                    target_velocity_x_pixels_per_second=0.0,
-                    target_velocity_y_pixels_per_second=0.0,
-                    projected_error_x_pixels=0.0,
-                    projected_error_y_pixels=0.0,
-                    valid=False,
-                    reset_reason="identity-expired",
+                        self._latest_correlated_lookahead = None
+                self._publish_calibrated_output_locked(
+                    CalibratedControlOutput(
+                        timestamp_ns=current_ns,
+                        rate_x_counts_per_second=0.0,
+                        rate_y_counts_per_second=0.0,
+                        target_velocity_x_pixels_per_second=0.0,
+                        target_velocity_y_pixels_per_second=0.0,
+                        projected_error_x_pixels=0.0,
+                        projected_error_y_pixels=0.0,
+                        valid=False,
+                        reset_reason="identity-expired",
+                    )
                 )
                 return
             if body_derived_motion_permitted and (
@@ -2458,8 +3128,7 @@ class MakcuAimingController:
                 # never combine with later static feedback into a post-deadline
                 # physical count.
                 controller.revoke_body_derived_motion()
-                self._fractional_x = 0.0
-                self._fractional_y = 0.0
+                self._clear_calibrated_output_motion_locked()
                 body_derived_motion_permitted = False
                 body_derived_motion_deadline_ns = None
                 with self._state_lock:
@@ -2471,7 +3140,12 @@ class MakcuAimingController:
             target_lost = False
             if new_sample:
                 self._calibrated_processed_sample_id = sample_id
-                if measurement_observed and target is not None:
+                if correlated_lookahead is not None:
+                    if not measurement_observed or target is None:
+                        raise MakcuError(
+                            "correlated lookahead lost its observed safety target"
+                        )
+                elif measurement_observed and target is not None:
                     error_x, error_y = position_error
                     observation = ScreenErrorObservation(
                         source_ns,
@@ -2510,16 +3184,21 @@ class MakcuAimingController:
                     # grace sample instead supplies neither observation nor
                     # loss and can bridge only the core's freshness interval.
                     target_lost = True
+            control_observation = observation
+            if correlated_lookahead is not None and new_sample:
+                control_observation = correlated_lookahead.lookahead
             try:
                 output = controller.step(
                     current_ns,
                     engaged=bool(active and button_pressed),
                     observation=observation,
+                    correlated_lookahead=(
+                        correlated_lookahead if new_sample else None
+                    ),
                     target_lost=target_lost,
                 )
             except (RuntimeError, TypeError, ValueError) as exc:
-                self._fractional_x = 0.0
-                self._fractional_y = 0.0
+                self._clear_calibrated_output_motion_locked()
                 raise MakcuError(
                     f"calibrated MAKCU control failed closed: {exc}"
                 ) from exc
@@ -2546,9 +3225,31 @@ class MakcuAimingController:
                 max(output.rate_y_counts_per_second, -rate_limit_y),
                 rate_limit_y,
             )
+            ordinary_rate_x = (
+                output.rate_x_counts_per_second
+                - output.pursuit_reserve_rate_x_counts_per_second
+            )
+            ordinary_rate_y = (
+                output.rate_y_counts_per_second
+                - output.pursuit_reserve_rate_y_counts_per_second
+            )
+            bounded_ordinary_rate_x = min(
+                max(ordinary_rate_x, -rate_limit_x),
+                rate_limit_x,
+            )
+            bounded_ordinary_rate_y = min(
+                max(ordinary_rate_y, -rate_limit_y),
+                rate_limit_y,
+            )
+            bounded_reserve_rate_x = bounded_rate_x - bounded_ordinary_rate_x
+            bounded_reserve_rate_y = bounded_rate_y - bounded_ordinary_rate_y
+            ordinary_rate_clamped_x = bounded_ordinary_rate_x != ordinary_rate_x
+            ordinary_rate_clamped_y = bounded_ordinary_rate_y != ordinary_rate_y
             if (
                 bounded_rate_x != output.rate_x_counts_per_second
                 or bounded_rate_y != output.rate_y_counts_per_second
+                or ordinary_rate_clamped_x
+                or ordinary_rate_clamped_y
             ):
                 output = CalibratedControlOutput(
                     timestamp_ns=output.timestamp_ns,
@@ -2566,10 +3267,12 @@ class MakcuAimingController:
                     saturated_x=(
                         output.saturated_x
                         or bounded_rate_x != output.rate_x_counts_per_second
+                        or ordinary_rate_clamped_x
                     ),
                     saturated_y=(
                         output.saturated_y
                         or bounded_rate_y != output.rate_y_counts_per_second
+                        or ordinary_rate_clamped_y
                     ),
                     reset_reason=output.reset_reason,
                     observer_position_sigma_x_pixels=(
@@ -2590,6 +3293,21 @@ class MakcuAimingController:
                     velocity_feedforward_confidence_y=(
                         output.velocity_feedforward_confidence_y
                     ),
+                    position_channel_agreement=(
+                        output.position_channel_agreement
+                    ),
+                    position_feedback_confidence_x=(
+                        output.position_feedback_confidence_x
+                    ),
+                    position_feedback_confidence_y=(
+                        output.position_feedback_confidence_y
+                    ),
+                    position_feedback_held_x=(
+                        output.position_feedback_held_x
+                    ),
+                    position_feedback_held_y=(
+                        output.position_feedback_held_y
+                    ),
                     innovation_mahalanobis_squared=(
                         output.innovation_mahalanobis_squared
                     ),
@@ -2597,16 +3315,57 @@ class MakcuAimingController:
                     motion_corroboration_confidence=(
                         output.motion_corroboration_confidence
                     ),
+                    body_derived_motion_confidence_x=(
+                        output.body_derived_motion_confidence_x
+                    ),
+                    body_derived_motion_confidence_y=(
+                        output.body_derived_motion_confidence_y
+                    ),
+                    correlated_lookahead_active=(
+                        output.correlated_lookahead_active
+                    ),
+                    lookahead_retained_authority_x=(
+                        output.lookahead_retained_authority_x
+                    ),
+                    lookahead_retained_authority_y=(
+                        output.lookahead_retained_authority_y
+                    ),
+                    ambiguous_lookahead_projection_retained_x=(
+                        output.ambiguous_lookahead_projection_retained_x
+                    ),
+                    ambiguous_lookahead_projection_retained_y=(
+                        output.ambiguous_lookahead_projection_retained_y
+                    ),
+                    pursuit_reserve_rate_x_counts_per_second=(
+                        bounded_reserve_rate_x
+                    ),
+                    pursuit_reserve_rate_y_counts_per_second=(
+                        bounded_reserve_rate_y
+                    ),
+                    material_motion_revoked_x=(
+                        output.material_motion_revoked_x
+                    ),
+                    material_motion_revoked_y=(
+                        output.material_motion_revoked_y
+                    ),
+                    predictive_authority_revoked_x=(
+                        output.predictive_authority_revoked_x
+                    ),
+                    predictive_authority_revoked_y=(
+                        output.predictive_authority_revoked_y
+                    ),
+                    physical_input_pending_x=output.physical_input_pending_x,
+                    physical_input_pending_y=output.physical_input_pending_y,
                 )
-            self._calibrated_last_output = output
-            if observation is not None and output.valid:
+            self._publish_calibrated_output_locked(output)
+            if control_observation is not None and output.valid:
                 # Reuse the existing sample-based control telemetry for the
                 # plant-aware path.  Here ``pursuit`` is the independent
                 # target-velocity feed-forward expressed in 60 Hz correction
                 # units; the formatter converts it back to counts/second.
                 self._record_control_sample(
-                    observation.error_x_pixels,
-                    observation.error_y_pixels,
+                    control_observation.error_x_pixels,
+                    control_observation.error_y_pixels,
                     output.target_velocity_x_pixels_per_second
                     * output.velocity_feedforward_confidence_x
                     / controller.plant.gain_x_pixels_per_count
@@ -2619,11 +3378,36 @@ class MakcuAimingController:
                     bounded_rate_y / REFERENCE_CONTROL_HZ,
                     rate_limit_x / REFERENCE_CONTROL_HZ,
                     rate_limit_y / REFERENCE_CONTROL_HZ,
-                    output.motion_corroboration_confidence,
+                    motion_corroboration_confidence=(
+                        output.motion_corroboration_confidence
+                    ),
+                    body_derived_motion_confidence_x=(
+                        output.body_derived_motion_confidence_x
+                    ),
+                    body_derived_motion_confidence_y=(
+                        output.body_derived_motion_confidence_y
+                    ),
+                    target_velocity_x_pixels_per_second=(
+                        output.target_velocity_x_pixels_per_second
+                    ),
+                    target_velocity_y_pixels_per_second=(
+                        output.target_velocity_y_pixels_per_second
+                    ),
+                    velocity_feedforward_confidence_x=(
+                        output.velocity_feedforward_confidence_x
+                    ),
+                    velocity_feedforward_confidence_y=(
+                        output.velocity_feedforward_confidence_y
+                    ),
+                    pursuit_reserve_rate_x_counts_per_second=(
+                        output.pursuit_reserve_rate_x_counts_per_second
+                    ),
+                    pursuit_reserve_rate_y_counts_per_second=(
+                        output.pursuit_reserve_rate_y_counts_per_second
+                    ),
                 )
             if not output.valid:
-                self._fractional_x = 0.0
-                self._fractional_y = 0.0
+                self._clear_calibrated_output_motion_locked()
                 if output.reset_reason in {
                     "released",
                     "target-lost",
@@ -2635,11 +3419,130 @@ class MakcuAimingController:
                             self._latest_body_derived_motion_permitted = False
                             self._latest_body_derived_motion_deadline_ns = None
                             self._latest_identity_deadline_ns = None
+                            self._latest_correlated_lookahead = None
                 return
 
+            # Smooth ordinary feedback/base feed-forward before integer
+            # truncation. At 1000 Hz a bare trunc() produces a felt 500 Hz
+            # count pattern, so retain the existing user-controlled EMA for
+            # that lock-safe path. The separately reported fast-pursuit
+            # reserve gets a prompt 3 ms rise and an immediate fall/sign
+            # change; otherwise the ordinary ~11 ms EMA would carry several
+            # stale pixels of extra motion through a stop or reversal.
+            alpha = 1.0 - math.pow(
+                1.0 - self.config.smoothing_alpha,
+                max(elapsed, 0.0) * REFERENCE_CONTROL_HZ,
+            )
+            reserve_alpha = 1.0 - math.exp(
+                -max(float(elapsed), 0.0)
+                / PURSUIT_RESERVE_RISE_TIME_CONSTANT_SECONDS
+            )
+            if (
+                self._calibrated_smooth_rate_x == 0.0
+                and self._calibrated_smooth_rate_y == 0.0
+            ):
+                self._calibrated_smooth_rate_x = bounded_ordinary_rate_x
+                self._calibrated_smooth_rate_y = bounded_ordinary_rate_y
+            else:
+                self._calibrated_smooth_rate_x += alpha * (
+                    bounded_ordinary_rate_x - self._calibrated_smooth_rate_x
+                )
+                self._calibrated_smooth_rate_y += alpha * (
+                    bounded_ordinary_rate_y - self._calibrated_smooth_rate_y
+                )
+
+            # The core has current physical evidence that this axis stopped or
+            # reversed and has already removed every velocity contribution.
+            # Do not let the ordinary/base feed-forward EMA turn that exact
+            # revoke into an additional ~11 ms emitted tail.  Static feedback
+            # remains in ``bounded_ordinary_rate_*`` and is applied directly.
+            if (
+                output.material_motion_revoked_x
+                or output.predictive_authority_revoked_x
+            ):
+                previous_ordinary_x = self._calibrated_smooth_rate_x
+                self._calibrated_smooth_rate_x = bounded_ordinary_rate_x
+                if self._fractional_x * previous_ordinary_x > 0.0:
+                    self._fractional_x = 0.0
+            if (
+                output.material_motion_revoked_y
+                or output.predictive_authority_revoked_y
+            ):
+                previous_ordinary_y = self._calibrated_smooth_rate_y
+                self._calibrated_smooth_rate_y = bounded_ordinary_rate_y
+                if self._fractional_y * previous_ordinary_y > 0.0:
+                    self._fractional_y = 0.0
+
+            previous_reserve_x = self._calibrated_smooth_pursuit_reserve_rate_x
+            reserve_x_withdrawn = (
+                previous_reserve_x != 0.0
+                and previous_reserve_x * bounded_reserve_rate_x <= 0.0
+            )
+            if reserve_x_withdrawn or (
+                previous_reserve_x != 0.0
+                and abs(bounded_reserve_rate_x) < abs(previous_reserve_x)
+            ):
+                self._calibrated_smooth_pursuit_reserve_rate_x = (
+                    bounded_reserve_rate_x
+                )
+                if (
+                    reserve_x_withdrawn
+                    and self._fractional_x * previous_reserve_x > 0.0
+                ):
+                    self._fractional_x = 0.0
+            else:
+                self._calibrated_smooth_pursuit_reserve_rate_x += (
+                    reserve_alpha
+                    * (
+                        bounded_reserve_rate_x
+                        - self._calibrated_smooth_pursuit_reserve_rate_x
+                    )
+                )
+            previous_reserve_y = self._calibrated_smooth_pursuit_reserve_rate_y
+            reserve_y_withdrawn = (
+                previous_reserve_y != 0.0
+                and previous_reserve_y * bounded_reserve_rate_y <= 0.0
+            )
+            if reserve_y_withdrawn or (
+                previous_reserve_y != 0.0
+                and abs(bounded_reserve_rate_y) < abs(previous_reserve_y)
+            ):
+                self._calibrated_smooth_pursuit_reserve_rate_y = (
+                    bounded_reserve_rate_y
+                )
+                if (
+                    reserve_y_withdrawn
+                    and self._fractional_y * previous_reserve_y > 0.0
+                ):
+                    self._fractional_y = 0.0
+            else:
+                self._calibrated_smooth_pursuit_reserve_rate_y += (
+                    reserve_alpha
+                    * (
+                        bounded_reserve_rate_y
+                        - self._calibrated_smooth_pursuit_reserve_rate_y
+                    )
+                )
+            smooth_rate_x = min(
+                max(
+                    self._calibrated_smooth_rate_x
+                    + self._calibrated_smooth_pursuit_reserve_rate_x,
+                    -rate_limit_x,
+                ),
+                rate_limit_x,
+            )
+            smooth_rate_y = min(
+                max(
+                    self._calibrated_smooth_rate_y
+                    + self._calibrated_smooth_pursuit_reserve_rate_y,
+                    -rate_limit_y,
+                ),
+                rate_limit_y,
+            )
+
             bounded_elapsed = min(max(float(elapsed), 0.0), 0.01)
-            self._fractional_x += bounded_rate_x * bounded_elapsed
-            self._fractional_y += bounded_rate_y * bounded_elapsed
+            self._fractional_x += smooth_rate_x * bounded_elapsed
+            self._fractional_y += smooth_rate_y * bounded_elapsed
             raw_delta_x = math.trunc(self._fractional_x)
             raw_delta_y = math.trunc(self._fractional_y)
             # A delayed scheduler tick may not collapse its whole backlog into
@@ -2711,14 +3614,34 @@ class MakcuAimingController:
                     identity_deadline_ns is None
                     or commit_ns < identity_deadline_ns
                 )
+                correlated_motion_deadline_ns = (
+                    min(
+                        correlated_lookahead.lookahead.timestamp_ns
+                        + round(
+                            CORRELATED_LOOKAHEAD_MAX_LEAD_SECONDS
+                            * 1_000_000_000
+                        ),
+                        correlated_lookahead.lookahead.identity_deadline_ns,
+                    )
+                    if output.correlated_lookahead_active
+                    and correlated_lookahead is not None
+                    else None
+                )
+                correlated_motion_fresh = bool(
+                    not output.correlated_lookahead_active
+                    or (
+                        correlated_motion_deadline_ns is not None
+                        and commit_ns < correlated_motion_deadline_ns
+                    )
+                )
                 commit_authorized = bool(
                     base_commit_authorized
                     and body_motion_fresh
                     and identity_fresh
+                    and correlated_motion_fresh
                 )
                 if not commit_authorized:
-                    self._fractional_x = 0.0
-                    self._fractional_y = 0.0
+                    self._clear_calibrated_output_motion_locked()
                     if self._latest_sample_id == sample_id:
                         if not body_motion_fresh:
                             self._latest_body_derived_motion_permitted = False
@@ -2727,15 +3650,23 @@ class MakcuAimingController:
                             self._latest_body_derived_motion_permitted = False
                             self._latest_body_derived_motion_deadline_ns = None
                             self._latest_identity_deadline_ns = None
+                            self._latest_correlated_lookahead = None
                     if (
                         base_commit_authorized
                         and identity_fresh
-                        and not body_motion_fresh
+                        and (
+                            not body_motion_fresh
+                            or not correlated_motion_fresh
+                        )
                     ):
-                        # Motion authority expired while this decision was in
-                        # flight. Preserve the accepted static point, but drop
-                        # this entire command and every predictive remainder.
-                        controller.revoke_body_derived_motion()
+                        # Predictive authority expired while this decision was
+                        # in flight. Preserve the accepted static point, but
+                        # drop this entire command and every adapter remainder.
+                        # Correlated authority has its deadline inside the core
+                        # and expires on the next 1 kHz step; body-derived
+                        # permission needs its explicit synchronous revoke.
+                        if not body_motion_fresh:
+                            controller.revoke_body_derived_motion()
                     else:
                         self._reset_calibrated_tracking_locked()
                         # The reset deliberately erases numeric state, but the
@@ -2751,23 +3682,29 @@ class MakcuAimingController:
                 try:
                     controller.preflight_emitted(emitted)
                 except (RuntimeError, TypeError, ValueError) as exc:
-                    self._fractional_x = 0.0
-                    self._fractional_y = 0.0
                     self._reset_calibrated_control_locked()
                     raise MakcuError(
                         "calibrated MAKCU command preflight failed closed: "
                         f"{exc}"
                     ) from exc
-                self._command(f"km.move({delta_x},{delta_y})")
+                try:
+                    self._command(f"km.move({delta_x},{delta_y})")
+                except MakcuError:
+                    self._clear_calibrated_output_motion_locked()
+                    raise
                 try:
                     controller.record_emitted(emitted)
                 except (RuntimeError, TypeError, ValueError) as exc:
-                    self._fractional_x = 0.0
-                    self._fractional_y = 0.0
+                    # The physical write is already a fact even if the
+                    # calibrated core rejects its local accounting. Preserve
+                    # that fact for diagnostics before failing closed.
+                    self._record_successful_normal_command(emitted)
+                    self._clear_calibrated_output_motion_locked()
                     raise MakcuError(
                         "calibrated MAKCU command accounting failed closed: "
                         f"{exc}"
                     ) from exc
+                self._record_successful_normal_command(emitted)
                 with self._telemetry_lock:
                     self._telemetry_movement_commands += 1
                     self._telemetry_emitted_x += delta_x
@@ -2818,6 +3755,7 @@ class MakcuAimingController:
                 self._latest_body_derived_motion_deadline_ns
             )
             identity_deadline_ns = self._latest_identity_deadline_ns
+            correlated_lookahead = self._latest_correlated_lookahead
             velocity_x = self._latest_velocity_x
             velocity_y = self._latest_velocity_y
             sample_id = self._latest_sample_id
@@ -2862,6 +3800,7 @@ class MakcuAimingController:
                     body_derived_motion_deadline_ns
                 ),
                 identity_deadline_ns=identity_deadline_ns,
+                correlated_lookahead=correlated_lookahead,
                 source_ns=source_ns,
                 sample_id=sample_id,
                 generation=generation,
@@ -3086,6 +4025,9 @@ class MakcuAimingController:
                     self._clear_normal_motion_locked()
                     return
                 self._command(f"km.move({delta_x},{delta_y})")
+                self._record_successful_normal_command(
+                    EmittedMouseCommand(current_ns, delta_x, delta_y)
+                )
                 with self._telemetry_lock:
                     self._telemetry_movement_commands += 1
                     self._telemetry_emitted_x += delta_x
@@ -3140,10 +4082,13 @@ class MakcuAimingController:
         connection: Any,
         closed: threading.Event,
     ) -> None:
-        """Disable button telemetry and close after the output worker exits."""
+        """Disable both physical-input streams and close after worker exit."""
 
         try:
             with self._serial_lock:
+                connection.write(b"km.mouse(0,0)\r")
+                # Button state remains an independent compatibility authority;
+                # always disable both streams during the same bounded shutdown.
                 connection.write(b"km.buttons(0)\r")
                 connection.flush()
         except Exception:  # noqa: BLE001 - closing is the bounded fallback
@@ -3193,7 +4138,7 @@ class MakcuAimingController:
     def stop(self) -> None:
         """Stop output and serial I/O within ``stop_timeout`` or fail explicitly.
 
-        The timeout covers worker exit, the normal ``km.buttons(0)`` command,
+        The timeout covers worker exit, the normal ``km.mouse(0,0)`` command,
         cancellation, and serial close.  If native I/O remains stuck, this
         method raises :class:`MakcuError` and deliberately retains references to
         every live worker instead of claiming the controller has stopped.
@@ -3296,6 +4241,7 @@ class MakcuAimingController:
         self._latest_body_derived_motion_permitted = False
         self._latest_body_derived_motion_deadline_ns = None
         self._latest_identity_deadline_ns = None
+        self._latest_correlated_lookahead = None
         self._body_derived_motion_revocation_pending = False
         self._identity_deadline_revocation_pending = False
         self._measurement_target_present = False
@@ -3311,4 +4257,5 @@ class MakcuAimingController:
         self._pursuit_correction_x = 0.0
         self._pursuit_correction_y = 0.0
         self._pursuit_measurement_ns = 0
-        self._button_parser.reset()
+        self._input_parser.reset()
+        self._physical_input_last_report_ns = -1

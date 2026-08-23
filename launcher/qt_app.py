@@ -964,6 +964,13 @@ class LauncherWindow(QMainWindow):
         for index, label in enumerate(MAKCU_BUTTON_LABELS):
             self.aim_makcu_button.addItem(label, index)
         self.aim_makcu_button.currentIndexChanged.connect(self._makcu_verification_selection_changed)
+        self.aim_makcu_tracking_mode = QComboBox()
+        self.aim_makcu_tracking_mode.addItem("Stable body (legacy)", "stable-body")
+        self.aim_makcu_tracking_mode.addItem("Direct head (new trained model)", "direct-head")
+        self.aim_makcu_tracking_mode.setToolTip(
+            "Stable body keeps the older body-box command-aware path. Direct head "
+            "switches to the trained head model that was just added."
+        )
         self.verify_makcu_button = QPushButton("Verify Right Mouse…")
         self.verify_makcu_button.clicked.connect(self.verify_makcu_activation)
         self.monitor_makcu_button = QPushButton("Monitor Mouse Clicks…")
@@ -1015,8 +1022,11 @@ class LauncherWindow(QMainWindow):
         self.aim_makcu_smoothing.valueChanged.connect(self._sync_smoothing_label)
         self.aim_makcu_max_step = QLineEdit()
         self.aim_makcu_max_step.setToolTip(
-            "Sets the active MAKCU mouse-rate envelope. Automatic direct-head "
-            "command-aware control uses the same envelope for X and Y."
+            "Sets the legacy/base MAKCU mouse-rate envelope. Values below 320 "
+            "remain a hard conservative limit. With a bound measured plant, "
+            "automatic direct-head at 320 or above may use the separately "
+            "reported per-axis pursuit envelope while near-lock output remains "
+            "unchanged."
         )
         self.aim_makcu_prediction_lead_seconds = QDoubleSpinBox()
         self.aim_makcu_prediction_lead_seconds.setRange(0.0, 0.25)
@@ -1112,10 +1122,11 @@ class LauncherWindow(QMainWindow):
         grid.addWidget(self.aim_invert_y, 1, 3)
         _field_row(grid, 2, "MAKCU device", port_row)
         _field_row(grid, 3, "Hold to activate", button_row)
-        _field_row(grid, 4, "Tuning", tuning_row)
-        _field_row(grid, 5, "Motion tuning", motion_tuning_row)
-        _field_row(grid, 6, "Optional calibration mode", self.aim_makcu_context)
-        _field_row(grid, 7, "Advanced response profile", calibration_row)
+        _field_row(grid, 4, "Tracking mode", self.aim_makcu_tracking_mode)
+        _field_row(grid, 5, "Tuning", tuning_row)
+        _field_row(grid, 6, "Motion tuning", motion_tuning_row)
+        _field_row(grid, 7, "Optional calibration mode", self.aim_makcu_context)
+        _field_row(grid, 8, "Advanced response profile", calibration_row)
         layout.addLayout(grid)
         self.aim_makcu_control_mode_note = _label("", "subtitle")
         self.aim_makcu_control_mode_note.setWordWrap(True)
@@ -1537,17 +1548,21 @@ class LauncherWindow(QMainWindow):
         self.custom_labels_path.setText(s.labels_path)
         self.aim.setChecked(s.aim)
         self.aim_label.setText(s.aim_label)
-        aim_point = AIM_POINT_LABEL_FOR_VALUE.get(s.aim_head_ratio, AIM_POINT_LABEL_FOR_VALUE["0.12"])
+        aim_point = AIM_POINT_LABEL_FOR_VALUE.get(s.aim_head_ratio, AIM_POINT_LABEL_FOR_VALUE["0.16"])
         self.aim_point.setCurrentText(aim_point)
         self.aim_invert_x.setChecked(s.aim_invert_x)
         self.aim_invert_y.setChecked(s.aim_invert_y)
         self.aim_makcu_port.blockSignals(True)
         self.aim_makcu_button.blockSignals(True)
+        self.aim_makcu_tracking_mode.blockSignals(True)
         self.aim_makcu_port.setText(s.aim_makcu_port)
         makcu_button = min(max(self._parse_int(s.aim_makcu_button, default=1), 0), 4)
         self.aim_makcu_button.setCurrentIndex(makcu_button)
         self.aim_makcu_port.blockSignals(False)
         self.aim_makcu_button.blockSignals(False)
+        tracking_index = self.aim_makcu_tracking_mode.findData(s.aim_makcu_tracking_mode)
+        self.aim_makcu_tracking_mode.setCurrentIndex(max(tracking_index, 0))
+        self.aim_makcu_tracking_mode.blockSignals(False)
         context_index = self.aim_makcu_context.findData(s.aim_makcu_context)
         self.aim_makcu_context.setCurrentIndex(max(context_index, 0))
         self._set_strength_slider_value(s.aim_makcu_strength)
@@ -1656,6 +1671,9 @@ class LauncherWindow(QMainWindow):
         s.aim_output = AIM_OUTPUT_MAKCU
         s.aim_makcu_port = self.aim_makcu_port.text().strip()
         s.aim_makcu_button = str(self._selected_makcu_button())
+        s.aim_makcu_tracking_mode = str(
+            self.aim_makcu_tracking_mode.currentData() or "stable-body"
+        )
         s.aim_makcu_context = str(self.aim_makcu_context.currentData() or "")
         s.aim_makcu_strength = f"{self._strength_from_slider():.2f}"
         s.aim_makcu_smoothing_alpha = f"{self._smoothing_from_slider():.2f}"
@@ -2295,6 +2313,7 @@ class LauncherWindow(QMainWindow):
             self.detect_makcu_button,
             self.browse_makcu_button,
             self.aim_makcu_button,
+            self.aim_makcu_tracking_mode,
             self.aim_makcu_context,
             self.aim_makcu_max_step,
         ):
@@ -2324,12 +2343,24 @@ class LauncherWindow(QMainWindow):
                 "values and do not affect profile control."
             )
         else:
+            tracking_mode = str(self.aim_makcu_tracking_mode.currentData() or "stable-body")
+            if tracking_mode == "direct-head":
+                tracking_note = (
+                    "Direct head tracking selected: the trained head model supplies "
+                    "the anatomical aim point."
+                )
+            else:
+                tracking_note = (
+                    "Stable body tracking selected: the older body-box path supplies "
+                    "the command-aware aim point."
+                )
             self.aim_makcu_control_mode_note.setText(
-                "Automatic direct-head command-aware control: the pinned direct head "
-                "detector supplies the anatomical aim point, so the saved body-box Aim "
-                "point ratio is ignored. Max step sets the equal X/Y rate envelope. "
-                "Strength, Smoothing, Prediction lead, Damping, and Vertical cap are "
-                "stored but do not affect normal tracking."
+                f"{tracking_note} The saved body-box Aim point ratio is ignored by "
+                "Automatic direct-head command-aware control. Max step sets the equal "
+                "X/Y rate envelope. Strength, Smoothing, Prediction lead, Damping, "
+                "and Vertical cap are stored but do not affect normal tracking. "
+                "When direct head tracking is selected, the pinned direct head "
+                "detector supplies the anatomical aim point."
             )
         verify_busy = (
             self._makcu_verify_thread is not None and self._makcu_verify_thread.is_alive()

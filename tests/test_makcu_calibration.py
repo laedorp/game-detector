@@ -42,6 +42,7 @@ def _synthetic_evidence(
     gain_y: float = 0.10,
     noise_pixels: float = 0.04,
     dropout_every: int | None = None,
+    dropout_run: tuple[int, int] | None = None,
     x_negative_gain: float | None = None,
     y_negative_gain: float | None = None,
     cross_x_to_y: float = 0.004,
@@ -179,6 +180,10 @@ def _synthetic_evidence(
             dropout_every is not None
             and (sample_index + 17) % dropout_every == 0
         )
+        if dropout_run is not None and dropout_run[0] <= sample_index < (
+            dropout_run[0] + dropout_run[1]
+        ):
+            observed = False
         measurements.append(
             CalibrationMeasurement(timestamp_ns, error_x, error_y, observed)
         )
@@ -416,8 +421,16 @@ class MakcuCalibrationFitTests(unittest.TestCase):
             _fit(gain_x=0.70, gain_y=0.65)
 
     def test_rejects_low_observation_duty(self) -> None:
+        # A sustained unbroken run of unobserved frames starves the axis fit
+        # even when the surrounding data is dense; this must still reject.
         with self.assertRaisesRegex(CalibrationQualityError, "observation duty"):
-            _fit(dropout_every=10)
+            _fit(dropout_run=(100, 40))
+
+    def test_accepts_isolated_single_frame_drops(self) -> None:
+        # Periodic single-frame motion-blur drops (as seen from a 235 Hz
+        # detector during pulse reversals) leave the fit fully constrained.
+        fit = _fit(dropout_every=10)
+        self.assertGreaterEqual(fit.observation_duty, 0.70)
 
     def test_rejects_wrong_response_sign(self) -> None:
         with self.assertRaisesRegex(CalibrationQualityError, "wrong sign"):
@@ -437,13 +450,19 @@ class MakcuCalibrationFitTests(unittest.TestCase):
 
     def test_rejects_pulse_to_pulse_delay_spread(self) -> None:
         with self.assertRaisesRegex(CalibrationQualityError, "delay"):
-            _fit(pulse_delay_offsets_ms=(0.0, 24.0), noise_pixels=0.12)
+            _fit(pulse_delay_offsets_ms=(0.0, 40.0), noise_pixels=0.12)
 
     def test_accepts_local_delays_one_frame_each_side_of_global_fit(self) -> None:
         fit = _fit(pulse_delay_offsets_ms=(0.0, 16.0), noise_pixels=0.12)
 
         self.assertAlmostEqual(fit.x.pulse_delay_spread_seconds, 0.008)
         self.assertAlmostEqual(fit.y.pulse_delay_spread_seconds, 0.008)
+
+    def test_accepts_pulse_delay_spread_up_to_one_and_a_half_frames(self) -> None:
+        fit = _fit(pulse_delay_offsets_ms=(0.0, 20.0), noise_pixels=0.12)
+
+        self.assertLessEqual(fit.x.pulse_delay_spread_seconds, 0.012)
+        self.assertLessEqual(fit.y.pulse_delay_spread_seconds, 0.012)
 
     def test_rejects_nonfinite_or_out_of_order_evidence(self) -> None:
         with self.assertRaises(CalibrationDataError):

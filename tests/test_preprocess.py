@@ -84,6 +84,51 @@ class PreprocessTests(unittest.TestCase):
             (60.0, 26.0, 140.0, 74.0),
         )
 
+    @unittest.skipIf(cv2 is None, "OpenCV is not installed")
+    def test_explicit_crop_origin_preserves_full_source_mapping(self) -> None:
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+
+        prepared = preprocess_frame(
+            frame,
+            inference_size=(384, 640),
+            crop_size=(48, 80),
+            crop_origin=(10, 20),
+        )
+
+        self.assertEqual(
+            (prepared.transform.crop_x, prepared.transform.crop_y),
+            (10, 20),
+        )
+        self.assertEqual(
+            prepared.transform.to_source_box((0.0, 0.0, 640.0, 384.0)),
+            (10.0, 20.0, 90.0, 68.0),
+        )
+
+    def test_explicit_crop_origin_requires_an_in_bounds_integer_pair(self) -> None:
+        frame = np.zeros((100, 200, 3), dtype=np.uint8)
+
+        with self.assertRaisesRegex(ValueError, "requires crop_size"):
+            preprocess_frame(frame, 32, crop_origin=(0, 0))
+        for origin in ((-1, 0), (121, 0), (0, 53)):
+            with self.subTest(origin=origin), self.assertRaisesRegex(
+                ValueError,
+                "within the source frame",
+            ):
+                preprocess_frame(
+                    frame,
+                    32,
+                    crop_size=(48, 80),
+                    crop_origin=origin,
+                )
+        for origin in ((0,), (0, 1, 2), (0.5, 1), [0, 1], True):
+            with self.subTest(origin=origin), self.assertRaises(TypeError):
+                preprocess_frame(
+                    frame,
+                    32,
+                    crop_size=(48, 80),
+                    crop_origin=origin,
+                )
+
     def test_empty_frames_are_rejected_before_resize(self) -> None:
         for shape in ((0, 10, 3), (10, 0, 3)):
             with self.subTest(shape=shape), self.assertRaises(ValueError):

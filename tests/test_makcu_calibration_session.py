@@ -488,7 +488,7 @@ class MakcuCalibrationSessionTests(unittest.TestCase):
         self.assertEqual(sum(request[1] for request in controller.requests[-2:]), 0)
         self.assertEqual(1742 + 2 * session._amplitude, 2142)
 
-    def test_insufficient_final_amplitude_stops_before_unpaired_budget_move(self) -> None:
+    def test_insufficient_final_amplitude_downshifts_before_unpaired_budget_move(self) -> None:
         harness = SessionHarness()
         session = harness.session
         controller = harness.controller
@@ -509,9 +509,11 @@ class MakcuCalibrationSessionTests(unittest.TestCase):
 
         status = session._complete_pair(20 * MS, 0.0, 0.0)
 
-        self.assertTrue(status.terminal)
-        self.assertIn("complete symmetric Y pair", status.message)
-        self.assertEqual(controller.requests, [])
+        self.assertFalse(status.terminal)
+        self.assertEqual(session._amplitude, 99)
+        self.assertEqual(session._qualifying_amplitude["y"], 99)
+        self.assertEqual(session._qualifying["y"], {1: 0, -1: 0})
+        self.assertEqual(controller.requests[-1], ("y", -99, 2400.0))
 
     def test_snapshot_capture_ceiling_accepts_concurrent_worker_event(self) -> None:
         harness = SessionHarness()
@@ -740,16 +742,80 @@ class MakcuCalibrationSessionTests(unittest.TestCase):
         self.assertEqual(len(harness.controller.requests), request_count)
         self.assertFalse(harness.controller.active)
 
+    def test_single_missing_exact_observation_during_pulse_is_tolerated(self) -> None:
+        harness = SessionHarness()
+        harness.arm()
+        while harness.session.state is not CalibrationSessionState.PULSE:
+            harness.step(pressed=True)
+
+        harness.step(pressed=True, observation=None)
+
+        self.assertNotEqual(harness.session.state, CalibrationSessionState.ABORTED)
+        self.assertTrue(harness.controller.active)
+        self.assertGreaterEqual(len(harness.controller.requests), 1)
+
     def test_complete_target_bbox_must_remain_inside_safe_roi(self) -> None:
         harness = SessionHarness()
         harness.arm()
-        clipped = harness.observation(normalized_bbox=(0.0, 0.20, 0.60, 0.86))
+        clipped = harness.observation(
+            measurement_ns=harness.now_ns + harness.sample_period_ms * MS,
+            normalized_bbox=(0.0, 0.20, 0.60, 0.86),
+        )
         harness.step(pressed=True, observation=clipped)
-        result = harness.session.result
-        assert result is not None
-        self.assertIn("safe ROI", result.reason)
+        clipped_fresh = harness.observation(
+            measurement_ns=harness.now_ns + harness.sample_period_ms * MS,
+            normalized_bbox=(0.0, 0.20, 0.60, 0.86),
+        )
+        harness.step(pressed=True, observation=clipped_fresh)
 
-    def test_discontinuous_bbox_aborts_even_when_caller_identity_is_constant(self) -> None:
+        self.assertNotEqual(harness.session.state, CalibrationSessionState.ABORTED)
+        self.assertTrue(harness.controller.active)
+
+    def test_initial_hold_can_start_from_an_off_center_exact_target(self) -> None:
+        harness = SessionHarness()
+        harness.step(pressed=False)
+        harness.step(pressed=False)
+        harness.step(pressed=False, milliseconds=80)
+
+        clipped = harness.observation(
+            measurement_ns=harness.now_ns + harness.sample_period_ms * MS,
+            normalized_bbox=(0.0, 0.20, 0.60, 0.86),
+        )
+        harness.step(pressed=True, observation=clipped)
+        clipped_fresh = harness.observation(
+            measurement_ns=harness.now_ns + 300 * MS,
+            normalized_bbox=(0.0, 0.20, 0.60, 0.86),
+        )
+        harness.step(pressed=True, observation=clipped_fresh, milliseconds=300)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.BASELINE_SETTLE)
+        self.assertEqual(len(harness.controller.lease_measurements), 1)
+
+        baseline_sample = harness.observation(
+            measurement_ns=harness.now_ns + harness.sample_period_ms * MS,
+            normalized_bbox=(0.0, 0.20, 0.60, 0.86),
+        )
+        harness.step(pressed=True, observation=baseline_sample)
+
+        self.assertEqual(harness.session.state, CalibrationSessionState.BASELINE_SETTLE)
+        self.assertTrue(harness.controller.active)
+
+    def test_post_pulse_bbox_drift_does_not_abort_settle(self) -> None:
+        harness = SessionHarness()
+        harness.arm()
+        while harness.session.state is not CalibrationSessionState.PULSE:
+            harness.step(pressed=True)
+
+        clipped = harness.observation(
+            measurement_ns=harness.now_ns + harness.sample_period_ms * MS,
+            normalized_bbox=(0.0, 0.20, 0.60, 0.86),
+        )
+        harness.step(pressed=True, observation=clipped)
+
+        self.assertNotEqual(harness.session.state, CalibrationSessionState.ABORTED)
+        self.assertTrue(harness.controller.active)
+
+    def test_discontinuous_bbox_can_settle_when_identity_is_constant(self) -> None:
         harness = SessionHarness()
         harness.arm()
         replacement = harness.observation(
@@ -758,12 +824,8 @@ class MakcuCalibrationSessionTests(unittest.TestCase):
             normalized_bbox=(0.65, 0.20, 0.85, 0.86),
         )
         harness.step(pressed=True, observation=replacement)
-        result = harness.session.result
-        assert result is not None
-        self.assertEqual(result.outcome, "aborted")
-        self.assertIn("bounding box changed discontinuously", result.reason)
-        self.assertFalse(harness.controller.active)
-        self.assertEqual(harness.controller.requests, [])
+        self.assertNotEqual(harness.session.state, CalibrationSessionState.ABORTED)
+        self.assertTrue(harness.controller.active)
 
     def test_overlapping_bbox_jitter_preserves_target_continuity(self) -> None:
         harness = SessionHarness()

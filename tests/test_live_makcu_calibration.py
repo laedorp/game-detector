@@ -4,6 +4,7 @@ from dataclasses import replace
 import contextlib
 from hashlib import sha256
 import io
+import json
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
@@ -26,6 +27,7 @@ from config import parse_args
 from detection.types import Detection
 from main import (
     _AutomaticHeadRuntime,
+    _automatic_direct_head_plant_delay_bounds,
     _build_calibration_runtime_binding,
     _calibrated_controller_from_active_profile,
     _calibration_model_sha256,
@@ -74,6 +76,72 @@ def _active_profile(binding) -> ActiveMakcuCalibrationProfile:
 
 
 class CalibrationInputHelperTests(unittest.TestCase):
+    @staticmethod
+    def _delay_fit(
+        *,
+        delay: float = 0.008,
+        x_ambiguity: float = 0.004,
+        y_ambiguity: float = 0.008,
+        x_spread: float = 0.016,
+        y_spread: float = 0.006,
+    ) -> SimpleNamespace:
+        return SimpleNamespace(
+            delay_seconds=delay,
+            x=SimpleNamespace(
+                delay_ambiguity_seconds=x_ambiguity,
+                pulse_delay_spread_seconds=x_spread,
+            ),
+            y=SimpleNamespace(
+                delay_ambiguity_seconds=y_ambiguity,
+                pulse_delay_spread_seconds=y_spread,
+            ),
+        )
+
+    def test_automatic_direct_head_delay_keeps_symmetric_uncertainty_out_of_point_estimate(
+        self,
+    ) -> None:
+        calibrated, effective, upper = (
+            _automatic_direct_head_plant_delay_bounds(self._delay_fit())
+        )
+
+        self.assertAlmostEqual(calibrated, 0.008)
+        # Ambiguity and pulse spread are absolute deviations around the fitted
+        # delay.  They may widen diagnostics, but cannot bias the command
+        # ledger toward the upper side of that symmetric interval.
+        self.assertAlmostEqual(effective, 0.008)
+        self.assertAlmostEqual(upper, 0.024)
+
+    def test_automatic_direct_head_delay_preserves_zero_uncertainty_and_caps(
+        self,
+    ) -> None:
+        zero = self._delay_fit(
+            delay=0.035,
+            x_ambiguity=0.0,
+            y_ambiguity=0.0,
+            x_spread=0.0,
+            y_spread=0.0,
+        )
+        self.assertEqual(
+            _automatic_direct_head_plant_delay_bounds(zero),
+            (0.035, 0.035, 0.035),
+        )
+
+        capped = self._delay_fit(delay=0.095, x_spread=0.020)
+        self.assertEqual(
+            _automatic_direct_head_plant_delay_bounds(capped),
+            (0.095, 0.095, 0.100),
+        )
+
+    def test_automatic_direct_head_delay_rejects_invalid_fit_values(self) -> None:
+        for description, fit in (
+            ("negative calibrated delay", self._delay_fit(delay=-0.001)),
+            ("non-finite ambiguity", self._delay_fit(y_ambiguity=float("nan"))),
+            ("negative pulse spread", self._delay_fit(x_spread=-0.001)),
+        ):
+            with self.subTest(description=description):
+                with self.assertRaisesRegex(ValueError, "finite and nonnegative"):
+                    _automatic_direct_head_plant_delay_bounds(fit)
+
     def test_one_strong_exact_target_is_normalized_to_reference_pixels(self) -> None:
         target = Detection(0, "player", 0.85, (760.0, 300.0, 1160.0, 900.0))
 
@@ -103,10 +171,9 @@ class CalibrationInputHelperTests(unittest.TestCase):
         self.assertFalse(observation.is_prediction)
         self.assertEqual(observation.unique_candidates, 1)
 
-    def test_unsafe_weak_or_out_of_frame_inputs_are_not_observations(self) -> None:
+    def test_weak_or_out_of_frame_inputs_are_not_observations(self) -> None:
         valid = Detection(0, "player", 0.85, (760.0, 300.0, 1160.0, 900.0))
         cases = (
-            ([valid], False),
             ([replace(valid, confidence=0.69)], True),
             ([replace(valid, xyxy=(-1.0, 300.0, 1160.0, 900.0))], True),
             ([replace(valid, class_name="person")], True),
@@ -127,6 +194,26 @@ class CalibrationInputHelperTests(unittest.TestCase):
                     ),
                     (None, None),
                 )
+
+    def test_exact_target_is_retained_when_self_safety_temporarily_flickers(self) -> None:
+        valid = Detection(0, "player", 0.85, (760.0, 300.0, 1160.0, 900.0))
+
+        observation, selected = _calibration_observation_and_target(
+            [valid],
+            (1080, 1920, 3),
+            aim_label="player",
+            head_ratio=0.12,
+            configured_confidence=0.70,
+            invert_x=False,
+            invert_y=False,
+            self_exclusion_safe=False,
+            measurement_ns=123,
+        )
+
+        self.assertIs(selected, valid)
+        self.assertIsNotNone(observation)
+        assert observation is not None
+        self.assertTrue(observation.self_safe)
 
     def test_configured_detector_confidence_has_no_hidden_calibration_floor(self) -> None:
         accepted = Detection(0, "player", 0.26, (760.0, 300.0, 1160.0, 900.0))
@@ -198,6 +285,64 @@ class CalibrationInputHelperTests(unittest.TestCase):
             )
 
         self.assertEqual(selections, [nearest, nearest])
+
+    def test_multiple_targets_lock_to_previous_continuity(self) -> None:
+        left = Detection(0, "player", 0.80, (460.0, 260.0, 700.0, 860.0))
+        nearest = Detection(0, "player", 0.99, (860.0, 250.0, 1060.0, 850.0))
+
+        observation, selected, readiness = _calibration_observation_target_and_readiness(
+            [left, nearest],
+            (1080, 1920, 3),
+            aim_label="player",
+            head_ratio=0.12,
+            configured_confidence=0.25,
+            invert_x=False,
+            invert_y=False,
+            self_exclusion_safe=True,
+            measurement_ns=123,
+            previous_normalized_bbox=(
+                450.0 / 1920.0,
+                250.0 / 1080.0,
+                690.0 / 1920.0,
+                850.0 / 1080.0,
+            ),
+        )
+
+        self.assertIs(selected, left)
+        self.assertIsNotNone(observation)
+        self.assertEqual(
+            readiness,
+            "target ready: continuity-locked of 2 exact detections",
+        )
+
+    def test_far_jump_requires_reacquiring_same_target(self) -> None:
+        right_a = Detection(0, "player", 0.85, (1220.0, 250.0, 1420.0, 850.0))
+        right_b = Detection(0, "player", 0.84, (1480.0, 250.0, 1680.0, 850.0))
+
+        observation, selected, readiness = _calibration_observation_target_and_readiness(
+            [right_a, right_b],
+            (1080, 1920, 3),
+            aim_label="player",
+            head_ratio=0.12,
+            configured_confidence=0.25,
+            invert_x=False,
+            invert_y=False,
+            self_exclusion_safe=True,
+            measurement_ns=123,
+            previous_normalized_bbox=(
+                300.0 / 1920.0,
+                250.0 / 1080.0,
+                500.0 / 1920.0,
+                850.0 / 1080.0,
+            ),
+        )
+
+        self.assertIsNone(observation)
+        self.assertIsNone(selected)
+        self.assertEqual(
+            readiness,
+            "target wait: reacquire the same exact player target",
+        )
 
     def test_equal_distance_tie_is_stable_and_invalid_boxes_are_ignored(self) -> None:
         left = Detection(0, "player", 0.80, (700.0, 300.0, 800.0, 900.0))
@@ -470,6 +615,8 @@ class _FakeDetector:
                     "disable_cpu_ep_fallback": True,
                 },
                 "runtime_ep_fail_fallback_disabled": True,
+                "provider_options_status": "ok",
+                "physical_device_identity": "test-migraphx-gpu",
             }
         else:
             self.runtime_summary = {
@@ -772,7 +919,10 @@ class LiveCalibrationArbitrationTests(unittest.TestCase):
         self.assertEqual(controller.normal_updates, 0)
         self.assertEqual(session.update_calls, 1)
         self.assertEqual(session.abort_calls, 0)
-        self.assertEqual(session.config.minimum_confidence, 0.25)
+        # Calibration tracks a visible box's motion rather than aiming, so the
+        # session uses the lower calibration confidence floor, not the aim
+        # threshold, to keep the observation-duty gate reachable.
+        self.assertEqual(session.config.minimum_confidence, 0.12)
         self.assertEqual(writes[0][0], self.evidence)
         self.assertTrue(self.source.closed)
 
@@ -791,7 +941,7 @@ class LiveCalibrationArbitrationTests(unittest.TestCase):
         self.assertIn("MAKCU calibration target: target ready", messages)
         self.assertEqual(
             _FakeCalibrationSession.instances[0].config.minimum_confidence,
-            0.25,
+            0.12,
         )
 
     def test_aborted_calibration_still_writes_evidence_and_raises(self) -> None:
@@ -864,6 +1014,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             self.base_config,
             backend="onnxruntime",
             require_full_provider=True,
+            aim_makcu_tracking_mode="direct-head",
         )
 
     def tearDown(self) -> None:
@@ -888,6 +1039,22 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             source_identity=("7be5eb1", "test-build"),
             context_name="ads-scope",
             aim_mode="ads",
+        )
+
+    def _automatic_binding(self, config, *, build_identity="test-build"):
+        detector = _FakeDetector(
+            model_path=self.model,
+            inference_size=config.inference_size,
+            require_full_provider=True,
+        )
+        return _build_calibration_runtime_binding(
+            config,
+            detector_summary=detector.runtime_summary,
+            capture_settings=self.source.actual_settings,
+            makcu_identity_token="c" * 64,
+            model_artifact_snapshot=snapshot_artifact(self.model),
+            labels_artifact_snapshot=snapshot_artifact(self.labels),
+            source_identity=("7be5eb1", build_identity),
         )
 
     def _write_profile(self, *, binding=None):
@@ -944,7 +1111,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         )
         self.assertTrue(controller.stopped)
         self.assertEqual(len(tracker_options), 1)
-        self.assertEqual(tracker_options[0]["lost_grace_frames"], 1)
+        self.assertEqual(tracker_options[0]["lost_grace_frames"], 6)
         self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.075)
         self.assertEqual(numeric.plant.gain_y_pixels_per_count, 0.14)
         self.assertEqual(numeric.plant.delay_seconds, 0.012)
@@ -987,23 +1154,50 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             aim_makcu_active_profile=self.profile_path,
             aim_calibration_context="hip-fire",
         )
-        with self.assertRaisesRegex(ValueError, "exactly match"):
-            self._run(hip_fire_config)
+        result, output = self._run(hip_fire_config)
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "Warning: Active calibration profile does not exactly match the current runtime binding",
+            output,
+        )
 
         controller = _FakeMakcuController.instances[0]
-        self.assertEqual(controller.normal_updates, 0)
         self.assertTrue(controller.stopped)
 
     def test_capture_binding_mismatch_fails_before_update_without_legacy_fallback(self) -> None:
         self._write_profile()
         self.source.settings_overrides["fps"] = 120.0
 
-        with self.assertRaisesRegex(ValueError, "exactly match"):
-            self._run()
+        result, output = self._run()
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "Warning: Active calibration profile does not exactly match the current runtime binding",
+            output,
+        )
 
         controller = _FakeMakcuController.instances[0]
         self.assertIsNotNone(controller.calibrated_controller)
-        self.assertEqual(controller.normal_updates, 0)
+        self.assertTrue(controller.stopped)
+
+    def test_stale_active_profile_binding_warns_and_still_starts(self) -> None:
+        self._write_profile()
+        stale_binding = replace(self._binding(), context_name="ads-scope-alt")
+
+        with mock.patch(
+            "main._build_calibration_runtime_binding",
+            return_value=stale_binding,
+        ):
+            result, output = self._run()
+
+        self.assertEqual(result, 0)
+        self.assertIn(
+            "Warning: Active calibration profile does not exactly match the current runtime binding",
+            output,
+        )
+        controller = _FakeMakcuController.instances[0]
+        self.assertIsNotNone(controller.calibrated_controller)
         self.assertTrue(controller.stopped)
 
     def test_makcu_identity_mismatch_fails_without_legacy_fallback(self) -> None:
@@ -1095,17 +1289,17 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(controller.normal_updates, 0)
         self.assertEqual(numeric.plant.gain_x_pixels_per_count, 0.125)
         self.assertEqual(numeric.plant.gain_y_pixels_per_count, 0.120)
-        self.assertEqual(numeric.plant.delay_seconds, 0.008)
-        self.assertEqual(numeric.config.velocity_median_window, 5)
+        self.assertEqual(numeric.plant.delay_seconds, 0.006)
+        self.assertEqual(numeric.config.velocity_median_window, 3)
         self.assertEqual(
             numeric.config.velocity_filter_time_constant_seconds,
-            0.018,
+            0.014,
         )
         self.assertEqual(
             numeric.config.maximum_target_acceleration_pixels_per_second_squared,
-            20_000.0,
+            40_000.0,
         )
-        self.assertEqual(numeric.config.stale_after_seconds, 0.065)
+        self.assertEqual(numeric.config.stale_after_seconds, 0.110)
         self.assertEqual(
             numeric.config.maximum_observation_interval_seconds,
             0.040,
@@ -1120,21 +1314,42 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(
             numeric.config.maximum_velocity_feedforward_fraction,
-            0.95,
+            1.0,
         )
         self.assertTrue(
             numeric.config.require_motion_corroboration_for_feedforward
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_projection_fraction,
-            0.0,
+            1.0,
         )
         self.assertEqual(
             numeric.config.maximum_body_derived_feedforward_fraction,
+            0.50,
+        )
+        self.assertEqual(
+            numeric.config.maximum_body_derived_pursuit_feedforward_fraction,
+            0.82,
+        )
+        self.assertEqual(
+            numeric.config.maximum_residual_pursuit_feedforward_fraction,
+            0.65,
+        )
+        self.assertEqual(
+            numeric.config.maximum_correlated_lookahead_pursuit_feedforward_fraction,
+            0.60,
+        )
+        self.assertEqual(
+            numeric.config.maximum_verified_flow_pursuit_feedforward_fraction,
             0.0,
         )
-        self.assertEqual(numeric.config.position_time_constant_seconds, 0.012)
-        self.assertEqual(numeric.config.feedback_deadzone_pixels, 4.0)
+        self.assertEqual(numeric.config.position_time_constant_seconds, 0.028)
+        self.assertEqual(numeric.config.feedback_deadzone_pixels, 4.5)
+        self.assertTrue(numeric.config.continuous_feedback_deadband)
+        self.assertEqual(
+            numeric.config.continuous_feedback_shoulder_pixels,
+            6.0,
+        )
         self.assertIn(
             "Loading direct-head model on MIGraphXExecutionProvider GPU-only; "
             "first compile may take about 40 seconds; CPU inference fallback "
@@ -1143,30 +1358,201 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         )
         self.assertIn("control automatic command-aware observer", output)
         self.assertIn("gains X/Y 0.125/0.12 px/count", output)
-        self.assertIn("delay 8.00 ms", output)
+        self.assertIn("delay 6.00 ms", output)
         self.assertIn(
             "head source pinned SunXDS 0.8.0 direct boxes on "
             "MIGraphXExecutionProvider GPU-only",
             output,
         )
         self.assertIn("CPU fallback disabled", output)
-        self.assertIn("direct-head confidence >= 0.25", output)
+        self.assertIn("direct-head confidence >= 0.15", output)
+        self.assertIn("direct results establish the head anchor", output)
+        self.assertIn("already-qualified fast pursuit <= 60%", output)
         self.assertIn(
-            "physical position/velocity updates direct-head-only",
+            "current measured primary geometry carries position for at most 750 ms",
             output,
         )
         self.assertIn(
-            "same-source accepted primary center corroborates motion only",
+            "body candidates schedule head verification only; no body-box output",
+            output,
+        )
+        self.assertIn("predicted primary geometry remains display-only", output)
+        self.assertIn(
+            "verified mapped-motion source-age projection 100% | "
+            "feed-forward baseline/aligned/fast max 25%/50%/82%",
+            output,
+        )
+        self.assertIn("closed-loop trailing-residual max 65%", output)
+        self.assertIn(
+            "mapped-point slew allowance/speed 4 px/3600 px/s",
             output,
         )
         self.assertIn(
-            "no body-mapped physical projection/feed-forward",
+            "local-anchor LP 60 ms",
             output,
         )
-        self.assertIn("position tau/deadzone 12 ms/4 px", output)
+        self.assertIn(
+            "velocity-channel translation-first reconcile/LP 30/12 ms",
+            output,
+        )
+        self.assertIn("position tau/deadzone/shoulder 28 ms/4.5/6 px", output)
+        self.assertIn("far-error tau 16 ms from 10.5 to 22 px", output)
         self.assertIn("caps X/Y 12000/12000 counts/s", output)
+        self.assertIn(
+            "Max step 200 limits each axis to 12000 counts/s; the validated "
+            "moving-target value is 320",
+            output,
+        )
         self.assertNotIn("control calibrated", output)
         self.assertNotIn("calibrated profile", output)
+
+    def test_direct_head_mode_uses_profile_plant_with_automatic_controller(self) -> None:
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.revoke_body.return_value = False
+        head_runtime.visible_sample.return_value = None
+        head_runtime.stop.return_value = True
+        _FakeDetector.detections = []
+        diagnostic_root = self.root / "measured-plant-diagnostic"
+        config = replace(
+            self.automatic_config,
+            aim_makcu_active_profile=self.profile_path,
+            aim_calibration_context="ads-scope",
+            aim_diagnostic_dir=diagnostic_root,
+        )
+        profile = self._write_profile(
+            binding=self._automatic_binding(
+                config,
+                # Only this dirty-tree identity may differ from the live run.
+                build_identity="older-clean-build",
+            )
+        )
+
+        with mock.patch(
+            "main._build_automatic_head_runtime",
+            return_value=head_runtime,
+        ):
+            result, output = self._run(config)
+
+        self.assertEqual(result, 0)
+        controller = _FakeMakcuController.instances[0]
+        numeric = controller.calibrated_controller
+        self.assertIsNotNone(numeric)
+        self.assertEqual(controller.expected_identity_token, "c" * 64)
+        self.assertEqual(
+            numeric.plant.gain_x_pixels_per_count,
+            profile.fit.x.gain_pixels_per_count,
+        )
+        self.assertEqual(
+            numeric.plant.gain_y_pixels_per_count,
+            profile.fit.y.gain_pixels_per_count,
+        )
+        self.assertEqual(numeric.plant.delay_seconds, 0.012)
+        self.assertEqual(numeric.config.position_time_constant_seconds, 0.028)
+        self.assertTrue(numeric.config.require_motion_corroboration_for_feedforward)
+        self.assertEqual(
+            numeric.config.maximum_body_derived_pursuit_feedforward_fraction,
+            0.82,
+        )
+        self.assertEqual(
+            numeric.config.maximum_residual_pursuit_feedforward_fraction,
+            0.65,
+        )
+        self.assertEqual(
+            numeric.config.maximum_correlated_lookahead_pursuit_feedforward_fraction,
+            0.60,
+        )
+        self.assertEqual(
+            numeric.config.maximum_verified_flow_pursuit_feedforward_fraction,
+            0.95,
+        )
+        self.assertEqual(numeric.config.maximum_rate_x_counts_per_second, 12_000.0)
+        self.assertEqual(numeric.config.maximum_rate_y_counts_per_second, 12_000.0)
+        self.assertIn("control automatic command-aware observer", output)
+        self.assertIn("Automatic direct-head measured plant: bound", output)
+        self.assertIn("measured-flow carry <= 95%", output)
+        self.assertIn(
+            "calibrated/effective/upper delay 12.00/12.00/13.00 ms",
+            output,
+        )
+        self.assertIn(profile.profile_sha256[:12], output)
+        self.assertIn("Automatic MAKCU detail rescue: enabled", output)
+        self.assertNotIn("control calibrated", output)
+        self.assertNotIn(str(self.profile_path), output)
+        manifest = json.loads(
+            next(diagnostic_root.iterdir())
+            .joinpath("manifest.json")
+            .read_text(encoding="utf-8")
+        )
+        metadata = manifest["metadata"]
+        self.assertEqual(metadata["plant_calibrated_delay_seconds"], 0.012)
+        self.assertEqual(metadata["plant_effective_delay_seconds"], 0.012)
+        self.assertAlmostEqual(metadata["plant_delay_upper_seconds"], 0.013)
+        self.assertEqual(metadata["plant_delay_seconds"], 0.012)
+
+    def test_recommended_direct_head_step_uses_measured_per_axis_envelope(self) -> None:
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.revoke_body.return_value = False
+        head_runtime.visible_sample.return_value = None
+        head_runtime.stop.return_value = True
+        _FakeDetector.detections = []
+        config = replace(
+            self.automatic_config,
+            aim_makcu_max_step=320,
+            aim_makcu_active_profile=self.profile_path,
+            aim_calibration_context="ads-scope",
+        )
+        self._write_profile(
+            binding=self._automatic_binding(
+                config,
+                build_identity="older-clean-build",
+            )
+        )
+
+        with mock.patch(
+            "main._build_automatic_head_runtime",
+            return_value=head_runtime,
+        ):
+            result, output = self._run(config)
+
+        self.assertEqual(result, 0)
+        controller = _FakeMakcuController.instances[0]
+        numeric = controller.calibrated_controller
+        self.assertIsNotNone(numeric)
+        # The fixture's X gain is intentionally too small to reach 3000 px/s
+        # under the 27k rollout ceiling; Y reaches exactly 3000 px/s.  The
+        # adapter transport boundary must cover both without re-clamping Y to
+        # the configured 19.2k legacy/base envelope.
+        self.assertEqual(
+            numeric.config.maximum_rate_x_counts_per_second,
+            27_000.0,
+        )
+        self.assertAlmostEqual(
+            numeric.config.maximum_rate_y_counts_per_second,
+            3000.0 / 0.14,
+        )
+        self.assertEqual(
+            numeric.config.maximum_feedback_rate_x_counts_per_second,
+            27_000.0,
+        )
+        self.assertAlmostEqual(
+            numeric.config.maximum_feedback_rate_y_counts_per_second,
+            3000.0 / 0.14,
+        )
+        self.assertEqual(controller.config.max_step, 450)
+        self.assertIn(
+            "configured base 320 (19200 counts/s) | measured per-axis caps "
+            "X/Y 27000/21429 counts/s | position-feedback caps X/Y "
+            "27000/21429 counts/s | transport ceiling 27000 counts/s",
+            output,
+        )
+        self.assertIn(
+            "gains, filters, deadzone, and unsaturated near-lock output unchanged",
+            output,
+        )
 
     def test_automatic_mode_rejects_non_strict_backend_before_model_startup(self) -> None:
         invalid_configs = (
@@ -1335,14 +1721,47 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         controller = _FakeMakcuController.instances[0]
         self.assertEqual(controller.corroboration_revocations, 2)
 
-    def test_automatic_mode_publishes_only_new_direct_worker_sample(self) -> None:
-        player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
-        _FakeDetector.detections = [player]
-        sample = SimpleNamespace(
+    def test_pending_far_reacquisition_holds_controller_without_stale_crop(
+        self,
+    ) -> None:
+        original = Detection(
+            0,
+            "player",
+            0.9,
+            (800.0, 200.0, 1000.0, 700.0),
+        )
+        rival = Detection(
+            0,
+            "player",
+            0.9,
+            (1300.0, 200.0, 1500.0, 700.0),
+        )
+        batches = iter(([original], [rival], [rival]))
+
+        class TimestampedSource(_FakeSource):
+            def __init__(self) -> None:
+                super().__init__()
+                self.base_ns = perf_counter_ns() - 100_000_000
+
+            def read(self, timeout=None):
+                del timeout
+                self.read_calls += 1
+                index = self.read_calls - 1
+                started_ns = self.base_ns + index * 10_000_000
+                return FramePacket(
+                    image=np.zeros((1080, 1920, 3), dtype=np.uint8),
+                    sequence=index,
+                    read_started_ns=started_ns,
+                    read_completed_ns=started_ns + 100_000,
+                )
+
+        source = TimestampedSource()
+        self.source = source
+        direct_sample = SimpleNamespace(
             point=(915.0, 238.0),
-            source_timestamp_ns=123,
-            direct_source_timestamp_ns=123,
-            identity_deadline_ns=200_000_100,
+            source_timestamp_ns=source.base_ns,
+            direct_source_timestamp_ns=source.base_ns,
+            identity_deadline_ns=source.base_ns + 500_000_000,
             track_generation=1,
             provenance=DirectHeadProvenance.DIRECT,
             confidence=0.88,
@@ -1352,18 +1771,132 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             body_derived_motion_deadline_ns=None,
             corroboration_point=(900.0, 450.0),
         )
+        visible_sample = SimpleNamespace(
+            point=(918.0, 241.0),
+            source_timestamp_ns=source.base_ns,
+            direct_source_timestamp_ns=source.base_ns,
+            identity_deadline_ns=direct_sample.identity_deadline_ns,
+            track_generation=1,
+            provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+            confidence=0.88,
+            evidence="filtered direct-head anchor",
+            bridging=False,
+            body_derived_motion_permitted=True,
+            body_derived_motion_deadline_ns=direct_sample.identity_deadline_ns,
+            corroboration_point=None,
+        )
+        predicted_visible_sample = SimpleNamespace(
+            **{
+                **vars(visible_sample),
+                "source_timestamp_ns": source.base_ns + 10_000_000,
+                "provenance": DirectHeadProvenance.PREDICTED_PRIMARY,
+                "bridging": True,
+                "body_derived_motion_permitted": False,
+                "body_derived_motion_deadline_ns": None,
+            }
+        )
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.side_effect = [False, False, True]
+        head_runtime.consume_motion_corroboration_revocation.side_effect = (
+            [False] * 6
+        )
+        head_runtime.take_latest.side_effect = [direct_sample, None, None]
+        head_runtime.visible_sample.side_effect = [
+            visible_sample,
+            predicted_visible_sample,
+            None,
+        ]
+        head_runtime.stop.return_value = True
+        config = replace(self.automatic_config, max_frames=3)
+
+        def sequenced_postprocess(_detector, _raw, **_arguments):
+            return list(next(batches))
+
+        with (
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            mock.patch.object(
+                _FakeDetector,
+                "postprocess",
+                new=sequenced_postprocess,
+            ),
+            mock.patch.object(
+                _FakeMakcuController,
+                "activation_pressed",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ),
+        ):
+            result, _output = self._run(config)
+
+        self.assertEqual(result, 0)
+        controller = _FakeMakcuController.instances[0]
+        # Frame one publishes the activation-edge loss and the verified head.
+        # The first far rival is only pending: it publishes neither a loss nor
+        # a new coordinate, and cannot schedule a crop from predicted geometry.
+        # The confirming second observation starts generation two, revokes the
+        # old controller lease, and submits that exact box for fresh head proof.
+        self.assertEqual(controller.normal_updates, 3)
+        self.assertEqual(
+            [arguments[0] for arguments in controller.normal_update_arguments],
+            [None, original, None],
+        )
+        self.assertEqual(
+            [
+                keywords["measurement_ns"]
+                for keywords in controller.normal_update_keywords
+            ],
+            [source.base_ns, source.base_ns, source.base_ns + 20_000_000],
+        )
+        self.assertEqual(head_runtime.submit.call_count, 2)
+        submitted_players = [
+            call.args[1] for call in head_runtime.submit.call_args_list
+        ]
+        self.assertEqual(submitted_players, [original, rival])
+
+        accept_calls = head_runtime.accept_body.call_args_list
+        self.assertEqual(len(accept_calls), 3)
+        self.assertEqual(
+            [call.kwargs["track_generation"] for call in accept_calls],
+            [1, 1, 2],
+        )
+        self.assertIsNone(accept_calls[1].kwargs["corroboration_box"])
+        self.assertEqual(
+            accept_calls[1].args[0],
+            original.box,
+        )
+        self.assertEqual(
+            accept_calls[2].kwargs["corroboration_box"],
+            rival.box,
+        )
+
+    def test_direct_head_mode_never_publishes_body_before_head_verification(
+        self,
+    ) -> None:
+        player = Detection(0, "player", 0.2, (800.0, 200.0, 1000.0, 700.0))
+        _FakeDetector.detections = [player]
         head_runtime = mock.Mock()
         head_runtime.provider = "MIGraphXExecutionProvider"
         head_runtime.status = SimpleNamespace()
         head_runtime.identity_generation = 1
         head_runtime.accept_body.return_value = False
-        head_runtime.consume_motion_corroboration_revocation.side_effect = [
-            False,
-            False,
-        ]
-        head_runtime.take_latest.return_value = sample
-        head_runtime.visible_sample.return_value = sample
+        head_runtime.consume_motion_corroboration_revocation.side_effect = (
+            [False] * 4
+        )
+        head_runtime.take_latest.return_value = None
+        head_runtime.visible_sample.return_value = None
         head_runtime.stop.return_value = True
+        diagnostic_root = self.root / "pending-head-diagnostic"
+        config = replace(
+            self.automatic_config,
+            aim_diagnostic_dir=diagnostic_root,
+            max_frames=2,
+        )
 
         with (
             mock.patch(
@@ -1377,51 +1910,163 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
                 return_value=True,
             ),
         ):
-            result, _output = self._run(self.automatic_config)
+            result, _output = self._run(config)
 
         self.assertEqual(result, 0)
         controller = _FakeMakcuController.instances[0]
+        # Frame one revokes on the activation edge. Frame two must independently
+        # exercise the pending-anchor branch and publish another explicit loss;
+        # neither low-confidence body observation may become an aim point.
         self.assertEqual(controller.normal_updates, 2)
+        self.assertTrue(
+            all(
+                arguments[0] is None
+                for arguments in controller.normal_update_arguments
+            )
+        )
+        self.assertTrue(
+            all(
+                "aim_point" not in keywords
+                for keywords in controller.normal_update_keywords
+            )
+        )
+        self.assertEqual(head_runtime.submit.call_count, 2)
+        records = [
+            json.loads(line)
+            for line in next(diagnostic_root.iterdir())
+            .joinpath("records.jsonl")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        ]
+        self.assertEqual(len(records), 2)
+        self.assertEqual(
+            [record["control_source"] for record in records],
+            ["none", "none"],
+        )
+        self.assertTrue(
+            all(
+                record["aim_status"]
+                == (
+                    "aim paused: direct-head anchor pending; body target is "
+                    "identity-only"
+                )
+                for record in records
+            )
+        )
+
+    def test_automatic_mode_publishes_visible_mapped_anchor_from_new_direct_sample(
+        self,
+    ) -> None:
+        player = Detection(0, "player", 0.9, (800.0, 200.0, 1000.0, 700.0))
+        _FakeDetector.detections = [player]
+        direct_sample = SimpleNamespace(
+            point=(915.0, 238.0),
+            source_timestamp_ns=123,
+            direct_source_timestamp_ns=123,
+            identity_deadline_ns=200_000_100,
+            track_generation=1,
+            provenance=DirectHeadProvenance.DIRECT,
+            confidence=0.88,
+            evidence="direct test head box",
+            bridging=False,
+            body_derived_motion_permitted=False,
+            body_derived_motion_deadline_ns=None,
+            corroboration_point=(900.0, 450.0),
+        )
+        visible_sample = SimpleNamespace(
+            point=(918.0, 241.0),
+            source_timestamp_ns=124,
+            direct_source_timestamp_ns=direct_sample.source_timestamp_ns,
+            identity_deadline_ns=direct_sample.identity_deadline_ns,
+            track_generation=1,
+            provenance=DirectHeadProvenance.MEASURED_PRIMARY,
+            confidence=0.88,
+            evidence="filtered direct-head anchor",
+            bridging=False,
+            body_derived_motion_permitted=True,
+            body_derived_motion_deadline_ns=direct_sample.identity_deadline_ns,
+            corroboration_point=None,
+        )
+        head_runtime = mock.Mock()
+        head_runtime.provider = "MIGraphXExecutionProvider"
+        head_runtime.status = SimpleNamespace()
+        head_runtime.identity_generation = 1
+        head_runtime.accept_body.return_value = False
+        head_runtime.consume_motion_corroboration_revocation.side_effect = (
+            [False] * 4
+        )
+        head_runtime.take_latest.side_effect = [direct_sample, None]
+        head_runtime.visible_sample.side_effect = [visible_sample, None]
+        head_runtime.stop.return_value = True
+        config = replace(self.automatic_config, max_frames=2)
+
+        with (
+            mock.patch(
+                "main._build_automatic_head_runtime",
+                return_value=head_runtime,
+            ),
+            mock.patch.object(
+                _FakeMakcuController,
+                "activation_pressed",
+                new_callable=mock.PropertyMock,
+                return_value=True,
+            ),
+        ):
+            result, _output = self._run(config)
+
+        self.assertEqual(result, 0)
+        controller = _FakeMakcuController.instances[0]
+        self.assertEqual(controller.normal_updates, 3)
         self.assertIsNone(controller.normal_update_arguments[0][0])
         self.assertNotIn("aim_point", controller.normal_update_keywords[0])
         self.assertIsNotNone(controller.normal_update_arguments[1][0])
         self.assertEqual(
             controller.normal_update_keywords[1]["aim_point"],
-            sample.point,
+            visible_sample.point,
         )
         self.assertEqual(
             controller.normal_update_keywords[1]["measurement_ns"],
-            sample.source_timestamp_ns,
+            visible_sample.source_timestamp_ns,
         )
         self.assertNotIn("velocity_target", controller.normal_update_keywords[1])
         self.assertEqual(
             controller.normal_update_keywords[1]["velocity_point"],
-            sample.point,
+            visible_sample.point,
         )
-        self.assertNotIn(
-            "body_derived_motion_permitted",
-            controller.normal_update_keywords[1],
+        self.assertTrue(
+            controller.normal_update_keywords[1][
+                "body_derived_motion_permitted"
+            ]
         )
-        self.assertNotIn(
-            "body_derived_motion_deadline_ns",
-            controller.normal_update_keywords[1],
+        self.assertEqual(
+            controller.normal_update_keywords[1][
+                "body_derived_motion_deadline_ns"
+            ],
+            visible_sample.identity_deadline_ns,
         )
         self.assertEqual(
             controller.normal_update_keywords[1]["identity_deadline_ns"],
-            sample.identity_deadline_ns,
+            visible_sample.identity_deadline_ns,
         )
-        self.assertEqual(
-            controller.normal_update_keywords[1]["motion_corroboration_point"],
-            sample.corroboration_point,
+        self.assertNotIn(
+            "motion_corroboration_point",
+            controller.normal_update_keywords[1],
         )
+        # Once the verified anchor disappears, the remaining body detection is
+        # identity/crop evidence only. Explicitly revoke the old controller
+        # lease instead of falling back to body-ratio movement.
+        self.assertIsNone(controller.normal_update_arguments[2][0])
+        self.assertNotIn("aim_point", controller.normal_update_keywords[2])
         self.assertEqual(controller.corroboration_revocations, 0)
         self.assertEqual(
             controller.control_events,
-            ["update", "update"],
+            ["update", "update", "update"],
         )
-        head_runtime.submit.assert_called_once()
-        submitted_player = head_runtime.submit.call_args.args[1]
-        self.assertEqual(submitted_player, player)
+        self.assertEqual(head_runtime.submit.call_count, 2)
+        submitted_players = [
+            call.args[1] for call in head_runtime.submit.call_args_list
+        ]
+        self.assertEqual(submitted_players, [player, player])
         self.assertEqual(
             head_runtime.accept_body.call_args.kwargs["track_generation"],
             1,

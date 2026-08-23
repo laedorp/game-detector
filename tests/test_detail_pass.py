@@ -7,6 +7,8 @@ import numpy as np
 
 from config import parse_args
 from detection.detail_pass import (
+    DETAIL_CROP_POLICY,
+    DETAIL_TARGET_CENTERED_CROP_POLICY,
     DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT,
     DetailPassStats,
     merge_cross_pass_detections,
@@ -15,6 +17,7 @@ from detection.detail_pass import (
 from detection.types import Detection
 from main import (
     AUTOMATIC_DETAIL_SELF_EDGE_MARGIN_MODEL_PIXELS,
+    _AutomaticDetailTargetHintState,
     _apply_hard_aim_guard,
     _automatic_detail_rescue_reason,
     _exclude_automatic_detail_lower_edge_self_fragments,
@@ -60,6 +63,54 @@ class DetailPassGeometryTests(unittest.TestCase):
         self.assertAlmostEqual(plan.effective_linear_magnification, 2.5)
         self.assertFalse(plan.clamped)
         self.assertFalse(plan.redundant)
+        self.assertEqual(plan.crop_policy, DETAIL_CROP_POLICY)
+
+    def test_target_centered_plan_moves_and_clamps_the_same_roi(self) -> None:
+        interior = plan_detail_pass(
+            (1080, 1920, 3),
+            640,
+            (416, 416),
+            center_point=(350.0, 540.0),
+        )
+        upper_left = plan_detail_pass(
+            (1080, 1920, 3),
+            640,
+            (416, 416),
+            center_point=(-100.0, -100.0),
+        )
+        lower_right = plan_detail_pass(
+            (1080, 1920, 3),
+            640,
+            (416, 416),
+            center_point=(2100.0, 1200.0),
+        )
+
+        self.assertEqual(interior.crop_policy, DETAIL_TARGET_CENTERED_CROP_POLICY)
+        self.assertEqual((interior.crop_x, interior.crop_y), (30, 220))
+        self.assertEqual(
+            (interior.applied_crop_width, interior.applied_crop_height),
+            (640, 640),
+        )
+        self.assertEqual((upper_left.crop_x, upper_left.crop_y), (0, 0))
+        self.assertEqual((lower_right.crop_x, lower_right.crop_y), (1280, 440))
+
+    def test_target_center_requires_finite_pair(self) -> None:
+        for center in ((1.0,), (1.0, 2.0, 3.0), "12", 3.0):
+            with self.subTest(center=center), self.assertRaises(TypeError):
+                plan_detail_pass(
+                    (1080, 1920, 3),
+                    640,
+                    (416, 416),
+                    center_point=center,
+                )
+        for center in ((float("nan"), 1.0), (1.0, float("inf"))):
+            with self.subTest(center=center), self.assertRaises(ValueError):
+                plan_detail_pass(
+                    (1080, 1920, 3),
+                    640,
+                    (416, 416),
+                    center_point=center,
+                )
 
     def test_rectangular_model_uses_exact_letterbox_scale_ratio(self) -> None:
         plan = plan_detail_pass((1080, 1920, 3), 768, (384, 640))
@@ -90,6 +141,32 @@ class DetailPassGeometryTests(unittest.TestCase):
         self.assertEqual(
             prepared.transform.to_source_box((0, 0, 640, 384)),
             (320.0, 168.0, 960.0, 552.0),
+        )
+
+    @unittest.skipIf(cv2 is None, "OpenCV is not installed")
+    def test_target_centered_tensor_uses_planned_source_origin(self) -> None:
+        frame = np.zeros((1080, 1920, 3), dtype=np.uint8)
+        plan = plan_detail_pass(
+            frame.shape,
+            640,
+            (416, 416),
+            center_point=(350.0, 540.0),
+        )
+
+        prepared = preprocess_frame(
+            frame,
+            (416, 416),
+            crop_size=(plan.applied_crop_height, plan.applied_crop_width),
+            crop_origin=(plan.crop_x, plan.crop_y),
+        )
+
+        self.assertEqual(
+            (prepared.transform.crop_x, prepared.transform.crop_y),
+            (30, 220),
+        )
+        self.assertEqual(
+            prepared.transform.to_source_box((0, 0, 416, 416)),
+            (30.0, 220.0, 670.0, 860.0),
         )
 
     def test_oversized_crop_is_clamped_but_widescreen_pass_is_not_redundant(self) -> None:
@@ -195,6 +272,91 @@ class DetailPassGeometryTests(unittest.TestCase):
                 unmatched_rejected_large=0,
                 merged=1,
             )
+
+
+class AutomaticDetailTargetHintTests(unittest.TestCase):
+    def test_hint_requires_matching_live_generations_and_fresh_timestamp(self) -> None:
+        state = _AutomaticDetailTargetHintState(max_age_seconds=0.100)
+        state.remember_box(
+            (300.0, 500.0, 400.0, 580.0),
+            source_timestamp_ns=1_000_000_000,
+            track_generation=4,
+            identity_generation=7,
+        )
+
+        self.assertEqual(
+            state.center_if_valid(
+                source_timestamp_ns=1_099_999_999,
+                track_generation=4,
+                identity_generation=7,
+                activation_active=True,
+            ),
+            (350.0, 540.0),
+        )
+        self.assertIsNone(
+            state.center_if_valid(
+                source_timestamp_ns=1_100_000_000,
+                track_generation=4,
+                identity_generation=7,
+                activation_active=True,
+            )
+        )
+
+    def test_generation_identity_and_release_each_clear_the_hint(self) -> None:
+        mismatches = (
+            {"track_generation": 3, "identity_generation": 9},
+            {"track_generation": 2, "identity_generation": 10},
+        )
+        for mismatch in mismatches:
+            with self.subTest(mismatch=mismatch):
+                state = _AutomaticDetailTargetHintState()
+                state.remember_box(
+                    (300.0, 500.0, 400.0, 580.0),
+                    source_timestamp_ns=1_000,
+                    track_generation=2,
+                    identity_generation=9,
+                )
+                self.assertIsNone(
+                    state.center_if_valid(
+                        source_timestamp_ns=2_000,
+                        activation_active=True,
+                        **mismatch,
+                    )
+                )
+                # A mismatch consumes the unsafe hint; changing back cannot
+                # resurrect it.
+                self.assertIsNone(
+                    state.center_if_valid(
+                        source_timestamp_ns=2_001,
+                        track_generation=2,
+                        identity_generation=9,
+                        activation_active=True,
+                    )
+                )
+
+        released = _AutomaticDetailTargetHintState()
+        released.remember_box(
+            (300.0, 500.0, 400.0, 580.0),
+            source_timestamp_ns=1_000,
+            track_generation=2,
+            identity_generation=9,
+        )
+        self.assertIsNone(
+            released.center_if_valid(
+                source_timestamp_ns=2_000,
+                track_generation=2,
+                identity_generation=9,
+                activation_active=False,
+            )
+        )
+        self.assertIsNone(
+            released.center_if_valid(
+                source_timestamp_ns=2_001,
+                track_generation=2,
+                identity_generation=9,
+                activation_active=True,
+            )
+        )
 
 
 class AutomaticDetailRescueDecisionTests(unittest.TestCase):

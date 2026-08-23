@@ -1,9 +1,9 @@
-"""Planning and conservative cross-pass merging for centered detail inference."""
+"""Planning and conservative cross-pass merging for detail inference."""
 
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass
-from math import gcd, isfinite
+from math import floor, gcd, isfinite
 from numbers import Integral
 from typing import Sequence
 
@@ -27,6 +27,7 @@ CROSS_PASS_DUPLICATE_IOU = 0.50
 DETAIL_REFERENCE_HEIGHT = 1080.0
 DETAIL_UNMATCHED_MAX_REFERENCE_HEIGHT = 96.0
 DETAIL_CROP_POLICY = "centered_model_aspect_roi"
+DETAIL_TARGET_CENTERED_CROP_POLICY = "target_centered_model_aspect_roi"
 
 
 @dataclass(frozen=True, slots=True)
@@ -146,15 +147,19 @@ def plan_detail_pass(
     frame_shape: Sequence[int],
     crop_size: int,
     model_shape_hw: InferenceSizeLike,
+    *,
+    center_point: Sequence[float] | None = None,
 ) -> DetailPassPlan:
-    """Resolve one centered model-aspect ROI without copying frame data.
+    """Resolve one bounded model-aspect ROI without copying frame data.
 
     ``crop_size`` is the requested source-pixel ROI width.  The height is
     derived from the detector's exact static input aspect ratio, then both
     dimensions are reduced together if the source cannot contain that ROI.
     A square model therefore preserves the former square-crop behavior, while
     a rectangular model uses its whole tensor instead of letterboxing a square
-    detail crop.
+    detail crop.  With no ``center_point`` the ROI keeps its original centered
+    behavior.  A supplied source-space ``(x, y)`` center is clamped so the same
+    ROI remains wholly inside the source frame.
     """
 
     if isinstance(crop_size, bool) or not isinstance(crop_size, Integral):
@@ -169,6 +174,19 @@ def plan_detail_pass(
     if source_height <= 0 or source_width <= 0:
         raise ValueError("frame dimensions must be positive")
     model_height, model_width = normalize_inference_size(model_shape_hw)
+    target_center: tuple[float, float] | None = None
+    if center_point is not None:
+        if isinstance(center_point, (str, bytes)) or len(center_point) != 2:
+            raise TypeError("detail center_point must be a finite (x, y) pair")
+        try:
+            center_x, center_y = (float(value) for value in center_point)
+        except (TypeError, ValueError) as exc:
+            raise TypeError(
+                "detail center_point must be a finite (x, y) pair"
+            ) from exc
+        if not isfinite(center_x) or not isfinite(center_y):
+            raise ValueError("detail center_point coordinates must be finite")
+        target_center = (center_x, center_y)
 
     requested_height = max(
         1,
@@ -201,8 +219,16 @@ def plan_detail_pass(
             source_height,
             max(1, int(round(applied_width * model_height / float(model_width)))),
         )
-    crop_x = (source_width - applied_width) // 2
-    crop_y = (source_height - applied_height) // 2
+    if target_center is None:
+        crop_x = (source_width - applied_width) // 2
+        crop_y = (source_height - applied_height) // 2
+        crop_policy = DETAIL_CROP_POLICY
+    else:
+        desired_x = floor(target_center[0] - applied_width * 0.5)
+        desired_y = floor(target_center[1] - applied_height * 0.5)
+        crop_x = min(max(desired_x, 0), source_width - applied_width)
+        crop_y = min(max(desired_y, 0), source_height - applied_height)
+        crop_policy = DETAIL_TARGET_CENTERED_CROP_POLICY
     # Running the exact source rectangle twice cannot add evidence.
     redundant = (
         applied_width == source_width and applied_height == source_height
@@ -223,7 +249,7 @@ def plan_detail_pass(
     )
     magnification = detail_scale / full_frame_scale
     return DetailPassPlan(
-        crop_policy=DETAIL_CROP_POLICY,
+        crop_policy=crop_policy,
         requested_crop_size=requested,
         requested_crop_height=requested_height,
         applied_crop_width=applied_width,

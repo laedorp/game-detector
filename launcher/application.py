@@ -10,8 +10,17 @@ import subprocess
 import threading
 import time
 
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+try:
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+except ImportError as exc:
+    tk = None
+    filedialog = None
+    messagebox = None
+    ttk = None
+    _TK_IMPORT_ERROR = exc
+else:
+    _TK_IMPORT_ERROR = None
 
 from utils.inference_size import format_inference_size
 
@@ -102,6 +111,11 @@ class DetectorLauncher:
     """A responsive Tk front end that runs detection in a child process."""
 
     def __init__(self, root: tk.Tk) -> None:
+        if _TK_IMPORT_ERROR is not None:
+            raise RuntimeError(
+                "Tkinter is unavailable in this environment; the compatibility "
+                "desktop launcher cannot start"
+            ) from _TK_IMPORT_ERROR
         self.root = root
         self.process: subprocess.Popen[str] | None = None
         self._process_output: queue.Queue[str | None] = queue.Queue()
@@ -205,6 +219,9 @@ class DetectorLauncher:
         self.aim_makcu_port = tk.StringVar(value=settings.aim_makcu_port)
         makcu_button = min(max(self._parse_int(settings.aim_makcu_button, default=1), 0), 4)
         self.aim_makcu_button = tk.StringVar(value=MAKCU_BUTTON_LABELS[makcu_button])
+        self.aim_makcu_tracking_mode = tk.StringVar(
+            value=settings.aim_makcu_tracking_mode
+        )
         self.aim_makcu_strength = tk.StringVar(value=settings.aim_makcu_strength)
         self.aim_makcu_smoothing_alpha = tk.DoubleVar(
             value=self._parse_float(settings.aim_makcu_smoothing_alpha, 0.78)
@@ -831,23 +848,34 @@ class DetectorLauncher:
         self._makcu_aim_panel = ttk.Frame(aiming)
         self._makcu_aim_panel.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         self._makcu_aim_panel.columnconfigure(1, weight=1)
-        ttk.Label(self._makcu_aim_panel, text="MAKCU serial device").grid(
+        ttk.Label(self._makcu_aim_panel, text="Tracking mode").grid(
             row=0, column=0, sticky="w", padx=(0, 8)
+        )
+        self._aim_makcu_tracking_mode_combo = ttk.Combobox(
+            self._makcu_aim_panel,
+            textvariable=self.aim_makcu_tracking_mode,
+            values=("stable-body", "direct-head"),
+            state="readonly",
+            width=18,
+        )
+        self._aim_makcu_tracking_mode_combo.grid(row=0, column=1, sticky="w")
+        ttk.Label(self._makcu_aim_panel, text="MAKCU serial device").grid(
+            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         self._aim_makcu_port_entry = ttk.Entry(
             self._makcu_aim_panel,
             textvariable=self.aim_makcu_port,
             width=44,
         )
-        self._aim_makcu_port_entry.grid(row=0, column=1, sticky="ew")
+        self._aim_makcu_port_entry.grid(row=1, column=1, sticky="ew", pady=(8, 0))
         self._aim_makcu_port_browse = ttk.Button(
             self._makcu_aim_panel,
             text="Browse…",
             command=self._browse_aim_makcu_port,
         )
-        self._aim_makcu_port_browse.grid(row=0, column=2, padx=(8, 0))
+        self._aim_makcu_port_browse.grid(row=1, column=2, padx=(8, 0), pady=(8, 0))
         ttk.Label(self._makcu_aim_panel, text="Hold to activate").grid(
-            row=1, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         self._aim_makcu_button_combo = ttk.Combobox(
             self._makcu_aim_panel,
@@ -856,7 +884,7 @@ class DetectorLauncher:
             state="readonly",
             width=12,
         )
-        self._aim_makcu_button_combo.grid(row=1, column=1, sticky="w", pady=(8, 0))
+        self._aim_makcu_button_combo.grid(row=2, column=1, sticky="w", pady=(8, 0))
         self._aim_makcu_button_combo.bind(
             "<<ComboboxSelected>>",
             self._makcu_verification_selection_changed,
@@ -866,32 +894,32 @@ class DetectorLauncher:
             text="Verify Right Mouse…",
             command=self.verify_makcu_activation,
         )
-        self._aim_makcu_verify_button.grid(row=1, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+        self._aim_makcu_verify_button.grid(row=2, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
         ttk.Label(
             self._makcu_aim_panel,
             textvariable=self.aim_makcu_verification_status,
             style="Subtitle.TLabel",
-        ).grid(row=3, column=0, columnspan=3, sticky="w", pady=(8, 0))
+        ).grid(row=5, column=0, columnspan=3, sticky="w", pady=(8, 0))
         ttk.Label(self._makcu_aim_panel, text="Tracking strength").grid(
-            row=2, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         self._aim_makcu_strength_entry = ttk.Entry(
             self._makcu_aim_panel,
             textvariable=self.aim_makcu_strength,
             width=9,
         )
-        self._aim_makcu_strength_entry.grid(row=2, column=1, sticky="w", pady=(8, 0))
+        self._aim_makcu_strength_entry.grid(row=3, column=1, sticky="w", pady=(8, 0))
         ttk.Label(self._makcu_aim_panel, text="Maximum per frame").grid(
-            row=2, column=1, sticky="w", padx=(90, 8), pady=(8, 0)
+            row=3, column=1, sticky="w", padx=(90, 8), pady=(8, 0)
         )
         self._aim_makcu_max_step_entry = ttk.Entry(
             self._makcu_aim_panel,
             textvariable=self.aim_makcu_max_step,
             width=9,
         )
-        self._aim_makcu_max_step_entry.grid(row=2, column=2, sticky="w", pady=(8, 0))
+        self._aim_makcu_max_step_entry.grid(row=3, column=2, sticky="w", pady=(8, 0))
         ttk.Label(self._makcu_aim_panel, text="Smoothing").grid(
-            row=3, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
+            row=4, column=0, sticky="w", padx=(0, 8), pady=(8, 0)
         )
         self._aim_makcu_smoothing_scale = ttk.Scale(
             self._makcu_aim_panel,
@@ -900,12 +928,12 @@ class DetectorLauncher:
             variable=self.aim_makcu_smoothing_alpha,
             command=self._sync_smoothing_label,
         )
-        self._aim_makcu_smoothing_scale.grid(row=3, column=1, sticky="ew", pady=(8, 0))
+        self._aim_makcu_smoothing_scale.grid(row=4, column=1, sticky="ew", pady=(8, 0))
         self._aim_makcu_smoothing_value = ttk.Label(
             self._makcu_aim_panel,
             text=f"{self.aim_makcu_smoothing_alpha.get():.2f}",
         )
-        self._aim_makcu_smoothing_value.grid(row=3, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
+        self._aim_makcu_smoothing_value.grid(row=4, column=2, sticky="w", padx=(8, 0), pady=(8, 0))
 
         self._local_aim_panel = ttk.Frame(aiming)
         self._local_aim_panel.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(8, 0))
@@ -962,6 +990,7 @@ class DetectorLauncher:
             self._aim_invert_y_check,
         ]
         self._makcu_aim_widgets = [
+            self._aim_makcu_tracking_mode_combo,
             self._aim_makcu_port_entry,
             self._aim_makcu_port_browse,
             self._aim_makcu_button_combo,
@@ -1713,7 +1742,7 @@ class DetectorLauncher:
             aim_label=self.aim_label.get().strip(),
             aim_invert_x=self.aim_invert_x.get(),
             aim_invert_y=self.aim_invert_y.get(),
-            aim_head_ratio=AIM_POINT_VALUES.get(self.aim_point.get(), "0.12"),
+            aim_head_ratio=AIM_POINT_VALUES.get(self.aim_point.get(), "0.16"),
             aim_output=AIM_OUTPUT_VALUES.get(self.aim_output.get(), AIM_OUTPUT_MAKCU),
             aim_host=self.aim_host.get().strip(),
             aim_port=self.aim_port.get().strip(),
@@ -1740,6 +1769,12 @@ class DetectorLauncher:
             # both its physical mode and selected immutable profile intact.
             aim_makcu_context=self._loaded.aim_makcu_context,
             aim_makcu_active_profile=self._loaded.aim_makcu_active_profile,
+            aim_makcu_tracking_mode=self._loaded.aim_makcu_tracking_mode,
+            aim_diagnostics=self._loaded.aim_diagnostics,
+            aim_diagnostic_sample_hz=self._loaded.aim_diagnostic_sample_hz,
+            aim_diagnostic_max_duration_seconds=(
+                self._loaded.aim_diagnostic_max_duration_seconds
+            ),
             aim_makcu_verified_port=(
                 self._makcu_verified_port if self._makcu_verification_matches() else ""
             ),

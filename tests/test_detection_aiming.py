@@ -10,11 +10,12 @@ from unittest.mock import patch
 import numpy as np
 
 from aiming.protocol import decode_aim_command
-from aiming.makcu import MakcuTelemetrySnapshot
+from aiming.makcu import MakcuAimConfig, MakcuTelemetrySnapshot
 from aiming.controller import (
     AimActivationSensor,
     AimingController,
     AimConfig,
+    DEFAULT_HEAD_RATIO,
     LOCAL_TARGET_STALE_SECONDS,
     TargetTracker,
     TargetTrackerTelemetrySnapshot,
@@ -28,6 +29,7 @@ from detection.types import Detection
 from main import (
     AimInputTelemetry,
     _aim_status,
+    _aim_detections_safely_distinct_from_uncertain_self,
     _aim_input_telemetry_summary,
     _apply_hard_aim_guard,
     _makcu_telemetry_summary,
@@ -112,6 +114,11 @@ class FailingAimController:
 
 
 class AimingControllerTests(unittest.TestCase):
+    def test_defaults_target_the_head_center_and_stable_makcu_response(self) -> None:
+        self.assertEqual(DEFAULT_HEAD_RATIO, 0.12)
+        self.assertEqual(MakcuAimConfig().strength, 0.50)
+        self.assertEqual(MakcuAimConfig().max_step, 160)
+
     def test_makcu_telemetry_summary_reports_gate_and_real_command_rates(self) -> None:
         previous = MakcuTelemetrySnapshot(
             output_ticks=100,
@@ -124,11 +131,24 @@ class AimingControllerTests(unittest.TestCase):
             emitted_y=10,
             emitted_abs_x=25,
             emitted_abs_y=30,
+            physical_input_reports=5,
+            physical_input_x=-2,
+            physical_input_y=3,
+            physical_input_abs_x=8,
+            physical_input_abs_y=9,
             control_samples=10,
             control_error_abs_x=100.0,
             control_error_abs_y=50.0,
             pursuit_abs_x=20.0,
             pursuit_abs_y=10.0,
+            target_velocity_abs_x_pixels_per_second=1000.0,
+            target_velocity_abs_y_pixels_per_second=500.0,
+            velocity_feedforward_confidence_x=5.0,
+            velocity_feedforward_confidence_y=4.0,
+            pursuit_reserve_abs_x_counts_per_second=200.0,
+            pursuit_reserve_abs_y_counts_per_second=100.0,
+            pursuit_reserve_active_x_samples=2,
+            pursuit_reserve_active_y_samples=1,
             saturated_x_samples=1,
             pursuit_resets=2,
             motion_corroboration_confidence=2.0,
@@ -144,11 +164,24 @@ class AimingControllerTests(unittest.TestCase):
             emitted_y=-190,
             emitted_abs_x=2425,
             emitted_abs_y=1230,
+            physical_input_reports=105,
+            physical_input_x=198,
+            physical_input_y=-97,
+            physical_input_abs_x=408,
+            physical_input_abs_y=209,
             control_samples=60,
             control_error_abs_x=600.0,
             control_error_abs_y=300.0,
             pursuit_abs_x=120.0,
             pursuit_abs_y=60.0,
+            target_velocity_abs_x_pixels_per_second=6000.0,
+            target_velocity_abs_y_pixels_per_second=3000.0,
+            velocity_feedforward_confidence_x=30.0,
+            velocity_feedforward_confidence_y=20.0,
+            pursuit_reserve_abs_x_counts_per_second=1200.0,
+            pursuit_reserve_abs_y_counts_per_second=600.0,
+            pursuit_reserve_active_x_samples=27,
+            pursuit_reserve_active_y_samples=11,
             saturated_x_samples=6,
             pursuit_resets=5,
             motion_corroboration_confidence=32.0,
@@ -164,9 +197,15 @@ class AimingControllerTests(unittest.TestCase):
         self.assertIn("moves 600/s", summary)
         self.assertIn("abs counts X/Y 2400/1200/s", summary)
         self.assertIn("net X/Y +400/-200/s", summary)
+        self.assertIn("physical reports 100/s", summary)
+        self.assertIn("physical abs X/Y 400/200/s", summary)
+        self.assertIn("physical net X/Y +200/-100/s", summary)
         self.assertIn("CTRL samples 50/s", summary)
         self.assertIn("error abs X/Y 10.0/5.0px", summary)
         self.assertIn("pursuit X/Y 120/60 cps", summary)
+        self.assertIn("target velocity X/Y 100/50 px/s", summary)
+        self.assertIn("FF confidence X/Y 50/32%", summary)
+        self.assertIn("reserve X/Y 20/10 cps at 50/20%", summary)
         self.assertIn("motion corroboration 60%", summary)
         self.assertIn("saturation X/Y 10/0%", summary)
         self.assertIn("pursuit resets 3", summary)
@@ -240,6 +279,130 @@ class AimingControllerTests(unittest.TestCase):
         self.assertEqual(result.detections, (opponent,))
         self.assertEqual(result.removed_exact_label_boxes, 1)
         self.assertFalse(result.targetless_after_exact_removal)
+
+    def test_direct_head_obvious_wide_self_guard_keeps_distinct_opponent(self) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        wide_self = Detection(
+            0,
+            "player",
+            0.72,
+            (3.7, 371.3, 765.2, 1078.9),
+        )
+        overlapping_fragment = Detection(
+            0,
+            "player",
+            0.42,
+            (250.0, 420.0, 690.0, 900.0),
+        )
+        opponent = Detection(
+            0,
+            "player",
+            0.48,
+            (903.5, 437.7, 954.1, 522.4),
+        )
+
+        result = _apply_hard_aim_guard(
+            (wide_self, overlapping_fragment, opponent),
+            frame_shape,
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.15,
+            unconfirmed_zone_guard=False,
+            obvious_bottom_shoulder_guard=True,
+        )
+
+        self.assertEqual(result.detections, (opponent,))
+        self.assertEqual(
+            result.removed_detections,
+            (wide_self, overlapping_fragment),
+        )
+        self.assertEqual(result.removed_exact_label_boxes, 2)
+        self.assertFalse(result.targetless_after_exact_removal)
+
+    def test_direct_head_guard_rejects_recorded_edge_clipped_self_avatar(self) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        recorded_self = Detection(
+            0,
+            "player",
+            0.44,
+            (9.6, 346.2, 676.2, 1079.6),
+        )
+
+        result = _apply_hard_aim_guard(
+            (recorded_self,),
+            frame_shape,
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.15,
+            unconfirmed_zone_guard=False,
+            obvious_bottom_shoulder_guard=True,
+        )
+
+        self.assertEqual(result.detections, ())
+        self.assertEqual(result.removed_detections, (recorded_self,))
+        self.assertTrue(result.targetless_after_exact_removal)
+
+    def test_direct_head_obvious_guard_keeps_bottom_opponent_in_mirrored_band(
+        self,
+    ) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        configured_self = Detection(
+            0,
+            "player",
+            0.72,
+            (3.7, 371.3, 765.2, 1078.9),
+        )
+        # These are the two close-opponent geometries that caused physical
+        # control to stop in diagnostic frames 692 and 1619.  Both touch the
+        # bottom inside the mirrored band, while remaining spatially distinct
+        # from the user's configured-left avatar.
+        mirrored_opponents = (
+            Detection(0, "player", 0.58, (884.0, 408.0, 1217.0, 1080.0)),
+            Detection(0, "player", 0.61, (930.0, 305.0, 1230.0, 1080.0)),
+        )
+
+        for opponent in mirrored_opponents:
+            with self.subTest(opponent_box=opponent.xyxy):
+                result = _apply_hard_aim_guard(
+                    (configured_self, opponent),
+                    frame_shape,
+                    self_zone=zone,
+                    aim_label="player",
+                    configured_confidence=0.15,
+                    unconfirmed_zone_guard=False,
+                    obvious_bottom_shoulder_guard=True,
+                )
+
+                self.assertEqual(result.detections, (opponent,))
+                self.assertEqual(result.removed_detections, (configured_self,))
+                self.assertEqual(result.removed_exact_label_boxes, 1)
+                self.assertFalse(result.targetless_after_exact_removal)
+
+    def test_direct_head_obvious_wide_self_only_revokes_prediction_grace(self) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        wide_self = Detection(
+            0,
+            "player",
+            0.72,
+            (3.7, 371.3, 765.2, 1078.9),
+        )
+
+        result = _apply_hard_aim_guard(
+            (wide_self,),
+            frame_shape,
+            self_zone=zone,
+            aim_label="player",
+            configured_confidence=0.15,
+            unconfirmed_zone_guard=False,
+            obvious_bottom_shoulder_guard=True,
+        )
+
+        self.assertEqual(result.detections, ())
+        self.assertTrue(result.targetless_after_exact_removal)
 
     def test_confirmed_self_removal_retains_distinct_in_zone_opponent(self) -> None:
         frame_shape = (1080, 1920, 3)
@@ -330,6 +493,75 @@ class AimingControllerTests(unittest.TestCase):
                 frame_shape,
                 self_exclusion_safe=exclusion.aim_safe,
             )
+        )
+
+    def test_uncertain_wide_self_boxes_do_not_globally_block_distinct_opponent(
+        self,
+    ) -> None:
+        frame_shape = (1080, 1920, 3)
+        zone = NormalizedBottomZone(left=0.18, width=0.34, height=0.10)
+        self_filter = SelfAvatarFilter(zone)
+        acquired_avatar = Detection(
+            0,
+            "player",
+            0.90,
+            (300.0, 450.0, 700.0, 1080.0),
+        )
+        for _ in range(3):
+            self_filter.apply((acquired_avatar,), frame_shape)
+
+        wide_self = Detection(
+            0,
+            "player",
+            0.72,
+            (3.7, 371.3, 745.2, 1074.9),
+        )
+        self_duplicate = Detection(
+            0,
+            "player",
+            0.31,
+            (0.0, 360.0, 720.0, 1080.0),
+        )
+        opponent = Detection(
+            0,
+            "player",
+            0.48,
+            (903.5, 437.7, 954.1, 522.4),
+        )
+        exclusion = self_filter.apply(
+            (wide_self, self_duplicate, opponent),
+            frame_shape,
+        )
+
+        self.assertFalse(exclusion.aim_safe)
+        self.assertEqual(
+            exclusion.uncertain_self_detections,
+            (wide_self, self_duplicate),
+        )
+        safe = _aim_detections_safely_distinct_from_uncertain_self(
+            exclusion.detections,
+            frame_shape,
+            uncertain_self_detections=exclusion.uncertain_self_detections,
+            aim_label="player",
+            configured_confidence=0.15,
+        )
+        self.assertEqual(safe, (opponent,))
+
+        weak_opponent = Detection(
+            0,
+            "player",
+            0.14,
+            opponent.xyxy,
+        )
+        self.assertEqual(
+            _aim_detections_safely_distinct_from_uncertain_self(
+                (wide_self, self_duplicate, weak_opponent),
+                frame_shape,
+                uncertain_self_detections=(wide_self, self_duplicate),
+                aim_label="player",
+                configured_confidence=0.15,
+            ),
+            (),
         )
 
     def test_confirmed_self_refinement_updates_guard_telemetry_exactly(self) -> None:
@@ -647,6 +879,135 @@ class AimingControllerTests(unittest.TestCase):
         self.assertIsNotNone(tracker.update([], (1080, 1920, 3)))
         self.assertIsNotNone(tracker.update([], (1080, 1920, 3)))
         self.assertIsNone(tracker.update([], (1080, 1920, 3)))
+
+    def test_target_tracker_default_grace_keeps_prediction_over_short_detector_gap(
+        self,
+    ) -> None:
+        tracker = TargetTracker(label="person")
+        target = Detection(0, "person", 0.8, (800, 300, 1000, 900))
+        base_ns = 4_000_000_000
+
+        self.assertIs(
+            tracker.update([target], (1080, 1920, 3), measurement_ns=base_ns),
+            target,
+        )
+        tracked = tracker.update(
+            (),
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 80_000_000,
+        )
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertEqual(tracked.class_name, "person")
+
+    def test_same_shape_large_jump_keeps_only_the_bounded_prior_prediction(
+        self,
+    ) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
+        original = Detection(0, "person", 0.9, (700, 250, 900, 850))
+        translated = Detection(0, "person", 0.85, (500, 150, 700, 750))
+        base_ns = 1_200_000_000
+
+        tracker.update([original], (1080, 1920, 3), measurement_ns=base_ns)
+        tracked = tracker.update([translated], (1080, 1920, 3), measurement_ns=base_ns + 8_000_000)
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertEqual(tracked.class_name, "person")
+        self.assertEqual(tracked.xyxy, original.xyxy)
+        self.assertTrue(tracker.output_is_prediction)
+        self.assertIsNone(tracker.accepted_measurement)
+        self.assertEqual(tracker.track_generation, 1)
+
+    def test_large_jump_with_scale_change_cannot_enter_the_existing_identity(
+        self,
+    ) -> None:
+        tracker = TargetTracker(label="person", lost_grace_frames=3)
+        original = Detection(
+            0,
+            "person",
+            0.9,
+            (1087.9192226780735, 645.1689621460064, 1263.6769731462352, 1013.2046410091846),
+        )
+        moved = Detection(
+            0,
+            "person",
+            0.9,
+            (816.3960441645622, 613.5714431638226, 1039.955626712524, 1081.7038726597975),
+        )
+        base_ns = 1_300_000_000
+
+        tracker.update([original], (1080, 1920, 3), measurement_ns=base_ns)
+        tracked = tracker.update([moved], (1080, 1920, 3), measurement_ns=base_ns + 8_000_000)
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertEqual(tracked.class_name, "person")
+        self.assertEqual(tracked.xyxy, original.xyxy)
+        self.assertTrue(tracker.output_is_prediction)
+        self.assertIsNone(tracker.accepted_measurement)
+        self.assertEqual(tracker.track_generation, 1)
+
+    def test_alternating_far_rivals_never_confirm_and_prediction_expires(
+        self,
+    ) -> None:
+        tracker = TargetTracker(
+            label="person",
+            lost_grace_frames=3,
+            reacquire_confirmations=2,
+        )
+        original = Detection(0, "person", 0.9, (800, 250, 1000, 850))
+        left_rival = Detection(0, "person", 0.9, (150, 250, 350, 850))
+        right_rival = Detection(0, "person", 0.9, (1500, 250, 1700, 850))
+        base_ns = 1_400_000_000
+
+        self.assertIs(
+            tracker.update(
+                [original],
+                (1080, 1920, 3),
+                measurement_ns=base_ns,
+            ),
+            original,
+        )
+        for elapsed_ns, rival in (
+            (8_000_000, left_rival),
+            (16_000_000, right_rival),
+            (32_000_000, left_rival),
+            (49_000_000, right_rival),
+        ):
+            with self.subTest(elapsed_ns=elapsed_ns):
+                tracked = tracker.update(
+                    [rival],
+                    (1080, 1920, 3),
+                    measurement_ns=base_ns + elapsed_ns,
+                )
+                self.assertIsNotNone(tracked)
+                assert tracked is not None
+                self.assertEqual(tracked.xyxy, original.xyxy)
+                self.assertTrue(tracker.output_is_prediction)
+                self.assertIsNone(tracker.accepted_measurement)
+                self.assertEqual(tracker.track_generation, 1)
+
+        expired = tracker.update(
+            [left_rival],
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 51_000_000,
+        )
+        self.assertIsNone(expired)
+        self.assertFalse(tracker.output_is_prediction)
+        self.assertIsNone(tracker.accepted_measurement)
+        self.assertEqual(tracker.track_generation, 1)
+
+        reacquired = tracker.update(
+            [left_rival],
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 60_000_000,
+        )
+        self.assertIs(reacquired, left_rival)
+        self.assertFalse(tracker.output_is_prediction)
+        self.assertIs(tracker.accepted_measurement, left_rival)
+        self.assertEqual(tracker.track_generation, 2)
 
     def test_target_tracker_reset_drops_stale_target_immediately(self) -> None:
         tracker = TargetTracker(label="person")
@@ -1111,7 +1472,7 @@ class AimingControllerTests(unittest.TestCase):
         )
         self.assertEqual(tracker.track_generation, 3)
 
-    def test_prediction_grace_does_not_replace_an_incompatible_detection(self) -> None:
+    def test_prediction_grace_keeps_old_identity_until_replacement_confirms(self) -> None:
         tracker = TargetTracker(label="person", lost_grace_frames=3)
         original = Detection(0, "person", 0.8, (200, 300, 400, 900))
         incompatible = Detection(0, "person", 0.9, (1200, 300, 1400, 900))
@@ -1119,13 +1480,27 @@ class AimingControllerTests(unittest.TestCase):
 
         tracker.update([original], (1080, 1920, 3), measurement_ns=base_ns)
 
-        self.assertIsNone(
-            tracker.update(
-                [incompatible],
-                (1080, 1920, 3),
-                measurement_ns=base_ns + 8_000_000,
-            )
+        pending = tracker.update(
+            [incompatible],
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 8_000_000,
         )
+        self.assertIsNotNone(pending)
+        assert pending is not None
+        self.assertEqual(pending.xyxy, original.xyxy)
+        self.assertTrue(tracker.output_is_prediction)
+        self.assertIsNone(tracker.accepted_measurement)
+        self.assertEqual(tracker.track_generation, 1)
+
+        replacement = tracker.update(
+            [incompatible],
+            (1080, 1920, 3),
+            measurement_ns=base_ns + 16_000_000,
+        )
+        self.assertIsNotNone(replacement)
+        self.assertIs(tracker.accepted_measurement, incompatible)
+        self.assertFalse(tracker.output_is_prediction)
+        self.assertEqual(tracker.track_generation, 2)
 
     def test_target_tracker_counts_one_loss_per_contiguous_missing_interval(self) -> None:
         tracker = TargetTracker(label="person", lost_grace_frames=0)
@@ -1268,6 +1643,100 @@ class AimingControllerTests(unittest.TestCase):
         self.assertEqual(telemetry.output_samples, 2)
         self.assertEqual(telemetry.compared_samples, 2)
         self.assertEqual(telemetry.target_loss_transitions, 1)
+
+    def test_target_tracker_accepts_physically_bounded_fast_target_motion(self) -> None:
+        tracker = TargetTracker(label="person")
+        original = Detection(0, "person", 0.9, (700, 250, 900, 850))
+        fast_moved = Detection(0, "person", 0.9, (780, 270, 980, 870))
+
+        tracker.update(
+            [original],
+            (1080, 1920, 3),
+            measurement_ns=1_000_000_000,
+        )
+
+        tracked = tracker.update(
+            [fast_moved],
+            (1080, 1920, 3),
+            measurement_ns=1_033_000_000,
+        )
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertEqual(tracked.confidence, fast_moved.confidence)
+        self.assertGreater(head_target_point(tracked)[0], 800.0)
+        self.assertIs(tracker.accepted_measurement, fast_moved)
+        self.assertFalse(tracker.output_is_prediction)
+
+    def test_target_tracker_does_not_merge_two_trace_lookalikes_by_shape(
+        self,
+    ) -> None:
+        tracker = TargetTracker(label="person")
+        original = Detection(0, "person", 0.9, (700, 522, 748, 590))
+        lookalike = Detection(0, "person", 0.9, (928, 532, 960, 594))
+
+        tracker.update(
+            [original],
+            (1080, 1920, 3),
+            measurement_ns=1_000_000_000,
+        )
+
+        tracked = tracker.update(
+            [lookalike],
+            (1080, 1920, 3),
+            measurement_ns=1_025_000_000,
+        )
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertEqual(tracked.xyxy, original.xyxy)
+        self.assertIsNone(tracker.accepted_measurement)
+        self.assertTrue(tracker.output_is_prediction)
+        self.assertEqual(tracker.track_generation, 1)
+
+    def test_long_gap_cannot_transfer_identity_across_latest_live_trace(self) -> None:
+        tracker = TargetTracker(label="player", lost_grace_frames=8)
+        established = Detection(
+            0,
+            "player",
+            0.3150913417339325,
+            (
+                990.6987915039062,
+                825.56494140625,
+                1046.15185546875,
+                896.5801391601562,
+            ),
+        )
+        distant_after_gap = Detection(
+            0,
+            "player",
+            0.2700393497943878,
+            (
+                819.1795654296875,
+                499.78009033203125,
+                863.1709594726562,
+                572.0420532226562,
+            ),
+        )
+        base_ns = 339_444_403_615_270
+        tracker.update(
+            [established],
+            (1080, 1920, 3),
+            measurement_ns=base_ns,
+        )
+
+        tracked = tracker.update(
+            [distant_after_gap],
+            (1080, 1920, 3),
+            measurement_ns=339_444_507_736_676,
+        )
+
+        self.assertIsNotNone(tracked)
+        assert tracked is not None
+        self.assertEqual(tracked.xyxy, established.xyxy)
+        self.assertTrue(tracker.output_is_prediction)
+        self.assertIsNone(tracker.accepted_measurement)
+        self.assertEqual(tracker.track_generation, 1)
 
     def test_target_tracker_association_keeps_exact_identity_over_confidence(self) -> None:
         tracker = TargetTracker(label="person")

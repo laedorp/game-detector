@@ -907,20 +907,56 @@ class MakcuCalibrationSession:
             self.config.held_session_timeout_seconds * 1_000_000_000
         ):
             return self._abort(now, "held calibration session exceeded its deadline")
-        rejection = self._observation_rejection(observation, now)
+        if observation is None and self.state in (
+            CalibrationSessionState.PULSE,
+            CalibrationSessionState.RESPONSE_SETTLE,
+        ):
+            if self._current is not None and self.state is CalibrationSessionState.PULSE:
+                try:
+                    snapshot = self.controller.calibration_snapshot()
+                    self._accept_snapshot(
+                        snapshot,
+                        snapshot.captured_ns,
+                        require_active=True,
+                    )
+                except Exception as exc:
+                    return self._abort(now, f"invalid calibration snapshot: {exc}")
+                if snapshot.abort_reason:
+                    return self._abort(now, f"controller aborted: {snapshot.abort_reason}")
+                if snapshot.pending_counts:
+                    return self.status()
+                return self._advance_pulse(now, snapshot)
+            if now > self._settle_deadline_ns:
+                return self._abort(now, "stationary response did not settle before timeout")
+            return self.status()
+        rejection = self._observation_rejection(
+            observation,
+            now,
+            lenient_roi=self.state
+            in (
+                CalibrationSessionState.BASELINE_SETTLE,
+                CalibrationSessionState.PULSE,
+                CalibrationSessionState.RESPONSE_SETTLE,
+            ),
+        )
         if rejection is not None:
             return self._abort(now, rejection)
         assert observation is not None and self._token is not None
         if self._target_identity != observation.target_identity:
             return self._abort(now, "the unique target identity changed")
-        if self._target_bbox is None or not _target_bbox_is_continuous(
-            self._target_bbox,
-            observation.normalized_bbox,
+        if self.state not in (
+            CalibrationSessionState.BASELINE_SETTLE,
+            CalibrationSessionState.PULSE,
+            CalibrationSessionState.RESPONSE_SETTLE,
         ):
-            return self._abort(
-                now,
-                "the unique target bounding box changed discontinuously",
-            )
+            if self._target_bbox is None or not _target_bbox_is_continuous(
+                self._target_bbox,
+                observation.normalized_bbox,
+            ):
+                return self._abort(
+                    now,
+                    "the unique target bounding box changed discontinuously",
+                )
         if (
             self._last_measurement_ns is not None
             and observation.measurement_ns <= self._last_measurement_ns
@@ -1112,7 +1148,11 @@ class MakcuCalibrationSession:
     ) -> CalibrationSessionStatus:
         """Authorize the first hold only after its release proof is complete."""
 
-        reason = self._observation_rejection(observation, now_ns)
+        reason = self._observation_rejection(
+            observation,
+            now_ns,
+            lenient_roi=True,
+        )
         if reason is not None:
             self.message = (
                 "Keep holding activation; waiting for one safe exact target "
@@ -1207,6 +1247,8 @@ class MakcuCalibrationSession:
         self,
         observation: CalibrationObservation | None,
         now_ns: int,
+        *,
+        lenient_roi: bool = False,
     ) -> str | None:
         if observation is None:
             return "no exact target observation was available"
@@ -1229,15 +1271,16 @@ class MakcuCalibrationSession:
             return "target confidence is below the calibration threshold"
         if observation.target_identity == "":
             return "target identity is empty"
-        if not target_within_safe_roi(
-            observation.normalized_bbox,
-            self.config.safe_roi_margin_ratio,
-        ):
-            return "the complete target box is outside the central safe ROI"
-        if max(abs(observation.error_x), abs(observation.error_y)) > (
-            self.config.maximum_reference_error
-        ):
-            return "target aim point is outside the central error envelope"
+        if not lenient_roi:
+            if not target_within_safe_roi(
+                observation.normalized_bbox,
+                self.config.safe_roi_margin_ratio,
+            ):
+                return "the complete target box is outside the central safe ROI"
+            if max(abs(observation.error_x), abs(observation.error_y)) > (
+                self.config.maximum_reference_error
+            ):
+                return "target aim point is outside the central error envelope"
         return None
 
     def _accept_snapshot(
@@ -1482,11 +1525,19 @@ class MakcuCalibrationSession:
             and snapshot.emitted_abs_counts + 2 * self._amplitude
             > CALIBRATION_MAX_SESSION_ABS_COUNTS
         ):
-            return self._abort(
-                now_ns,
-                "bounded calibration budget cannot fit another complete symmetric "
-                f"{axis.upper()} pair at {self._amplitude} counts",
-            )
+            remaining_pair_budget = (
+                CALIBRATION_MAX_SESSION_ABS_COUNTS - snapshot.emitted_abs_counts
+            ) // 2
+            if remaining_pair_budget <= 0:
+                return self._abort(
+                    now_ns,
+                    "bounded calibration budget cannot fit another complete symmetric "
+                    f"{axis.upper()} pair at {self._amplitude} counts",
+                )
+            if remaining_pair_budget < self._amplitude:
+                self._amplitude = remaining_pair_budget
+                self._qualifying[axis] = {1: 0, -1: 0}
+                self._qualifying_amplitude[axis] = remaining_pair_budget
         polarity = self._next_polarities.pop(0)
         if snapshot.emitted_abs_counts + self._amplitude > (
             CALIBRATION_MAX_SESSION_ABS_COUNTS

@@ -59,7 +59,7 @@ SELF_POSITION_GEOMETRY = {
 # A settings file records the preset key rather than paths into a particular
 # checkout/PyInstaller extraction directory, so its model and labels always move
 # together.
-SETTINGS_VERSION = 11
+SETTINGS_VERSION = 12
 
 MODEL_PRESET_FORT_PLAYER_BALANCED = "fort_player_balanced"
 MODEL_PRESET_FORT_PLAYER_BALANCED_INT8 = "fort_player_balanced_int8"
@@ -367,7 +367,7 @@ class LauncherSettings:
     camera_index: str = "0"
     capture_width: str = "1280"
     capture_height: str = "720"
-    capture_fps: str = "60"
+    capture_fps: str = "120"
     capture_format: str = ""
     capture_rotate_180: bool = False
     screen_monitor: str = "1"
@@ -376,7 +376,7 @@ class LauncherSettings:
     screen_y: str = "0"
     screen_width: str = "1920"
     screen_height: str = "1080"
-    screen_fps: str = "60"
+    screen_fps: str = "120"
     # Empty is an initialization sentinel: no paths means the fresh bundled
     # preset, while explicitly supplied paths mean a custom model.  Every live
     # LauncherSettings instance is normalized to a semantic key in
@@ -407,7 +407,7 @@ class LauncherSettings:
     self_position: str = SELF_POSITION_LEFT
     preview: bool = True
     draw: bool = True
-    preview_fps: str = "15"
+    preview_fps: str = "30"
     aim: bool = False
     aim_label: str = ""
     aim_invert_x: bool = False
@@ -419,12 +419,16 @@ class LauncherSettings:
     aim_pairing_key: str = field(default_factory=lambda: secrets.token_hex(16))
     aim_makcu_port: str = ""
     aim_makcu_button: str = "1"
-    aim_makcu_strength: str = "0.5"
+    aim_makcu_strength: str = "0.50"
     aim_makcu_max_step: str = "160"
     aim_makcu_smoothing_alpha: str = "0.78"
     aim_makcu_prediction_lead_seconds: str = "0.03"
     aim_makcu_derivative_damping_seconds: str = "0.008"
     aim_makcu_vertical_rate_ratio: str = "0.48"
+    aim_makcu_tracking_mode: str = "stable-body"
+    aim_diagnostics: bool = True
+    aim_diagnostic_sample_hz: str = "20"
+    aim_diagnostic_max_duration_seconds: str = "30"
     aim_makcu_context: str = "hip"
     aim_makcu_active_profile: str = ""
     aim_makcu_verified_port: str = ""
@@ -768,18 +772,20 @@ class LauncherSettings:
             )
             if not self.draw:
                 args.append("--no-draw")
-        if self.aim:
-            if self.model_preset in {
-                MODEL_PRESET_COCO_HIGH,
-                MODEL_PRESET_COCO_BALANCED,
-                MODEL_PRESET_COCO,
-            }:
-                raise SettingsError(
-                    "The bundled COCO models are generic and are not validated "
-                    "for clone-player aim output. Choose "
-                    f"{_MODEL_PRESETS_BY_KEY[DEFAULT_MODEL_PRESET].label!r} or Fast 320 "
-                    "before enabling aim output."
-                )
+        aim_enabled = self.aim
+        if aim_enabled and self.model_preset in {
+            MODEL_PRESET_COCO_HIGH,
+            MODEL_PRESET_COCO_BALANCED,
+            MODEL_PRESET_COCO,
+        }:
+            print(
+                "Warning: the selected COCO model is generic and is not "
+                "validated for clone-player aim output; launching detection-only "
+                "instead.",
+                file=sys.stderr,
+            )
+            aim_enabled = False
+        if aim_enabled:
             aim_label = self.aim_label.strip()
             if not aim_label:
                 raise SettingsError(
@@ -858,10 +864,41 @@ class LauncherSettings:
                             "MAKCU vertical cap",
                             1.0,
                         ),
+                        "--aim-makcu-tracking-mode",
+                        _choice(
+                            self.aim_makcu_tracking_mode,
+                            ("stable-body", "direct-head"),
+                            "MAKCU tracking mode",
+                        ),
                         "--aim-calibration-context",
                         _launcher_aim_context_text(self.aim_makcu_context),
                     )
                 )
+                if self.aim_diagnostics:
+                    state_root = Path(
+                        os.environ.get(
+                            "XDG_STATE_HOME",
+                            str(Path.home() / ".local" / "state"),
+                        )
+                    )
+                    args.extend(
+                        (
+                            "--aim-diagnostic-dir",
+                            str(state_root / "proaim" / "diagnostics"),
+                            "--aim-diagnostic-sample-hz",
+                            _bounded_positive_float_text(
+                                self.aim_diagnostic_sample_hz,
+                                "aim diagnostic sample rate",
+                                60.0,
+                            ),
+                            "--aim-diagnostic-max-duration-seconds",
+                            _bounded_positive_float_text(
+                                self.aim_diagnostic_max_duration_seconds,
+                                "aim diagnostic duration",
+                                300.0,
+                            ),
+                        )
+                    )
                 active_profile_text = self.aim_makcu_active_profile.strip()
                 if active_profile_text:
                     active_profile = _existing_non_symlink_file(

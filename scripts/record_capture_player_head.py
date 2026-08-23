@@ -641,7 +641,10 @@ def record_session(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description=__doc__)
+    try:
+        parser = argparse.ArgumentParser(description=__doc__, color=False)
+    except TypeError:
+        parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--range", dest="range_label", choices=RANGE_LABELS, required=True)
     parser.add_argument("--motion", choices=MOTION_LABELS, required=True)
     parser.add_argument(

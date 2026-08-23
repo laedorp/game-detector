@@ -196,6 +196,38 @@ class LauncherSettingsTests(unittest.TestCase):
                 capture_format="not-a-fourcc",
             ).detector_arguments()
 
+    def test_makcu_tracking_mode_defaults_to_stable_body(self) -> None:
+        args = parse_args(
+            [
+                "--aim",
+                "--aim-label",
+                "player",
+                "--ignore-self",
+                "--aim-output",
+                "makcu",
+                "--aim-makcu-port",
+                "/dev/ttyACM0",
+            ]
+        )
+        self.assertEqual(args.aim_makcu_tracking_mode, "stable-body")
+
+    def test_makcu_tracking_mode_can_select_direct_head(self) -> None:
+        args = parse_args(
+            [
+                "--aim",
+                "--aim-label",
+                "player",
+                "--ignore-self",
+                "--aim-output",
+                "makcu",
+                "--aim-makcu-port",
+                "/dev/ttyACM0",
+                "--aim-makcu-tracking-mode",
+                "direct-head",
+            ]
+        )
+        self.assertEqual(args.aim_makcu_tracking_mode, "direct-head")
+
     def test_preview_rate_is_bounded_without_throttling_detection(self) -> None:
         args = self.settings(preview=True, preview_fps="30").detector_arguments()
 
@@ -270,15 +302,15 @@ class LauncherSettingsTests(unittest.TestCase):
 
     def test_bundled_generic_models_cannot_drive_clone_aim_output(self) -> None:
         for preset in ("coco_high", "coco_balanced", "coco"):
-            with self.subTest(preset=preset), self.assertRaisesRegex(
-                SettingsError, "generic.*not validated"
-            ):
-                self.settings(
+            with self.subTest(preset=preset):
+                args = self.settings(
                     model_preset=preset,
                     aim=True,
                     aim_label="person",
                     ignore_self=True,
                 ).detector_arguments()
+                self.assertNotIn("--aim", args)
+                self.assertNotIn("--aim-output", args)
 
     def test_remote_aim_is_rejected_until_a_safe_receiver_exists(self) -> None:
         with self.assertRaisesRegex(SettingsError, "Remote aim output is unavailable"):
@@ -332,6 +364,10 @@ class LauncherSettingsTests(unittest.TestCase):
         self.assertEqual(
             args[args.index("--aim-makcu-vertical-rate-ratio") + 1],
             "0.63",
+        )
+        self.assertEqual(
+            args[args.index("--aim-makcu-tracking-mode") + 1],
+            "stable-body",
         )
         self.assertEqual(
             args[args.index("--aim-calibration-context") + 1],

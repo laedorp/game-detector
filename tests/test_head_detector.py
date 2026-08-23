@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import json
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -10,6 +11,7 @@ import numpy as np
 
 from detection.base import OutputDecodeError
 from detection.head_detector import (
+    DIRECT_HEAD_RUNTIME_MANIFEST_ENV,
     DEFAULT_HEAD_CONFIDENCE,
     HEAD_CLASS_ID,
     HEAD_OUTPUT_CANDIDATES,
@@ -18,6 +20,7 @@ from detection.head_detector import (
     PINNED_HEAD_MODEL_RELATIVE_PATH,
     PLAYER_CLASS_ID,
     DirectHeadLocalizer,
+    HeadModelSpec,
     HeadAssociationOutcome,
     HeadCandidate,
     HeadCropTransform,
@@ -27,6 +30,7 @@ from detection.head_detector import (
     plan_head_crop,
     pinned_head_model_path,
     prepare_head_input,
+    runtime_head_model_spec,
     verify_pinned_head_model,
 )
 from detection.head_worker import HeadLocalizationReason
@@ -186,6 +190,44 @@ class PinnedHeadModelTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "SHA-256 mismatch"):
                     verify_pinned_head_model(path)
 
+    def test_runtime_override_manifest_resolves_verified_contract(self) -> None:
+        payload = b"override-head-model"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            model = root / "override.onnx"
+            model.write_bytes(payload)
+            import hashlib
+
+            manifest = root / "runtime-head.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "model": str(model),
+                        "model_size_bytes": len(payload),
+                        "model_sha256": hashlib.sha256(payload).hexdigest(),
+                        "input_shape_nchw": [1, 3, 640, 640],
+                        "output_shape": [1, 6, 8400],
+                        "model_name": "Nightly head 640",
+                        "evidence_label": "Nightly head box",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {DIRECT_HEAD_RUNTIME_MANIFEST_ENV: str(manifest)},
+                clear=False,
+            ):
+                spec = runtime_head_model_spec(root)
+
+        self.assertIsInstance(spec, HeadModelSpec)
+        self.assertEqual(spec.path, model)
+        self.assertEqual(spec.input_shape, (1, 3, 640, 640))
+        self.assertEqual(spec.output_shape, (1, 6, 8400))
+        self.assertEqual(spec.model_name, "Nightly head 640")
+        self.assertEqual(spec.evidence_label, "Nightly head box")
+        self.assertEqual(spec.confidence_threshold, 0.15)
+
 
 class HeadDecoderTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -220,7 +262,7 @@ class HeadDecoderTests(unittest.TestCase):
         self.assertTrue(np.allclose(decoded[1].box, (120, 70, 320, 350)))
 
     def test_default_threshold_is_selected_safe_recall_floor(self) -> None:
-        self.assertEqual(DEFAULT_HEAD_CONFIDENCE, 0.25)
+        self.assertEqual(DEFAULT_HEAD_CONFIDENCE, 0.15)
         output = model_output(((80, 30, 120, 70), 0.01, 0.27))
 
         decoded = decode_head_output(output, self.transform)
@@ -230,7 +272,7 @@ class HeadDecoderTests(unittest.TestCase):
         self.assertAlmostEqual(decoded[0].confidence, 0.27, places=6)
         self.assertEqual(
             decode_head_output(
-                model_output(((80, 30, 120, 70), 0.01, 0.24)),
+                model_output(((80, 30, 120, 70), 0.01, 0.14)),
                 self.transform,
             ),
             [],
@@ -251,9 +293,26 @@ class HeadDecoderTests(unittest.TestCase):
             [(PLAYER_CLASS_ID, 0.92), (HEAD_CLASS_ID, 0.90)],
         )
 
+    def test_dense_player_rows_cannot_starve_a_valid_head_candidate(self) -> None:
+        output = np.zeros((1, 6, HEAD_OUTPUT_CANDIDATES), dtype=np.float32)
+        for index in range(200):
+            x = 2.0 + (index % 16) * 19.0
+            y = 2.0 + (index // 16) * 19.0
+            output[0, :, index] = (x, y, 2, 2, 0.99, 0.01)
+        output[0, :, 500] = (100, 50, 40, 40, 0.01, 0.80)
+
+        decoded = decode_head_output(output, self.transform)
+
+        self.assertTrue(
+            any(
+                item.class_id == HEAD_CLASS_ID and item.row_index == 500
+                for item in decoded
+            )
+        )
+
     def test_low_nonfinite_impossible_and_out_of_crop_rows_are_skipped(self) -> None:
         output = model_output(
-            ((10, 10, 30, 30), 0.01, 0.24),
+            ((10, 10, 30, 30), 0.01, 0.14),
             ((30, 30, 50, 50), 0.01, 0.90),
             ((60, 60, 60, 80), 0.01, 0.95),
             ((-40, 10, -20, 30), 0.01, 0.95),
@@ -265,7 +324,7 @@ class HeadDecoderTests(unittest.TestCase):
 
     def test_wrong_or_ambiguous_output_contract_is_rejected(self) -> None:
         outputs = (
-            np.zeros((1, 6, 2099), dtype=np.float32),
+            np.zeros((1, 5, 2100), dtype=np.float32),
             np.zeros((1, 2100, 6), dtype=np.float32),
             np.zeros((6, 2100), dtype=np.float32),
             np.full((1, 6, 2100), "x", dtype="<U1"),
@@ -409,6 +468,157 @@ class HeadAssociationTests(unittest.TestCase):
             HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
         )
         self.assertIsNone(outcome.localization)
+
+    def test_nested_multiscale_secondary_pair_supports_one_head(self) -> None:
+        target = (100.0, 100.0, 200.0, 300.0)
+        full_scale = candidate(
+            target,
+            0.90,
+            class_id=PLAYER_CLASS_ID,
+            row_index=30,
+        )
+        nested_scale = candidate(
+            (110.0, 120.0, 190.0, 220.0),
+            0.80,
+            class_id=PLAYER_CLASS_ID,
+            row_index=31,
+        )
+        sole_head = candidate(
+            (135.0, 125.0, 165.0, 150.0),
+            0.75,
+            row_index=32,
+        )
+
+        outcome = associate_head_to_player_outcome(
+            [full_scale, nested_scale, sole_head],
+            target,
+            source_timestamp_ns=33,
+        )
+
+        self.assertIs(outcome.reason, HeadLocalizationReason.LOCALIZED)
+        assert outcome.localization is not None
+        self.assertEqual(outcome.localization.point, (150.0, 137.5))
+        self.assertEqual(outcome.localization.supporting_player_index, 0)
+
+    def test_nested_secondary_pair_requires_both_boxes_to_support_head(self) -> None:
+        target = (100.0, 100.0, 200.0, 300.0)
+        full_scale = candidate(
+            target,
+            0.90,
+            class_id=PLAYER_CLASS_ID,
+            row_index=33,
+        )
+        nested_scale = candidate(
+            (110.0, 120.0, 190.0, 220.0),
+            0.80,
+            class_id=PLAYER_CLASS_ID,
+            row_index=34,
+        )
+        head_outside_nested = candidate(
+            (101.0, 125.0, 108.0, 150.0),
+            0.75,
+            row_index=35,
+        )
+
+        outcome = associate_head_to_player_outcome(
+            [full_scale, nested_scale, head_outside_nested],
+            target,
+            source_timestamp_ns=36,
+        )
+
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
+        )
+        self.assertIsNone(outcome.localization)
+
+    def test_three_nested_secondary_players_remain_ambiguous(self) -> None:
+        target = (100.0, 100.0, 200.0, 300.0)
+        players = [
+            candidate(
+                target,
+                0.90,
+                class_id=PLAYER_CLASS_ID,
+                row_index=40,
+            ),
+            candidate(
+                (110.0, 120.0, 190.0, 220.0),
+                0.80,
+                class_id=PLAYER_CLASS_ID,
+                row_index=41,
+            ),
+            candidate(
+                (111.0, 121.0, 189.0, 219.0),
+                0.70,
+                class_id=PLAYER_CLASS_ID,
+                row_index=42,
+            ),
+        ]
+        sole_head = candidate(
+            (135.0, 125.0, 165.0, 150.0),
+            0.75,
+            row_index=43,
+        )
+
+        outcome = associate_head_to_player_outcome(
+            [*players, sole_head],
+            target,
+            source_timestamp_ns=44,
+        )
+
+        self.assertIs(
+            outcome.reason,
+            HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
+        )
+        self.assertIsNone(outcome.localization)
+
+    def test_nested_secondary_pair_enforces_every_geometric_boundary(self) -> None:
+        target = (100.0, 100.0, 200.0, 300.0)
+        sole_head = candidate(
+            (135.0, 140.0, 165.0, 160.0),
+            0.75,
+            row_index=50,
+        )
+        invalid_pairs = {
+            # Nested area ratio/IoU is 0.35, just below the 0.36 floor.
+            "iou": (
+                target,
+                (115.0, 120.0, 185.0, 220.0),
+            ),
+            # Both boxes move together, but one overlaps only 89% of the
+            # primary's smaller area.
+            "primary-overlap": (
+                (89.0, 100.0, 189.0, 300.0),
+                (99.0, 120.0, 179.0, 220.0),
+            ),
+            # A nested box whose top is more than 0.18 target heights away.
+            "top-offset": (
+                target,
+                (110.0, 137.0, 190.0, 237.0),
+            ),
+        }
+
+        for label, boxes in invalid_pairs.items():
+            with self.subTest(label=label):
+                players = [
+                    candidate(
+                        box,
+                        0.90 - index * 0.10,
+                        class_id=PLAYER_CLASS_ID,
+                        row_index=51 + index,
+                    )
+                    for index, box in enumerate(boxes)
+                ]
+                outcome = associate_head_to_player_outcome(
+                    [*players, sole_head],
+                    target,
+                    source_timestamp_ns=53,
+                )
+                self.assertIs(
+                    outcome.reason,
+                    HeadLocalizationReason.MULTIPLE_MATCHING_SECONDARY_PLAYERS,
+                )
+                self.assertIsNone(outcome.localization)
 
     def test_outcome_reports_head_unsupported_by_matched_player(self) -> None:
         supporting_player = candidate(
@@ -700,7 +910,7 @@ class DirectHeadLocalizerTests(unittest.TestCase):
 
     def test_malformed_inference_output_is_not_hidden_by_a_fallback(self) -> None:
         localizer = DirectHeadLocalizer(
-            lambda _tensor: np.zeros((1, 6, 100), dtype=np.float32)
+            lambda _tensor: np.zeros((1, 5, 100), dtype=np.float32)
         )
         frame = np.zeros((200, 200, 3), dtype=np.uint8)
 

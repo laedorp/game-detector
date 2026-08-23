@@ -46,7 +46,7 @@ class DirectHeadAnchorTests(unittest.TestCase):
         self.assertEqual(sample.point, self.head)
         self.assertEqual(sample.source_timestamp_ns, 100 * NS_PER_MS)
         self.assertEqual(sample.direct_source_timestamp_ns, 100 * NS_PER_MS)
-        self.assertEqual(sample.identity_deadline_ns, 300 * NS_PER_MS)
+        self.assertEqual(sample.identity_deadline_ns, 850 * NS_PER_MS)
         self.assertEqual(sample.track_generation, 4)
         self.assertIs(sample.provenance, DirectHeadProvenance.DIRECT)
         self.assertFalse(sample.body_derived)
@@ -81,7 +81,10 @@ class DirectHeadAnchorTests(unittest.TestCase):
         self.assertTrue(mapped.body_derived)
         self.assertTrue(mapped.primary_observed)
         self.assertFalse(mapped.motion_corroboration_permitted)
-        self.assertAlmostEqual(mapped.confidence, 0.64)
+        self.assertAlmostEqual(
+            mapped.confidence,
+            0.80 * (1.0 - 40.0 / 750.0),
+        )
 
     def test_isolated_direct_jitter_is_rejected_by_rolling_median(self) -> None:
         normalized_points = (
@@ -143,7 +146,7 @@ class DirectHeadAnchorTests(unittest.TestCase):
                 sample.direct_source_timestamp_ns,
                 100 * NS_PER_MS,
             )
-            self.assertEqual(sample.identity_deadline_ns, 300 * NS_PER_MS)
+            self.assertEqual(sample.identity_deadline_ns, 850 * NS_PER_MS)
 
         self.assertEqual(points[0], (270.0, 222.0))
         self.assertEqual(points[-1], (570.0, 522.0))
@@ -152,27 +155,27 @@ class DirectHeadAnchorTests(unittest.TestCase):
             100 * NS_PER_MS,
         )
 
-    def test_body_mapping_expires_at_two_hundred_ms_without_direct_renewal(
+    def test_body_mapping_expires_at_seven_hundred_fifty_ms_without_direct_renewal(
         self,
     ) -> None:
-        self.assertEqual(DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS, 0.200)
+        self.assertEqual(DIRECT_HEAD_ANCHOR_MAX_AGE_SECONDS, 0.750)
         self.seed()
         before = self.anchor.map_primary(
             self.body,
             track_generation=4,
-            source_timestamp_ns=299 * NS_PER_MS,
+            source_timestamp_ns=849 * NS_PER_MS,
             primary_observed=True,
         )
         expired = self.anchor.map_primary(
             self.body,
             track_generation=4,
-            source_timestamp_ns=300 * NS_PER_MS,
+            source_timestamp_ns=850 * NS_PER_MS,
             primary_observed=True,
         )
 
         self.assertIsNotNone(before)
         assert before is not None
-        self.assertAlmostEqual(before.confidence, 0.004)
+        self.assertAlmostEqual(before.confidence, 0.80 / 750.0)
         self.assertIsNone(expired)
         self.assertFalse(self.anchor.active)
         self.assertIsNone(self.anchor.identity_deadline_ns)
@@ -194,7 +197,7 @@ class DirectHeadAnchorTests(unittest.TestCase):
         expired = self.anchor.map_primary(
             (130.0, 115.0, 330.0, 715.0),
             track_generation=4,
-            source_timestamp_ns=300 * NS_PER_MS,
+            source_timestamp_ns=850 * NS_PER_MS,
             primary_observed=False,
         )
 
@@ -207,7 +210,7 @@ class DirectHeadAnchorTests(unittest.TestCase):
             )
             self.assertFalse(sample.primary_observed)
             self.assertFalse(sample.motion_corroboration_permitted)
-            self.assertEqual(sample.identity_deadline_ns, 300 * NS_PER_MS)
+            self.assertEqual(sample.identity_deadline_ns, 850 * NS_PER_MS)
             self.assertEqual(
                 sample.direct_source_timestamp_ns,
                 100 * NS_PER_MS,

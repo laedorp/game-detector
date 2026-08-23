@@ -171,6 +171,21 @@ class CaptureSource(ABC):
             self._frames_delivered += 1
             return packet
 
+    def peek_latest(self) -> FramePacket | None:
+        """Return the pending live packet without consuming the mailbox.
+
+        The returned packet remains immutable as a packet record, and live
+        backends publish a newly owned image for every capture.  This narrow
+        snapshot lets a latency-sensitive consumer inspect the frame captured
+        while it was processing an older packet without changing delivery or
+        overwrite accounting.  Synchronous sources simply have no pending
+        live packet and return ``None``.
+        """
+
+        self._require_started()
+        with self._condition:
+            return self._latest_packet
+
     def _record_direct_delivery(self) -> None:
         """Record a successful synchronous file read and delivery."""
 

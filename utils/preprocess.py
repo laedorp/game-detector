@@ -63,6 +63,8 @@ def preprocess_frame(
     frame: np.ndarray,
     inference_size: InferenceSizeLike,
     crop_size: int | tuple[int, int] | None = None,
+    *,
+    crop_origin: tuple[int, int] | None = None,
 ) -> PreprocessedFrame:
     try:
         import cv2
@@ -99,6 +101,17 @@ def preprocess_frame(
             raise ValueError(
                 "crop_size must contain positive dimensions or be None"
             )
+    if crop_origin is not None:
+        if crop_size is None:
+            raise ValueError("crop_origin requires crop_size")
+        if not isinstance(crop_origin, tuple) or len(crop_origin) != 2:
+            raise TypeError("crop_origin must be an (x, y) integer pair or None")
+        raw_crop_x, raw_crop_y = crop_origin
+        if any(
+            isinstance(value, bool) or not isinstance(value, Integral)
+            for value in (raw_crop_x, raw_crop_y)
+        ):
+            raise TypeError("crop_origin must contain integer x and y")
 
     if not isinstance(frame, np.ndarray):
         raise TypeError("frame must be a NumPy array")
@@ -122,8 +135,17 @@ def preprocess_frame(
             applied_crop_height != crop_height
             or applied_crop_width != crop_width
         )
-        crop_x = (source_width - applied_crop_width) // 2
-        crop_y = (source_height - applied_crop_height) // 2
+        if crop_origin is None:
+            crop_x = (source_width - applied_crop_width) // 2
+            crop_y = (source_height - applied_crop_height) // 2
+        else:
+            crop_x, crop_y = (int(value) for value in crop_origin)
+            maximum_crop_x = source_width - applied_crop_width
+            maximum_crop_y = source_height - applied_crop_height
+            if not 0 <= crop_x <= maximum_crop_x or not 0 <= crop_y <= maximum_crop_y:
+                raise ValueError(
+                    "crop_origin must keep the applied crop within the source frame"
+                )
         roi = frame[
             crop_y : crop_y + applied_crop_height,
             crop_x : crop_x + applied_crop_width,

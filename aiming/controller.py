@@ -20,7 +20,7 @@ DEFAULT_HEAD_RATIO = 0.12
 LOCAL_TARGET_STALE_SECONDS = 0.15
 LOCAL_WATCHDOG_INTERVAL_SECONDS = 0.025
 TARGET_TRACK_REFERENCE_HZ = 60.0
-TARGET_TRACK_MEMORY_SECONDS = 0.20
+TARGET_TRACK_MEMORY_SECONDS = 0.35
 TARGET_CONTINUATION_STRONG_WINDOW_SECONDS = 0.10
 TARGET_REACQUIRE_CONFIRMATIONS = 2
 TARGET_POSITION_TIME_CONSTANT_SECONDS = 0.020
@@ -673,7 +673,7 @@ class TargetTracker:
         *,
         label: str | None = None,
         head_ratio: float = DEFAULT_HEAD_RATIO,
-        lost_grace_frames: int = 3,
+        lost_grace_frames: int = 6,
         reacquire_confirmations: int = TARGET_REACQUIRE_CONFIRMATIONS,
         track_memory_seconds: float = TARGET_TRACK_MEMORY_SECONDS,
     ) -> None:
@@ -937,9 +937,31 @@ class TargetTracker:
                 measurement = selected
                 self._target = self._start_track(selected, sample_ns)
             else:
-                # Never snap a physical output to an incompatible detection in
-                # one frame. Keeping the old box internally is only identity
-                # memory; returning None makes this interval fail closed.
+                # An unrelated detection does not prove that the established
+                # target vanished.  Preserve only the existing track's bounded
+                # prediction while the replacement is still pending; never
+                # blend the rival's box into the old identity.  A consistent
+                # replacement still starts a new generation after the normal
+                # confirmation count, and prediction still expires at the
+                # existing empty-frame grace deadline.
+                if (
+                    self._target is not None
+                    and self._within_prediction_grace(sample_ns)
+                ):
+                    self._misses += 1
+                    self._target = self._predict_missing_target(
+                        dimensions,
+                        sample_ns,
+                    )
+                    self._output_is_prediction = True
+                    return self._record_observation(
+                        candidate,
+                        None,
+                        self._target,
+                        dimensions,
+                    )
+                # Outside that immutable grace, fail closed while retaining
+                # identity memory for an ordinary measured reacquisition.
                 self._target = None
                 self._misses += 1
                 return self._record_observation(
@@ -1094,12 +1116,10 @@ class TargetTracker:
         predicted_point = _box_target_point(predicted_box, self.head_ratio)
         predicted_area = _box_area(predicted_box)
         distance_gate = min(max(0.035 + elapsed * 1.5, 0.045), 0.10)
-        # The last raw measurement is a better mode reference than the
-        # smoothed/predicted box. Some detectors emit two heavily-overlapping
-        # boxes for the same player (for example, a narrow torso box and a
-        # slightly wider full-player box). Mixing those shapes into the filter
-        # lets confidence noise alternate the selected measurement and moves
-        # the derived head point even when the physical player is steady.
+        # Cadence may expand the zero-overlap gate only to one tenth of the
+        # frame diagonal. The former 0.24 ceiling let a different player more
+        # than 400 px away inherit the same identity after a 100 ms detector
+        # gap and resume physical control without direct-head re-verification.
         mode_reference = self._last_observed_box or predicted_box
         scored: list[tuple[float, float, float, float, Detection]] = []
         for candidate in candidates:
@@ -1119,17 +1139,23 @@ class TargetTracker:
                 point[1] - predicted_point[1],
             )
             normalized_distance = distance / diagonal if diagonal > 0.0 else 1.0
+            shape_continuity = _box_shape_similarity(
+                mode_reference,
+                candidate.xyxy,
+            )
+            # Shape similarity is a tie-breaker, never identity proof.  The
+            # former same-shape bypass accepted any lookalike within one quarter
+            # of the frame diagonal regardless of cadence.  In crowded live
+            # frames that silently alternated a single generation between two
+            # opponents roughly 230 px apart.  Zero-overlap continuation must
+            # remain inside the existing time-bounded distance gate.
             if iou >= 0.10 or normalized_distance <= distance_gate:
-                proximity = max(0.0, 1.0 - normalized_distance / distance_gate)
+                proximity = max(0.0, 1.0 - normalized_distance / max(distance_gate, 1e-6))
                 confidence = min(max(float(candidate.confidence), 0.0), 1.0)
                 # Identity continuity dominates detector confidence. Confidence
                 # breaks close association ties, but cannot make a nearby rival
                 # steal a well-overlapping established track in one frame.
                 identity_score = iou * 0.70 + proximity * 0.30
-                shape_continuity = _box_shape_similarity(
-                    mode_reference,
-                    candidate.xyxy,
-                )
                 scored.append(
                     (
                         identity_score,

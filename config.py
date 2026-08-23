@@ -20,6 +20,7 @@ from utils.inference_size import (
 
 SourceKind = Literal["device", "file", "screen"]
 AimOutput = Literal["local", "remote", "makcu"]
+AimMakcuTrackingMode = Literal["stable-body", "direct-head"]
 APPLICATION_ROOT = Path(__file__).resolve().parent
 DEFAULT_SELF_ZONE_LEFT = 0.18
 DEFAULT_SELF_ZONE_WIDTH = 0.34
@@ -90,6 +91,10 @@ class AppConfig:
     aim_makcu_prediction_lead_seconds: float = 0.03
     aim_makcu_derivative_damping_seconds: float = 0.008
     aim_makcu_vertical_rate_ratio: float = 0.48
+    aim_makcu_tracking_mode: AimMakcuTrackingMode = "stable-body"
+    aim_diagnostic_dir: Path | None = None
+    aim_diagnostic_sample_hz: float = 20.0
+    aim_diagnostic_max_duration_seconds: float = 30.0
     aim_makcu_active_profile: Path | None = None
     aim_calibration_evidence: Path | None = None
     aim_calibration_context: str = DEFAULT_AIM_CALIBRATION_CONTEXT
@@ -509,6 +514,35 @@ def build_parser() -> argparse.ArgumentParser:
         help="Optional MAKCU serial path; auto-detected by USB ID when omitted.",
     )
     parser.add_argument(
+        "--aim-makcu-tracking-mode",
+        choices=("stable-body", "direct-head"),
+        default="stable-body",
+        help=(
+            "Automatic MAKCU target source: stable measured player boxes or "
+            "experimental direct-head localization (default: stable-body)."
+        ),
+    )
+    parser.add_argument(
+        "--aim-diagnostic-dir",
+        type=Path,
+        metavar="DIR",
+        help="Write a bounded local frame/decision trace for MAKCU diagnosis.",
+    )
+    parser.add_argument(
+        "--aim-diagnostic-sample-hz",
+        type=_positive_float,
+        default=20.0,
+        metavar="HZ",
+        help="Diagnostic frame sampling rate, at most 60 Hz (default: 20).",
+    )
+    parser.add_argument(
+        "--aim-diagnostic-max-duration-seconds",
+        type=_positive_float,
+        default=30.0,
+        metavar="SECONDS",
+        help="Maximum diagnostic capture duration, at most 300 seconds (default: 30).",
+    )
+    parser.add_argument(
         "--aim-makcu-button",
         type=int,
         choices=range(5),
@@ -526,7 +560,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--aim-makcu-max-step",
         type=_positive_int,
         default=160,
-        help="Maximum relative mouse movement per frame (default: 160).",
+        help=(
+            "Legacy/base relative mouse-rate envelope (default: 160). In "
+            "automatic direct-head mode, values below 320 remain a hard "
+            "conservative limit; a bound measured plant at 320 or above may "
+            "use the separately reported per-axis pursuit envelope."
+        ),
     )
     parser.add_argument(
         "--aim-makcu-smoothing-alpha",
@@ -641,6 +680,14 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         parser.error("--self-zone-left plus --self-zone-width must be at most 1")
     if args.aim_makcu_strength > 4.0:
         parser.error("--aim-makcu-strength must be at most 4")
+    if args.aim_diagnostic_sample_hz > 60.0:
+        parser.error("--aim-diagnostic-sample-hz must be at most 60")
+    if args.aim_diagnostic_max_duration_seconds > 300.0:
+        parser.error("--aim-diagnostic-max-duration-seconds must be at most 300")
+    if args.aim_diagnostic_dir is not None and not (
+        args.aim and args.aim_output == "makcu"
+    ):
+        parser.error("--aim-diagnostic-dir requires MAKCU aim output")
     if not 0.0 <= args.aim_makcu_prediction_lead_seconds <= 0.25:
         parser.error("--aim-makcu-prediction-lead-seconds must be between 0 and 0.25")
     if not 0.0 <= args.aim_makcu_derivative_damping_seconds <= 0.25:
@@ -797,6 +844,16 @@ def parse_args(argv: Sequence[str] | None = None) -> AppConfig:
         aim_makcu_prediction_lead_seconds=args.aim_makcu_prediction_lead_seconds,
         aim_makcu_derivative_damping_seconds=args.aim_makcu_derivative_damping_seconds,
         aim_makcu_vertical_rate_ratio=args.aim_makcu_vertical_rate_ratio,
+        aim_makcu_tracking_mode=args.aim_makcu_tracking_mode,
+        aim_diagnostic_dir=(
+            args.aim_diagnostic_dir.expanduser()
+            if args.aim_diagnostic_dir is not None
+            else None
+        ),
+        aim_diagnostic_sample_hz=args.aim_diagnostic_sample_hz,
+        aim_diagnostic_max_duration_seconds=(
+            args.aim_diagnostic_max_duration_seconds
+        ),
         aim_makcu_active_profile=active_profile,
         aim_calibration_evidence=calibration_evidence,
         aim_calibration_context=args.aim_calibration_context,

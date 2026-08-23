@@ -131,6 +131,13 @@ class DesktopCaptureSource(CaptureSource):
             return None
         return source.read(timeout)
 
+    def peek_latest(self) -> FramePacket | None:
+        self._require_started()
+        source = self._source
+        if source is None:
+            return None
+        return source.peek_latest()
+
     def close(self) -> None:
         self._begin_close()
         source = self._source

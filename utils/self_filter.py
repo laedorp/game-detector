@@ -35,6 +35,13 @@ PLAYER_LABEL_WORDS = frozenset(
 OTHER_PLAYER_LABEL_WORDS = frozenset({"bot", "enemy", "npc", "opponent"})
 SHOULDER_SWAP_BOTTOM = 0.88
 SHOULDER_SWAP_MIN_HEIGHT = 0.25
+OBVIOUS_SELF_BOTTOM = 0.985
+# The wide third-person avatar is commonly clipped by the screen edge, which
+# shifts its detected box center a little farther outward than the configured
+# shoulder band.  Extend only that band's outer edge: widening toward screen
+# center would also consume the space where a close opponent can appear.
+OBVIOUS_SELF_OUTER_EDGE_MARGIN = 0.02
+OBVIOUS_SELF_SCREEN_EDGE_CONTACT = 0.02
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,12 +142,20 @@ class NormalizedBottomZone:
 
 @dataclass(frozen=True, slots=True)
 class ExclusionResult:
-    """Retained detections plus the candidate hidden on this frame, if any."""
+    """Retained detections plus current self-avatar safety evidence.
+
+    ``uncertain_self_detections`` names only current-frame detections which the
+    temporal filter cannot yet distinguish from the user's avatar.  They remain
+    in ``detections`` for preview compatibility; aim callers can use the narrow
+    identity list to reject those boxes and their spatial relatives without
+    treating every separate player in the frame as unsafe.
+    """
 
     detections: tuple[Any, ...]
     ignored_count: int
     ignored_detection: Any | None = None
     aim_safe: bool = False
+    uncertain_self_detections: tuple[Any, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -226,7 +241,13 @@ class SelfAvatarFilter:
         # and wait for an unambiguous view instead of guessing which is self.
         if len(candidates) != 1:
             self._clear_pending()
-            return ExclusionResult(detections, 0)
+            return ExclusionResult(
+                detections,
+                0,
+                uncertain_self_detections=_unique_candidate_detections(
+                    candidates,
+                ),
+            )
 
         candidate = candidates[0]
         if self._pending_box is None or self._pending_class != candidate.class_key:
@@ -238,7 +259,11 @@ class SelfAvatarFilter:
             self._pending_hits += 1
 
         if self._pending_hits < self.acquire_frames:
-            return ExclusionResult(detections, 0)
+            return ExclusionResult(
+                detections,
+                0,
+                uncertain_self_detections=(candidate.detection,),
+            )
 
         self._locked_box = candidate.box
         self._locked_class = candidate.class_key
@@ -274,6 +299,15 @@ class SelfAvatarFilter:
                 for candidate in tracking_candidates
                 if _is_shoulder_handoff_candidate(candidate.box, self.zone)
             )
+            plausible_handoffs = tuple(
+                candidate
+                for candidate in tracking_candidates
+                if _is_bottom_avatar_shape(candidate.box)
+            )
+            uncertain_detections = _unique_candidate_detections(
+                matches,
+                plausible_handoffs,
+            )
             if len(matches) == 0 and len(shoulder_handoffs) == 1:
                 candidate = shoulder_handoffs[0]
                 if (
@@ -292,7 +326,12 @@ class SelfAvatarFilter:
                     self._locked_box = candidate.box
                     self._clear_handoff()
                     return _remove_candidate(detections, candidate)
-                return ExclusionResult(detections, 0, aim_safe=False)
+                return ExclusionResult(
+                    detections,
+                    0,
+                    aim_safe=False,
+                    uncertain_self_detections=uncertain_detections,
+                )
 
             self._clear_handoff()
             self._lost_frames += 1
@@ -302,10 +341,7 @@ class SelfAvatarFilter:
             # it lies outside the user's acquisition zone. Keep detections for
             # preview, but fail aim closed until the old lock expires and this
             # candidate is reacquired deliberately.
-            plausible_handoff = any(
-                _is_bottom_avatar_shape(candidate.box)
-                for candidate in tracking_candidates
-            )
+            plausible_handoff = bool(plausible_handoffs)
             aim_safe = len(matches) == 0 and not candidates and not plausible_handoff
             if self._lost_frames > self.lost_grace_frames:
                 self._locked_box = None
@@ -313,7 +349,14 @@ class SelfAvatarFilter:
                 self._lost_frames = 0
                 self._clear_pending()
                 aim_safe = False
-            return ExclusionResult(detections, 0, aim_safe=aim_safe)
+            return ExclusionResult(
+                detections,
+                0,
+                aim_safe=aim_safe,
+                uncertain_self_detections=(
+                    () if aim_safe else uncertain_detections
+                ),
+            )
 
         candidate = matches[0]
         self._lost_frames = 0
@@ -337,7 +380,11 @@ class SelfAvatarFilter:
             self._handoff_box = candidate.box
             self._handoff_hits += 1
         if self._handoff_hits < self.handoff_confirm_frames:
-            return ExclusionResult(detections, 0)
+            return ExclusionResult(
+                detections,
+                0,
+                uncertain_self_detections=(candidate.detection,),
+            )
 
         self._locked_box = candidate.box
         self._clear_handoff()
@@ -374,7 +421,11 @@ def exclude_self_avatar(
     materialized = tuple(detections)
     candidates = _candidates(materialized, frame_shape, zone)
     if len(candidates) != 1:
-        return ExclusionResult(materialized, 0)
+        return ExclusionResult(
+            materialized,
+            0,
+            uncertain_self_detections=_unique_candidate_detections(candidates),
+        )
     return _remove_candidate(materialized, candidates[0])
 
 
@@ -388,6 +439,57 @@ def is_player_like(detection: Any) -> bool:
     if any(_token_matches_words(token, OTHER_PLAYER_LABEL_WORDS) for token in tokens):
         return False
     return any(_token_matches_words(token, PLAYER_LABEL_WORDS) for token in tokens)
+
+
+def is_obvious_bottom_shoulder_avatar(
+    detection: Any,
+    frame_shape: Sequence[int],
+    zone: NormalizedBottomZone,
+) -> bool:
+    """Whether geometry alone makes a player box an obvious self avatar.
+
+    This stricter aim-only guard complements the temporal filter.  It catches
+    the very wide, screen-bottom avatar boxes that intentionally fail the
+    ordinary aspect-ratio acquisition rule, but only in the explicitly
+    configured shoulder band.  Opposite-shoulder handoff remains a temporal
+    decision in :class:`SelfAvatarFilter`; treating both bands as obvious at
+    once can misclassify a close bottom-touching opponent as self.
+    """
+
+    if not is_player_like(detection):
+        return False
+    normalized = _normalized_box(_detection_box(detection), frame_shape)
+    if normalized is None:
+        return False
+    x1, y1, x2, y2 = normalized
+    height = y2 - y1
+    width = x2 - x1
+    if (
+        y2 < OBVIOUS_SELF_BOTTOM
+        or height < SHOULDER_SWAP_MIN_HEIGHT
+        or width < MIN_SELF_BOX_WIDTH
+    ):
+        return False
+    anchor_x = (x1 + x2) * 0.5
+    zone_center = zone.left + zone.width * 0.5
+    right = zone.left + zone.width
+    if zone.left <= anchor_x <= right:
+        return True
+    if zone_center < 0.5:
+        return bool(
+            max(0.0, zone.left - OBVIOUS_SELF_OUTER_EDGE_MARGIN)
+            <= anchor_x
+            < zone.left
+            and x1 <= OBVIOUS_SELF_SCREEN_EDGE_CONTACT
+        )
+    elif zone_center > 0.5:
+        return bool(
+            right
+            < anchor_x
+            <= min(1.0, right + OBVIOUS_SELF_OUTER_EDGE_MARGIN)
+            and x2 >= 1.0 - OBVIOUS_SELF_SCREEN_EDGE_CONTACT
+        )
+    return False
 
 
 def _token_matches_words(token: str, words: frozenset[str]) -> bool:
@@ -460,6 +562,30 @@ def _remove_candidate(
         if index != candidate.index
     )
     return ExclusionResult(retained, 1, candidate.detection, aim_safe=True)
+
+
+def _unique_candidate_detections(
+    *candidate_groups: Iterable[_Candidate],
+) -> tuple[Any, ...]:
+    """Return candidate detections once each, preserving source order.
+
+    A candidate can enter more than one conservative identity category (for
+    example, both an old-lock match and a large bottom-avatar shape).  Deduping
+    by object identity avoids reporting it twice without conflating two
+    distinct detector boxes which happen to compare equal.
+    """
+
+    unique: list[tuple[int, Any]] = []
+    seen_identities: set[int] = set()
+    for candidates in candidate_groups:
+        for candidate in candidates:
+            identity = id(candidate.detection)
+            if identity in seen_identities:
+                continue
+            seen_identities.add(identity)
+            unique.append((candidate.index, candidate.detection))
+    unique.sort(key=lambda item: item[0])
+    return tuple(detection for _index, detection in unique)
 
 
 def _association_score(
