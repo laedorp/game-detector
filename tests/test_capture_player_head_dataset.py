@@ -295,7 +295,14 @@ class CapturePlayerHeadDatasetTests(unittest.TestCase):
         previous = Path.cwd()
         try:
             with mock.patch.dict(os.environ, {"MPLCONFIGDIR": str(matplotlib_config)}):
-                from ultralytics.data.utils import check_det_dataset
+                try:
+                    from ultralytics.data.utils import check_det_dataset
+                except ModuleNotFoundError as exc:
+                    if exc.name == "ultralytics":
+                        self.skipTest(
+                            "requires the optional Ultralytics export dependency"
+                        )
+                    raise
 
                 os.chdir(unrelated)
                 loaded = check_det_dataset(str(yaml_path.resolve()), autodownload=False)

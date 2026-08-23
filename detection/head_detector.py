@@ -156,11 +156,14 @@ class HeadModelSpec:
 
 
 def _project_root(project_root: str | Path | None = None) -> Path:
-    return (
-        Path(__file__).resolve().parents[1]
-        if project_root is None
-        else Path(project_root).expanduser().resolve()
-    )
+    if project_root is None:
+        return Path(__file__).resolve().parents[1]
+    # Keep an explicitly supplied root in the caller's native spelling.  In
+    # particular, resolving ``/opt/proaim`` on Windows adds the current drive,
+    # and resolving an 8.3 temporary-directory path expands it to its long
+    # name.  Both still address the same file, but changing the spelling makes
+    # the public path helpers return a different path than the caller supplied.
+    return Path(project_root).expanduser()
 
 
 def _verify_model_file(
@@ -255,7 +258,7 @@ def runtime_head_model_spec(project_root: str | Path | None = None) -> HeadModel
         )
     return HeadModelSpec(
         path=_verify_model_file(
-            model_path.resolve(),
+            model_path,
             expected_size_bytes=(
                 int(payload["model_size_bytes"])
                 if payload.get("model_size_bytes") is not None

@@ -195,6 +195,14 @@ class PinnedHeadModelTests(unittest.TestCase):
             Path("/opt/proaim") / PINNED_HEAD_MODEL_RELATIVE_PATH,
         )
 
+    def test_pinned_path_preserves_explicit_project_root_spelling(self) -> None:
+        root = Path("portable-root") / "nested" / ".."
+
+        self.assertEqual(
+            pinned_head_model_path(root),
+            root / PINNED_HEAD_MODEL_RELATIVE_PATH,
+        )
+
     def test_verifier_checks_both_size_and_sha256(self) -> None:
         payload = b"pinned-head-model"
         with TemporaryDirectory() as directory:
@@ -273,6 +281,37 @@ class PinnedHeadModelTests(unittest.TestCase):
         self.assertEqual(spec.model_name, "Nightly head 640")
         self.assertEqual(spec.evidence_label, "Nightly head box")
         self.assertEqual(spec.confidence_threshold, 0.15)
+
+    def test_runtime_override_preserves_verified_model_path_spelling(self) -> None:
+        payload = b"override-head-model"
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "existing").mkdir()
+            model = root / "existing" / ".." / "override.onnx"
+            model.write_bytes(payload)
+            import hashlib
+
+            manifest = root / "runtime-head.json"
+            manifest.write_text(
+                json.dumps(
+                    {
+                        "model": str(model),
+                        "model_size_bytes": len(payload),
+                        "model_sha256": hashlib.sha256(payload).hexdigest(),
+                        "input_shape_nchw": [1, 3, 640, 640],
+                        "output_shape": [1, 6, 8400],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch.dict(
+                "os.environ",
+                {DIRECT_HEAD_RUNTIME_MANIFEST_ENV: str(manifest)},
+                clear=False,
+            ):
+                spec = runtime_head_model_spec(root)
+
+        self.assertEqual(spec.path, model)
 
 
 class HeadDecoderTests(unittest.TestCase):

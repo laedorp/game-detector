@@ -117,6 +117,22 @@ def _run(
     )
 
 
+def _assert_sealed_mode(
+    test_case: unittest.TestCase,
+    path: Path,
+    expected_posix_mode: int,
+) -> None:
+    actual = os.stat(path).st_mode & 0o777
+    if os.name == "nt":
+        # Windows chmod exposes only the read-only attribute and reports the
+        # corresponding read/execute bits for all user classes.
+        test_case.assertEqual(actual & 0o222, 0)
+        expected_access = expected_posix_mode & 0o500
+        test_case.assertEqual(actual & expected_access, expected_access)
+        return
+    test_case.assertEqual(actual, expected_posix_mode)
+
+
 class RecorderManifestTests(unittest.TestCase):
     def test_png_is_lossless_default_and_manifest_hashes_exact_published_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -242,8 +258,8 @@ class InterruptionAndBoundsTests(unittest.TestCase):
             self.assertEqual(len(manifest["frames"]), 1)
             self.assertIsNotNone(manifest["ended_utc"])
             self.assertTrue(source.closed)
-            self.assertEqual(os.stat(result.manifest_path).st_mode & 0o777, 0o400)
-            self.assertEqual(os.stat(result.session_dir).st_mode & 0o777, 0o500)
+            _assert_sealed_mode(self, result.manifest_path, 0o400)
+            _assert_sealed_mode(self, result.session_dir, 0o500)
 
     def test_zero_frame_duration_bound_is_failed_not_false_success(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -290,7 +306,7 @@ class InterruptionAndBoundsTests(unittest.TestCase):
             self.assertEqual(manifest["status"], "failed")
             self.assertFalse(manifest["complete"])
             self.assertIn("clock_ns", manifest["completion_reason"])
-            self.assertEqual(os.stat(manifest_path).st_mode & 0o777, 0o400)
+            _assert_sealed_mode(self, manifest_path, 0o400)
             self.assertFalse(source.started)
 
     def test_unexpected_source_end_is_valid_but_incomplete(self) -> None:
@@ -328,7 +344,7 @@ class InterruptionAndBoundsTests(unittest.TestCase):
                 manifest["capture"]["error"],
                 "Timed out waiting for capture worker to stop",
             )
-            self.assertEqual(os.stat(result.manifest_path).st_mode & 0o777, 0o400)
+            _assert_sealed_mode(self, result.manifest_path, 0o400)
 
     def test_encoder_failure_is_recorded_before_error_is_raised(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -445,6 +461,39 @@ class OutputSafetyTests(unittest.TestCase):
             self.assertEqual(
                 [frame["source_sequence"] for frame in manifest["frames"]], [4, 6]
             )
+
+
+class DirectoryDurabilityTests(unittest.TestCase):
+    def test_windows_exclusive_publication_renames_instead_of_hard_linking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "frame.png"
+            real_rename = os.rename
+            with mock.patch.object(recorder.os, "name", "nt"):
+                with mock.patch.object(
+                    recorder.os, "rename", wraps=real_rename
+                ) as rename:
+                    with mock.patch.object(recorder.os, "link") as link:
+                        recorder._exclusive_file(path, PNG_BYTES)
+
+            self.assertEqual(path.read_bytes(), PNG_BYTES)
+            rename.assert_called_once()
+            link.assert_not_called()
+
+    def test_directory_fsync_skips_unsupported_windows_directory_flush(self) -> None:
+        directory = Path("windows-directory")
+        with mock.patch.object(recorder.os, "name", "nt"):
+            with mock.patch.object(recorder, "_posix_directory_fsync") as posix:
+                recorder._directory_fsync(directory)
+
+        posix.assert_not_called()
+
+    def test_directory_fsync_routes_to_posix_helper_off_windows(self) -> None:
+        directory = Path("posix-directory")
+        with mock.patch.object(recorder.os, "name", "posix"):
+            with mock.patch.object(recorder, "_posix_directory_fsync") as posix:
+                recorder._directory_fsync(directory)
+
+        posix.assert_called_once_with(directory)
 
 
 class DefaultsAndIsolationTests(unittest.TestCase):

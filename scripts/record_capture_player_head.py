@@ -294,13 +294,24 @@ def _prepare_session(output_root: Path, session_id: str) -> tuple[Path, Path]:
     return session_dir, images_dir
 
 
-def _directory_fsync(directory: Path) -> None:
+def _posix_directory_fsync(directory: Path) -> None:
     flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
     descriptor = os.open(directory, flags)
     try:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def _directory_fsync(directory: Path) -> None:
+    """Flush directory-entry changes when the platform supports it."""
+
+    if os.name == "nt":
+        # Windows has no supported equivalent of POSIX directory fsync.
+        # Every temporary file is flushed before its link/replace publication;
+        # do not try os.open(directory), which raises PermissionError on Windows.
+        return
+    _posix_directory_fsync(directory)
 
 
 def _exclusive_file(path: Path, payload: bytes, mode: int = 0o400) -> None:
@@ -318,11 +329,19 @@ def _exclusive_file(path: Path, payload: bytes, mode: int = 0o400) -> None:
             stream.write(payload)
             stream.flush()
             os.fsync(stream.fileno())
-        os.chmod(temporary, mode, follow_symlinks=False)
-        # Hard-link publication has atomic visibility and fails if the final
-        # name appeared concurrently; unlike replace(), it cannot overwrite.
-        os.link(temporary, path, follow_symlinks=False)
-        temporary.unlink()
+        if os.name == "nt":
+            # On Windows rename is atomic and refuses an existing destination.
+            # It also avoids trying to unlink a read-only temporary hard link,
+            # which Windows rejects even after the other link is published.
+            os.rename(temporary, path)
+            os.chmod(path, mode, follow_symlinks=False)
+        else:
+            os.chmod(temporary, mode, follow_symlinks=False)
+            # Hard-link publication has atomic visibility and fails if the
+            # final name appeared concurrently; unlike replace(), it cannot
+            # overwrite.
+            os.link(temporary, path, follow_symlinks=False)
+            temporary.unlink()
         _directory_fsync(path.parent)
     except FileExistsError as exc:
         raise RecorderError(f"refusing to overwrite existing file: {path}") from exc
