@@ -148,15 +148,28 @@ class NormalizedBottomZoneTests(unittest.TestCase):
                 )
 
         # The extra outboard margin is not a generic widening toward nearby
-        # players: only a box actually clipped by that screen edge may use it.
+        # players: only a box inside the narrow recorded edge-contact band may
+        # use it.
         close_opponent = self.detection(
-            (100.0, 340.0, 600.0, 1000.0),
+            (110.0, 340.0, 600.0, 1000.0),
             "player",
         )
         self.assertFalse(
             is_obvious_bottom_shoulder_avatar(
                 close_opponent,
                 self.frame_shape,
+                self.zone,
+            )
+        )
+
+        recorded_inset_self = self.detection(
+            (77.37, 283.41, 542.58, 1074.35),
+            "player",
+        )
+        self.assertTrue(
+            is_obvious_bottom_shoulder_avatar(
+                recorded_inset_self,
+                (1080, 1920, 3),
                 self.zone,
             )
         )

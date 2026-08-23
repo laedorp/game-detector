@@ -1997,7 +1997,7 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
             )
         )
 
-    def test_no_decoded_head_allows_only_confirmed_position_body_fallback(
+    def test_no_decoded_head_body_proxy_remains_diagnostic_only(
         self,
     ) -> None:
         player = Detection(0, "player", 0.8, (800.0, 200.0, 1000.0, 700.0))
@@ -2047,37 +2047,19 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         self.assertEqual(result, 0)
         controller = _FakeMakcuController.instances[0]
         self.assertEqual(controller.normal_updates, 3)
-        self.assertIsNone(controller.normal_update_arguments[0][0])
-        expected_point = (900.0, 260.0)
-        for arguments, keywords in zip(
-            controller.normal_update_arguments[1:],
-            controller.normal_update_keywords[1:],
-        ):
-            self.assertIsNotNone(arguments[0])
-            self.assertEqual(keywords["aim_point"], expected_point)
-            self.assertEqual(keywords["velocity_point"], expected_point)
-            self.assertFalse(keywords["body_derived_motion_permitted"])
-            self.assertNotIn("motion_corroboration_point", keywords)
-            self.assertNotIn("body_derived_motion_deadline_ns", keywords)
-            self.assertGreater(
-                keywords["identity_deadline_ns"],
-                keywords["measurement_ns"],
+        self.assertTrue(
+            all(
+                arguments[0] is None
+                for arguments in controller.normal_update_arguments
             )
-            self.assertLessEqual(
-                keywords["identity_deadline_ns"]
-                - keywords["measurement_ns"],
-                110_000_000,
-            )
-        self.assertEqual(len(fallback_deadlines), 1)
-        self.assertEqual(
-            len(
-                {
-                    keywords["identity_deadline_ns"]
-                    for keywords in controller.normal_update_keywords[1:]
-                }
-            ),
-            1,
         )
+        self.assertTrue(
+            all(
+                "aim_point" not in keywords
+                for keywords in controller.normal_update_keywords
+            )
+        )
+        self.assertEqual(len(fallback_deadlines), 1)
         records = [
             json.loads(line)
             for line in next(diagnostic_root.iterdir())
@@ -2087,16 +2069,20 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
         ]
         self.assertEqual(
             [record["control_source"] for record in records],
-            ["none", "body-fallback", "body-fallback"],
+            ["none", "none", "none"],
         )
         self.assertTrue(
             all(
-                "position-only body proxy" in record["aim_status"]
-                for record in records[1:]
+                record["aim_status"]
+                == (
+                    "aim paused: direct-head anchor pending; body target is "
+                    "identity-only"
+                )
+                for record in records
             )
         )
 
-    def test_body_fallback_is_revoked_on_first_prediction_only_frame(
+    def test_body_fallback_eligibility_never_activates_controller(
         self,
     ) -> None:
         player = Detection(0, "player", 0.8, (800.0, 200.0, 1000.0, 700.0))
@@ -2147,10 +2133,13 @@ class ActiveProfileRuntimeTests(unittest.TestCase):
 
         self.assertEqual(result, 0)
         controller = _FakeMakcuController.instances[0]
-        self.assertEqual(controller.normal_updates, 3)
-        self.assertIsNone(controller.normal_update_arguments[0][0])
-        self.assertIsNotNone(controller.normal_update_arguments[1][0])
-        self.assertIsNone(controller.normal_update_arguments[2][0])
+        self.assertEqual(controller.normal_updates, 2)
+        self.assertTrue(
+            all(
+                arguments[0] is None
+                for arguments in controller.normal_update_arguments
+            )
+        )
 
     def test_automatic_mode_publishes_visible_mapped_anchor_from_new_direct_sample(
         self,

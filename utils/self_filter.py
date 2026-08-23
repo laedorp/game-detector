@@ -41,7 +41,11 @@ OBVIOUS_SELF_BOTTOM = 0.985
 # shoulder band.  Extend only that band's outer edge: widening toward screen
 # center would also consume the space where a close opponent can appear.
 OBVIOUS_SELF_OUTER_EDGE_MARGIN = 0.02
-OBVIOUS_SELF_SCREEN_EDGE_CONTACT = 0.02
+# Recorded third-person avatar boxes can begin about 4% inside the image after
+# weapon/build occlusion even though they remain bottom-clipped, avatar-height,
+# and just outside the configured shoulder center band.  This affects only the
+# final obvious-self guard; ordinary opponent/self acquisition stays unchanged.
+OBVIOUS_SELF_SCREEN_EDGE_CONTACT = 0.05
 
 
 @dataclass(frozen=True, slots=True)
